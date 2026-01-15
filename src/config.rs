@@ -360,7 +360,11 @@ mod tests {
         assert_eq!(config.server.host, "192.168.1.1");
         assert_eq!(config.server.port, 5000);
         assert!(config.security.auth.enabled);
-        assert!(config.security.auth.api_keys.contains(&"test-key".to_string()));
+        assert!(config
+            .security
+            .auth
+            .api_keys
+            .contains(&"test-key".to_string()));
         assert!(!config.security.rate_limit.enabled);
     }
 

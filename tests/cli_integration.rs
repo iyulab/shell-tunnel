@@ -159,7 +159,11 @@ fn test_config_api_key_enables_auth() {
     let config = Config::load(&args).unwrap();
 
     assert!(config.security.auth.enabled);
-    assert!(config.security.auth.api_keys.contains(&"secret-key".to_string()));
+    assert!(config
+        .security
+        .auth
+        .api_keys
+        .contains(&"secret-key".to_string()));
 }
 
 #[test]

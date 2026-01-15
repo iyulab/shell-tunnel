@@ -165,7 +165,9 @@ pub fn generate_api_key() -> String {
 
     // Simple but unique key generation
     // Format: st_<timestamp_hex>_<random_hex>
-    let random: u64 = (timestamp as u64).wrapping_mul(0x5DEECE66D).wrapping_add(0xB);
+    let random: u64 = (timestamp as u64)
+        .wrapping_mul(0x5DEECE66D)
+        .wrapping_add(0xB);
     format!("st_{:x}_{:016x}", timestamp as u64, random)
 }
 

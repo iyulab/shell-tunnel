@@ -218,8 +218,7 @@ pub async fn serve_with_state(config: ServerConfig, state: AppState) -> crate::R
     let addr = config.bind_address();
 
     // Create router with security
-    let (router, auth_store, _rate_limiter) =
-        create_secure_router(state, config.security.clone());
+    let (router, auth_store, _rate_limiter) = create_secure_router(state, config.security.clone());
 
     // Log API key if auth is enabled and keys are registered
     if auth_store.is_enabled() {

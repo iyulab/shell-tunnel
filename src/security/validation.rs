@@ -24,7 +24,7 @@ impl Default for ValidationConfig {
         Self {
             max_command_length: 4096,
             max_output_size: 10 * 1024 * 1024, // 10MB
-            max_timeout_secs: 300,              // 5 minutes
+            max_timeout_secs: 300,             // 5 minutes
             min_timeout_secs: 1,
             block_dangerous: true,
             blocked_patterns: Vec::new(),
@@ -38,7 +38,7 @@ impl ValidationConfig {
         Self {
             max_command_length: 65536,
             max_output_size: 100 * 1024 * 1024, // 100MB
-            max_timeout_secs: 3600,              // 1 hour
+            max_timeout_secs: 3600,             // 1 hour
             min_timeout_secs: 1,
             block_dangerous: false,
             blocked_patterns: Vec::new(),

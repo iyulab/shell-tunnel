@@ -213,12 +213,16 @@ pub async fn execute_command(
     }
 
     // Execute
-    let result = state.executor.execute_in_session(&id, &cmd).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse::internal_error(e.to_string())),
-        )
-    })?;
+    let result = state
+        .executor
+        .execute_in_session(&id, &cmd)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse::internal_error(e.to_string())),
+            )
+        })?;
 
     // Update session context
     state

@@ -145,11 +145,7 @@ async fn test_get_session_not_found() {
     let app = create_router_with_state(state);
 
     let response = app
-        .oneshot(json_request(
-            Method::GET,
-            "/api/v1/sessions/99999",
-            None,
-        ))
+        .oneshot(json_request(Method::GET, "/api/v1/sessions/99999", None))
         .await
         .unwrap();
 
@@ -162,11 +158,7 @@ async fn test_delete_session_not_found() {
     let app = create_router_with_state(state);
 
     let response = app
-        .oneshot(json_request(
-            Method::DELETE,
-            "/api/v1/sessions/99999",
-            None,
-        ))
+        .oneshot(json_request(Method::DELETE, "/api/v1/sessions/99999", None))
         .await
         .unwrap();
 

@@ -63,7 +63,10 @@ impl SessionStatusResponse {
         Self {
             session_id: session.id.as_u64(),
             state: format!("{:?}", session.state),
-            working_dir: session.context.cwd().map(|p| p.to_string_lossy().to_string()),
+            working_dir: session
+                .context
+                .cwd()
+                .map(|p| p.to_string_lossy().to_string()),
             last_exit_code: session.context.last_exit_code(),
             execution_count: session.context.execution_count(),
             idle_seconds: session.idle_duration().as_secs_f64(),
@@ -166,7 +169,10 @@ impl ErrorResponse {
     pub fn invalid_state(state: SessionState) -> Self {
         Self::new(
             "INVALID_STATE",
-            format!("Session is in {:?} state and cannot execute commands", state),
+            format!(
+                "Session is in {:?} state and cannot execute commands",
+                state
+            ),
         )
     }
 
@@ -204,7 +210,10 @@ pub enum WsMessage {
         timed_out: bool,
     },
     /// Error message.
-    Error { code: String, message: String },
+    Error {
+        code: String,
+        message: String,
+    },
     /// Ping/pong for connection health.
     Ping,
     Pong,

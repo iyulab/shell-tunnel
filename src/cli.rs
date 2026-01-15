@@ -242,8 +242,7 @@ mod tests {
 
     #[test]
     fn test_long_options() {
-        let result =
-            parse_args_from(args(&["--host", "192.168.1.1", "--port", "9000"])).unwrap();
+        let result = parse_args_from(args(&["--host", "192.168.1.1", "--port", "9000"])).unwrap();
         assert_eq!(result.host.to_string(), "192.168.1.1");
         assert_eq!(result.port, 9000);
     }

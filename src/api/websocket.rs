@@ -111,10 +111,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: u64) {
                                     .ok();
 
                                 let result_msg = WsMessage::Result {
-                                    success: result
-                                        .exit_code
-                                        .map(|c| c == 0)
-                                        .unwrap_or(false)
+                                    success: result.exit_code.map(|c| c == 0).unwrap_or(false)
                                         && !result.timed_out,
                                     exit_code: result.exit_code,
                                     duration_ms: result.duration.as_millis() as u64,
@@ -233,10 +230,7 @@ async fn handle_oneshot_socket(socket: WebSocket, state: AppState) {
                         match handle.await {
                             Ok(Ok(result)) => {
                                 let result_msg = WsMessage::Result {
-                                    success: result
-                                        .exit_code
-                                        .map(|c| c == 0)
-                                        .unwrap_or(false)
+                                    success: result.exit_code.map(|c| c == 0).unwrap_or(false)
                                         && !result.timed_out,
                                     exit_code: result.exit_code,
                                     duration_ms: result.duration.as_millis() as u64,
