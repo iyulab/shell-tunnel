@@ -7,7 +7,7 @@ mod async_adapter;
 mod native;
 
 pub use async_adapter::{AsyncPtyReader, AsyncPtyWriter};
-pub use native::{default_shell, NativePty};
+pub use native::{default_shell, NativePty, SpawnedShell};
 
 use std::io::{Read, Write};
 

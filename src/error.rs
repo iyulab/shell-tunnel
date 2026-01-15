@@ -47,6 +47,18 @@ pub enum ShellTunnelError {
     /// Channel receive error.
     #[error("channel closed")]
     ChannelClosed,
+
+    /// Command execution failed.
+    #[error("command execution failed: {0}")]
+    ExecutionFailed(String),
+
+    /// Output parsing error.
+    #[error("output parse error: {0}")]
+    ParseError(String),
+
+    /// Session is not in executable state.
+    #[error("session not executable: current state is {0:?}")]
+    NotExecutable(crate::session::SessionState),
 }
 
 /// Convenience Result type for shell-tunnel operations.

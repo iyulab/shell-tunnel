@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::Instant;
 
-use super::{SessionId, SessionState};
+use super::{SessionContext, SessionId, SessionState};
 use crate::error::ShellTunnelError;
 use crate::Result;
 
@@ -28,6 +28,8 @@ pub struct Session {
     pub state: SessionState,
     /// Configuration used to create this session.
     pub config: SessionConfig,
+    /// Execution context (CWD, env, etc.).
+    pub context: SessionContext,
     /// Time when session was created.
     pub created_at: Instant,
     /// Time of last activity.
@@ -38,10 +40,17 @@ impl Session {
     /// Create a new session with the given ID and configuration.
     pub fn new(id: SessionId, config: SessionConfig) -> Self {
         let now = Instant::now();
+        let context = config
+            .working_dir
+            .as_ref()
+            .map(SessionContext::with_cwd)
+            .unwrap_or_default();
+
         Self {
             id,
             state: SessionState::Created,
             config,
+            context,
             created_at: now,
             last_activity: now,
         }
@@ -64,6 +73,7 @@ impl Clone for Session {
             id: self.id,
             state: self.state,
             config: self.config.clone(),
+            context: self.context.clone(),
             created_at: self.created_at,
             last_activity: self.last_activity,
         }

@@ -2,23 +2,35 @@
 
 **Last Updated:** 2026-01-15
 
-## Status: Phase 1 Complete
+## Status: Phase 2 Complete
 
 | Metric | Result |
 |--------|--------|
-| Tests | 40 passed, 1 ignored |
-| Binary | 966KB |
-| Commit | `a44406e` |
+| Tests | 88 passed, 3 ignored |
+| Binary | 989KB |
 
-## Next: Phase 2 - Core Features
+## Implemented Features
+
+### Phase 1 - Core Foundation
+- Cross-platform PTY (portable-pty)
+- Session management (ID, State, Store)
+- Async I/O adapters
+
+### Phase 2 - Core Features
+- Command Execution Engine (sync/async)
+- Output Sanitization (VTE parser)
+- Virtual Screen (vt100 emulation)
+- State Tracking (SessionContext)
+
+## Next: Phase 3 - API Layer
 
 | Task | Description |
 |------|-------------|
-| T2.1 | Command Execution Engine |
-| T2.2 | Output Sanitization (VTE) |
-| T2.3 | State Tracking System |
+| T3.1 | REST API (axum) |
+| T3.2 | WebSocket streaming |
+| T3.3 | JSON response format |
 
-**New deps:** `vte`, `vt100`
+**New deps:** `axum`, `tower`, `serde_json`
 
 ## Commands
 
@@ -28,7 +40,3 @@ cargo test --all         # Test
 cargo clippy             # Lint
 cargo fmt                # Format
 ```
-
-## Docs
-
-- Detailed plans: `local-docs/` (gitignored)

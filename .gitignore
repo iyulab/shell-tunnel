@@ -22,4 +22,5 @@ Thumbs.db
 
 # Local
 local-docs/
+CLAUDE.md
 tmpclaude-*-cwd

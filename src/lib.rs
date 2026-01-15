@@ -40,11 +40,17 @@
 //! ```
 
 pub mod error;
+pub mod execution;
 pub mod logging;
+pub mod output;
 pub mod pty;
 pub mod session;
 
 // Re-export commonly used types
 pub use error::{Result, ShellTunnelError};
+pub use execution::{Command, CommandExecutor, ExecutionResult};
+pub use output::{OutputSanitizer, VirtualScreen};
 pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
-pub use session::{Session, SessionConfig, SessionId, SessionState, SessionStore};
+pub use session::{
+    Session, SessionConfig, SessionContext, SessionId, SessionState, SessionStore, StateProbe,
+};

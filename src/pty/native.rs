@@ -99,6 +99,82 @@ impl NativePty {
     ) -> Result<PtyHandle<Box<dyn Read + Send>, Box<dyn Write + Send>>> {
         self.spawn(default_shell(), size)
     }
+
+    /// Spawn a shell process with optional working directory.
+    ///
+    /// This is a convenience method for command execution that spawns
+    /// a shell with default size and optionally sets the working directory.
+    pub fn spawn_shell(&mut self, working_dir: Option<&std::path::Path>) -> Result<SpawnedShell> {
+        let native_size = NativePtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let pair = self
+            .pty_system
+            .openpty(native_size)
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))?;
+
+        let mut cmd = CommandBuilder::new(default_shell());
+
+        if let Some(dir) = working_dir {
+            cmd.cwd(dir);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))?;
+
+        Ok(SpawnedShell {
+            master: pair.master,
+            child,
+            reader: None,
+            writer: None,
+        })
+    }
+}
+
+/// A spawned shell process with PTY.
+pub struct SpawnedShell {
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    reader: Option<Box<dyn Read + Send>>,
+    writer: Option<Box<dyn Write + Send>>,
+}
+
+impl SpawnedShell {
+    /// Take the writer (can only be called once).
+    pub fn take_writer(&mut self) -> Result<Box<dyn Write + Send>> {
+        if let Some(writer) = self.writer.take() {
+            return Ok(writer);
+        }
+        self.master
+            .take_writer()
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))
+    }
+
+    /// Take the reader (can only be called once).
+    pub fn take_reader(&mut self) -> Result<Box<dyn Read + Send>> {
+        if let Some(reader) = self.reader.take() {
+            return Ok(reader);
+        }
+        self.master
+            .try_clone_reader()
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))
+    }
+
+    /// Try to wait for the child process without blocking.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Wait for the child process to exit.
+    pub fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+        self.child.wait()
+    }
 }
 
 impl Default for NativePty {
