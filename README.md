@@ -1,50 +1,227 @@
 # shell-tunnel
 
-**shell-tunnel** is an ultra-lightweight system gateway designed to enable AI agents to seamlessly control remote terminals via API without the friction of complex infrastructure setup or traditional SSH management.
+[![CI](https://github.com/iyulab/shell-tunnel/actions/workflows/ci.yml/badge.svg)](https://github.com/iyulab/shell-tunnel/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/shell-tunnel.svg)](https://crates.io/crates/shell-tunnel)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Project Introduction
+**Ultra-lightweight shell tunnel for AI agent integration.**
 
-Modern AI agents need to go beyond writing code—they must interact directly with systems to execute commands, debug environments, and solve problems in real-time. **shell-tunnel** removes the burden of heavy SSH authentication and the fragmentation of OS-specific shells. It provides a standardized channel for agents to command any OS terminal using a single **REST/WebSocket API** specification.
+A zero-dependency, single binary that enables AI agents to control remote terminals via REST/WebSocket API.
 
-## Project Objectives
+## Features
 
-* **Maximize Agent Connectivity:** Bypass the complexity of SSH key management and provide an immediate, programmable path for agents to access systems.
-* **Unified Control Interface:** Provide a consistent command and response structure regardless of whether the target system is Windows (PowerShell/CMD) or Linux (Bash/Zsh).
-* **Minimize Operational Overhead:** Distributed as a zero-dependency, single binary that requires near-zero configuration for deployment.
+- **Cross-platform**: Windows (ConPTY), Linux, macOS (PTY)
+- **Lightweight**: ~2MB binary, minimal resource footprint
+- **Real-time streaming**: WebSocket support for live output
+- **Secure**: API key authentication, rate limiting, command validation
+- **Self-updating**: Automatic updates from GitHub Releases
 
-## Roles and Scope
+## Installation
 
-### Key Capabilities (In-Scope)
+### From GitHub Releases (Recommended)
 
-* **Multi-Platform Shell Abstraction:** Supports Windows ConPTY and Unix PTY to expose full control of interactive programs (e.g., Vim, Top) via API.
-* **Real-time Streaming:** Leverages WebSockets to stream terminal output back to the agent with minimal latency.
-* **Stateful Session Management:** Manages independent sessions per agent to ensure continuity of working directories (`cd`), environment variables, and process states.
+Download the latest binary for your platform:
 
-### Constraints (Out-of-Scope)
+```bash
+# Linux x64
+curl -LO https://github.com/iyulab/shell-tunnel/releases/latest/download/shell-tunnel-linux-x64.tar.gz
+tar xzf shell-tunnel-linux-x64.tar.gz
+sudo mv shell-tunnel /usr/local/bin/
 
-* Provision of a User GUI (Web terminal interface).
-* Complex Multi-user RBAC (Role-Based Access Control).
-* Persistent storage of session logs after termination.
+# macOS (Apple Silicon)
+curl -LO https://github.com/iyulab/shell-tunnel/releases/latest/download/shell-tunnel-macos-arm64.tar.gz
+tar xzf shell-tunnel-macos-arm64.tar.gz
+sudo mv shell-tunnel /usr/local/bin/
 
-## Technical Highlights
+# Windows (PowerShell)
+Invoke-WebRequest -Uri "https://github.com/iyulab/shell-tunnel/releases/latest/download/shell-tunnel-windows-x64.zip" -OutFile "shell-tunnel.zip"
+Expand-Archive shell-tunnel.zip -DestinationPath .
+```
 
-### 1. Ultra-lightweight Single Binary (Rust-based)
+### From crates.io
 
-* **Zero-Dependency:** Operates as a standalone executable without requiring external runtimes like Python or Node.js.
-* **Low Resource Consumption:** Optimized for a minimal CPU and memory footprint while idling for agent requests.
+```bash
+cargo install shell-tunnel
+```
 
-### 2. High-Performance OS Integration
+### From Source
 
-* **Native PTY Bridge:** Interfaces directly with native OS terminal engines (ConPTY/PTY) to ensure the lowest possible latency.
-* **Unified API:** Standardized JSON schema for sending commands and receiving results across all supported operating systems.
+```bash
+git clone https://github.com/iyulab/shell-tunnel.git
+cd shell-tunnel
+cargo build --release
+```
 
-### 3. Built-in Security Layer
+## Quick Start
 
-* **Token-based Auth:** Uses API token authentication optimized for automated agent integration.
-* **Encryption:** Supports secure communication channels to ensure data confidentiality during transit.
-* **Command Sandboxing:** Includes features to restrict working directories or blacklist dangerous commands.
+```bash
+# Start server with defaults (localhost:3000, no auth)
+shell-tunnel
 
-### 4. Agent-Centric Interface
+# Start with API key authentication
+shell-tunnel -k my-secret-key
 
-* **REST & WebSocket Hybrid:** Supports both discrete command execution (REST) and continuous interactive control (WebSocket).
-* **Structured Output:** Returns execution results and exit codes in standardized JSON, removing the parsing burden from the AI agent.
+# Start on all interfaces
+shell-tunnel -H 0.0.0.0 -p 8080 -k my-secret-key
+
+# Development mode (no security)
+shell-tunnel --no-auth --no-rate-limit
+```
+
+## CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-H, --host <ADDR>` | Host address to bind | `127.0.0.1` |
+| `-p, --port <PORT>` | Port to listen on | `3000` |
+| `-c, --config <FILE>` | Path to config file (JSON) | - |
+| `-k, --api-key <KEY>` | API key for authentication | - |
+| `-l, --log-level <LVL>` | Log level (error, warn, info, debug, trace) | `info` |
+| `--no-auth` | Disable authentication | `false` |
+| `--no-rate-limit` | Disable rate limiting | `false` |
+| `--check-update` | Check for updates and exit | - |
+| `--update` | Download and install latest version | - |
+| `--no-update-check` | Disable automatic update check on startup | `false` |
+| `-h, --help` | Print help | - |
+| `-V, --version` | Print version | - |
+
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `SHELL_TUNNEL_HOST` | Host address |
+| `SHELL_TUNNEL_PORT` | Port number |
+| `SHELL_TUNNEL_API_KEY` | API key |
+| `SHELL_TUNNEL_LOG_LEVEL` | Log level |
+| `RUST_LOG` | Alternative log level |
+
+## API Usage
+
+### Health Check
+
+```bash
+curl http://localhost:3000/health
+# OK
+```
+
+### Execute Command (One-shot)
+
+```bash
+curl -X POST http://localhost:3000/api/v1/execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"command": "echo Hello World"}'
+```
+
+Response:
+```json
+{
+  "success": true,
+  "exit_code": 0,
+  "output": "Hello World\n",
+  "duration_ms": 5,
+  "timed_out": false
+}
+```
+
+### Session-based Execution
+
+```bash
+# Create session
+curl -X POST http://localhost:3000/api/v1/sessions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{}'
+
+# Response: {"session_id": 1, "session_id_str": "sess-00000001"}
+
+# Execute in session
+curl -X POST http://localhost:3000/api/v1/sessions/1/execute \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer my-secret-key" \
+  -d '{"command": "pwd"}'
+
+# Delete session
+curl -X DELETE http://localhost:3000/api/v1/sessions/1 \
+  -H "Authorization: Bearer my-secret-key"
+```
+
+### API Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check (no auth) |
+| `GET` | `/api/v1` | API information |
+| `GET` | `/api/v1/sessions` | List all sessions |
+| `POST` | `/api/v1/sessions` | Create a new session |
+| `GET` | `/api/v1/sessions/{id}` | Get session status |
+| `DELETE` | `/api/v1/sessions/{id}` | Delete a session |
+| `POST` | `/api/v1/sessions/{id}/execute` | Execute command in session |
+| `POST` | `/api/v1/execute` | Execute command (one-shot) |
+| `WS` | `/api/v1/sessions/{id}/ws` | WebSocket streaming |
+| `WS` | `/api/v1/ws` | WebSocket one-shot |
+
+## Configuration File
+
+Create a JSON config file for complex setups:
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "graceful_shutdown": true
+  },
+  "security": {
+    "auth": {
+      "enabled": true,
+      "api_keys": ["key1", "key2"]
+    },
+    "rate_limit": {
+      "enabled": true,
+      "requests_per_window": 100,
+      "window_secs": 60
+    }
+  },
+  "logging": {
+    "level": "info"
+  }
+}
+```
+
+```bash
+shell-tunnel -c /etc/shell-tunnel/config.json
+```
+
+## Auto-Update
+
+shell-tunnel includes built-in auto-update functionality:
+
+```bash
+# Check for updates
+shell-tunnel --check-update
+
+# Self-update to latest version
+shell-tunnel --update
+```
+
+By default, shell-tunnel checks for updates on startup (can be disabled with `--no-update-check`).
+
+## Security
+
+### Authentication
+- Bearer token API keys via `Authorization` header
+- `/health` endpoint bypasses authentication (for monitoring)
+
+### Rate Limiting
+- Default: 100 requests/minute per IP
+- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+
+### Input Validation
+- Command length limits
+- Dangerous pattern detection (fork bombs, `rm -rf /`, etc.)
+- Path traversal prevention
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
