@@ -11,6 +11,8 @@
 //! - **Cross-platform PTY**: Unified interface for Windows ConPTY and Unix PTY
 //! - **Async I/O**: Non-blocking operations using tokio
 //! - **Session Management**: Stateful shell sessions with lifecycle tracking
+//! - **REST API**: HTTP endpoints for command execution
+//! - **WebSocket**: Real-time streaming of command output
 //! - **Lightweight**: Minimal dependencies, small binary size
 //!
 //! ## Quick Start
@@ -38,7 +40,21 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! ## API Server
+//!
+//! ```no_run
+//! use shell_tunnel::api::{ServerConfig, serve};
+//!
+//! #[tokio::main]
+//! async fn main() -> shell_tunnel::Result<()> {
+//!     shell_tunnel::logging::try_init().ok();
+//!     let config = ServerConfig::new("127.0.0.1", 3000);
+//!     serve(config).await
+//! }
+//! ```
 
+pub mod api;
 pub mod error;
 pub mod execution;
 pub mod logging;
@@ -54,3 +70,6 @@ pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
 pub use session::{
     Session, SessionConfig, SessionContext, SessionId, SessionState, SessionStore, StateProbe,
 };
+
+// Re-export API types
+pub use api::{AppState, ServerConfig};

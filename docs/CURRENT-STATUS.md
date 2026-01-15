@@ -2,12 +2,12 @@
 
 **Last Updated:** 2026-01-15
 
-## Status: Phase 2 Complete
+## Status: Phase 3 Complete
 
 | Metric | Result |
 |--------|--------|
-| Tests | 88 passed, 3 ignored |
-| Binary | 989KB |
+| Tests | 102 passed, 3 ignored |
+| Binary | 993KB |
 
 ## Implemented Features
 
@@ -22,15 +22,38 @@
 - Virtual Screen (vt100 emulation)
 - State Tracking (SessionContext)
 
-## Next: Phase 3 - API Layer
+### Phase 3 - API Layer
+- REST API (axum 0.8)
+- WebSocket streaming (real-time output)
+- JSON request/response format
+- CORS support (tower-http)
+
+## API Endpoints
+
+### Health & Info
+- `GET /health` - Health check
+- `GET /api/v1/` - API information
+
+### Sessions
+- `GET /api/v1/sessions` - List all sessions
+- `POST /api/v1/sessions` - Create a new session
+- `GET /api/v1/sessions/{id}` - Get session status
+- `DELETE /api/v1/sessions/{id}` - Delete a session
+- `POST /api/v1/sessions/{id}/execute` - Execute command
+- `WS /api/v1/sessions/{id}/ws` - WebSocket streaming
+
+### One-shot Execution
+- `POST /api/v1/execute` - Execute without session
+- `WS /api/v1/ws` - WebSocket one-shot
+
+## Next: Phase 4 - Security & Production
 
 | Task | Description |
 |------|-------------|
-| T3.1 | REST API (axum) |
-| T3.2 | WebSocket streaming |
-| T3.3 | JSON response format |
-
-**New deps:** `axum`, `tower`, `serde_json`
+| T4.1 | Authentication (API keys, JWT) |
+| T4.2 | Rate limiting |
+| T4.3 | Input validation & sanitization |
+| T4.4 | Graceful shutdown |
 
 ## Commands
 
@@ -39,4 +62,18 @@ cargo build --release    # Build
 cargo test --all         # Test
 cargo clippy             # Lint
 cargo fmt                # Format
+RUST_LOG=debug cargo run # Run with debug logging
+```
+
+## Usage Example
+
+```rust
+use shell_tunnel::api::{ServerConfig, serve};
+
+#[tokio::main]
+async fn main() -> shell_tunnel::Result<()> {
+    shell_tunnel::logging::try_init().ok();
+    let config = ServerConfig::new("127.0.0.1", 3000);
+    serve(config).await
+}
 ```
