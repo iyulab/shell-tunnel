@@ -1,0 +1,600 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Shell-Tunnel API",
+    "description": "Ultra-lightweight shell tunnel for AI agent integration. Provides secure, cross-platform API for AI agents to interact with system shells.",
+    "version": "0.1.0",
+    "license": {
+      "name": "MIT",
+      "url": "https://opensource.org/licenses/MIT"
+    },
+    "contact": {
+      "name": "iyulab",
+      "url": "https://github.com/iyulab/shell-tunnel"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:3000",
+      "description": "Local development server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Health check endpoints"
+    },
+    {
+      "name": "Sessions",
+      "description": "Session management operations"
+    },
+    {
+      "name": "Execution",
+      "description": "Command execution endpoints"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health check",
+        "description": "Returns server health status. Does not require authentication.",
+        "operationId": "healthCheck",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Server is healthy",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "OK"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "API information",
+        "description": "Returns API version and status information.",
+        "operationId": "apiInfo",
+        "responses": {
+          "200": {
+            "description": "API information",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "List all sessions",
+        "description": "Returns a list of all active sessions.",
+        "operationId": "listSessions",
+        "responses": {
+          "200": {
+            "description": "List of sessions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListSessionsResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": ["Sessions"],
+        "summary": "Create a new session",
+        "description": "Creates a new shell session with optional configuration.",
+        "operationId": "createSession",
+        "requestBody": {
+          "description": "Session configuration",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSessionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Session created successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateSessionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}": {
+      "get": {
+        "tags": ["Sessions"],
+        "summary": "Get session status",
+        "description": "Returns the current status of a session.",
+        "operationId": "getSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Session status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionStatusResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": ["Sessions"],
+        "summary": "Delete a session",
+        "description": "Terminates and removes a session.",
+        "operationId": "deleteSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Session deleted successfully"
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/execute": {
+      "post": {
+        "tags": ["Execution"],
+        "summary": "Execute command in session",
+        "description": "Executes a command in an existing session.",
+        "operationId": "executeInSession",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "requestBody": {
+          "description": "Command to execute",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteCommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command executed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid command or validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Session not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/execute": {
+      "post": {
+        "tags": ["Execution"],
+        "summary": "Execute command (one-shot)",
+        "description": "Executes a command without creating a persistent session.",
+        "operationId": "executeOneshot",
+        "requestBody": {
+          "description": "Command to execute",
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExecuteCommandRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Command executed successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ExecuteCommandResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid command or validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/sessions/{sessionId}/ws": {
+      "get": {
+        "tags": ["Execution"],
+        "summary": "WebSocket connection for session",
+        "description": "Establishes a WebSocket connection for real-time command streaming in a session.",
+        "operationId": "sessionWebSocket",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/sessionId"
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "WebSocket connection established"
+          },
+          "404": {
+            "description": "Session not found"
+          }
+        }
+      }
+    },
+    "/api/v1/ws": {
+      "get": {
+        "tags": ["Execution"],
+        "summary": "WebSocket connection (one-shot)",
+        "description": "Establishes a WebSocket connection for one-shot command execution.",
+        "operationId": "oneshotWebSocket",
+        "responses": {
+          "101": {
+            "description": "WebSocket connection established"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "API key authentication using Bearer token"
+      }
+    },
+    "parameters": {
+      "sessionId": {
+        "name": "sessionId",
+        "in": "path",
+        "required": true,
+        "description": "Session identifier",
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "schemas": {
+      "ApiInfo": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "example": "shell-tunnel"
+          },
+          "version": {
+            "type": "string",
+            "example": "0.1.0"
+          },
+          "status": {
+            "type": "string",
+            "example": "running"
+          }
+        }
+      },
+      "CreateSessionRequest": {
+        "type": "object",
+        "properties": {
+          "shell": {
+            "type": "string",
+            "description": "Shell command to use (e.g., bash, powershell.exe)",
+            "example": "bash"
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Initial working directory",
+            "example": "/home/user"
+          },
+          "env": {
+            "type": "object",
+            "description": "Environment variables to set",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "example": {
+              "MY_VAR": "my_value"
+            }
+          }
+        }
+      },
+      "CreateSessionResponse": {
+        "type": "object",
+        "required": ["session_id", "session_id_str"],
+        "properties": {
+          "session_id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Numeric session ID",
+            "example": 1
+          },
+          "session_id_str": {
+            "type": "string",
+            "description": "Human-readable session ID",
+            "example": "session-1"
+          }
+        }
+      },
+      "SessionStatusResponse": {
+        "type": "object",
+        "required": ["session_id", "state", "execution_count", "idle_seconds"],
+        "properties": {
+          "session_id": {
+            "type": "integer",
+            "format": "int64",
+            "example": 1
+          },
+          "state": {
+            "type": "string",
+            "description": "Current session state",
+            "enum": ["Created", "Active", "Idle", "Terminated"],
+            "example": "Idle"
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Current working directory",
+            "example": "/home/user"
+          },
+          "last_exit_code": {
+            "type": "integer",
+            "description": "Exit code of last command"
+          },
+          "execution_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total commands executed",
+            "example": 5
+          },
+          "idle_seconds": {
+            "type": "number",
+            "format": "double",
+            "description": "Seconds since last activity",
+            "example": 10.5
+          }
+        }
+      },
+      "ListSessionsResponse": {
+        "type": "object",
+        "required": ["count", "sessions"],
+        "properties": {
+          "count": {
+            "type": "integer",
+            "description": "Number of sessions",
+            "example": 2
+          },
+          "sessions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionSummary"
+            }
+          }
+        }
+      },
+      "SessionSummary": {
+        "type": "object",
+        "required": ["session_id", "state", "idle_seconds"],
+        "properties": {
+          "session_id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "state": {
+            "type": "string"
+          },
+          "idle_seconds": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "ExecuteCommandRequest": {
+        "type": "object",
+        "required": ["command"],
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command to execute",
+            "example": "ls -la"
+          },
+          "working_dir": {
+            "type": "string",
+            "description": "Working directory override"
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "description": "Command timeout in seconds",
+            "default": 30,
+            "minimum": 1,
+            "maximum": 300
+          }
+        }
+      },
+      "ExecuteCommandResponse": {
+        "type": "object",
+        "required": ["output", "exit_code", "duration_ms"],
+        "properties": {
+          "output": {
+            "type": "string",
+            "description": "Command output (stdout + stderr)"
+          },
+          "exit_code": {
+            "type": "integer",
+            "description": "Exit code (0 for success)"
+          },
+          "duration_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Execution duration in milliseconds"
+          },
+          "timed_out": {
+            "type": "boolean",
+            "description": "Whether the command timed out",
+            "default": false
+          }
+        }
+      },
+      "ErrorResponse": {
+        "type": "object",
+        "required": ["error", "message"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "Error type",
+            "example": "validation_error"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable error message",
+            "example": "Command cannot be empty"
+          },
+          "details": {
+            "type": "object",
+            "description": "Additional error details",
+            "additionalProperties": true
+          }
+        }
+      },
+      "WsMessage": {
+        "type": "object",
+        "description": "WebSocket message format",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": ["type", "command"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["execute"]
+              },
+              "command": {
+                "type": "string"
+              },
+              "timeout_secs": {
+                "type": "integer"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type", "data"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["output"]
+              },
+              "data": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["ping", "pong"]
+              }
+            }
+          }
+        ]
+      }
+    }
+  },
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ]
+}

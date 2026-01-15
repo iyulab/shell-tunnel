@@ -55,6 +55,8 @@
 //! ```
 
 pub mod api;
+pub mod cli;
+pub mod config;
 pub mod error;
 pub mod execution;
 pub mod logging;
@@ -76,4 +78,10 @@ pub use session::{
 pub use api::{AppState, ServerConfig};
 
 // Re-export security types
-pub use security::{ApiKeyStore, CommandValidator, RateLimiter};
+pub use security::{
+    ApiKeyStore, AuthConfig, CommandValidator, RateLimiter, ValidationConfig,
+};
+
+// Re-export CLI and config types
+pub use cli::{parse_args, print_help, print_version, Args};
+pub use config::{Config, ConfigError};

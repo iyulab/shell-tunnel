@@ -28,12 +28,16 @@ vt100 = "0.16"
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# CLI (Phase 5) - minimal footprint (~34KB)
+lexopt = "0.3"
 futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
 
 [profile.release]
 lto = true

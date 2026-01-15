@@ -1,38 +1,60 @@
 //! Shell-tunnel binary entry point.
 
-use shell_tunnel::{logging, NativePty, PtySize, SessionConfig, SessionStore};
+use shell_tunnel::{api::serve, logging, parse_args, print_help, print_version, Config};
 use tracing::info;
 
 #[tokio::main]
 async fn main() -> shell_tunnel::Result<()> {
-    // Initialize logging
+    // Parse command-line arguments
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            eprintln!("Use --help for usage information");
+            std::process::exit(1);
+        }
+    };
+
+    // Handle help and version flags
+    if args.help {
+        print_help();
+        return Ok(());
+    }
+
+    if args.version {
+        print_version();
+        return Ok(());
+    }
+
+    // Load configuration
+    let config = match Config::load(&args) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    // Initialize logging with configured level
+    std::env::set_var("RUST_LOG", config.log_filter());
     logging::init();
 
     info!("shell-tunnel v{}", env!("CARGO_PKG_VERSION"));
-    info!("Starting shell-tunnel server...");
 
-    // Create session store
-    let store = SessionStore::new();
-    info!("Session store initialized");
+    // Convert to server config
+    let server_config = match config.to_server_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Configuration error: {}", e);
+            std::process::exit(1);
+        }
+    };
 
-    // Create a test session
-    let session_id = store.create(SessionConfig::default())?;
-    info!("Test session created: {}", session_id);
+    // Start the server
+    info!(
+        "Starting server on {}:{}",
+        server_config.host, server_config.port
+    );
 
-    // Spawn a PTY
-    let pty = NativePty::new();
-    let handle = pty.spawn_default(PtySize::default())?;
-    info!("PTY spawned with PID: {}", handle.pid);
-
-    // Update session state
-    store.update(&session_id, |s| {
-        s.state = shell_tunnel::SessionState::Active;
-    })?;
-
-    info!("Session {} is now active", session_id);
-    info!("shell-tunnel initialized successfully");
-
-    // TODO: Start API server in Phase 3
-
-    Ok(())
+    serve(server_config).await
 }

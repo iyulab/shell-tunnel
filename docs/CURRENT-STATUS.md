@@ -2,12 +2,12 @@
 
 **Last Updated:** 2026-01-15
 
-## Status: Phase 4 Complete
+## Status: Phase 5 Complete
 
 | Metric | Result |
 |--------|--------|
-| Tests | 139 passed, 3 ignored |
-| Binary | 993KB |
+| Tests | 193 passed, 4 ignored |
+| Binary | 2.0MB |
 
 ## Implemented Features
 
@@ -34,29 +34,85 @@
 - Input Validation (dangerous command detection)
 - Graceful Shutdown (SIGTERM/Ctrl+C handling)
 
-## Security Features
+### Phase 5 - Polish & Documentation
+- CLI interface (lexopt - minimal footprint)
+- JSON configuration file support
+- Environment variable configuration
+- Integration tests
+- OpenAPI 3.0 specification
 
-### Authentication
-- Bearer token API keys
-- Auto-generated keys if none provided
-- `/health` endpoint bypass (for monitoring)
+## CLI Usage
 
-### Rate Limiting
-- Default: 100 requests/minute per IP
-- Configurable via `RateLimitConfig`
-- `X-RateLimit-*` response headers
+```bash
+# Show help
+shell-tunnel --help
 
-### Input Validation
-- Command length limits
-- Dangerous pattern detection (fork bomb, rm -rf /, etc.)
-- Path traversal prevention
-- Null byte injection prevention
+# Start with defaults (localhost:3000, no auth)
+shell-tunnel
+
+# Start on all interfaces with API key
+shell-tunnel -H 0.0.0.0 -p 8080 -k my-secret-key
+
+# Start with config file
+shell-tunnel -c /etc/shell-tunnel/config.json
+
+# Development mode (no security)
+shell-tunnel --no-auth --no-rate-limit
+```
+
+### CLI Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-H, --host` | Host address to bind | 127.0.0.1 |
+| `-p, --port` | Port to listen on | 3000 |
+| `-c, --config` | Path to config file (JSON) | - |
+| `-k, --api-key` | API key for authentication | - |
+| `-l, --log-level` | Log level | info |
+| `--no-auth` | Disable authentication | false |
+| `--no-rate-limit` | Disable rate limiting | false |
+
+### Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `SHELL_TUNNEL_HOST` | Host address |
+| `SHELL_TUNNEL_PORT` | Port number |
+| `SHELL_TUNNEL_API_KEY` | API key |
+| `SHELL_TUNNEL_LOG_LEVEL` | Log level |
+| `RUST_LOG` | Alternative log level |
+
+## Configuration File
+
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8080,
+    "graceful_shutdown": true
+  },
+  "security": {
+    "auth": {
+      "enabled": true,
+      "api_keys": ["key1", "key2"]
+    },
+    "rate_limit": {
+      "enabled": true,
+      "requests_per_window": 100,
+      "window_secs": 60
+    }
+  },
+  "logging": {
+    "level": "info"
+  }
+}
+```
 
 ## API Endpoints
 
 ### Health & Info
 - `GET /health` - Health check (no auth)
-- `GET /api/v1/` - API information
+- `GET /api/v1` - API information
 
 ### Sessions
 - `GET /api/v1/sessions` - List all sessions
@@ -70,14 +126,23 @@
 - `POST /api/v1/execute` - Execute without session
 - `WS /api/v1/ws` - WebSocket one-shot
 
-## Next: Phase 5 - Polish & Documentation
+## Security Features
 
-| Task | Description |
-|------|-------------|
-| T5.1 | CLI interface (clap) |
-| T5.2 | Configuration file support |
-| T5.3 | Integration tests |
-| T5.4 | API documentation (OpenAPI) |
+### Authentication
+- Bearer token API keys
+- Auto-generated keys if none provided
+- `/health` endpoint bypass (for monitoring)
+
+### Rate Limiting
+- Default: 100 requests/minute per IP
+- Configurable via config file or CLI
+- `X-RateLimit-*` response headers
+
+### Input Validation
+- Command length limits
+- Dangerous pattern detection (fork bomb, rm -rf /, etc.)
+- Path traversal prevention
+- Null byte injection prevention
 
 ## Commands
 
@@ -89,34 +154,18 @@ cargo fmt                # Format
 RUST_LOG=debug cargo run # Run with debug logging
 ```
 
-## Usage Example
+## API Documentation
 
-### Basic Server (No Auth)
-```rust
-use shell_tunnel::api::{ServerConfig, serve};
+OpenAPI 3.0 specification available at `docs/openapi.json`.
 
-#[tokio::main]
-async fn main() -> shell_tunnel::Result<()> {
-    shell_tunnel::logging::try_init().ok();
-    let config = ServerConfig::new("127.0.0.1", 3000);
-    serve(config).await
-}
-```
+## Project Complete
 
-### Secure Server (With Auth)
-```rust
-use shell_tunnel::api::{ServerConfig, SecurityConfig, serve};
+All planned phases have been implemented:
 
-#[tokio::main]
-async fn main() -> shell_tunnel::Result<()> {
-    shell_tunnel::logging::try_init().ok();
-
-    let config = ServerConfig::new("0.0.0.0", 3000)
-        .with_security(
-            SecurityConfig::secure()
-                .with_api_key("my-secret-key")
-        );
-
-    serve(config).await
-}
-```
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 1 | Core Foundation | Done |
+| 2 | Core Features | Done |
+| 3 | API Layer | Done |
+| 4 | Security & Production | Done |
+| 5 | Polish & Documentation | Done |
