@@ -40,7 +40,10 @@ pub mod websocket;
 
 // Re-export commonly used types
 pub use handlers::AppState;
-pub use router::{create_router, create_router_with_state, serve, serve_with_state, ServerConfig};
+pub use router::{
+    create_router, create_router_with_state, create_secure_router, serve, serve_with_state,
+    SecurityConfig, ServerConfig,
+};
 pub use types::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ExecuteCommandRequest,
     ExecuteCommandResponse, ListSessionsResponse, SessionStatusResponse, WsMessage,

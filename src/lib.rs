@@ -60,6 +60,7 @@ pub mod execution;
 pub mod logging;
 pub mod output;
 pub mod pty;
+pub mod security;
 pub mod session;
 
 // Re-export commonly used types
@@ -73,3 +74,6 @@ pub use session::{
 
 // Re-export API types
 pub use api::{AppState, ServerConfig};
+
+// Re-export security types
+pub use security::{ApiKeyStore, CommandValidator, RateLimiter};

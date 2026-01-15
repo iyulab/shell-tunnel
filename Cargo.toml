@@ -8,7 +8,7 @@ repository = "https://github.com/iyulab/shell-tunnel"
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.43", features = ["rt-multi-thread", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.43", features = ["rt-multi-thread", "io-util", "sync", "time", "macros", "signal"] }
 
 # Cross-platform PTY
 portable-pty = "0.9"
