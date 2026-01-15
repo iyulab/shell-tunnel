@@ -48,3 +48,6 @@ panic = "abort"
 [profile.dev]
 # Faster builds for development
 incremental = true
+
+[target."cfg(unix)".dependencies]
+libc = "0.2.180"

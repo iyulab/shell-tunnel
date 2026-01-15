@@ -715,6 +715,7 @@ dependencies = [
  "axum",
  "futures-util",
  "lexopt",
+ "libc",
  "portable-pty",
  "serde",
  "serde_json",

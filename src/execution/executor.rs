@@ -1,6 +1,6 @@
 //! Command execution engine.
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,18 +38,10 @@ impl CommandExecutor {
         let start = Instant::now();
         let timeout_duration = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
 
-        // Create PTY and spawn shell
+        // Create PTY and spawn command directly (non-interactive)
         let mut pty = NativePty::new();
-        let mut shell = pty.spawn_shell(command.working_dir.as_deref())?;
-        let mut writer = shell.take_writer()?;
+        let mut shell = pty.spawn_command(&command.command_line, command.working_dir.as_deref())?;
         let mut reader = shell.take_reader()?;
-
-        // Write command to PTY
-        let cmd_with_newline = format!("{}\n", command.command_line);
-        writer
-            .write_all(cmd_with_newline.as_bytes())
-            .map_err(ShellTunnelError::Io)?;
-        writer.flush().map_err(ShellTunnelError::Io)?;
 
         // Collect output with timeout
         let mut raw_output = Vec::new();
@@ -123,18 +115,10 @@ impl CommandExecutor {
         let handle = tokio::task::spawn_blocking(move || {
             let start = Instant::now();
 
-            // Create PTY and spawn shell
+            // Create PTY and spawn command directly (non-interactive)
             let mut pty = NativePty::new();
-            let mut shell = pty.spawn_shell(working_dir.as_deref())?;
-            let mut writer = shell.take_writer()?;
+            let mut shell = pty.spawn_command(&cmd_line, working_dir.as_deref())?;
             let mut reader = shell.take_reader()?;
-
-            // Write command
-            let cmd_with_newline = format!("{}\n", cmd_line);
-            writer
-                .write_all(cmd_with_newline.as_bytes())
-                .map_err(ShellTunnelError::Io)?;
-            writer.flush().map_err(ShellTunnelError::Io)?;
 
             // Collect output
             let mut raw_output = Vec::new();

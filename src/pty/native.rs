@@ -135,6 +135,60 @@ impl NativePty {
             writer: None,
         })
     }
+
+    /// Spawn a command directly (non-interactive).
+    ///
+    /// This runs a single command and exits when done.
+    /// The command is executed via `sh -c "command"` (Unix) or `cmd /c command` (Windows).
+    pub fn spawn_command(
+        &mut self,
+        command_line: &str,
+        working_dir: Option<&std::path::Path>,
+    ) -> Result<SpawnedShell> {
+        let native_size = NativePtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let pair = self
+            .pty_system
+            .openpty(native_size)
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))?;
+
+        #[cfg(unix)]
+        let mut cmd = {
+            let mut c = CommandBuilder::new("/bin/sh");
+            c.arg("-c");
+            c.arg(command_line);
+            c
+        };
+
+        #[cfg(windows)]
+        let mut cmd = {
+            let mut c = CommandBuilder::new("cmd.exe");
+            c.arg("/c");
+            c.arg(command_line);
+            c
+        };
+
+        if let Some(dir) = working_dir {
+            cmd.cwd(dir);
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| ShellTunnelError::Pty(e.to_string()))?;
+
+        Ok(SpawnedShell {
+            master: pair.master,
+            child,
+            reader: None,
+            writer: None,
+        })
+    }
 }
 
 /// A spawned shell process with PTY.
