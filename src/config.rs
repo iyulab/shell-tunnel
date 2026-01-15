@@ -16,7 +16,7 @@ use crate::cli::Args;
 use crate::security::{AuthConfig, RateLimitConfig};
 
 /// Application configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// Server configuration.
@@ -25,16 +25,6 @@ pub struct Config {
     pub security: SecuritySection,
     /// Logging configuration.
     pub logging: LoggingSection,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerSection::default(),
-            security: SecuritySection::default(),
-            logging: LoggingSection::default(),
-        }
-    }
 }
 
 /// Server configuration section.
@@ -60,7 +50,7 @@ impl Default for ServerSection {
 }
 
 /// Security configuration section.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecuritySection {
     /// Authentication settings.
@@ -69,32 +59,14 @@ pub struct SecuritySection {
     pub rate_limit: RateLimitSection,
 }
 
-impl Default for SecuritySection {
-    fn default() -> Self {
-        Self {
-            auth: AuthSection::default(),
-            rate_limit: RateLimitSection::default(),
-        }
-    }
-}
-
 /// Authentication configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AuthSection {
     /// Enable authentication.
     pub enabled: bool,
     /// API keys.
     pub api_keys: Vec<String>,
-}
-
-impl Default for AuthSection {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_keys: Vec::new(),
-        }
-    }
 }
 
 /// Rate limiting configuration.
