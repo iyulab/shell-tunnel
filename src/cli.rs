@@ -27,6 +27,12 @@ pub struct Args {
     pub version: bool,
     /// Show help and exit.
     pub help: bool,
+    /// Check for updates and exit.
+    pub check_update: bool,
+    /// Perform self-update and exit.
+    pub update: bool,
+    /// Disable automatic update check on startup.
+    pub no_update_check: bool,
 }
 
 impl Default for Args {
@@ -41,6 +47,9 @@ impl Default for Args {
             log_level: None,
             version: false,
             help: false,
+            check_update: false,
+            update: false,
+            no_update_check: false,
         }
     }
 }
@@ -95,6 +104,15 @@ where
             Short('l') | Long("log-level") => {
                 result.log_level = Some(parser.value()?.parse()?);
             }
+            Long("check-update") => {
+                result.check_update = true;
+            }
+            Long("update") => {
+                result.update = true;
+            }
+            Long("no-update-check") => {
+                result.no_update_check = true;
+            }
             Value(val) => {
                 return Err(ArgsError::UnexpectedArgument(val.to_string_lossy().into()));
             }
@@ -123,6 +141,9 @@ OPTIONS:
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication
         --no-rate-limit     Disable rate limiting
+        --check-update      Check for updates and exit
+        --update            Download and install latest version
+        --no-update-check   Disable automatic update check on startup
     -h, --help              Print help
     -V, --version           Print version
 
@@ -145,6 +166,12 @@ EXAMPLES:
 
     # Development mode (no security)
     shell-tunnel --no-auth --no-rate-limit
+
+    # Check for updates
+    shell-tunnel --check-update
+
+    # Self-update to latest version
+    shell-tunnel --update
 "#
     );
 }

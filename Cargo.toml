@@ -2,9 +2,22 @@
 name = "shell-tunnel"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
 description = "Ultra-lightweight shell tunnel for AI agent integration"
 license = "MIT"
 repository = "https://github.com/iyulab/shell-tunnel"
+homepage = "https://github.com/iyulab/shell-tunnel"
+documentation = "https://docs.rs/shell-tunnel"
+readme = "README.md"
+keywords = ["shell", "tunnel", "pty", "api", "ai-agent"]
+categories = ["command-line-utilities", "development-tools", "api-bindings"]
+authors = ["iyulab"]
+exclude = [
+    ".github/",
+    "local-docs/",
+    "docs/",
+    "tests/",
+]
 
 [dependencies]
 # Async runtime
@@ -34,6 +47,9 @@ lexopt = "0.3"
 futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Auto-update
+self_update = { version = "0.42", features = ["archive-tar", "archive-zip", "compression-flate2"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

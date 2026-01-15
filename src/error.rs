@@ -59,6 +59,10 @@ pub enum ShellTunnelError {
     /// Session is not in executable state.
     #[error("session not executable: current state is {0:?}")]
     NotExecutable(crate::session::SessionState),
+
+    /// Update error.
+    #[error("update error: {0}")]
+    Update(String),
 }
 
 /// Convenience Result type for shell-tunnel operations.
