@@ -1,6 +1,8 @@
 //! Command execution engine.
 
 use std::io::Read;
+use std::process::{Command as OsCommand, Stdio};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,15 +12,233 @@ use super::command::Command;
 use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
-use crate::pty::NativePty;
 use crate::session::{SessionState, SessionStore};
 use crate::Result;
 
 /// Default execution timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default buffer size for reading PTY output.
+/// Default buffer size for reading process output.
 const READ_BUFFER_SIZE: usize = 4096;
+
+/// Poll interval for the non-blocking control loop.
+const CONTROL_POLL: Duration = Duration::from_millis(5);
+
+/// Hard backstop for collecting trailing output after the process has ended.
+/// Bounds the tail so a lingering grandchild that inherited a pipe cannot block
+/// the return past this grace period.
+const COLLECT_GRACE: Duration = Duration::from_millis(500);
+
+/// Forcibly terminate a process and all of its descendants.
+///
+/// A shell command (`cmd /c ...` / `sh -c ...`) commonly spawns grandchildren;
+/// killing only the direct child would leave them running and holding the
+/// output pipes open. On Windows this shells out to `taskkill /T /F`; on Unix
+/// it signals the child's process group (the child is made a group leader via
+/// `setsid` at spawn time).
+fn kill_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        let _ = OsCommand::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: kill with a negative pid targets the process group; harmless
+        // if the group is already gone (returns ESRCH).
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+/// Build the platform shell command that runs `command_line` non-interactively.
+fn shell_command(command_line: &str) -> OsCommand {
+    #[cfg(windows)]
+    {
+        let mut c = OsCommand::new("cmd.exe");
+        c.arg("/c").arg(command_line);
+        c
+    }
+    #[cfg(unix)]
+    {
+        let mut c = OsCommand::new("/bin/sh");
+        c.arg("-c").arg(command_line);
+        c
+    }
+}
+
+/// Spawn a reader thread that pumps a pipe into `tx` until EOF.
+fn spawn_pipe_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    tx: std_mpsc::Sender<Vec<u8>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let mut buf = [0u8; READ_BUFFER_SIZE];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF: the process closed this pipe
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break; // control side went away
+                    }
+                }
+                Err(_) => break, // broken pipe / closed handle
+            }
+        }
+    })
+}
+
+/// Run a non-interactive command with an *enforceable* timeout.
+///
+/// This is the blocking core shared by both the sync and async entry points.
+///
+/// Non-interactive commands are executed via a piped [`std::process::Command`]
+/// rather than a PTY. This is deliberate: a PTY (Windows ConPTY in particular)
+/// does not signal EOF or report child exit for a one-shot command until the
+/// pseudoconsole itself is torn down, so there is no reliable way to tell when
+/// the command finished — every command would run to the full timeout, and each
+/// hung read leaked a `conhost.exe`. A piped child gives real EOF on pipe close
+/// and a working `try_wait()`/`kill()`, which is exactly what a deterministic
+/// "run command, capture output, get exit code, honor timeout" contract needs.
+/// (Interactive/streaming sessions that genuinely need a TTY keep using the PTY
+/// path in [`super::executor::CommandExecutor::execute_async`].)
+///
+/// The design keeps a blocking `read()` from ever stalling progress:
+/// - stdout and stderr are each pumped by a dedicated reader thread (reading
+///   only one while the other's pipe buffer fills would deadlock the child).
+/// - the control loop here is fully non-blocking: it drains the channel, polls
+///   `try_wait()`, and checks the deadline, so the timeout is actually honored.
+/// - on timeout the child is killed; both pipes then close and the reader
+///   threads reach EOF, so nothing leaks.
+///
+/// `on_chunk` is invoked for every output chunk as it arrives, which is what
+/// lets the streaming (WebSocket) path forward output live; the non-streaming
+/// callers pass a no-op.
+fn run_command_streaming(
+    command: &Command,
+    mut on_chunk: impl FnMut(&[u8]),
+) -> Result<ExecutionResult> {
+    let start = Instant::now();
+    let timeout_duration = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
+
+    let mut os_cmd = shell_command(&command.command_line);
+    os_cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = &command.working_dir {
+        os_cmd.current_dir(dir);
+    }
+    for (key, value) in &command.env {
+        os_cmd.env(key, value);
+    }
+
+    // On Unix, put the child in its own process group so that on timeout we can
+    // signal the whole tree (a shell that spawned grandchildren) with one
+    // `kill(-pgid)`. Windows tree termination is handled via `taskkill /T`.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid only detaches the child into a new session/group; it
+        // touches no shared state in the forked child before exec.
+        unsafe {
+            os_cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let mut child = os_cmd.spawn().map_err(ShellTunnelError::Io)?;
+    let child_pid = child.id();
+
+    // stdout and stderr are merged into one output stream. True interleaving is
+    // not guaranteed (nor is it with a TTY), but agents consume a single stream.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
+    let out_handle = stdout.map(|s| spawn_pipe_reader(s, tx.clone()));
+    let err_handle = stderr.map(|s| spawn_pipe_reader(s, tx));
+
+    // Non-blocking control loop.
+    let mut raw_output = Vec::new();
+    let mut exit_status = None;
+    let mut timed_out = false;
+    loop {
+        while let Ok(chunk) = rx.try_recv() {
+            on_chunk(&chunk);
+            raw_output.extend_from_slice(&chunk);
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(ShellTunnelError::Io(e)),
+        }
+
+        if start.elapsed() >= timeout_duration {
+            timed_out = true;
+            // Kill the whole tree: `cmd /c ...` / `sh -c ...` may have spawned
+            // grandchildren that would otherwise keep the output pipes open and
+            // stall our collection below (and keep running as orphans).
+            kill_tree(child_pid);
+            let _ = child.wait();
+            break;
+        }
+
+        std::thread::sleep(CONTROL_POLL);
+    }
+
+    // Collect any remaining output. Once the process (and, on timeout, its whole
+    // tree) is gone, both pipe handles close, the reader threads reach EOF and
+    // drop their senders, and `recv_timeout` returns `Disconnected`. The grace
+    // deadline is a hard backstop so a stray grandchild that inherited a pipe
+    // can never block us — we return the timed-out result regardless.
+    drop(out_handle);
+    drop(err_handle);
+    let collect_deadline = Instant::now() + COLLECT_GRACE;
+    loop {
+        match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(chunk) => {
+                on_chunk(&chunk);
+                raw_output.extend_from_slice(&chunk);
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= collect_deadline {
+                    break;
+                }
+            }
+        }
+    }
+
+    let duration = start.elapsed();
+    let text = OutputSanitizer::strip_ansi(&raw_output);
+
+    if timed_out {
+        return Ok(ExecutionResult::timeout(raw_output, text, duration));
+    }
+
+    let exit_code = exit_status.and_then(|s| s.code());
+    let mut result = ExecutionResult::new(raw_output, text, duration);
+    if let Some(code) = exit_code {
+        result = result.with_exit_code(code);
+    }
+    Ok(result)
+}
+
+/// Run a non-interactive command, collecting all output (no streaming).
+fn run_command(command: &Command) -> Result<ExecutionResult> {
+    run_command_streaming(command, |_| {})
+}
 
 /// Command executor for running commands in shell sessions.
 pub struct CommandExecutor {
@@ -33,73 +253,35 @@ impl CommandExecutor {
 
     /// Execute a command synchronously (blocking).
     ///
-    /// This runs the command and waits for completion or timeout.
+    /// This runs the command and waits for completion or timeout. Prefer
+    /// [`CommandExecutor::execute`] from async contexts — this blocking variant
+    /// must never be called directly on a tokio worker thread.
     pub fn execute_sync(&self, command: &Command) -> Result<ExecutionResult> {
-        let start = Instant::now();
-        let timeout_duration = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
-
-        // Create PTY and spawn command directly (non-interactive)
-        let mut pty = NativePty::new();
-        let mut shell = pty.spawn_command(&command.command_line, command.working_dir.as_deref())?;
-        let mut reader = shell.take_reader()?;
-
-        // Collect output with timeout
-        let mut raw_output = Vec::new();
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-
-        loop {
-            if start.elapsed() > timeout_duration {
-                let text = OutputSanitizer::strip_ansi(&raw_output);
-                return Ok(ExecutionResult::timeout(raw_output, text, start.elapsed()));
-            }
-
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF
-                Ok(n) => {
-                    raw_output.extend_from_slice(&buf[..n]);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(e) => return Err(ShellTunnelError::Io(e)),
-            }
-
-            // Check if child has exited
-            if let Ok(Some(_)) = shell.try_wait() {
-                // Read any remaining output
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    raw_output.extend_from_slice(&buf[..n]);
-                }
-                break;
-            }
-        }
-
-        let duration = start.elapsed();
-        let exit_status = shell.wait().ok();
-        let exit_code = exit_status.map(|s| {
-            if s.success() {
-                0i32
-            } else {
-                s.exit_code() as i32
-            }
-        });
-
-        let text = OutputSanitizer::strip_ansi(&raw_output);
-        let mut result = ExecutionResult::new(raw_output, text, duration);
-        if let Some(code) = exit_code {
-            result = result.with_exit_code(code);
-        }
-
-        Ok(result)
+        run_command(command)
     }
 
-    /// Execute a command asynchronously.
+    /// Execute a command, keeping the async runtime responsive.
     ///
-    /// Returns a receiver for streaming output chunks.
+    /// The blocking work runs on a dedicated blocking thread via
+    /// `spawn_blocking`, so the tokio worker pool (and therefore `/health` and
+    /// the accept loop) is never starved by a slow or hung command. The
+    /// underlying [`run_command`] enforces its own timeout, so this always
+    /// completes without leaking runtime capacity.
+    pub async fn execute(&self, command: &Command) -> Result<ExecutionResult> {
+        let command = command.clone();
+        tokio::task::spawn_blocking(move || run_command(&command))
+            .await
+            .map_err(|e| ShellTunnelError::Pty(format!("execution task failed: {e}")))?
+    }
+
+    /// Execute a command asynchronously, streaming output chunks as they arrive.
+    ///
+    /// Returns a receiver that yields [`OutputChunk`]s live, plus a join handle
+    /// resolving to the final [`ExecutionResult`]. Backed by the same piped
+    /// [`run_command_streaming`] core as the non-streaming paths, so it inherits
+    /// real completion detection, enforceable timeout, and process-tree kill —
+    /// none of which the previous PTY implementation could provide for
+    /// non-interactive commands (see [`run_command_streaming`]).
     pub async fn execute_async(
         &self,
         command: &Command,
@@ -108,74 +290,13 @@ impl CommandExecutor {
         tokio::task::JoinHandle<Result<ExecutionResult>>,
     )> {
         let (tx, rx) = mpsc::channel::<OutputChunk>(64);
-        let timeout_duration = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
-        let cmd_line = command.command_line.clone();
-        let working_dir = command.working_dir.clone();
+        let command = command.clone();
 
         let handle = tokio::task::spawn_blocking(move || {
-            let start = Instant::now();
-
-            // Create PTY and spawn command directly (non-interactive)
-            let mut pty = NativePty::new();
-            let mut shell = pty.spawn_command(&cmd_line, working_dir.as_deref())?;
-            let mut reader = shell.take_reader()?;
-
-            // Collect output
-            let mut raw_output = Vec::new();
-            let mut buf = [0u8; READ_BUFFER_SIZE];
-
-            loop {
-                if start.elapsed() > timeout_duration {
-                    let text = OutputSanitizer::strip_ansi(&raw_output);
-                    return Ok(ExecutionResult::timeout(raw_output, text, start.elapsed()));
-                }
-
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let chunk_data = buf[..n].to_vec();
-                        raw_output.extend_from_slice(&chunk_data);
-
-                        // Send chunk (ignore if receiver dropped)
-                        let _ = tx.blocking_send(OutputChunk::combined(chunk_data));
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(e) => return Err(ShellTunnelError::Io(e)),
-                }
-
-                if let Ok(Some(_)) = shell.try_wait() {
-                    while let Ok(n) = reader.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                        let chunk_data = buf[..n].to_vec();
-                        raw_output.extend_from_slice(&chunk_data);
-                        let _ = tx.blocking_send(OutputChunk::combined(chunk_data));
-                    }
-                    break;
-                }
-            }
-
-            let duration = start.elapsed();
-            let exit_status = shell.wait().ok();
-            let exit_code = exit_status.map(|s| {
-                if s.success() {
-                    0i32
-                } else {
-                    s.exit_code() as i32
-                }
-            });
-
-            let text = OutputSanitizer::strip_ansi(&raw_output);
-            let mut result = ExecutionResult::new(raw_output, text, duration);
-            if let Some(code) = exit_code {
-                result = result.with_exit_code(code);
-            }
-
-            Ok(result)
+            run_command_streaming(&command, |chunk| {
+                // Forward the chunk live; ignore if the receiver was dropped.
+                let _ = tx.blocking_send(OutputChunk::combined(chunk.to_vec()));
+            })
         });
 
         Ok((rx, handle))
@@ -203,8 +324,8 @@ impl CommandExecutor {
             s.touch();
         })?;
 
-        // Execute command
-        let result = self.execute_sync(command);
+        // Execute command (off the async runtime workers)
+        let result = self.execute(command).await;
 
         // Mark session as idle
         self.store.update(session_id, |s| {

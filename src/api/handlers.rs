@@ -252,8 +252,8 @@ pub async fn execute_oneshot(
         cmd = cmd.env(key, value);
     }
 
-    // Execute directly without session
-    let result = state.executor.execute_sync(&cmd).map_err(|e| {
+    // Execute directly without session (off the async runtime workers)
+    let result = state.executor.execute(&cmd).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse::internal_error(e.to_string())),

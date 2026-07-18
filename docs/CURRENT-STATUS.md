@@ -1,40 +1,82 @@
 # Shell-Tunnel: Current Status
 
-**Last Updated:** 2026-01-15
+**Last Updated:** 2026-07-18
 
-## Status: Phase 5 Complete
+## Status
+
+**Base platform: implemented and hardened.** The foundational gateway (sessions,
+execution, REST/WebSocket API, auth, rate limiting, CLI/config) is in place and
+the core agent flow (create → execute, one-shot execute, streaming) works
+out-of-the-box.
+
+**Differentiation layer for the "safe control protocol" positioning: not yet
+started.** shell-tunnel's direction is a single binary + protocol for
+controlling remote environments *safely and deterministically* — the
+capability/permission tokens, audit trail, pluggable transport / self-hosted
+relay, filesystem & destructive-operation guards, and native MCP exposure that
+define that positioning are still ahead (see **What's next** below).
 
 | Metric | Result |
 |--------|--------|
-| Tests | 193 passed, 4 ignored |
-| Binary | 2.0MB |
+| Tests | 200 passed, 4 ignored (unit + integration + doc) |
+| Binary | ~1–2MB (release, LTO) |
+
+## Execution model
+
+Non-interactive commands (session `execute`, one-shot `/execute`, and WebSocket
+streaming) run via a piped `std::process` child, **not** a PTY. This gives real
+EOF, working completion detection, an enforceable timeout, and process-tree
+termination — properties a PTY (Windows ConPTY in particular) does not provide
+for one-shot commands. Every execution:
+
+- runs off the async runtime workers (`spawn_blocking`), so `/health` and the
+  accept loop stay responsive regardless of a slow or hung command;
+- honors its `timeout_secs`, killing the **whole process tree** on expiry
+  (`taskkill /T` on Windows, process-group signal on Unix);
+- merges stdout and stderr into a single output stream.
+
+The PTY abstraction (`pty` module) is retained as public API and the intended
+foundation for future *interactive* sessions that need real TTY semantics; it is
+not currently on the non-interactive execution path.
+
+## Recent hardening (2026-07-18)
+
+- Fixed: freshly created session was stuck in `Created` and rejected `execute`
+  (`INVALID_STATE`). Sessions are now ready-to-execute on creation.
+- Fixed: a single one-shot `/execute` could hang the entire server (including
+  `/health`). Root cause was blocking work on async workers plus ConPTY never
+  signalling completion. Resolved by the piped execution model above.
+- Added enforceable timeouts with process-tree kill across all execution paths.
+- Added cross-platform executor integration tests.
 
 ## Implemented Features
 
-### Phase 1 - Core Foundation
-- Cross-platform PTY (portable-pty)
+### Core Foundation
+- Cross-platform PTY abstraction (portable-pty) — foundation for interactive sessions
 - Session management (ID, State, Store)
 - Async I/O adapters
 
-### Phase 2 - Core Features
-- Command Execution Engine (sync/async)
+### Execution & Output
+- Piped command execution (enforceable timeout, process-tree kill)
+- WebSocket streaming (real-time output)
 - Output Sanitization (VTE parser)
 - Virtual Screen (vt100 emulation)
 - State Tracking (SessionContext)
 
-### Phase 3 - API Layer
+### API Layer
 - REST API (axum 0.8)
-- WebSocket streaming (real-time output)
 - JSON request/response format
 - CORS support (tower-http)
 
-### Phase 4 - Security & Production
+### Security & Production
 - API Key Authentication (Bearer token)
 - Rate Limiting (IP-based sliding window)
-- Input Validation (dangerous command detection)
+- Input Validation (dangerous command detection — **secondary** defense; substring
+  matching is bypassable; hardened defense is planned via capability tokens — see
+  **What's next**, Phases A/B)
 - Graceful Shutdown (SIGTERM/Ctrl+C handling)
 
-### Phase 5 - Polish & Documentation
+### Tooling
 - CLI interface (lexopt - minimal footprint)
 - JSON configuration file support
 - Environment variable configuration
@@ -158,14 +200,18 @@ RUST_LOG=debug cargo run # Run with debug logging
 
 OpenAPI 3.0 specification available at `docs/openapi.json`.
 
-## Project Complete
+## What's next
 
-All planned phases have been implemented:
+The base platform is complete; the differentiating "safe control protocol"
+layer is the active roadmap, in priority order:
 
-| Phase | Description | Status |
-|-------|-------------|--------|
-| 1 | Core Foundation | Done |
-| 2 | Core Features | Done |
-| 3 | API Layer | Done |
-| 4 | Security & Production | Done |
-| 5 | Polish & Documentation | Done |
+| Phase | Direction | Status |
+|-------|-----------|--------|
+| A | Permission-scope tokens · audit trail · versioned capability wire contract · pluggable transport / self-hosted relay | Not started (top priority) |
+| B | Security hardening & resilience (CORS/auth defaults, request isolation, risk-detection as secondary defense) | Partially done — timeout enforcement, process-tree kill, and `/health` independence landed 2026-07-18 |
+| C | Cross-platform FS abstraction · filesystem read/write APIs · destructive-operation guards | Not started |
+| D | Native MCP server exposure (`remote_shell_exec`, `remote_fs_read`, …) | Not started |
+
+Cross-cutting: `self_update` dependency review (RUSTSEC surface vs. "zero-dependency"
+vision), positioning re-confirmation (avoid web-terminal feature-parity drift),
+and session state-model redesign.

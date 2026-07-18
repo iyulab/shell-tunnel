@@ -19,15 +19,23 @@ impl SessionState {
     ///
     /// Valid transitions:
     /// - Created -> Active
+    /// - Created -> Idle    (session created and immediately ready for commands)
     /// - Active -> Idle
     /// - Active -> Terminated
     /// - Idle -> Active
     /// - Idle -> Terminated
+    ///
+    /// Note: `Created -> Idle` exists because a freshly created session holds no
+    /// persistent PTY (each command spawns its own), so it is ready to accept
+    /// commands the moment it is created. This keeps the create→execute flow
+    /// working out-of-the-box without the consumer having to drive an explicit
+    /// activation step (thin-API principle).
     pub fn can_transition_to(&self, target: SessionState) -> bool {
         use SessionState::*;
         matches!(
             (*self, target),
             (Created, Active)
+                | (Created, Idle)
                 | (Active, Idle)
                 | (Active, Terminated)
                 | (Idle, Active)
@@ -86,11 +94,20 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_created_to_idle() {
+    fn test_created_to_idle_is_valid() {
+        // A freshly created session is immediately ready for commands.
         let mut state = SessionState::Created;
-        assert!(state.transition_to(SessionState::Idle).is_err());
+        assert!(state.transition_to(SessionState::Idle).is_ok());
+        assert_eq!(state, SessionState::Idle);
+    }
+
+    #[test]
+    fn test_invalid_idle_to_created() {
+        // Going back to Created is never valid.
+        let mut state = SessionState::Idle;
+        assert!(state.transition_to(SessionState::Created).is_err());
         // State should remain unchanged
-        assert_eq!(state, SessionState::Created);
+        assert_eq!(state, SessionState::Idle);
     }
 
     #[test]
