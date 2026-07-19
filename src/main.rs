@@ -1,6 +1,6 @@
 //! Shell-tunnel binary entry point.
 
-use shell_tunnel::{api::serve, logging, parse_args, print_help, print_version, update, Config};
+use shell_tunnel::{api::serve, logging, parse_args, print_help, print_version, Config};
 use tracing::info;
 
 #[tokio::main]
@@ -26,41 +26,46 @@ async fn main() -> shell_tunnel::Result<()> {
         return Ok(());
     }
 
-    // Handle update commands
-    if args.check_update {
-        match update::check_update() {
-            Ok(info) => {
-                println!("Current version: {}", info.current);
-                println!("Latest version:  {}", info.latest);
-                if info.update_available {
-                    println!("\nUpdate available! Run with --update to install.");
-                } else {
-                    println!("\nYou are running the latest version.");
+    // Handle update commands (only compiled with the `self-update` feature)
+    #[cfg(feature = "self-update")]
+    {
+        use shell_tunnel::update;
+
+        if args.check_update {
+            match update::check_update() {
+                Ok(info) => {
+                    println!("Current version: {}", info.current);
+                    println!("Latest version:  {}", info.latest);
+                    if info.update_available {
+                        println!("\nUpdate available! Run with --update to install.");
+                    } else {
+                        println!("\nYou are running the latest version.");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Failed to check for updates: {}", e);
+                    std::process::exit(1);
                 }
             }
-            Err(e) => {
-                eprintln!("Failed to check for updates: {}", e);
-                std::process::exit(1);
-            }
+            return Ok(());
         }
-        return Ok(());
-    }
 
-    if args.update {
-        println!("Checking for updates...");
-        match update::self_update() {
-            Ok(true) => {
-                println!("Successfully updated! Please restart shell-tunnel.");
+        if args.update {
+            println!("Checking for updates...");
+            match update::self_update() {
+                Ok(true) => {
+                    println!("Successfully updated! Please restart shell-tunnel.");
+                }
+                Ok(false) => {
+                    println!("Already running the latest version.");
+                }
+                Err(e) => {
+                    eprintln!("Update failed: {}", e);
+                    std::process::exit(1);
+                }
             }
-            Ok(false) => {
-                println!("Already running the latest version.");
-            }
-            Err(e) => {
-                eprintln!("Update failed: {}", e);
-                std::process::exit(1);
-            }
+            return Ok(());
         }
-        return Ok(());
     }
 
     // Load configuration
@@ -78,9 +83,10 @@ async fn main() -> shell_tunnel::Result<()> {
 
     info!("shell-tunnel v{}", env!("CARGO_PKG_VERSION"));
 
-    // Background update check (unless disabled)
+    // Background update check (unless disabled; only with the `self-update` feature)
+    #[cfg(feature = "self-update")]
     if !args.no_update_check {
-        update::background_update_check();
+        shell_tunnel::update::background_update_check();
     }
 
     // Convert to server config

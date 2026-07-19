@@ -23,6 +23,24 @@ use crate::security::{
     auth_middleware, rate_limit_middleware, ApiKeyStore, AuthConfig, RateLimitConfig, RateLimiter,
 };
 
+/// Cross-Origin Resource Sharing (CORS) configuration.
+///
+/// CORS is a browser-enforced mechanism; non-browser clients (AI agents, `curl`)
+/// ignore it entirely. shell-tunnel therefore emits **no** permissive CORS headers
+/// by default: this blocks a malicious web page from reading responses cross-origin
+/// and, because the JSON execute endpoints require a preflight, from issuing the
+/// request at all — with zero impact on the intended non-browser consumers.
+///
+/// Note: CORS does **not** defend against DNS-rebinding (the attacker's host is
+/// rebound to `127.0.0.1`, making the request same-origin); that requires
+/// Host-header validation and is tracked separately.
+#[derive(Debug, Clone, Default)]
+pub struct CorsConfig {
+    /// Allow any origin/method/header (restores the permissive `Any` behavior).
+    /// Off by default; enable only for trusted browser-based UIs.
+    pub allow_any: bool,
+}
+
 /// Security configuration for the server.
 #[derive(Debug, Clone)]
 pub struct SecurityConfig {
@@ -32,6 +50,8 @@ pub struct SecurityConfig {
     pub rate_limit: RateLimitConfig,
     /// API keys to pre-register.
     pub api_keys: Vec<String>,
+    /// CORS configuration.
+    pub cors: CorsConfig,
 }
 
 impl Default for SecurityConfig {
@@ -40,8 +60,21 @@ impl Default for SecurityConfig {
             auth: AuthConfig::disabled(), // Disabled by default for ease of use
             rate_limit: RateLimitConfig::default(),
             api_keys: Vec::new(),
+            cors: CorsConfig::default(), // Restrictive by default (no permissive CORS)
         }
     }
+}
+
+/// Build a permissive CORS layer when `allow_any` is set, otherwise `None`.
+///
+/// Returning `None` means no CORS headers are emitted — the secure default.
+fn cors_layer(cfg: &CorsConfig) -> Option<CorsLayer> {
+    cfg.allow_any.then(|| {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    })
 }
 
 impl SecurityConfig {
@@ -51,6 +84,7 @@ impl SecurityConfig {
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             api_keys: Vec::new(),
+            cors: CorsConfig::default(),
         }
     }
 
@@ -60,12 +94,19 @@ impl SecurityConfig {
             auth: AuthConfig::disabled(),
             rate_limit: RateLimitConfig::relaxed(),
             api_keys: Vec::new(),
+            cors: CorsConfig::default(),
         }
     }
 
     /// Add an API key.
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_keys.push(key.into());
+        self
+    }
+
+    /// Enable permissive (`Any`) CORS. Opt-in; only for trusted browser UIs.
+    pub fn with_cors_allow_any(mut self) -> Self {
+        self.cors.allow_any = true;
         self
     }
 }
@@ -91,17 +132,12 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .route("/ws", any(ws_oneshot_handler))
         .nest("/sessions", session_routes);
 
-    // Build main router
+    // Build main router. This "no security" convenience constructor uses the
+    // restrictive CORS default (no permissive CORS headers emitted).
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
         .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
         .with_state(state)
 }
 
@@ -134,7 +170,7 @@ pub fn create_secure_router(
         .nest("/sessions", session_routes);
 
     // Build main router with security layers
-    let router = Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
         .layer(middleware::from_fn_with_state(
@@ -145,14 +181,14 @@ pub fn create_secure_router(
             Arc::clone(&rate_limiter),
             rate_limit_middleware,
         ))
-        .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(state);
+        .layer(TraceLayer::new_for_http());
+
+    // Permissive CORS only when explicitly opted in (default: restrictive).
+    if let Some(cors) = cors_layer(&security.cors) {
+        router = router.layer(cors);
+    }
+
+    let router = router.with_state(state);
 
     (router, auth_store, rate_limiter)
 }
@@ -335,6 +371,20 @@ mod tests {
         let config = SecurityConfig::secure();
         assert!(config.auth.enabled);
         assert!(config.rate_limit.enabled);
+    }
+
+    #[test]
+    fn test_cors_restrictive_by_default() {
+        assert!(!SecurityConfig::default().cors.allow_any);
+        assert!(!SecurityConfig::secure().cors.allow_any);
+        assert!(cors_layer(&CorsConfig::default()).is_none());
+    }
+
+    #[test]
+    fn test_cors_allow_any_opt_in() {
+        let config = SecurityConfig::development().with_cors_allow_any();
+        assert!(config.cors.allow_any);
+        assert!(cors_layer(&config.cors).is_some());
     }
 
     #[test]

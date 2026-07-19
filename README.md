@@ -8,13 +8,34 @@
 
 A zero-dependency, single binary that enables AI agents to control remote terminals via REST/WebSocket API.
 
+## What it is (and isn't)
+
+shell-tunnel is a gateway **for AI agents**, not a human-facing web terminal. It exposes
+remote command execution as a structured REST/WebSocket API — typed JSON requests and
+responses, resource-style sessions — so an agent can drive a remote environment
+programmatically. The base platform (sessions, execution, streaming, auth, rate limiting)
+is implemented; the differentiating **safe control protocol** (permission-scoped tokens,
+audit trail, self-hosted relay, native MCP tools) is on the roadmap — see
+[`docs/CURRENT-STATUS.md`](docs/CURRENT-STATUS.md).
+
+**Non-Goals**
+
+- **Not** a browser terminal emulator or screen-sharing UI (cf. ttyd / gotty / wetty /
+  sshx) — there is no xterm.js front-end and no human terminal-sharing.
+- **Not** a remote-desktop or mobile control app — the consumer is an agent/program, not a
+  person at a screen.
+- **Not** a general-purpose tunneling / reverse-proxy product — transport is borrowed; the
+  value is the agent-facing *control protocol* layered on top.
+- **Not** a multi-user collaboration surface.
+
 ## Features
 
 - **Cross-platform**: Windows (ConPTY), Linux, macOS (PTY)
 - **Lightweight**: ~2MB binary, minimal resource footprint
 - **Real-time streaming**: WebSocket support for live output
 - **Secure**: API key authentication, rate limiting, command validation
-- **Self-updating**: Automatic updates from GitHub Releases
+- **Zero-dependency core**: the default build links no update/HTTP stack
+- **Self-updating** *(opt-in)*: in-binary updates from GitHub Releases — bundled in official release binaries, enabled for source builds with `--features self-update`
 
 ## Installation
 
@@ -78,10 +99,12 @@ shell-tunnel --no-auth --no-rate-limit
 | `-k, --api-key <KEY>` | API key for authentication | - |
 | `-l, --log-level <LVL>` | Log level (error, warn, info, debug, trace) | `info` |
 | `--no-auth` | Disable authentication | `false` |
+| `--require-auth` | Require auth, auto-generating an API key if none given | `false` |
 | `--no-rate-limit` | Disable rate limiting | `false` |
-| `--check-update` | Check for updates and exit | - |
-| `--update` | Download and install latest version | - |
-| `--no-update-check` | Disable automatic update check on startup | `false` |
+| `--cors-allow-any` | Allow any CORS origin (opt-in; for browser UIs) | `false` |
+| `--check-update` | Check for updates and exit *(self-update builds only)* | - |
+| `--update` | Download and install latest version *(self-update builds only)* | - |
+| `--no-update-check` | Disable automatic update check on startup *(self-update builds only)* | `false` |
 | `-h, --help` | Print help | - |
 | `-V, --version` | Print version | - |
 
@@ -195,7 +218,16 @@ shell-tunnel -c /etc/shell-tunnel/config.json
 
 ## Auto-Update
 
-shell-tunnel includes built-in auto-update functionality:
+The core binary is zero-dependency and ships **without** an update stack. In-binary
+self-update is an opt-in build feature (`self-update`): it is **bundled in the official
+release binaries**, so downloads from GitHub Releases already support it. When building
+from source, enable it explicitly:
+
+```bash
+cargo build --release --features self-update
+```
+
+With the feature enabled:
 
 ```bash
 # Check for updates
@@ -205,13 +237,16 @@ shell-tunnel --check-update
 shell-tunnel --update
 ```
 
-By default, shell-tunnel checks for updates on startup (can be disabled with `--no-update-check`).
+Such builds check for updates on startup (can be disabled with `--no-update-check`).
+Builds without the feature omit these flags entirely.
 
 ## Security
 
 ### Authentication
 - Bearer token API keys via `Authorization` header
 - `/health` endpoint bypasses authentication (for monitoring)
+- Disabled by default for ease of use. Enable with `--api-key <KEY>`, or with
+  `--require-auth` to turn auth on and have a key auto-generated (and logged) at startup.
 
 ### Rate Limiting
 - Default: 100 requests/minute per IP
@@ -219,8 +254,20 @@ By default, shell-tunnel checks for updates on startup (can be disabled with `--
 
 ### Input Validation
 - Command length limits
-- Dangerous pattern detection (fork bombs, `rm -rf /`, etc.)
+- Dangerous pattern detection (fork bombs, `rm -rf /`, etc.) — a secondary defence; the
+  primary control is authentication, not substring matching
 - Path traversal prevention
+
+### CORS
+- **Restrictive by default**: no permissive CORS headers are emitted. CORS is a
+  browser-only mechanism, so this has no effect on AI-agent/CLI clients, while it
+  reduces the CSRF / cross-origin surface a malicious web page could exploit against a
+  local instance (the JSON execute endpoints require a preflight, which is not approved).
+- Enable permissive CORS for a trusted browser UI with `--cors-allow-any` (or
+  `security.cors.allow_any` in the config file).
+- Scope note: CORS does **not** stop DNS-rebinding attacks (the request is same-origin
+  after rebinding); Host-header validation is the complementary control and is tracked
+  on the roadmap.
 
 ## License
 

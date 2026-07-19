@@ -64,6 +64,7 @@ pub mod output;
 pub mod pty;
 pub mod security;
 pub mod session;
+#[cfg(feature = "self-update")]
 pub mod update;
 
 // Re-export commonly used types

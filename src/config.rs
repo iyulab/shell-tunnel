@@ -11,7 +11,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::{SecurityConfig, ServerConfig};
+use crate::api::{CorsConfig, SecurityConfig, ServerConfig};
 use crate::cli::Args;
 use crate::security::{AuthConfig, RateLimitConfig};
 
@@ -57,6 +57,17 @@ pub struct SecuritySection {
     pub auth: AuthSection,
     /// Rate limiting settings.
     pub rate_limit: RateLimitSection,
+    /// CORS settings.
+    pub cors: CorsSection,
+}
+
+/// CORS configuration section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CorsSection {
+    /// Allow any origin (permissive CORS). Off by default; enable only for
+    /// trusted browser-based UIs.
+    pub allow_any: bool,
 }
 
 /// Authentication configuration.
@@ -154,12 +165,22 @@ impl Config {
             }
         }
 
+        // Enable auth on request (a key is auto-generated at startup if none is set).
+        // Applied before `no_auth` so an explicit `--no-auth` still wins.
+        if args.require_auth {
+            self.security.auth.enabled = true;
+        }
+
         if args.no_auth {
             self.security.auth.enabled = false;
         }
 
         if args.no_rate_limit {
             self.security.rate_limit.enabled = false;
+        }
+
+        if args.cors_allow_any {
+            self.security.cors.allow_any = true;
         }
 
         if let Some(ref level) = args.log_level {
@@ -214,6 +235,11 @@ impl Config {
             max_requests: self.security.rate_limit.requests_per_window,
             window: std::time::Duration::from_secs(self.security.rate_limit.window_secs),
             max_tracked_ips: 10000,
+        };
+
+        // Apply CORS settings (restrictive by default)
+        security.cors = CorsConfig {
+            allow_any: self.security.cors.allow_any,
         };
 
         // Add API keys
@@ -351,6 +377,31 @@ mod tests {
         };
 
         config.apply_args(&args);
+        assert!(!config.security.auth.enabled);
+    }
+
+    #[test]
+    fn test_apply_require_auth() {
+        let mut config = Config::default();
+        assert!(!config.security.auth.enabled); // disabled by default
+
+        config.apply_args(&Args {
+            require_auth: true,
+            ..Args::default()
+        });
+        assert!(config.security.auth.enabled);
+    }
+
+    #[test]
+    fn test_no_auth_overrides_require_auth() {
+        let mut config = Config::default();
+
+        // Contradictory flags: explicit --no-auth wins.
+        config.apply_args(&Args {
+            require_auth: true,
+            no_auth: true,
+            ..Args::default()
+        });
         assert!(!config.security.auth.enabled);
     }
 

@@ -42,7 +42,7 @@ pub mod websocket;
 pub use handlers::AppState;
 pub use router::{
     create_router, create_router_with_state, create_secure_router, serve, serve_with_state,
-    SecurityConfig, ServerConfig,
+    CorsConfig, SecurityConfig, ServerConfig,
 };
 pub use types::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ExecuteCommandRequest,

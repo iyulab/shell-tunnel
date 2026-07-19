@@ -8,7 +8,9 @@ use axum::{
     http::{header, Method, Request, StatusCode},
 };
 use serde_json::{json, Value};
-use shell_tunnel::api::{create_router, create_router_with_state, AppState};
+use shell_tunnel::api::{
+    create_router, create_router_with_state, create_secure_router, AppState, SecurityConfig,
+};
 use tower::ServiceExt;
 
 /// Helper to create a JSON request.
@@ -295,4 +297,60 @@ fn test_dangerous_command_detection() {
     assert!(validator.validate_command("rm -rf /").is_err());
     assert!(validator.validate_command(":(){ :|:& };:").is_err());
     assert!(validator.validate_command("shutdown -h now").is_err());
+}
+
+// ============================================================================
+// CORS Tests
+// ============================================================================
+
+/// Build a cross-origin preflight (OPTIONS) request, as a browser would send
+/// before a cross-origin JSON POST to the execute endpoint.
+fn cors_preflight(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::OPTIONS)
+        .uri(uri)
+        .header(header::ORIGIN, "http://evil.test")
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+        .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn test_cors_restrictive_by_default() {
+    // Default build must emit no permissive CORS headers, so a browser preflight
+    // for a cross-origin execute POST is not approved.
+    let app = create_router();
+
+    let response = app
+        .oneshot(cors_preflight("/api/v1/execute"))
+        .await
+        .unwrap();
+
+    assert!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .is_none(),
+        "default build must not emit Access-Control-Allow-Origin"
+    );
+}
+
+#[tokio::test]
+async fn test_cors_allow_any_opt_in() {
+    // With the opt-in enabled, the preflight is approved with a wildcard origin.
+    let state = AppState::new();
+    let (app, _store, _rl) =
+        create_secure_router(state, SecurityConfig::development().with_cors_allow_any());
+
+    let response = app
+        .oneshot(cors_preflight("/api/v1/execute"))
+        .await
+        .unwrap();
+
+    let acao = response
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+        .expect("opt-in must emit Access-Control-Allow-Origin");
+    assert_eq!(acao, "*");
 }

@@ -19,8 +19,12 @@ pub struct Args {
     pub api_key: Option<String>,
     /// Disable authentication.
     pub no_auth: bool,
+    /// Require authentication, auto-generating an API key if none is provided.
+    pub require_auth: bool,
     /// Disable rate limiting.
     pub no_rate_limit: bool,
+    /// Allow any CORS origin (permissive; opt-in for browser UIs).
+    pub cors_allow_any: bool,
     /// Log level (error, warn, info, debug, trace).
     pub log_level: Option<String>,
     /// Show version and exit.
@@ -43,7 +47,9 @@ impl Default for Args {
             config: None,
             api_key: None,
             no_auth: false,
+            require_auth: false,
             no_rate_limit: false,
+            cors_allow_any: false,
             log_level: None,
             version: false,
             help: false,
@@ -98,18 +104,27 @@ where
             Long("no-auth") => {
                 result.no_auth = true;
             }
+            Long("require-auth") => {
+                result.require_auth = true;
+            }
             Long("no-rate-limit") => {
                 result.no_rate_limit = true;
+            }
+            Long("cors-allow-any") => {
+                result.cors_allow_any = true;
             }
             Short('l') | Long("log-level") => {
                 result.log_level = Some(parser.value()?.parse()?);
             }
+            #[cfg(feature = "self-update")]
             Long("check-update") => {
                 result.check_update = true;
             }
+            #[cfg(feature = "self-update")]
             Long("update") => {
                 result.update = true;
             }
+            #[cfg(feature = "self-update")]
             Long("no-update-check") => {
                 result.no_update_check = true;
             }
@@ -126,6 +141,18 @@ where
 /// Print help message.
 pub fn print_help() {
     let version = env!("CARGO_PKG_VERSION");
+
+    // Update flags exist only when compiled with the `self-update` feature.
+    #[cfg(feature = "self-update")]
+    let update_opts = "        --check-update      Check for updates and exit\n        --update            Download and install latest version\n        --no-update-check   Disable automatic update check on startup\n";
+    #[cfg(not(feature = "self-update"))]
+    let update_opts = "";
+
+    #[cfg(feature = "self-update")]
+    let update_examples = "\n    # Check for updates\n    shell-tunnel --check-update\n\n    # Self-update to latest version\n    shell-tunnel --update\n";
+    #[cfg(not(feature = "self-update"))]
+    let update_examples = "";
+
     println!(
         r#"shell-tunnel {version}
 Ultra-lightweight shell tunnel for AI agent integration
@@ -140,11 +167,10 @@ OPTIONS:
     -k, --api-key <KEY>     API key for authentication
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication
+        --require-auth      Require auth, auto-generating an API key if none given
         --no-rate-limit     Disable rate limiting
-        --check-update      Check for updates and exit
-        --update            Download and install latest version
-        --no-update-check   Disable automatic update check on startup
-    -h, --help              Print help
+        --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
+{update_opts}    -h, --help              Print help
     -V, --version           Print version
 
 ENVIRONMENT VARIABLES:
@@ -166,13 +192,7 @@ EXAMPLES:
 
     # Development mode (no security)
     shell-tunnel --no-auth --no-rate-limit
-
-    # Check for updates
-    shell-tunnel --check-update
-
-    # Self-update to latest version
-    shell-tunnel --update
-"#
+{update_examples}"#
     );
 }
 
@@ -263,6 +283,13 @@ mod tests {
     fn test_no_auth() {
         let result = parse_args_from(args(&["--no-auth"])).unwrap();
         assert!(result.no_auth);
+    }
+
+    #[test]
+    fn test_require_auth() {
+        let result = parse_args_from(args(&["--require-auth"])).unwrap();
+        assert!(result.require_auth);
+        assert!(!Args::default().require_auth);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Shell-Tunnel: Current Status
 
-**Last Updated:** 2026-07-18
+**Last Updated:** 2026-07-19
 
 ## Status
 
@@ -18,7 +18,7 @@ define that positioning are still ahead (see **What's next** below).
 
 | Metric | Result |
 |--------|--------|
-| Tests | 200 passed, 4 ignored (unit + integration + doc) |
+| Tests | 203 passed default / 204 with `self-update`, 4 ignored (unit + integration + doc) |
 | Binary | ~1–2MB (release, LTO) |
 
 ## Execution model
@@ -66,7 +66,8 @@ not currently on the non-interactive execution path.
 ### API Layer
 - REST API (axum 0.8)
 - JSON request/response format
-- CORS support (tower-http)
+- CORS: restrictive by default (browser-only mechanism; no effect on agent/CLI
+  clients), permissive `Any` opt-in via `--cors-allow-any`
 
 ### Security & Production
 - API Key Authentication (Bearer token)
@@ -208,10 +209,13 @@ layer is the active roadmap, in priority order:
 | Phase | Direction | Status |
 |-------|-----------|--------|
 | A | Permission-scope tokens · audit trail · versioned capability wire contract · pluggable transport / self-hosted relay | Not started (top priority) |
-| B | Security hardening & resilience (CORS/auth defaults, request isolation, risk-detection as secondary defense) | Partially done — timeout enforcement, process-tree kill, and `/health` independence landed 2026-07-18 |
+| B | Security hardening & resilience (CORS/auth defaults, request isolation, risk-detection as secondary defense) | Partially done — timeout enforcement + process-tree kill + `/health` independence (2026-07-18); CORS secure-by-default + opt-out (2026-07-19). Remaining: local-binding token opt-in, Host-header validation (DNS-rebinding, folds into Phase A) |
 | C | Cross-platform FS abstraction · filesystem read/write APIs · destructive-operation guards | Not started |
 | D | Native MCP server exposure (`remote_shell_exec`, `remote_fs_read`, …) | Not started |
 
-Cross-cutting: `self_update` dependency review (RUSTSEC surface vs. "zero-dependency"
-vision), positioning re-confirmation (avoid web-terminal feature-parity drift),
-and session state-model redesign.
+Cross-cutting: `self_update` is now an opt-in `self-update` cargo feature
+(default-off) so the core build is zero-dependency (2026-07-19); `rust-version`
+corrected to 1.78 for the default graph. Positioning re-confirmed with explicit
+Non-Goals in the README (2026-07-19). Remaining: full `self_update` removal
+(product decision — official binaries still bundle it), and session state-model
+redesign.

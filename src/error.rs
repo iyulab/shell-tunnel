@@ -61,6 +61,7 @@ pub enum ShellTunnelError {
     NotExecutable(crate::session::SessionState),
 
     /// Update error.
+    #[cfg(feature = "self-update")]
     #[error("update error: {0}")]
     Update(String),
 }
