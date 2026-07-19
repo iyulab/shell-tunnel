@@ -41,16 +41,20 @@ jobs:
             archive: shell-tunnel-macos-arm64.tar.gz
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      # Prebuilt `cross` binary instead of `cargo install --git` (which compiles
+      # from source every release) — cuts several minutes of Actions time.
       - name: Install cross (for ARM64 Linux)
         if: matrix.cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
 
       # Release binaries bundle the opt-in `self-update` feature so downloaded
       # binaries keep their advertised `--update` capability (the default source
@@ -76,7 +80,7 @@ jobs:
           7z a ../../../${{ matrix.archive }} ${{ matrix.artifact }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
@@ -87,10 +91,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -99,7 +103,7 @@ jobs:
         run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: Release ${{ steps.version.outputs.version }}
           draft: false
@@ -109,12 +113,21 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Binaries are now attached to the GitHub Release; drop the transient
+      # build artifacts immediately so they consume no Actions storage.
+      - name: Delete build artifacts
+        uses: geekyeggo/delete-artifact@v6
+        with:
+          name: shell-tunnel-*
+          useGlob: true
+          failOnError: false
+
   publish-crate:
     name: Publish to crates.io
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable

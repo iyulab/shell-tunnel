@@ -37,6 +37,13 @@ audit trail, self-hosted relay, native MCP tools) is on the roadmap — see
 - **Zero-dependency core**: the default build links no update/HTTP stack
 - **Self-updating** *(opt-in)*: in-binary updates from GitHub Releases — bundled in official release binaries, enabled for source builds with `--features self-update`
 
+## Documentation
+
+This README is the quick-start entry point. Deeper references live in [`docs/`](docs/):
+
+- **Feature status & roadmap** — [docs/CURRENT-STATUS.md](docs/CURRENT-STATUS.md)
+- **Full API reference** (authoritative) — [docs/openapi.json](docs/openapi.json) (OpenAPI 3.0)
+
 ## Installation
 
 ### From GitHub Releases (Recommended)
@@ -281,22 +288,11 @@ shell-tunnel -k agent-key --capabilities exec,session.read
 - Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining` (and `Retry-After` on a 429)
 
 ### Input Validation
-
-> **Status: library primitive, not yet enforced by the built-in server.**
-
-shell-tunnel ships a `CommandValidator` primitive (command-length limits, dangerous-pattern
-detection for fork bombs / `rm -rf /` / disk-wipe / `shutdown`, and null-byte rejection) and a
-companion path validator (traversal / null-byte / length). These are **public, unit-tested library
-primitives, but the built-in server does not currently invoke them on the execute paths** — a
-command sent to `/api/v1/execute` (or a session/WS execute) is not pattern-filtered today, and a
-`working_dir` is not traversal-checked.
-
 The primary access control is the [capability token](#authentication--capabilities): withhold
-`exec` and a token cannot run commands at all. Command-*content* filtering (dangerous-substring
-matching) is a *bypassable secondary* defence and remains unwired — so a token that **does** hold
-`exec` can run any command today. Consumers embedding the crate can call
-`CommandValidator::validate_command` directly in the meantime; wiring it into the server is a
-deferred product decision.
+`exec` and a token cannot run commands. Command-*content* filtering (a `CommandValidator` /
+path-validator primitive shipped in the crate) is a *bypassable secondary* defence and is **not yet
+wired into the server** — a token holding `exec` can run any command today. Rationale and detail:
+[docs/CURRENT-STATUS.md](docs/CURRENT-STATUS.md).
 
 ### CORS
 - **Restrictive by default**: no permissive CORS headers are emitted. CORS is a
