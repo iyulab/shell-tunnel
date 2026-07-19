@@ -33,7 +33,7 @@ audit trail, self-hosted relay, native MCP tools) is on the roadmap — see
 - **Cross-platform**: Windows (ConPTY), Linux, macOS (PTY)
 - **Lightweight**: ~2MB binary, minimal resource footprint
 - **Real-time streaming**: WebSocket support for live output
-- **Secure**: API key authentication, rate limiting, command validation
+- **Secure**: enforced API key authentication and rate limiting (command-validation primitives ship but are not yet wired into the server — see [Input Validation](#input-validation))
 - **Zero-dependency core**: the default build links no update/HTTP stack
 - **Self-updating** *(opt-in)*: in-binary updates from GitHub Releases — bundled in official release binaries, enabled for source builds with `--features self-update`
 
@@ -250,13 +250,23 @@ Builds without the feature omit these flags entirely.
 
 ### Rate Limiting
 - Default: 100 requests/minute per IP
-- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`
+- Response headers: `X-RateLimit-Limit`, `X-RateLimit-Remaining` (and `Retry-After` on a 429)
 
 ### Input Validation
-- Command length limits
-- Dangerous pattern detection (fork bombs, `rm -rf /`, etc.) — a secondary defence; the
-  primary control is authentication, not substring matching
-- Path traversal prevention
+
+> **Status: library primitive, not yet enforced by the built-in server.**
+
+shell-tunnel ships a `CommandValidator` primitive (command-length limits, dangerous-pattern
+detection for fork bombs / `rm -rf /` / disk-wipe / `shutdown`, and null-byte rejection) and a
+companion path validator (traversal / null-byte / length). These are **public, unit-tested library
+primitives, but the built-in server does not currently invoke them on the execute paths** — a
+command sent to `/api/v1/execute` (or a session/WS execute) is not pattern-filtered today, and a
+`working_dir` is not traversal-checked.
+
+Enforcement is deliberately deferred to Phase A, where the primary control is an operator-scoped
+capability token (whitelist); substring pattern matching is a *bypassable secondary* defence, not
+the primary one. Consumers embedding the crate can call `CommandValidator::validate_command`
+directly in the meantime.
 
 ### CORS
 - **Restrictive by default**: no permissive CORS headers are emitted. CORS is a

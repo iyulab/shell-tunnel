@@ -72,9 +72,11 @@ not currently on the non-interactive execution path.
 ### Security & Production
 - API Key Authentication (Bearer token)
 - Rate Limiting (IP-based sliding window)
-- Input Validation (dangerous command detection — **secondary** defense; substring
-  matching is bypassable; hardened defense is planned via capability tokens — see
-  **What's next**, Phases A/B)
+- Input Validation *(library primitive — **not yet wired** into the server execute paths)*:
+  `CommandValidator` (length, dangerous-pattern, null-byte) + path validator ship and are
+  unit-tested, but no handler invokes them today, so commands are not pattern-filtered on
+  `/execute`. Enforcement is deferred to Phase A, where the primary control is an operator-scoped
+  capability token (substring matching = bypassable secondary) — see **What's next**, Phases A/B
 - Graceful Shutdown (SIGTERM/Ctrl+C handling)
 
 ### Tooling
@@ -182,9 +184,11 @@ shell-tunnel --no-auth --no-rate-limit
 - `X-RateLimit-*` response headers
 
 ### Input Validation
+*(available in the `CommandValidator` / path-validator primitives — **not invoked** by the
+built-in server today; see Security & Production above. Enforcement deferred to Phase A.)*
 - Command length limits
 - Dangerous pattern detection (fork bomb, rm -rf /, etc.)
-- Path traversal prevention
+- Path traversal prevention (path validator)
 - Null byte injection prevention
 
 ## Commands

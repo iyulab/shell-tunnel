@@ -354,3 +354,175 @@ async fn test_cors_allow_any_opt_in() {
         .expect("opt-in must emit Access-Control-Allow-Origin");
     assert_eq!(acao, "*");
 }
+
+// ============================================================================
+// Authentication Property Tests
+// ============================================================================
+//
+// These assert the *enforcement* behavior of the secure router end-to-end
+// (through `auth_middleware`), not just the key-store unit logic: a request
+// with no/invalid Bearer key is rejected with 401, a valid key passes through,
+// and `/health` stays exempt even when auth is on. The unit tests above only
+// cover `ApiKeyStore::is_valid`; nothing exercised the middleware's HTTP
+// contract until now.
+
+/// Build a secure router from `config` with mock connection info attached.
+///
+/// The secure stack includes `rate_limit_middleware`, which extracts
+/// `ConnectInfo<SocketAddr>`. A bare `oneshot` request carries no connection
+/// info, so we attach a `MockConnectInfo` layer — the canonical axum idiom for
+/// driving connect-info middleware in tests (matches how `serve` supplies it
+/// via `into_make_service_with_connect_info` in production). The fixed mock IP
+/// also means every request in a test shares one rate-limit bucket.
+fn secure_app_from(config: SecurityConfig) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    use std::net::SocketAddr;
+
+    let state = AppState::new();
+    let (app, _store, _rl) = create_secure_router(state, config);
+    app.layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
+}
+
+/// Build a secure router (auth on) pre-registered with `key`.
+///
+/// Uses `RateLimitConfig::default()` (100 req/window) via `secure()`, so the
+/// handful of requests each test issues cannot trip the rate limiter.
+fn secure_app_with_key(key: &str) -> axum::Router {
+    secure_app_from(SecurityConfig::secure().with_api_key(key))
+}
+
+/// A GET request carrying an optional `Authorization: Bearer <key>` header.
+fn get_with_auth(uri: &str, bearer: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder().method(Method::GET).uri(uri);
+    if let Some(key) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {key}"));
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn test_auth_rejects_missing_key() {
+    // Auth enabled, no Authorization header -> 401 (not reaching the handler).
+    let app = secure_app_with_key("secret-key");
+
+    let response = app
+        .oneshot(get_with_auth("/api/v1/sessions", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_rejects_wrong_key() {
+    // Auth enabled, wrong Bearer key -> 401.
+    let app = secure_app_with_key("secret-key");
+
+    let response = app
+        .oneshot(get_with_auth("/api/v1/sessions", Some("wrong-key")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_auth_accepts_valid_key() {
+    // Auth enabled, correct Bearer key -> request reaches the handler (200).
+    // Target /sessions (no PTY) rather than /execute so the happy path does not
+    // require command execution.
+    let app = secure_app_with_key("secret-key");
+
+    let response = app
+        .oneshot(get_with_auth("/api/v1/sessions", Some("secret-key")))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    assert_eq!(json["count"], 0);
+}
+
+#[tokio::test]
+async fn test_auth_exempts_health() {
+    // `/health` must stay reachable without a key even when auth is enabled,
+    // so liveness probes never require credentials (auth.rs bypasses /health).
+    let app = secure_app_with_key("secret-key");
+
+    let response = app.oneshot(get_with_auth("/health", None)).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response_text(response).await, "OK");
+}
+
+// ============================================================================
+// Rate Limit Property Tests
+// ============================================================================
+//
+// Assert the *enforcement* behavior of `rate_limit_middleware` through the
+// secure router: once an IP exceeds its window budget the response is 429 with
+// a `Retry-After` header. Prior coverage only checked config values, never the
+// HTTP contract. Auth is disabled here to isolate the rate-limit behavior.
+
+#[tokio::test]
+async fn test_rate_limit_returns_429_past_threshold() {
+    use shell_tunnel::security::RateLimitConfig;
+
+    // 2 requests / 60s window from one IP; auth off so 200s aren't gated on keys.
+    let mut config = SecurityConfig::development();
+    config.rate_limit = RateLimitConfig::custom(2, 60);
+    let app = secure_app_from(config);
+
+    // The first two requests are within budget.
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // The third exceeds the window budget -> 429 with a Retry-After hint.
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        response.headers().get("Retry-After").is_some(),
+        "429 response must carry a Retry-After header"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limit_exempts_health() {
+    use shell_tunnel::security::RateLimitConfig;
+
+    // `/health` bypasses the rate limiter (rate_limit.rs), so it stays available
+    // for liveness probes even after the budget for other routes is exhausted.
+    let mut config = SecurityConfig::development();
+    config.rate_limit = RateLimitConfig::custom(1, 60);
+    let app = secure_app_from(config);
+
+    // Exhaust the budget on a non-health route (2nd is 429).
+    let _ = app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+    let limited = app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // /health is still 200 despite the exhausted bucket.
+    let health = app
+        .oneshot(json_request(Method::GET, "/health", None))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+}
