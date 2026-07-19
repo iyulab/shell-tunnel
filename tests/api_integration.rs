@@ -456,6 +456,241 @@ async fn test_auth_exempts_health() {
 }
 
 // ============================================================================
+// Capability Authorization Property Tests
+// ============================================================================
+//
+// Assert the *capability enforcement* of the scope-aware middleware (spec §3/§5):
+// a valid but under-privileged token gets 403 on a route requiring a capability
+// it lacks, passes (2xx) on a route it holds, and always passes authenticated-
+// only routes. Wildcard/legacy tokens satisfy everything. This is distinct from
+// the 401 auth tests above (missing/invalid token) — here the token IS valid.
+
+/// Build a secure router pre-registered with a fine-grained `token` holding
+/// exactly `caps`, with mock connection info attached for the rate limiter.
+fn secure_app_with_token(token: &str, caps: &[&str]) -> axum::Router {
+    use axum::extract::connect_info::MockConnectInfo;
+    use shell_tunnel::security::CapabilitySet;
+    use std::net::SocketAddr;
+
+    let state = AppState::new();
+    let (app, store, _rl) = create_secure_router(state, SecurityConfig::secure());
+    let capset: CapabilitySet = caps.iter().copied().collect();
+    store.add_key_with_capabilities(token, capset, "test");
+    app.layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))))
+}
+
+/// A request with method/uri and a `Bearer <token>` header (JSON content type).
+fn authed_request(method: Method, uri: &str, token: &str, body: Option<Value>) -> Request<Body> {
+    let builder = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, "application/json");
+    match body {
+        Some(json) => builder.body(Body::from(json.to_string())).unwrap(),
+        None => builder.body(Body::empty()).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn test_capability_allows_held_capability() {
+    // A token holding `session.read` may list sessions (GET requires session.read).
+    let app = secure_app_with_token("reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_request(
+            Method::GET,
+            "/api/v1/sessions",
+            "reader",
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_capability_forbids_missing_capability() {
+    // The same read-only token may NOT create a session (POST requires
+    // session.manage) — valid token, insufficient capability → 403 (not 401).
+    let app = secure_app_with_token("reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/sessions",
+            "reader",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_capability_manage_token_creates_session() {
+    // A token holding `session.manage` may create a session (201).
+    let app = secure_app_with_token("manager", &["session.manage"]);
+
+    let response = app
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/sessions",
+            "manager",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn test_authenticated_only_route_passes_any_valid_token() {
+    // `GET /api/v1` requires no specific capability — any valid token passes,
+    // even one holding zero capabilities.
+    let app = secure_app_with_token("empty", &[]);
+
+    let response = app
+        .oneshot(authed_request(Method::GET, "/api/v1", "empty", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_zero_capability_token_forbidden_on_capability_route() {
+    // A valid token holding no capabilities is 403 on any capability-gated route.
+    let app = secure_app_with_token("empty", &[]);
+
+    let response = app
+        .oneshot(authed_request(
+            Method::GET,
+            "/api/v1/sessions",
+            "empty",
+            None,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_security_config_with_capabilities_scopes_registered_key() {
+    // Exercise the full wiring path: SecurityConfig::with_capabilities ->
+    // create_secure_router registers the key scoped (not full-control), so the
+    // key is 403 on a route requiring a capability outside its set.
+    use axum::extract::connect_info::MockConnectInfo;
+    use shell_tunnel::security::CapabilitySet;
+    use std::net::SocketAddr;
+
+    let caps: CapabilitySet = ["session.read"].into_iter().collect();
+    let config = SecurityConfig::secure()
+        .with_api_key("scoped-key")
+        .with_capabilities(caps);
+    let (app, _store, _rl) = create_secure_router(AppState::new(), config);
+    let app = app.layer(MockConnectInfo(SocketAddr::from(([127, 0, 0, 1], 8080))));
+
+    // Holds session.read -> list is 200.
+    let ok = app
+        .clone()
+        .oneshot(authed_request(
+            Method::GET,
+            "/api/v1/sessions",
+            "scoped-key",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+
+    // Lacks session.manage -> create is 403 (scoped, not full-control).
+    let forbidden = app
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/sessions",
+            "scoped-key",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_legacy_wildcard_key_satisfies_every_route() {
+    // A legacy `--api-key` maps to full-control (wildcard): it must pass every
+    // capability-gated route, so no existing consumer can hit a 403 (spec §4).
+    let app = secure_app_with_key("legacy");
+
+    // Wildcard passes a manage-gated route.
+    let created = app
+        .clone()
+        .oneshot(authed_request(
+            Method::POST,
+            "/api/v1/sessions",
+            "legacy",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    // ...and a read-gated route.
+    let listed = app
+        .oneshot(authed_request(
+            Method::GET,
+            "/api/v1/sessions",
+            "legacy",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_ws_route_enforces_exec_capability() {
+    // The WebSocket routes require `exec`. Capability enforcement happens in the
+    // middleware, before the WebSocketUpgrade extractor runs, so a token lacking
+    // `exec` is rejected with 403 on a plain GET to the WS path — no upgrade needed.
+    let app = secure_app_with_token("reader", &["session.read"]);
+
+    for path in ["/api/v1/ws", "/api/v1/sessions/1/ws"] {
+        let response = app
+            .clone()
+            .oneshot(authed_request(Method::GET, path, "reader", None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "WS path {path} must be 403 for a non-exec token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_ws_route_passes_auth_for_exec_capability() {
+    // A token holding `exec` clears the auth/capability layer on the WS route;
+    // the request then fails only at the upgrade step (missing WS headers), i.e.
+    // it is neither 401 nor 403 — proving the middleware let it through.
+    let app = secure_app_with_token("runner", &["exec"]);
+
+    let response = app
+        .oneshot(authed_request(Method::GET, "/api/v1/ws", "runner", None))
+        .await
+        .unwrap();
+
+    assert_ne!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_ne!(response.status(), StatusCode::FORBIDDEN);
+}
+
+// ============================================================================
 // Rate Limit Property Tests
 // ============================================================================
 //

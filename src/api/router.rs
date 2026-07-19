@@ -4,8 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::connect_info::IntoMakeServiceWithConnectInfo,
-    middleware,
+    extract::{connect_info::IntoMakeServiceWithConnectInfo, MatchedPath, Request, State},
+    http::{header::AUTHORIZATION, Method, StatusCode},
+    middleware::{self, Next},
+    response::Response,
     routing::{any, get, post},
     Router,
 };
@@ -20,7 +22,7 @@ use super::handlers::{
 };
 use super::websocket::{ws_handler, ws_oneshot_handler};
 use crate::security::{
-    auth_middleware, rate_limit_middleware, ApiKeyStore, AuthConfig, RateLimitConfig, RateLimiter,
+    rate_limit_middleware, ApiKeyStore, AuthConfig, CapabilitySet, RateLimitConfig, RateLimiter,
 };
 
 /// Cross-Origin Resource Sharing (CORS) configuration.
@@ -50,6 +52,13 @@ pub struct SecurityConfig {
     pub rate_limit: RateLimitConfig,
     /// API keys to pre-register.
     pub api_keys: Vec<String>,
+    /// Capabilities granted to the pre-registered keys and to the
+    /// auto-generated fallback key.
+    ///
+    /// `None` (the default) means **full-control** (wildcard) — the backward-
+    /// compatible behavior for a bare `--api-key` / `--require-auth` (spec §4).
+    /// `Some(set)` issues fine-grained tokens scoped to that set (spec §9).
+    pub capabilities: Option<CapabilitySet>,
     /// CORS configuration.
     pub cors: CorsConfig,
 }
@@ -60,6 +69,7 @@ impl Default for SecurityConfig {
             auth: AuthConfig::disabled(), // Disabled by default for ease of use
             rate_limit: RateLimitConfig::default(),
             api_keys: Vec::new(),
+            capabilities: None, // Full-control by default (legacy-compatible)
             cors: CorsConfig::default(), // Restrictive by default (no permissive CORS)
         }
     }
@@ -84,6 +94,7 @@ impl SecurityConfig {
             auth: AuthConfig::default(),
             rate_limit: RateLimitConfig::default(),
             api_keys: Vec::new(),
+            capabilities: None,
             cors: CorsConfig::default(),
         }
     }
@@ -94,6 +105,7 @@ impl SecurityConfig {
             auth: AuthConfig::disabled(),
             rate_limit: RateLimitConfig::relaxed(),
             api_keys: Vec::new(),
+            capabilities: None,
             cors: CorsConfig::default(),
         }
     }
@@ -104,10 +116,28 @@ impl SecurityConfig {
         self
     }
 
+    /// Scope the issued tokens to a fine-grained capability set (spec §9).
+    ///
+    /// Applies to the pre-registered keys and to the auto-generated fallback
+    /// key. Without this, tokens are full-control (legacy-compatible).
+    pub fn with_capabilities(mut self, capabilities: CapabilitySet) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
     /// Enable permissive (`Any`) CORS. Opt-in; only for trusted browser UIs.
     pub fn with_cors_allow_any(mut self) -> Self {
         self.cors.allow_any = true;
         self
+    }
+}
+
+/// Register `key` into `store` with `capabilities` (fine-grained), or as a
+/// legacy full-control key when `capabilities` is `None` (spec §4/§9).
+fn register_key(store: &ApiKeyStore, key: &str, capabilities: &Option<CapabilitySet>) {
+    match capabilities {
+        Some(caps) => store.add_key_with_capabilities(key, caps.clone(), "configured"),
+        None => store.add_key(key),
     }
 }
 
@@ -141,6 +171,127 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// The capability a route requires (Phase A spec §3).
+///
+/// Declared here at the router layer — co-located with the route definitions,
+/// which are the single source of truth for the matched-path strings this maps
+/// against. Not a per-handler attribute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequiredCapability {
+    /// No authentication at all (e.g. `/health`).
+    Public,
+    /// Authenticated only: any valid token passes, no specific capability
+    /// required (spec §3 "인증만" tier, e.g. `GET /api/v1`).
+    Authenticated,
+    /// Requires a specific capability string (set membership, or wildcard).
+    Capability(&'static str),
+}
+
+/// Map a matched route (`method` + axum [`MatchedPath`]) to its required
+/// capability (spec §3 table).
+///
+/// Keyed on the **full nested** `MatchedPath` (confirmed against the real router
+/// structure) plus the HTTP method, because one path can require different
+/// capabilities per method (e.g. `GET /api/v1/sessions` = read, `POST` = manage).
+///
+/// Unknown routes fail **closed** to [`RequiredCapability::Authenticated`]: an
+/// unmapped route still requires a valid token, never less than that.
+pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapability {
+    use RequiredCapability::{Authenticated, Capability, Public};
+
+    match (method, matched_path) {
+        (_, "/health") => Public,
+        (&Method::GET, "/api/v1") => Authenticated,
+        (&Method::POST, "/api/v1/execute") => Capability("exec"),
+        (_, "/api/v1/ws") => Capability("exec"),
+        (&Method::GET, "/api/v1/sessions") => Capability("session.read"),
+        (&Method::POST, "/api/v1/sessions") => Capability("session.manage"),
+        (&Method::GET, "/api/v1/sessions/{id}") => Capability("session.read"),
+        (&Method::DELETE, "/api/v1/sessions/{id}") => Capability("session.manage"),
+        (&Method::POST, "/api/v1/sessions/{id}/execute") => Capability("exec"),
+        (_, "/api/v1/sessions/{id}/ws") => Capability("exec"),
+        _ => Authenticated,
+    }
+}
+
+/// Scope-aware authentication + authorization middleware (spec §5).
+///
+/// 1. Resolve the route's required capability from `method` + `MatchedPath`.
+/// 2. `Public` route or auth disabled → pass through.
+/// 3. Extract the bearer token; look up its `TokenRecord` in the store.
+///    Missing/invalid token → **401**.
+/// 4. `Authenticated` route → any valid token passes. `Capability(c)` route →
+///    the token's set must satisfy `c` (membership or wildcard), else **403**.
+async fn capability_auth_middleware(
+    State(store): State<std::sync::Arc<ApiKeyStore>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // Auth disabled → open server (existing behavior).
+    if !store.is_enabled() {
+        return Ok(next.run(request).await);
+    }
+
+    let method = request.method().clone();
+    // Owned so it can be used in the rejection logs after `request` is consumed.
+    let matched = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_default();
+    let required = required_capability(&method, &matched);
+
+    // Public routes (e.g. /health) skip auth entirely.
+    if required == RequiredCapability::Public {
+        return Ok(next.run(request).await);
+    }
+
+    // Extract the bearer token and resolve its capabilities.
+    // Missing header, wrong prefix, or unregistered token → 401.
+    let token = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|header| store.extract_key(header));
+
+    let capabilities = match token.as_deref().and_then(|t| store.capabilities(t)) {
+        Some(caps) => caps,
+        None => {
+            // Logged at debug to avoid a log-flood amplifier under probing; the
+            // token value itself is never logged. `missing-token` = no/malformed
+            // Authorization header, `invalid-token` = present but unregistered.
+            let reason = if token.is_none() {
+                "missing-token"
+            } else {
+                "invalid-token"
+            };
+            tracing::debug!(%method, path = %matched, reason, "auth rejected (401)");
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    };
+
+    match required {
+        // Already handled above, but keep the match exhaustive.
+        RequiredCapability::Public => Ok(next.run(request).await),
+        // Any valid token satisfies an authenticated-only route.
+        RequiredCapability::Authenticated => Ok(next.run(request).await),
+        // Specific capability: set membership (or wildcard) required, else 403.
+        RequiredCapability::Capability(cap) => {
+            if capabilities.satisfies(cap) {
+                Ok(next.run(request).await)
+            } else {
+                tracing::debug!(
+                    %method,
+                    path = %matched,
+                    required = cap,
+                    "authorization denied (403): insufficient capability"
+                );
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+    }
+}
+
 /// Create the API router with security enabled.
 pub fn create_secure_router(
     state: AppState,
@@ -150,9 +301,9 @@ pub fn create_secure_router(
     let auth_store = Arc::new(ApiKeyStore::new(security.auth));
     let rate_limiter = Arc::new(RateLimiter::new(security.rate_limit));
 
-    // Register API keys
+    // Register API keys with their configured capabilities.
     for key in &security.api_keys {
-        auth_store.add_key(key);
+        register_key(&auth_store, key, &security.capabilities);
     }
 
     // Session routes
@@ -175,7 +326,7 @@ pub fn create_secure_router(
         .nest("/api/v1", api_v1)
         .layer(middleware::from_fn_with_state(
             Arc::clone(&auth_store),
-            auth_middleware,
+            capability_auth_middleware,
         ))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&rate_limiter),
@@ -259,9 +410,10 @@ pub async fn serve_with_state(config: ServerConfig, state: AppState) -> crate::R
     // Log API key if auth is enabled and keys are registered
     if auth_store.is_enabled() {
         if auth_store.count() == 0 {
-            // Generate and register a key if none provided
+            // Generate and register a key if none provided, scoped to the
+            // configured capabilities (full-control when unset).
             let key = crate::security::generate_api_key();
-            auth_store.add_key(&key);
+            register_key(&auth_store, &key, &config.security.capabilities);
             tracing::info!("Generated API key: {}", key);
         }
         tracing::info!(
@@ -398,6 +550,60 @@ mod tests {
     fn test_router_creation() {
         let _router = create_router();
         // Router created successfully
+    }
+
+    #[test]
+    fn test_required_capability_mapping() {
+        use RequiredCapability::{Authenticated, Capability, Public};
+
+        // Public + authenticated-only tiers.
+        assert_eq!(required_capability(&Method::GET, "/health"), Public);
+        assert_eq!(required_capability(&Method::GET, "/api/v1"), Authenticated);
+
+        // exec routes (oneshot + session-scoped + WS).
+        assert_eq!(
+            required_capability(&Method::POST, "/api/v1/execute"),
+            Capability("exec")
+        );
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/ws"),
+            Capability("exec")
+        );
+        assert_eq!(
+            required_capability(&Method::POST, "/api/v1/sessions/{id}/execute"),
+            Capability("exec")
+        );
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/sessions/{id}/ws"),
+            Capability("exec")
+        );
+
+        // read vs manage split on the same path, keyed by method.
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/sessions"),
+            Capability("session.read")
+        );
+        assert_eq!(
+            required_capability(&Method::POST, "/api/v1/sessions"),
+            Capability("session.manage")
+        );
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/sessions/{id}"),
+            Capability("session.read")
+        );
+        assert_eq!(
+            required_capability(&Method::DELETE, "/api/v1/sessions/{id}"),
+            Capability("session.manage")
+        );
+    }
+
+    #[test]
+    fn test_required_capability_unknown_fails_closed() {
+        // An unmapped route requires at least a valid token (never less).
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/unknown"),
+            RequiredCapability::Authenticated
+        );
     }
 
     #[test]

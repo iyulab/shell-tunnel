@@ -80,7 +80,10 @@ pub use session::{
 pub use api::{AppState, ServerConfig};
 
 // Re-export security types
-pub use security::{ApiKeyStore, AuthConfig, CommandValidator, RateLimiter, ValidationConfig};
+pub use security::{
+    ApiKeyStore, AuthConfig, CapabilitySet, CommandValidator, RateLimiter, TokenRecord,
+    ValidationConfig,
+};
 
 // Re-export CLI and config types
 pub use cli::{parse_args, print_help, print_version, Args};

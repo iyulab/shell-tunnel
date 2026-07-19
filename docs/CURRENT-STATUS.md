@@ -9,16 +9,18 @@ execution, REST/WebSocket API, auth, rate limiting, CLI/config) is in place and
 the core agent flow (create → execute, one-shot execute, streaming) works
 out-of-the-box.
 
-**Differentiation layer for the "safe control protocol" positioning: not yet
-started.** shell-tunnel's direction is a single binary + protocol for
-controlling remote environments *safely and deterministically* — the
-capability/permission tokens, audit trail, pluggable transport / self-hosted
-relay, filesystem & destructive-operation guards, and native MCP exposure that
-define that positioning are still ahead (see **What's next** below).
+**Differentiation layer for the "safe control protocol" positioning: in
+progress.** shell-tunnel's direction is a single binary + protocol for
+controlling remote environments *safely and deterministically*. The first pillar
+— **capability-scoped bearer tokens** (fine-grained `exec` / `session.read` /
+`session.manage` with role presets, enforced per route with 401/403) — is now
+implemented (Phase A wire contract v1). The audit trail, pluggable transport /
+self-hosted relay, filesystem & destructive-operation guards, and native MCP
+exposure are still ahead (see **What's next** below).
 
 | Metric | Result |
 |--------|--------|
-| Tests | 203 passed default / 204 with `self-update`, 4 ignored (unit + integration + doc) |
+| Tests | 242 passed default / 243 with `self-update`, 4 ignored (unit + integration + doc) |
 | Binary | ~1–2MB (release, LTO) |
 
 ## Execution model
@@ -70,13 +72,18 @@ not currently on the non-interactive execution path.
   clients), permissive `Any` opt-in via `--cors-allow-any`
 
 ### Security & Production
-- API Key Authentication (Bearer token)
+- Capability-scoped Bearer tokens (Phase A wire contract v1): opaque tokens carry a set of
+  capabilities (`exec` / `session.read` / `session.manage`, `*` wildcard); each route declares a
+  required capability; missing/invalid token → 401, insufficient capability → 403. Role presets
+  (`operator` / `read-only` / `full-control`) and `--capabilities` / `--preset` issuance. Legacy
+  bare keys map to full-control (backward-compatible)
 - Rate Limiting (IP-based sliding window)
-- Input Validation *(library primitive — **not yet wired** into the server execute paths)*:
-  `CommandValidator` (length, dangerous-pattern, null-byte) + path validator ship and are
-  unit-tested, but no handler invokes them today, so commands are not pattern-filtered on
-  `/execute`. Enforcement is deferred to Phase A, where the primary control is an operator-scoped
-  capability token (substring matching = bypassable secondary) — see **What's next**, Phases A/B
+- Input Validation *(command-**content** filter — library primitive, **not yet wired** into the
+  server execute paths)*: `CommandValidator` (length, dangerous-pattern, null-byte) + path validator
+  ship and are unit-tested, but no handler invokes them today, so a token holding `exec` can run any
+  command. The primary access control is the capability token (withhold `exec` to deny execution);
+  substring content matching is a bypassable secondary defence whose wiring is a deferred product
+  decision — see **What's next**, Phases A/B
 - Graceful Shutdown (SIGTERM/Ctrl+C handling)
 
 ### Tooling
@@ -115,6 +122,9 @@ shell-tunnel --no-auth --no-rate-limit
 | `-k, --api-key` | API key for authentication | - |
 | `-l, --log-level` | Log level | info |
 | `--no-auth` | Disable authentication | false |
+| `--require-auth` | Require auth, auto-generating a key if none given | false |
+| `--capabilities <C>` | Scope issued token(s) to comma-separated capabilities | full-control |
+| `--preset <NAME>` | Scope issued token(s) by role preset (operator/read-only/full-control) | full-control |
 | `--no-rate-limit` | Disable rate limiting | false |
 
 ### Environment Variables
@@ -139,7 +149,9 @@ shell-tunnel --no-auth --no-rate-limit
   "security": {
     "auth": {
       "enabled": true,
-      "api_keys": ["key1", "key2"]
+      "api_keys": ["key1", "key2"],
+      "preset": "operator",
+      "capabilities": []
     },
     "rate_limit": {
       "enabled": true,
@@ -159,23 +171,29 @@ shell-tunnel --no-auth --no-rate-limit
 - `GET /health` - Health check (no auth)
 - `GET /api/v1` - API information
 
+Required capability shown in parentheses (enforced only when auth is enabled).
+
 ### Sessions
-- `GET /api/v1/sessions` - List all sessions
-- `POST /api/v1/sessions` - Create a new session
-- `GET /api/v1/sessions/{id}` - Get session status
-- `DELETE /api/v1/sessions/{id}` - Delete a session
-- `POST /api/v1/sessions/{id}/execute` - Execute command
-- `WS /api/v1/sessions/{id}/ws` - WebSocket streaming
+- `GET /api/v1/sessions` - List all sessions (`session.read`)
+- `POST /api/v1/sessions` - Create a new session (`session.manage`)
+- `GET /api/v1/sessions/{id}` - Get session status (`session.read`)
+- `DELETE /api/v1/sessions/{id}` - Delete a session (`session.manage`)
+- `POST /api/v1/sessions/{id}/execute` - Execute command (`exec`)
+- `WS /api/v1/sessions/{id}/ws` - WebSocket streaming (`exec`)
 
 ### One-shot Execution
-- `POST /api/v1/execute` - Execute without session
-- `WS /api/v1/ws` - WebSocket one-shot
+- `POST /api/v1/execute` - Execute without session (`exec`)
+- `WS /api/v1/ws` - WebSocket one-shot (`exec`)
 
 ## Security Features
 
-### Authentication
-- Bearer token API keys
-- Auto-generated keys if none provided
+### Authentication & Capabilities
+- Opaque Bearer tokens; each token carries a capability set, each route a required capability
+- Capabilities: `exec`, `session.read`, `session.manage`; `*` wildcard satisfies all
+- 401 (missing/invalid token) vs 403 (valid token, insufficient capability)
+- Role presets: `operator` / `read-only` / `full-control`; issue via `--capabilities` / `--preset`
+- Legacy bare keys map to full-control (backward-compatible)
+- Auto-generated key if none provided (scoped to the configured capabilities)
 - `/health` endpoint bypass (for monitoring)
 
 ### Rate Limiting
@@ -184,8 +202,9 @@ shell-tunnel --no-auth --no-rate-limit
 - `X-RateLimit-*` response headers
 
 ### Input Validation
-*(available in the `CommandValidator` / path-validator primitives — **not invoked** by the
-built-in server today; see Security & Production above. Enforcement deferred to Phase A.)*
+*(command-**content** filter available in the `CommandValidator` / path-validator primitives —
+**not invoked** by the built-in server today; see Security & Production above. The capability token
+is the primary access control; content filtering wiring is a deferred product decision.)*
 - Command length limits
 - Dangerous pattern detection (fork bomb, rm -rf /, etc.)
 - Path traversal prevention (path validator)
@@ -212,7 +231,7 @@ layer is the active roadmap, in priority order:
 
 | Phase | Direction | Status |
 |-------|-----------|--------|
-| A | Permission-scope tokens · audit trail · versioned capability wire contract · pluggable transport / self-hosted relay | Not started (top priority) |
+| A | Permission-scope tokens · audit trail · versioned capability wire contract · pluggable transport / self-hosted relay | Capability tokens **done** (wire contract v1: scoped bearer tokens, route→capability enforcement 401/403, presets, CLI issuance). Remaining: audit trail, transport/relay, Host-header validation — deferred to follow-on design |
 | B | Security hardening & resilience (CORS/auth defaults, request isolation, risk-detection as secondary defense) | Partially done — timeout enforcement + process-tree kill + `/health` independence (2026-07-18); CORS secure-by-default + opt-out (2026-07-19). Remaining: local-binding token opt-in, Host-header validation (DNS-rebinding, folds into Phase A) |
 | C | Cross-platform FS abstraction · filesystem read/write APIs · destructive-operation guards | Not started |
 | D | Native MCP server exposure (`remote_shell_exec`, `remote_fs_read`, …) | Not started |

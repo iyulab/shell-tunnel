@@ -1,7 +1,8 @@
 //! API Key authentication.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::RwLock;
+use std::time::SystemTime;
 
 use axum::{
     extract::{Request, State},
@@ -9,6 +10,8 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+
+use super::capability::CapabilitySet;
 
 /// API key configuration.
 #[derive(Debug, Clone)]
@@ -49,18 +52,51 @@ impl AuthConfig {
     }
 }
 
-/// Thread-safe API key store.
+/// A registered token: the capabilities it grants plus provenance metadata.
+///
+/// The store maps an opaque bearer-token string to one of these records
+/// (spec §9). The token string itself stays the wire credential
+/// (`Authorization: Bearer <token>`); the record is the server-side authority
+/// on what that token may do.
+#[derive(Debug, Clone)]
+pub struct TokenRecord {
+    /// Capabilities this token grants (spec §2 mechanism).
+    pub capabilities: CapabilitySet,
+    /// Human-readable label for provenance (e.g. `"legacy"`, `"operator"`).
+    pub label: String,
+    /// When the token was registered.
+    pub created_at: SystemTime,
+}
+
+impl TokenRecord {
+    /// Create a token record with the given capabilities and label.
+    pub fn new(capabilities: CapabilitySet, label: impl Into<String>) -> Self {
+        Self {
+            capabilities,
+            label: label.into(),
+            created_at: SystemTime::now(),
+        }
+    }
+
+    /// Create a full-control (wildcard) token — the legacy-key mapping target
+    /// and the `full-control` preset (spec §4, §6).
+    pub fn full_control(label: impl Into<String>) -> Self {
+        Self::new(CapabilitySet::wildcard(), label)
+    }
+}
+
+/// Thread-safe token store, keyed by opaque bearer-token string.
 #[derive(Debug)]
 pub struct ApiKeyStore {
-    keys: RwLock<HashSet<String>>,
+    tokens: RwLock<HashMap<String, TokenRecord>>,
     config: AuthConfig,
 }
 
 impl ApiKeyStore {
-    /// Create a new API key store.
+    /// Create a new token store.
     pub fn new(config: AuthConfig) -> Self {
         Self {
-            keys: RwLock::new(HashSet::new()),
+            tokens: RwLock::new(HashMap::new()),
             config,
         }
     }
@@ -70,32 +106,63 @@ impl ApiKeyStore {
         Self::new(AuthConfig::disabled())
     }
 
-    /// Add an API key.
+    /// Add a legacy full-control API key.
+    ///
+    /// Backward-compatibility path (spec §4): a bare key with no declared
+    /// capabilities maps to a `full-control` token holding the wildcard, so any
+    /// existing `--api-key` / `--require-auth` consumer is unaffected and can
+    /// never trigger a 403.
     pub fn add_key(&self, key: impl Into<String>) {
-        if let Ok(mut keys) = self.keys.write() {
-            keys.insert(key.into());
+        self.add_token(key, TokenRecord::full_control("legacy"));
+    }
+
+    /// Register a token string with an explicit capability record.
+    pub fn add_token(&self, key: impl Into<String>, record: TokenRecord) {
+        if let Ok(mut tokens) = self.tokens.write() {
+            tokens.insert(key.into(), record);
         }
     }
 
-    /// Remove an API key.
+    /// Register a token with the given capabilities and label.
+    pub fn add_key_with_capabilities(
+        &self,
+        key: impl Into<String>,
+        capabilities: CapabilitySet,
+        label: impl Into<String>,
+    ) {
+        self.add_token(key, TokenRecord::new(capabilities, label));
+    }
+
+    /// Remove a token.
     pub fn remove_key(&self, key: &str) -> bool {
-        self.keys
+        self.tokens
             .write()
-            .map(|mut keys| keys.remove(key))
+            .map(|mut tokens| tokens.remove(key).is_some())
             .unwrap_or(false)
     }
 
-    /// Check if a key is valid.
+    /// Check if a token is registered (valid).
     pub fn is_valid(&self, key: &str) -> bool {
-        self.keys
+        self.tokens
             .read()
-            .map(|keys| keys.contains(key))
+            .map(|tokens| tokens.contains_key(key))
             .unwrap_or(false)
     }
 
-    /// Get the number of registered keys.
+    /// Look up the capabilities a token grants, if it is registered.
+    ///
+    /// This is the store surface the scope-aware middleware consumes
+    /// (spec §5 step 2): token → `TokenRecord` → capability check.
+    pub fn capabilities(&self, key: &str) -> Option<CapabilitySet> {
+        self.tokens
+            .read()
+            .ok()
+            .and_then(|tokens| tokens.get(key).map(|record| record.capabilities.clone()))
+    }
+
+    /// Get the number of registered tokens.
     pub fn count(&self) -> usize {
-        self.keys.read().map(|k| k.len()).unwrap_or(0)
+        self.tokens.read().map(|t| t.len()).unwrap_or(0)
     }
 
     /// Check if authentication is enabled.
@@ -242,5 +309,48 @@ mod tests {
         assert!(store.is_valid("key1"));
         assert!(store.is_valid("key2"));
         assert!(store.is_valid("key3"));
+    }
+
+    #[test]
+    fn test_legacy_key_maps_to_full_control() {
+        // spec §4: a bare `add_key` maps to a wildcard token so legacy
+        // consumers can never trigger a 403.
+        let store = ApiKeyStore::default();
+        store.add_key("legacy-key");
+
+        let caps = store.capabilities("legacy-key").expect("token registered");
+        assert!(caps.is_wildcard());
+        assert!(caps.satisfies("exec"));
+        assert!(caps.satisfies("session.manage"));
+    }
+
+    #[test]
+    fn test_add_key_with_capabilities() {
+        let store = ApiKeyStore::default();
+        let caps: CapabilitySet = ["exec", "session.read"].into_iter().collect();
+        store.add_key_with_capabilities("fine-grained", caps, "operator");
+
+        assert!(store.is_valid("fine-grained"));
+        let caps = store
+            .capabilities("fine-grained")
+            .expect("token registered");
+        assert!(caps.satisfies("exec"));
+        assert!(caps.satisfies("session.read"));
+        // Fine-grained token is NOT wildcard and lacks unlisted capabilities.
+        assert!(!caps.is_wildcard());
+        assert!(!caps.satisfies("session.manage"));
+    }
+
+    #[test]
+    fn test_capabilities_of_unknown_key_is_none() {
+        let store = ApiKeyStore::default();
+        assert!(store.capabilities("nope").is_none());
+    }
+
+    #[test]
+    fn test_token_record_full_control() {
+        let record = TokenRecord::full_control("legacy");
+        assert!(record.capabilities.is_wildcard());
+        assert_eq!(record.label, "legacy");
     }
 }

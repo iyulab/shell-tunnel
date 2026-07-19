@@ -21,6 +21,10 @@ pub struct Args {
     pub no_auth: bool,
     /// Require authentication, auto-generating an API key if none is provided.
     pub require_auth: bool,
+    /// Capability strings scoping the issued token(s) (empty = full-control).
+    pub capabilities: Vec<String>,
+    /// Role preset scoping the issued token(s) (operator/read-only/full-control).
+    pub preset: Option<String>,
     /// Disable rate limiting.
     pub no_rate_limit: bool,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
@@ -48,6 +52,8 @@ impl Default for Args {
             api_key: None,
             no_auth: false,
             require_auth: false,
+            capabilities: Vec::new(),
+            preset: None,
             no_rate_limit: false,
             cors_allow_any: false,
             log_level: None,
@@ -106,6 +112,20 @@ where
             }
             Long("require-auth") => {
                 result.require_auth = true;
+            }
+            Long("capabilities") => {
+                // Comma-separated; may be repeated. Accumulate non-empty entries.
+                let value: String = parser.value()?.parse()?;
+                result.capabilities.extend(
+                    value
+                        .split(',')
+                        .map(|s| s.trim())
+                        .filter(|s| !s.is_empty())
+                        .map(String::from),
+                );
+            }
+            Long("preset") => {
+                result.preset = Some(parser.value()?.parse()?);
             }
             Long("no-rate-limit") => {
                 result.no_rate_limit = true;
@@ -168,6 +188,10 @@ OPTIONS:
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication
         --require-auth      Require auth, auto-generating an API key if none given
+        --capabilities <C>  Scope issued token(s): comma-separated capabilities
+                            (e.g. exec,session.read). Default: full-control
+        --preset <NAME>     Scope issued token(s) by role preset
+                            (operator | read-only | full-control)
         --no-rate-limit     Disable rate limiting
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
 {update_opts}    -h, --help              Print help
@@ -192,6 +216,12 @@ EXAMPLES:
 
     # Development mode (no security)
     shell-tunnel --no-auth --no-rate-limit
+
+    # Issue a fine-grained, read-only token
+    shell-tunnel -k readonly-key --preset read-only
+
+    # Issue a token scoped to specific capabilities
+    shell-tunnel -k agent-key --capabilities exec,session.read
 {update_examples}"#
     );
 }
@@ -296,6 +326,41 @@ mod tests {
     fn test_no_rate_limit() {
         let result = parse_args_from(args(&["--no-rate-limit"])).unwrap();
         assert!(result.no_rate_limit);
+    }
+
+    #[test]
+    fn test_capabilities_csv() {
+        let result = parse_args_from(args(&["--capabilities", "exec,session.read"])).unwrap();
+        assert_eq!(result.capabilities, vec!["exec", "session.read"]);
+        assert!(Args::default().capabilities.is_empty());
+    }
+
+    #[test]
+    fn test_capabilities_trims_and_ignores_blanks() {
+        let result = parse_args_from(args(&["--capabilities", " exec , , session.read "])).unwrap();
+        assert_eq!(result.capabilities, vec!["exec", "session.read"]);
+    }
+
+    #[test]
+    fn test_capabilities_repeated_accumulate() {
+        let result = parse_args_from(args(&[
+            "--capabilities",
+            "exec",
+            "--capabilities",
+            "session.read,session.manage",
+        ]))
+        .unwrap();
+        assert_eq!(
+            result.capabilities,
+            vec!["exec", "session.read", "session.manage"]
+        );
+    }
+
+    #[test]
+    fn test_preset() {
+        let result = parse_args_from(args(&["--preset", "operator"])).unwrap();
+        assert_eq!(result.preset, Some("operator".to_string()));
+        assert!(Args::default().preset.is_none());
     }
 
     #[test]

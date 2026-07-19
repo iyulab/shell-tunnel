@@ -33,7 +33,7 @@ audit trail, self-hosted relay, native MCP tools) is on the roadmap — see
 - **Cross-platform**: Windows (ConPTY), Linux, macOS (PTY)
 - **Lightweight**: ~2MB binary, minimal resource footprint
 - **Real-time streaming**: WebSocket support for live output
-- **Secure**: enforced API key authentication and rate limiting (command-validation primitives ship but are not yet wired into the server — see [Input Validation](#input-validation))
+- **Secure**: capability-scoped bearer tokens (fine-grained `exec` / `session.read` / `session.manage`, with role presets) and rate limiting (command-*content* validation primitives ship but are not yet wired into the server — see [Input Validation](#input-validation))
 - **Zero-dependency core**: the default build links no update/HTTP stack
 - **Self-updating** *(opt-in)*: in-binary updates from GitHub Releases — bundled in official release binaries, enabled for source builds with `--features self-update`
 
@@ -100,6 +100,8 @@ shell-tunnel --no-auth --no-rate-limit
 | `-l, --log-level <LVL>` | Log level (error, warn, info, debug, trace) | `info` |
 | `--no-auth` | Disable authentication | `false` |
 | `--require-auth` | Require auth, auto-generating an API key if none given | `false` |
+| `--capabilities <C>` | Scope issued token(s) to comma-separated capabilities (e.g. `exec,session.read`) | full-control |
+| `--preset <NAME>` | Scope issued token(s) by role preset (`operator` / `read-only` / `full-control`) | full-control |
 | `--no-rate-limit` | Disable rate limiting | `false` |
 | `--cors-allow-any` | Allow any CORS origin (opt-in; for browser UIs) | `false` |
 | `--check-update` | Check for updates and exit *(self-update builds only)* | - |
@@ -171,18 +173,21 @@ curl -X DELETE http://localhost:3000/api/v1/sessions/1 \
 
 ### API Endpoints
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| `GET` | `/health` | Health check (no auth) |
-| `GET` | `/api/v1` | API information |
-| `GET` | `/api/v1/sessions` | List all sessions |
-| `POST` | `/api/v1/sessions` | Create a new session |
-| `GET` | `/api/v1/sessions/{id}` | Get session status |
-| `DELETE` | `/api/v1/sessions/{id}` | Delete a session |
-| `POST` | `/api/v1/sessions/{id}/execute` | Execute command in session |
-| `POST` | `/api/v1/execute` | Execute command (one-shot) |
-| `WS` | `/api/v1/sessions/{id}/ws` | WebSocket streaming |
-| `WS` | `/api/v1/ws` | WebSocket one-shot |
+Required capability applies only when auth is enabled. A route with no specific
+capability just needs a valid token; `*` (full-control) tokens satisfy every route.
+
+| Method | Endpoint | Description | Required capability |
+|--------|----------|-------------|---------------------|
+| `GET` | `/health` | Health check | *(none — no auth)* |
+| `GET` | `/api/v1` | API information | *(authenticated only)* |
+| `GET` | `/api/v1/sessions` | List all sessions | `session.read` |
+| `POST` | `/api/v1/sessions` | Create a new session | `session.manage` |
+| `GET` | `/api/v1/sessions/{id}` | Get session status | `session.read` |
+| `DELETE` | `/api/v1/sessions/{id}` | Delete a session | `session.manage` |
+| `POST` | `/api/v1/sessions/{id}/execute` | Execute command in session | `exec` |
+| `POST` | `/api/v1/execute` | Execute command (one-shot) | `exec` |
+| `WS` | `/api/v1/sessions/{id}/ws` | WebSocket streaming | `exec` |
+| `WS` | `/api/v1/ws` | WebSocket one-shot | `exec` |
 
 ## Configuration File
 
@@ -198,7 +203,9 @@ Create a JSON config file for complex setups:
   "security": {
     "auth": {
       "enabled": true,
-      "api_keys": ["key1", "key2"]
+      "api_keys": ["key1", "key2"],
+      "preset": "operator",
+      "capabilities": []
     },
     "rate_limit": {
       "enabled": true,
@@ -242,11 +249,32 @@ Builds without the feature omit these flags entirely.
 
 ## Security
 
-### Authentication
-- Bearer token API keys via `Authorization` header
-- `/health` endpoint bypasses authentication (for monitoring)
+### Authentication & Capabilities
+- Opaque bearer tokens via the `Authorization: Bearer <token>` header.
+- `/health` bypasses authentication (for monitoring).
 - Disabled by default for ease of use. Enable with `--api-key <KEY>`, or with
   `--require-auth` to turn auth on and have a key auto-generated (and logged) at startup.
+
+**Capability model.** Each token carries a *set* of capability strings; each route
+declares a *required capability*, and access is a set-membership check:
+- Capabilities: `exec` (run commands), `session.read` (list/inspect sessions),
+  `session.manage` (create/delete sessions). `*` is a wildcard satisfying every check.
+- Missing/invalid token → **401**; valid token lacking the required capability → **403**.
+- Role presets (convenience, not a wire contract): `operator` = `{exec, session.read,
+  session.manage}`, `read-only` = `{session.read}`, `full-control` = `{*}`.
+
+**Issuing scoped tokens.** Passing `--capabilities`/`--preset` turns auth on (a scope with auth
+off would be silently ignored), so `--preset read-only` alone starts a locked server; `--no-auth`
+still overrides. Without `--capabilities`/`--preset`, a key is **full-control** (backward-compatible
+— an existing `--api-key` / `--require-auth` key can never hit a 403):
+
+```bash
+# A read-only token (may list/inspect sessions, cannot exec or create)
+shell-tunnel -k readonly-key --preset read-only
+
+# A token scoped to exactly these capabilities
+shell-tunnel -k agent-key --capabilities exec,session.read
+```
 
 ### Rate Limiting
 - Default: 100 requests/minute per IP
@@ -263,10 +291,12 @@ primitives, but the built-in server does not currently invoke them on the execut
 command sent to `/api/v1/execute` (or a session/WS execute) is not pattern-filtered today, and a
 `working_dir` is not traversal-checked.
 
-Enforcement is deliberately deferred to Phase A, where the primary control is an operator-scoped
-capability token (whitelist); substring pattern matching is a *bypassable secondary* defence, not
-the primary one. Consumers embedding the crate can call `CommandValidator::validate_command`
-directly in the meantime.
+The primary access control is the [capability token](#authentication--capabilities): withhold
+`exec` and a token cannot run commands at all. Command-*content* filtering (dangerous-substring
+matching) is a *bypassable secondary* defence and remains unwired — so a token that **does** hold
+`exec` can run any command today. Consumers embedding the crate can call
+`CommandValidator::validate_command` directly in the meantime; wiring it into the server is a
+deferred product decision.
 
 ### CORS
 - **Restrictive by default**: no permissive CORS headers are emitted. CORS is a
