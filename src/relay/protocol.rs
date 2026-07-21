@@ -29,6 +29,18 @@ pub enum DeviceMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
     },
+    /// First frame on a *data* connection: claim a slot in a device's pool.
+    ///
+    /// The secret travels in the frame body, never in the URL. Query strings are
+    /// written to access logs by default by the reverse proxies this relay is
+    /// meant to sit behind, so a token in the URL would end up on disk in
+    /// plaintext on every deployment that follows our own TLS advice.
+    Attach {
+        /// Which device's pool this connection joins.
+        device_id: String,
+        /// Same secret the control channel presented.
+        enroll_token: String,
+    },
     /// Liveness heartbeat.
     ///
     /// Sent by the device rather than relied upon from the transport: a proxy
@@ -127,6 +139,17 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<RelayMessage>(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn attach_roundtrips() {
+        let msg = DeviceMessage::Attach {
+            device_id: "dev-1".into(),
+            enroll_token: "secret".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"attach\""));
+        assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
     }
 
     #[test]

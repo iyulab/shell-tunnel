@@ -50,14 +50,13 @@ impl RelayClientConfig {
         format!("{}/relay/v1/control", self.base())
     }
 
-    /// Build a data-connection URL for `device_id`.
-    pub fn data_url(&self, device_id: &str) -> String {
-        format!(
-            "{}/relay/v1/data?device_id={}&enroll_token={}",
-            self.base(),
-            device_id,
-            self.enroll_token
-        )
+    /// Build the data-connection URL.
+    ///
+    /// Deliberately carries no credentials: the device authenticates in the
+    /// connection's first frame instead, because URLs end up in proxy and load
+    /// balancer access logs.
+    pub fn data_url(&self) -> String {
+        format!("{}/relay/v1/data", self.base())
     }
 
     /// Normalise the relay URL to a WebSocket scheme without a trailing slash.
@@ -168,9 +167,15 @@ fn spawn_data_connection(config: RelayClientConfig, device_id: String) {
 
 /// Wait for one proxied request, replay it locally, return the response.
 async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
-    let (mut conn, _) = tokio_tungstenite::connect_async(config.data_url(device_id))
+    let (mut conn, _) = tokio_tungstenite::connect_async(config.data_url())
         .await
         .map_err(|e| ShellTunnelError::Tunnel(format!("data connection refused: {e}")))?;
+
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.to_string(),
+        enroll_token: config.enroll_token.clone(),
+    };
+    send(&mut conn, &attach).await?;
 
     let request: ProxyRequest = loop {
         match conn.next().await {
@@ -356,10 +361,12 @@ mod tests {
     }
 
     #[test]
-    fn data_urls_carry_the_device_id_and_token() {
-        let url = config("wss://relay.example.com").data_url("dev-1");
-        assert!(url.contains("device_id=dev-1"), "{url}");
-        assert!(url.contains("enroll_token=secret"), "{url}");
+    fn data_urls_carry_no_credentials() {
+        let url = config("wss://relay.example.com").data_url();
+        assert_eq!(url, "wss://relay.example.com/relay/v1/data");
+        // A secret in the URL would be written to proxy access logs.
+        assert!(!url.contains("secret"), "{url}");
+        assert!(!url.contains('?'), "{url}");
     }
 
     #[test]

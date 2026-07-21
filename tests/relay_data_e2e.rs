@@ -78,10 +78,18 @@ async fn serve_one_request(
     status: u16,
     reply: &'static str,
 ) -> tokio::task::JoinHandle<ProxyRequest> {
-    let url = format!("ws://{addr}/relay/v1/data?device_id={device_id}&enroll_token={token}");
-    let (mut conn, _) = tokio_tungstenite::connect_async(url)
+    let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
         .await
         .expect("data connection should be accepted");
+
+    // Credentials go in the first frame, never in the URL.
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.to_string(),
+        enroll_token: token.to_string(),
+    };
+    conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+        .await
+        .unwrap();
 
     tokio::spawn(async move {
         let request: ProxyRequest = loop {
@@ -220,15 +228,51 @@ async fn an_attached_device_with_no_connections_is_unavailable() {
 }
 
 #[tokio::test]
-async fn a_data_connection_with_a_bad_token_is_rejected() {
+async fn a_data_connection_with_a_bad_token_never_joins_the_pool() {
     let addr = start_relay().await;
     let (device_id, _control) = enroll(addr).await;
 
-    let url = format!("ws://{addr}/relay/v1/data?device_id={device_id}&enroll_token=wrong");
-    assert!(
-        tokio_tungstenite::connect_async(url).await.is_err(),
-        "a data connection must prove the same secret the control channel did"
-    );
+    let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+        .await
+        .expect("the upgrade itself is not the authentication step");
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.clone(),
+        enroll_token: "wrong".to_string(),
+    };
+    conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+        .await
+        .unwrap();
+
+    // A connection that cannot prove the secret must not become usable
+    // capacity: requests still find an empty pool.
+    let (status, _body) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_eq!(status, 503);
+}
+
+#[tokio::test]
+async fn credentials_never_appear_in_a_data_connection_url() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+
+    // The URL a device dials carries no secret — proxies log query strings.
+    let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+        .await
+        .expect("a credential-free URL must still be accepted");
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.clone(),
+        enroll_token: "secret".to_string(),
+    };
+    conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+        .await
+        .unwrap();
+
+    // Give the relay a moment to park it, then prove it became real capacity.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::spawn(async move {
+        let _ = conn.next().await;
+    });
+    let (status, _body) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_ne!(status, 503, "the connection should have joined the pool");
 }
 
 #[tokio::test]

@@ -149,7 +149,12 @@ with backoff instead of exiting.
 **Two separate secrets, deliberately.** The enroll token only decides *which devices may
 attach* to your relay. What a caller may then do is decided by the capability token, which
 the relay forwards untouched and never inspects or logs — attaching a relay does not put it
-inside your trust boundary.
+inside your trust boundary. Neither secret ever travels in a URL, so nothing leaks into the
+access logs of a proxy in front of the relay.
+
+**Single-tenant by design.** All devices share one enroll token, so anyone holding it can
+attach connections for any device on that relay. Run a relay for devices you own; it does not
+isolate tenants from each other.
 
 The relay server runs in any build. The *device* side needs the `relay-client` feature — it is
 **bundled in the official release binaries**, and off by default from source (the core build

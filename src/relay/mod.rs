@@ -25,7 +25,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Query, Request, State,
+        Request, State,
     },
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -271,36 +271,49 @@ async fn control_session(socket: WebSocket, state: RelayState) {
     tracing::info!(target: "relay", device_id = %device_id, "device detached");
 }
 
-/// Query parameters a device sends when opening a data connection.
-#[derive(Debug, serde::Deserialize)]
-struct DataParams {
-    device_id: String,
-    enroll_token: String,
-}
-
 /// Accept a data connection and park it in its device's pool.
 ///
-/// Data connections re-present the enrollment token: a socket that can serve a
-/// device's traffic must prove the same thing the control channel proved.
-async fn data_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<RelayState>,
-    Query(params): Query<DataParams>,
-) -> Response {
-    if !constant_time_eq(&params.enroll_token, &state.config.enroll_token) {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let Some(device) = state.devices.get(&params.device_id) else {
-        return StatusCode::NOT_FOUND.into_response();
+/// The connection authenticates itself in its first frame rather than in the
+/// URL: query strings land in the access logs of the reverse proxies this relay
+/// is meant to sit behind, so a token there would be written to disk in
+/// plaintext on exactly the deployments that follow our own TLS advice.
+async fn data_handler(ws: WebSocketUpgrade, State(state): State<RelayState>) -> Response {
+    ws.on_upgrade(move |socket| attach_data_connection(socket, state))
+}
+
+/// Read the attach frame, verify it, and hand the socket to the device's pool.
+async fn attach_data_connection(mut socket: WebSocket, state: RelayState) {
+    let first = tokio::time::timeout(ENROLL_TIMEOUT, socket.recv()).await;
+    let Ok(Some(Ok(Message::Text(text)))) = first else {
+        let _ = socket.close().await;
+        return;
     };
 
-    ws.on_upgrade(move |socket| async move {
-        // A pool that is already full means the device over-supplied; closing
-        // the extra socket is better than holding it open forever.
-        if let Some(mut extra) = device.offer(socket).await {
-            let _ = extra.close().await;
-        }
-    })
+    let Ok(DeviceMessage::Attach {
+        device_id,
+        enroll_token,
+    }) = serde_json::from_str::<DeviceMessage>(&text)
+    else {
+        let _ = socket.close().await;
+        return;
+    };
+
+    if !constant_time_eq(&enroll_token, &state.config.enroll_token) {
+        tracing::debug!(target: "relay", "data connection rejected: bad token");
+        let _ = socket.close().await;
+        return;
+    }
+
+    let Some(device) = state.devices.get(&device_id) else {
+        let _ = socket.close().await;
+        return;
+    };
+
+    // A pool that is already full means the device over-supplied; closing the
+    // extra socket is better than holding it open forever.
+    if let Some(mut extra) = device.offer(socket).await {
+        let _ = extra.close().await;
+    }
 }
 
 /// Forward a public request to the addressed device and return its response.
