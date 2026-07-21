@@ -148,11 +148,10 @@ async fn main() -> shell_tunnel::Result<()> {
         }
     };
 
-    // Start the server
-    info!(
-        "Starting server on {}:{}",
-        server_config.host, server_config.port
-    );
+    // The bound address is logged once the listener exists, by `serve`. Saying
+    // it here would be a guess: attaching to a relay lets the OS choose the
+    // port, so this line used to announce 3000 while the server bound something
+    // else entirely.
 
     #[cfg(feature = "relay-client")]
     if let Some(relay_url) = args.relay_url.clone() {
