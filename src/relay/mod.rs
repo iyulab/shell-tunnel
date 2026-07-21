@@ -19,15 +19,16 @@ pub mod proxy;
 pub mod registry;
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Request, State,
+        FromRequestParts, Request, State,
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
     Router,
@@ -40,7 +41,7 @@ use protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
 };
-use registry::DeviceRegistry;
+use registry::{Device, DeviceRegistry};
 
 pub use registry::{DeviceRegistry as Registry, POOL_TARGET};
 
@@ -57,30 +58,45 @@ pub struct RelayConfig {
     pub bind: SocketAddr,
     /// Secret a device must present to attach.
     pub enroll_token: String,
-    /// Public base URL of this relay, used to build each device's public URL.
-    pub public_base: String,
+    /// Public base URL of this relay, when the operator states it explicitly.
+    ///
+    /// Left unset, the relay derives it from each connection's `Host` (and
+    /// `X-Forwarded-*`) headers, so a relay behind TLS termination still tells
+    /// devices an address that actually works.
+    pub public_base: Option<String>,
 }
 
 impl RelayConfig {
     /// Create a configuration with the given bind address and token.
     pub fn new(bind: SocketAddr, enroll_token: impl Into<String>) -> Self {
-        let bind_str = bind.to_string();
         Self {
             bind,
             enroll_token: enroll_token.into(),
-            public_base: format!("http://{bind_str}"),
+            public_base: None,
         }
     }
 
     /// Set the public base URL advertised to devices.
     pub fn with_public_base(mut self, base: impl Into<String>) -> Self {
-        self.public_base = base.into().trim_end_matches('/').to_string();
+        self.public_base = Some(base.into().trim_end_matches('/').to_string());
         self
     }
 
+    /// The base URL to advertise, preferring what the operator configured.
+    ///
+    /// `observed` is what the connection itself says this relay is reachable at.
+    /// Falling back to the bind address is a last resort — it is right only when
+    /// nothing is in front of the relay.
+    pub fn public_base_or(&self, observed: Option<String>) -> String {
+        self.public_base
+            .clone()
+            .or(observed)
+            .unwrap_or_else(|| format!("http://{}", self.bind))
+    }
+
     /// Public URL that routes to `device_id`.
-    pub fn public_url_for(&self, device_id: &str) -> String {
-        format!("{}/d/{}", self.public_base, device_id)
+    pub fn public_url_for(&self, device_id: &str, observed: Option<String>) -> String {
+        format!("{}/d/{}", self.public_base_or(observed), device_id)
     }
 }
 
@@ -146,16 +162,39 @@ pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
     Ok(())
 }
 
+/// Work out how this relay was addressed, from the connection's own headers.
+///
+/// A relay behind TLS termination sees plain HTTP on a loopback port, so the
+/// scheme and host it should advertise are only knowable from what the proxy
+/// forwards.
+fn observed_base(headers: &HeaderMap) -> Option<String> {
+    let host = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|value| value.to_str().ok())?;
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .map(|proto| proto.split(',').next().unwrap_or(proto).trim().to_string())
+        .unwrap_or_else(|| "http".to_string());
+    Some(format!("{scheme}://{host}"))
+}
+
 /// Upgrade a device's outbound connection into the control channel.
 async fn control_handler(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| control_session(socket, state))
+    let observed = observed_base(&headers);
+    ws.on_upgrade(move |socket| control_session(socket, state, observed))
 }
 
 /// Enroll a device, then serve its heartbeats until the connection ends.
-async fn control_session(socket: WebSocket, state: RelayState) {
+async fn control_session(socket: WebSocket, state: RelayState, observed: Option<String>) {
     let (mut sink, mut stream) = socket.split();
 
     // An unauthenticated peer must not be able to hold a connection open
@@ -203,7 +242,7 @@ async fn control_session(socket: WebSocket, state: RelayState) {
     // Relay-assigned, never device-chosen: an attacker cannot pick or squat on
     // another device's routing key.
     let device_id = generate_api_key();
-    let public_url = state.config.public_url_for(&device_id);
+    let public_url = state.config.public_url_for(&device_id, observed);
     let registry::DeviceHandles {
         device,
         mut refill_rx,
@@ -347,6 +386,26 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
         })
         .collect();
 
+    // A WebSocket upgrade cannot be answered by buffering: the exchange has no
+    // end until one side closes. Because one request already owns one data
+    // connection for its lifetime, the same socket simply becomes the pipe —
+    // the connection-per-request model pays off here rather than needing a
+    // second mechanism.
+    if is_websocket_upgrade(request.headers()) {
+        let (mut parts, _) = request.into_parts();
+        let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+            Ok(upgrade) => upgrade,
+            Err(rejection) => return rejection.into_response(),
+        };
+        let proxied = ProxyRequest {
+            method,
+            path: tail,
+            headers,
+            websocket: true,
+        };
+        return upgrade.on_upgrade(move |client| pipe_websocket(client, device, proxied));
+    }
+
     let body = match axum::body::to_bytes(request.into_body(), MAX_BODY).await {
         Ok(body) => body,
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
@@ -371,6 +430,7 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
                 method,
                 path: tail,
                 headers,
+                websocket: false,
             },
             body,
         ),
@@ -384,6 +444,85 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
         }
         Err(_) => (StatusCode::GATEWAY_TIMEOUT, "device timed out").into_response(),
     }
+}
+
+/// Whether these headers ask to switch protocols to WebSocket.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    let header_contains = |name: axum::http::HeaderName, needle: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.to_ascii_lowercase().contains(needle))
+    };
+    header_contains(axum::http::header::UPGRADE, "websocket")
+        && header_contains(axum::http::header::CONNECTION, "upgrade")
+}
+
+/// Join a client's WebSocket to the device over one data connection.
+///
+/// The relay has already answered 101 by the time this runs — axum completes the
+/// handshake before invoking the callback — so a device that then refuses simply
+/// results in the client's socket closing.
+async fn pipe_websocket(mut client: WebSocket, device: Arc<Device>, request: ProxyRequest) {
+    let Some(mut conn) = device.take(POOL_WAIT).await else {
+        tracing::debug!(target: "relay", device_id = %device.id, "no data connection for websocket");
+        let _ = client.close().await;
+        return;
+    };
+
+    let Ok(header) = serde_json::to_string(&request) else {
+        let _ = client.close().await;
+        return;
+    };
+    if conn.send(Message::Text(header.into())).await.is_err() {
+        let _ = client.close().await;
+        return;
+    }
+
+    // The device answers with the status its own server returned; anything but
+    // a switch means the upgrade did not happen there.
+    let switched = matches!(
+        conn.recv().await,
+        Some(Ok(Message::Text(ref text)))
+            if serde_json::from_str::<ProxyResponse>(text)
+                .map(|response| response.status == 101)
+                .unwrap_or(false)
+    );
+    if !switched {
+        let _ = client.close().await;
+        let _ = conn.close().await;
+        return;
+    }
+
+    // From here the two sockets are the same conversation: copy frames until
+    // either end hangs up.
+    loop {
+        tokio::select! {
+            from_client = client.recv() => {
+                match from_client {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(message)) => {
+                        if conn.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            from_device = conn.recv() => {
+                match from_device {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(message)) => {
+                        if client.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = client.close().await;
+    let _ = conn.close().await;
 }
 
 /// Largest request body the relay will buffer before forwarding.
@@ -484,7 +623,7 @@ mod tests {
     fn public_url_uses_the_device_path_prefix() {
         let config = config().with_public_base("https://relay.example.com/");
         assert_eq!(
-            config.public_url_for("dev-1"),
+            config.public_url_for("dev-1", None),
             "https://relay.example.com/d/dev-1"
         );
     }
@@ -492,7 +631,64 @@ mod tests {
     #[test]
     fn public_base_defaults_to_the_bind_address() {
         let config = RelayConfig::new("127.0.0.1:8443".parse().unwrap(), "secret");
-        assert_eq!(config.public_url_for("d"), "http://127.0.0.1:8443/d/d");
+        assert_eq!(
+            config.public_url_for("d", None),
+            "http://127.0.0.1:8443/d/d"
+        );
+    }
+
+    #[test]
+    fn an_observed_address_is_used_when_the_operator_configured_none() {
+        let config = config();
+        assert_eq!(
+            config.public_url_for("dev-1", Some("https://relay.example.com".into())),
+            "https://relay.example.com/d/dev-1"
+        );
+    }
+
+    #[test]
+    fn a_configured_base_wins_over_what_the_connection_observed() {
+        let config = config().with_public_base("https://canonical.example");
+        assert_eq!(
+            config.public_url_for("dev-1", Some("https://whatever.invalid".into())),
+            "https://canonical.example/d/dev-1"
+        );
+    }
+
+    #[test]
+    fn the_forwarded_scheme_and_host_are_preferred_over_the_direct_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::HOST, "127.0.0.1:8443".parse().unwrap());
+        assert_eq!(
+            observed_base(&headers).as_deref(),
+            Some("http://127.0.0.1:8443")
+        );
+
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        headers.insert("x-forwarded-host", "relay.example.com".parse().unwrap());
+        assert_eq!(
+            observed_base(&headers).as_deref(),
+            Some("https://relay.example.com")
+        );
+    }
+
+    #[test]
+    fn a_proxy_chain_scheme_takes_the_first_entry() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "relay.example.com".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert_eq!(
+            observed_base(&headers).as_deref(),
+            Some("https://relay.example.com")
+        );
+    }
+
+    #[test]
+    fn no_host_header_means_nothing_observed() {
+        assert!(observed_base(&HeaderMap::new()).is_none());
     }
 
     #[test]

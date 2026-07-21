@@ -225,7 +225,10 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     if let Some(base) = &args.public_base {
         config = config.with_public_base(base);
     }
-    let public_base = config.public_base.clone();
+    // What to print: the operator's own URL when they gave one, otherwise the
+    // bind address. Devices are told the address their own connection observed,
+    // which is what works when the relay sits behind TLS termination.
+    let public_base = config.public_base_or(None);
 
     std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
     logging::init();

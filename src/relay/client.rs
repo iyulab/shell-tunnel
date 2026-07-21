@@ -14,7 +14,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+/// The device's side of a relay connection.
+type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 use super::protocol::{DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use super::proxy::{is_forwardable, ProxyRequest, ProxyResponse};
@@ -74,12 +80,28 @@ impl RelayClientConfig {
     }
 }
 
+/// Select the TLS backend once, before any `wss://` connection is made.
+///
+/// rustls 0.23 will not choose a crypto provider implicitly; without this the
+/// first TLS handshake panics deep inside the library rather than returning an
+/// error. Installing it explicitly (rather than relying on feature unification
+/// to leave exactly one provider enabled) keeps that failure impossible no
+/// matter what else ends up in the dependency graph.
+fn install_crypto_provider() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // An error here means a provider was already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
 /// Attach to the relay and keep serving until the process ends.
 ///
 /// Reconnects with exponential backoff: unlike a spawned tunnel, the device's
 /// public URL is stable across reconnects (the relay keeps addressing it by the
 /// same id), so recovering silently is the honest behaviour here.
 pub async fn run(config: RelayClientConfig) -> Result<()> {
+    install_crypto_provider();
     let mut backoff = BACKOFF_MIN;
     loop {
         match attach(&config).await {
@@ -100,6 +122,7 @@ pub async fn run(config: RelayClientConfig) -> Result<()> {
 ///
 /// Returns `Ok(())` when the relay closed the channel cleanly.
 pub async fn attach(config: &RelayClientConfig) -> Result<()> {
+    install_crypto_provider();
     let (mut control, _) = tokio_tungstenite::connect_async(config.control_url())
         .await
         .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
@@ -188,6 +211,12 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
         }
     };
 
+    // A WebSocket request never gets a body frame: the relay switches the
+    // connection into a pipe instead, so this branch must not wait for one.
+    if request.websocket {
+        return pipe_websocket(conn, config, &request).await;
+    }
+
     let body = match conn.next().await {
         Some(Ok(Message::Binary(bytes))) => bytes.to_vec(),
         _ => Vec::new(),
@@ -201,6 +230,96 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
     let _ = conn.send(Message::Text(json)).await;
     let _ = conn.send(Message::Binary(body)).await;
     let _ = conn.close(None).await;
+    Ok(())
+}
+
+/// Open the local WebSocket the request is really for, then join the two.
+///
+/// The relay has committed to a 101 with its own client already; this side
+/// reports whether the device's server agreed, and if so the data connection
+/// becomes a plain two-way pipe.
+async fn pipe_websocket(
+    mut conn: WsStream,
+    config: &RelayClientConfig,
+    request: &ProxyRequest,
+) -> Result<()> {
+    let local_url = format!("ws://{}{}", config.local, request.path);
+    let mut builder = local_url
+        .into_client_request()
+        .map_err(|e| ShellTunnelError::Tunnel(format!("bad local websocket url: {e}")))?;
+
+    // The capability token lives in these headers; without replaying them the
+    // device's own auth would reject its own traffic.
+    for (name, value) in &request.headers {
+        if !is_forwardable(name) || name.eq_ignore_ascii_case("sec-websocket-key") {
+            continue;
+        }
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(name.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            builder.headers_mut().insert(name, value);
+        }
+    }
+
+    let local = match tokio_tungstenite::connect_async(builder).await {
+        Ok((socket, _)) => socket,
+        Err(e) => {
+            // Report the refusal so the relay can close its client cleanly
+            // instead of leaving it waiting on a pipe that will never carry.
+            tracing::debug!(target: "relay-client", "local websocket refused: {e}");
+            let head = ProxyResponse {
+                status: 502,
+                headers: Vec::new(),
+            };
+            if let Ok(json) = serde_json::to_string(&head) {
+                let _ = conn.send(Message::Text(json)).await;
+            }
+            let _ = conn.close(None).await;
+            return Ok(());
+        }
+    };
+
+    let head = ProxyResponse {
+        status: 101,
+        headers: Vec::new(),
+    };
+    let json = serde_json::to_string(&head)
+        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot encode response: {e}")))?;
+    conn.send(Message::Text(json))
+        .await
+        .map_err(|_| ShellTunnelError::Tunnel("relay connection lost".to_string()))?;
+
+    let (mut local_tx, mut local_rx) = local.split();
+    let (mut relay_tx, mut relay_rx) = conn.split();
+
+    loop {
+        tokio::select! {
+            from_relay = relay_rx.next() => {
+                match from_relay {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(message)) => {
+                        if local_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            from_local = local_rx.next() => {
+                match from_local {
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    Some(Ok(message)) => {
+                        if relay_tx.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = local_tx.close().await;
+    let _ = relay_tx.close().await;
     Ok(())
 }
 

@@ -160,8 +160,9 @@ The relay server runs in any build. The *device* side needs the `relay-client` f
 **bundled in the official release binaries**, and off by default from source (the core build
 links no TLS or WebSocket client): `cargo build --release --features relay-client`.
 
-**Current limitation:** the relay proxies ordinary request/response HTTP. WebSocket
-streaming (`/api/v1/ws`) works over `--tunnel` but not yet through the relay.
+WebSocket streaming (`/api/v1/ws`) works through the relay as well: the data connection that
+carries the request becomes the pipe. Server-sent events do not — a streaming *response* still
+buffers, which is a follow-up.
 
 ## API
 
@@ -224,6 +225,10 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 
 `transport.mode` is `none` (local only), `cloudflared`, or `command` — with `command` naming
 the tunnel client to run. CLI flags override it, as with every other setting.
+
+A relay behind TLS termination does not need `--public-base`: it derives the URL it advertises
+from each connection's `Host` / `X-Forwarded-*` headers, so devices are told an address that
+actually resolves. Set `--public-base` when you want to pin a canonical one.
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json

@@ -30,6 +30,14 @@ pub struct ProxyRequest {
     /// Headers to replay, including `Authorization` — which the relay forwards
     /// verbatim and never inspects.
     pub headers: Vec<(String, String)>,
+    /// Whether this is a WebSocket upgrade.
+    ///
+    /// Carried as a field rather than as `Upgrade`/`Connection` headers: those
+    /// are hop-by-hop and describe the *client's* connection to the relay, so
+    /// replaying them would contradict the filtering everything else goes
+    /// through. The device performs its own local handshake instead.
+    #[serde(default)]
+    pub websocket: bool,
 }
 
 /// Response metadata returned by the device ahead of the body.
@@ -112,6 +120,13 @@ mod tests {
     }
 
     #[test]
+    fn the_websocket_flag_defaults_to_false_for_older_peers() {
+        let json = r#"{"method":"GET","path":"/","headers":[]}"#;
+        let request: ProxyRequest = serde_json::from_str(json).unwrap();
+        assert!(!request.websocket);
+    }
+
+    #[test]
     fn hop_by_hop_headers_are_not_forwarded() {
         assert!(!is_forwardable("Connection"));
         assert!(!is_forwardable("transfer-encoding"));
@@ -132,6 +147,7 @@ mod tests {
             method: "POST".into(),
             path: "/api/v1/execute".into(),
             headers: vec![("authorization".into(), "Bearer st_x".into())],
+            websocket: false,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(

@@ -56,6 +56,10 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # for wss://, a TLS stack — neither of which the local-listen core build has any
 # use for. Same shape as `self-update`: off by default, on in release binaries.
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+# rustls 0.23 refuses to pick a crypto backend implicitly, so the provider is
+# selected here and installed explicitly at startup — otherwise the first wss://
+# connection panics at runtime rather than failing gracefully.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
 # Auto-update (optional, off by default to keep the core binary zero-dependency).
 # Pulls a large transitive tree (reqwest/hyper-rustls/self_update -> quick-xml, time, number_prefix)
@@ -69,7 +73,7 @@ default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
-relay-client = ["dep:tokio-tungstenite"]
+relay-client = ["dep:tokio-tungstenite", "dep:rustls"]
 
 [dev-dependencies]
 tokio-test = "0.4"

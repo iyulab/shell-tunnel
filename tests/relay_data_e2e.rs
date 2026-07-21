@@ -296,3 +296,99 @@ async fn consuming_a_connection_asks_the_device_for_another() {
         RelayMessage::OpenData { count: 1 }
     ));
 }
+
+// ===========================================================================
+// WebSocket through the relay
+// ===========================================================================
+
+/// Stand in for a device that answers a WebSocket upgrade: accept the request
+/// header, agree with 101, then echo frames back.
+async fn serve_one_websocket(addr: SocketAddr, device_id: &str, token: &str) {
+    let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+        .await
+        .expect("data connection should be accepted");
+
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.to_string(),
+        enroll_token: token.to_string(),
+    };
+    conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+        .await
+        .unwrap();
+
+    tokio::spawn(async move {
+        let request: ProxyRequest = loop {
+            match conn.next().await {
+                Some(Ok(Message::Text(text))) => break serde_json::from_str(&text).unwrap(),
+                Some(Ok(_)) => continue,
+                other => panic!("expected a request header, got {other:?}"),
+            }
+        };
+        assert!(
+            request.websocket,
+            "the upgrade intent must survive the hop as a typed field"
+        );
+
+        let head = ProxyResponse {
+            status: 101,
+            headers: Vec::new(),
+        };
+        conn.send(Message::Text(serde_json::to_string(&head).unwrap()))
+            .await
+            .unwrap();
+
+        // Echo whatever the client sends, prefixed so the test can tell the
+        // frame really made the round trip.
+        while let Some(Ok(message)) = conn.next().await {
+            match message {
+                Message::Text(text) => {
+                    if conn
+                        .send(Message::Text(format!("echo:{text}")))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Message::Close(_) => break,
+                _ => continue,
+            }
+        }
+    });
+}
+
+#[tokio::test]
+async fn a_websocket_is_piped_through_the_relay() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    serve_one_websocket(addr, &device_id, "secret").await;
+
+    let (mut client, response) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/d/{device_id}/api/v1/ws"))
+            .await
+            .expect("the relay should complete the upgrade");
+    assert_eq!(response.status().as_u16(), 101);
+
+    client
+        .send(Message::Text("hello".to_string()))
+        .await
+        .unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.next())
+        .await
+        .expect("the device should answer")
+        .expect("stream open")
+        .expect("frame readable");
+    assert_eq!(reply, Message::Text("echo:hello".to_string()));
+}
+
+#[tokio::test]
+async fn a_websocket_to_an_unknown_device_is_refused() {
+    let addr = start_relay().await;
+    assert!(
+        tokio_tungstenite::connect_async(format!("ws://{addr}/d/nobody/api/v1/ws"))
+            .await
+            .is_err(),
+        "an unattached device cannot carry a websocket"
+    );
+}
