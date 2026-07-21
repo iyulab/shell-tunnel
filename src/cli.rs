@@ -303,7 +303,7 @@ EXAMPLES:
     shell-tunnel --tunnel-command "ngrok http 3000"
 
     # Attach to a relay under a stable name
-    shell-tunnel --relay https://relay.example.com --enroll-token <t>                  --device-name build-box --preset operator
+    shell-tunnel --relay https://relay.example.com --enroll-token <t> --device-name box
 
     # Run a relay devices can dial out to
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
