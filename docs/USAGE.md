@@ -246,12 +246,17 @@ shell-tunnel --port 3000 --preset operator \
 Public URL:  https://relay.example.com/d/build-box   (via relay)
 ```
 
-`--device-name` claims a stable routing key so the URL survives restarts and
-reconnects. Without it the relay assigns a random id that changes on every
-attach. Names accept letters, digits, `-` and `_`, up to 64 characters; anything
-else is refused rather than sanitized, because the name lands in a URL path.
-Re-attaching under a name you already hold replaces the previous entry, so a
-device recovers immediately after a network drop.
+The device is named after the machine it runs on, so its URL survives restarts
+without anyone naming hosts by hand. `--device-name` overrides that. Names accept
+letters, digits, `-` and `_`, up to 64 characters; anything else is refused
+rather than sanitized, because the name lands in a URL path. Re-attaching under a
+name already held replaces the previous entry, so a device recovers immediately
+after a network drop — two machines sharing a hostname would displace each other,
+which is when to name them explicitly.
+
+The local port is chosen by the OS unless `-p` says otherwise: behind a relay the
+listener only ever talks to this process, so a port in use elsewhere is no reason
+for startup to fail.
 
 Set `-k` explicitly when the caller cannot read the device's console — otherwise
 the generated key is only visible there.
@@ -277,10 +282,12 @@ curl -X POST "https://relay.example.com/d/build-box/api/v1/execute" \
 
 ### Trust model
 
-Two secrets, deliberately separate:
+Two secrets, deliberately separate — they are not interchangeable:
 
-- the **enrol token** decides which devices may attach, and who may list them
-- the **capability token** decides what a caller may do, end to end
+| | Held by | Answers |
+|---|---|---|
+| `--enroll-token` | the relay | which **devices** may attach, and who may list them |
+| `-k` / `--api-key` | each device | which **callers** may run commands there |
 
 The relay forwards `Authorization` untouched and never inspects, stores, or logs
 it. Neither secret travels in a URL, so nothing leaks into the access logs of a
@@ -307,9 +314,9 @@ own; it does not isolate tenants from each other.
 | Option | Description | Default |
 |---|---|---|
 | `-H, --host <ADDR>` | Bind address | `127.0.0.1` |
-| `-p, --port <PORT>` | Port | `3000` |
+| `-p, --port <PORT>` | Port | `3000`, or OS-chosen with `--relay` |
 | `-c, --config <FILE>` | JSON config file | - |
-| `-k, --api-key <KEY>` | API key | - |
+| `-k, --api-key <KEY>` | Key callers present to run commands here | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
 | `--require-auth` | Enable auth, generating a key if none given | `false` |
@@ -320,14 +327,14 @@ own; it does not isolate tenants from each other.
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
-| `--device-name <N>` | Stable name to claim on the relay | relay-assigned |
+| `--device-name <N>` | Stable name to claim on the relay | this machine's name |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
 | Option | Description | Default |
 |---|---|---|
-| `--enroll-token <T>` | Secret devices present to attach | generated |
+| `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,

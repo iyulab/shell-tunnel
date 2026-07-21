@@ -400,8 +400,31 @@ pub async fn serve(config: ServerConfig) -> crate::Result<()> {
     serve_with_state(config, AppState::new()).await
 }
 
+/// Bind the API server's port without starting to serve.
+///
+/// Callers that need to know the port before traffic flows — anything binding
+/// port 0, where the OS chooses — take the listener from here and hand it to
+/// [`serve_on`]. Splitting bind from serve is what makes an ephemeral port
+/// usable: the alternative is binding twice and racing whoever grabs it in
+/// between.
+pub async fn bind(config: &ServerConfig) -> crate::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(config.bind_address())
+        .await
+        .map_err(crate::error::ShellTunnelError::Io)
+}
+
 /// Start the API server with custom state.
 pub async fn serve_with_state(config: ServerConfig, state: AppState) -> crate::Result<()> {
+    let listener = bind(&config).await?;
+    serve_on(listener, config, state).await
+}
+
+/// Serve on an already-bound listener.
+pub async fn serve_on(
+    listener: tokio::net::TcpListener,
+    config: ServerConfig,
+    state: AppState,
+) -> crate::Result<()> {
     let addr = config.bind_address();
 
     // Create router with security
@@ -424,11 +447,14 @@ pub async fn serve_with_state(config: ServerConfig, state: AppState) -> crate::R
         tracing::warn!("Authentication is DISABLED - server is open to all requests");
     }
 
-    tracing::info!("Starting shell-tunnel API server on {}", addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(crate::error::ShellTunnelError::Io)?;
+    let _ = addr;
+    tracing::info!(
+        "Starting shell-tunnel API server on {}",
+        listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| config.bind_address())
+    );
 
     // Create service with connection info for rate limiting
     let service: IntoMakeServiceWithConnectInfo<Router, SocketAddr> =

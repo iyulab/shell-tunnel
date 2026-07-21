@@ -83,6 +83,45 @@ impl RelayClientConfig {
     }
 }
 
+/// This machine's short hostname, reduced to something usable as a routing key.
+///
+/// Used when no `--device-name` is given, so a device gets a URL that survives
+/// restarts without the operator having to name every machine by hand. Read from
+/// the environment first and from `hostname` only as a fallback, because the
+/// environment variable is absent when running as a service on Unix.
+pub fn default_device_name() -> Option<String> {
+    #[cfg(windows)]
+    const HOST_VAR: &str = "COMPUTERNAME";
+    #[cfg(not(windows))]
+    const HOST_VAR: &str = "HOSTNAME";
+
+    let raw = std::env::var(HOST_VAR)
+        .ok()
+        .filter(|v| !v.trim().is_empty());
+    let raw = raw.or_else(|| {
+        let output = std::process::Command::new("hostname").output().ok()?;
+        let name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!name.is_empty()).then_some(name)
+    })?;
+
+    sanitize_device_name(&raw)
+}
+
+/// Reduce a hostname to the characters a routing key may contain.
+///
+/// Takes the short name (a FQDN's first label) and drops anything that would
+/// need escaping in a URL path, rather than letting the relay reject a name the
+/// user never chose.
+fn sanitize_device_name(raw: &str) -> Option<String> {
+    let short = raw.split('.').next().unwrap_or(raw);
+    let cleaned: String = short
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .take(64)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 /// Select the TLS backend once, before any `wss://` connection is made.
 ///
 /// rustls 0.23 will not choose a crypto provider implicitly; without this the
@@ -454,6 +493,35 @@ mod tests {
             label: None,
             device_name: None,
         }
+    }
+
+    #[test]
+    fn a_hostname_becomes_a_usable_routing_key() {
+        assert_eq!(
+            sanitize_device_name("UJ-Book3").as_deref(),
+            Some("UJ-Book3")
+        );
+        assert_eq!(
+            sanitize_device_name("build_box").as_deref(),
+            Some("build_box")
+        );
+        // A FQDN contributes only its short name; dots are not path-safe.
+        assert_eq!(
+            sanitize_device_name("box.example.com").as_deref(),
+            Some("box")
+        );
+        // Anything left unusable is reported as absent rather than mangled into
+        // a name the user never chose.
+        assert_eq!(sanitize_device_name("!!!").as_deref(), None);
+        assert_eq!(sanitize_device_name("").as_deref(), None);
+        assert_eq!(sanitize_device_name(&"x".repeat(100)).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn this_machine_has_a_default_device_name() {
+        // Every platform the project runs on can name itself somehow; a `None`
+        // here would silently fall back to a random id that changes on reconnect.
+        assert!(default_device_name().is_some());
     }
 
     #[test]

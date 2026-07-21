@@ -225,19 +225,29 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     if let Some(base) = &args.public_base {
         config = config.with_public_base(base);
     }
-    // What to print: the operator's own URL when they gave one, otherwise the
-    // bind address. Devices are told the address their own connection observed,
-    // which is what works when the relay sits behind TLS termination.
-    let public_base = config.public_base_or(None);
-
     std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
     logging::init();
 
-    println!("\nRelay:        {public_base}");
+    // `0.0.0.0` is a bind address, not somewhere a device can dial. Printing it
+    // as a join URL would hand the operator a command that cannot work off-box,
+    // so a wildcard bind reports what it is listening on and leaves the address
+    // to them. (Devices themselves are told the address their own connection
+    // observed, which is what works behind TLS termination.)
+    let reachable = if args.public_base.is_some() || !bind.ip().is_unspecified() {
+        Some(config.public_base_or(None))
+    } else {
+        None
+    };
+
+    match &reachable {
+        Some(url) => println!("\nRelay:        {url}"),
+        None => println!("\nRelay:        listening on {bind}"),
+    }
     if generated {
         println!("Enroll token: {enroll_token}   (generated)");
     }
-    println!("Devices join with:\n    shell-tunnel --relay {public_base} --enroll-token <token>\n");
+    let join_url = reachable.unwrap_or_else(|| format!("http://<this-host>:{}", bind.port()));
+    println!("Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>\n");
 
     serve_relay(config).await
 }
@@ -256,13 +266,24 @@ async fn run_with_relay(
 ) -> shell_tunnel::Result<()> {
     use shell_tunnel::relay::client::{run as run_relay_client, RelayClientConfig};
 
-    let local: SocketAddr = server_config
-        .bind_address()
-        .parse()
-        .expect("bind address is built from a parsed IpAddr and a u16 port");
-    let server = tokio::spawn(serve(server_config));
+    // Behind a relay the local listener only ever talks to this process, so the
+    // port is an implementation detail — let the OS pick a free one unless the
+    // user asked for a specific port. That removes the most common way this
+    // setup fails: something else already holding 3000.
+    let mut server_config = server_config;
+    if !args.port_explicit {
+        server_config.port = 0;
+    }
 
-    wait_until_listening(local, Duration::from_secs(5)).await;
+    let listener = shell_tunnel::api::bind(&server_config).await?;
+    let local = listener
+        .local_addr()
+        .map_err(shell_tunnel::ShellTunnelError::Io)?;
+    let server = tokio::spawn(shell_tunnel::api::serve_on(
+        listener,
+        server_config,
+        shell_tunnel::AppState::new(),
+    ));
 
     let client_config = RelayClientConfig {
         relay_url,
@@ -272,7 +293,12 @@ async fn run_with_relay(
             .expect("checked before logging starts"),
         local,
         label: None,
-        device_name: args.device_name.clone(),
+        // Naming the device after the machine keeps its URL stable across
+        // restarts without the operator naming every host by hand.
+        device_name: args
+            .device_name
+            .clone()
+            .or_else(shell_tunnel::relay::client::default_device_name),
     };
 
     for warning in &exposure.warnings {

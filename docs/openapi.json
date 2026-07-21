@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.5.1",
+    "version": "0.6.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -427,7 +427,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.5.1"
+            "example": "0.6.0"
           },
           "status": {
             "type": "string",

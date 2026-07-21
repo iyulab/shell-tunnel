@@ -13,6 +13,11 @@ pub struct Args {
     pub host: IpAddr,
     /// Port to listen on.
     pub port: u16,
+    /// Whether the port was stated rather than defaulted.
+    ///
+    /// A relay-attached device serves only itself on loopback, so the port is an
+    /// implementation detail there — but only if the user did not ask for one.
+    pub port_explicit: bool,
     /// Path to configuration file.
     pub config: Option<PathBuf>,
     /// API key for authentication (overrides config file).
@@ -62,6 +67,7 @@ impl Default for Args {
         Self {
             host: "127.0.0.1".parse().unwrap(),
             port: 3000,
+            port_explicit: false,
             config: None,
             api_key: None,
             no_auth: false,
@@ -121,6 +127,7 @@ where
                 result.port = value
                     .parse()
                     .map_err(|_| ArgsError::InvalidValue("port", value))?;
+                result.port_explicit = true;
             }
             Short('c') | Long("config") => {
                 result.config = Some(parser.value()?.parse()?);
@@ -248,7 +255,7 @@ OPTIONS:
     -H, --host <ADDR>       Host address to bind [default: 127.0.0.1]
     -p, --port <PORT>       Port to listen on [default: 3000]
     -c, --config <FILE>     Path to configuration file (JSON)
-    -k, --api-key <KEY>     API key for authentication
+    -k, --api-key <KEY>     API key callers present to run commands here
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication
         --require-auth      Require auth, auto-generating an API key if none given
@@ -264,13 +271,17 @@ OPTIONS:
                             command (ngrok, bore, frp, ...); its printed URL
                             is used. Implies authentication
         --relay <URL>       Attach to a self-hosted relay (dial out, no inbound
-                            port). Needs --enroll-token; implies authentication
+                            port). Needs the relay's --enroll-token; implies
+                            authentication. The local port is chosen for you
+                            unless -p says otherwise
         --device-name <N>   Claim a stable name on the relay, so the device URL
-                            survives reconnects [default: relay-assigned random]
+                            survives reconnects [default: this machine's name]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
 
 RELAY OPTIONS (with `relay`):
-        --enroll-token <T>  Secret devices present to attach (generated if unset)
+        --enroll-token <T>  Secret devices present to attach to this relay
+                            (generated if unset). Distinct from --api-key, which
+                            is what callers present to a device
         --public-base <URL> Public base URL of this relay
                             [default: http://<bind address>]
 {update_opts}    -h, --help              Print help
