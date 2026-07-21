@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -64,8 +64,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # Auto-update (optional, off by default to keep the core binary zero-dependency).
 # Pulls a large transitive tree (reqwest/hyper-rustls/self_update -> quick-xml, time, number_prefix)
 # that is only needed for `--update`/`--check-update`. Enable with `--features self-update`.
-# rustls-tls avoids OpenSSL for cross-compilation.
-self_update = { version = "0.42", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "rustls"], optional = true }
+# rustls-tls avoids OpenSSL for cross-compilation. `compression-flate2` only covers
+# .tar.gz; extracting the Windows .zip needs `compression-zip-deflate` as well.
+self_update = { version = "0.42", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "rustls"], optional = true }
 
 [features]
 # Core binary is zero-dependency by default; self-update is opt-in.

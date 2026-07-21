@@ -240,9 +240,14 @@ mod tests {
         let start_at = Instant::now();
         let err = start(&fake(quiet), addr(), Duration::from_millis(300)).unwrap_err();
         assert!(err.to_string().contains("did not publish"), "{err}");
+
+        // The property is that the deadline ends the wait at all, not that it
+        // ends it fast: tearing the provider down shells out to `taskkill` on
+        // Windows, which is itself a process spawn and can take seconds on a
+        // loaded machine. A tight bound here measures the host, not the code.
         assert!(
-            start_at.elapsed() < Duration::from_secs(5),
-            "timeout should end the wait promptly"
+            start_at.elapsed() < Duration::from_secs(20),
+            "the deadline should end the wait, not hang"
         );
     }
 

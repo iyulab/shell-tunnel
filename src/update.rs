@@ -22,6 +22,26 @@ const BIN_NAME: &str = "shell-tunnel.exe";
 #[cfg(not(windows))]
 const BIN_NAME: &str = "shell-tunnel";
 
+/// Platform token used in release asset names.
+///
+/// The release workflow publishes `shell-tunnel-<platform>.<ext>`, and
+/// `self_update` locates an asset by substring-matching whatever `target` it is
+/// given. Left to its default it looks for the compile-time triple
+/// (`x86_64-pc-windows-msvc`), which no asset has ever contained — so every
+/// update failed with "No asset found for target". The naming has to be handed
+/// to it explicitly, and [`tests::release_targets_match_the_published_assets`]
+/// keeps this table and the workflow from drifting apart.
+fn release_target() -> Option<&'static str> {
+    Some(match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86_64") => "windows-x64",
+        ("linux", "x86_64") => "linux-x64",
+        ("linux", "aarch64") => "linux-arm64",
+        ("macos", "x86_64") => "macos-x64",
+        ("macos", "aarch64") => "macos-arm64",
+        _ => return None,
+    })
+}
+
 /// Update check result.
 #[derive(Debug)]
 pub struct UpdateInfo {
@@ -63,10 +83,19 @@ pub fn check_update() -> Result<UpdateInfo> {
 ///
 /// Returns `Ok(true)` if updated, `Ok(false)` if already up to date.
 pub fn self_update() -> Result<bool> {
+    let target = release_target().ok_or_else(|| {
+        crate::ShellTunnelError::Update(format!(
+            "no release binary is published for {}-{}; build from source instead",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        ))
+    })?;
+
     let status = Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
+        .target(target)
         .current_version(cargo_crate_version!())
         .show_download_progress(true)
         .no_confirm(true)
@@ -124,6 +153,48 @@ fn is_newer_version(current: &str, latest: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn this_platform_maps_to_a_published_asset() {
+        // Every platform the project builds for must resolve; a `None` here on a
+        // supported platform is the bug that broke `--update`.
+        let target = release_target();
+        if matches!(
+            (std::env::consts::OS, std::env::consts::ARCH),
+            ("windows", "x86_64")
+                | ("linux", "x86_64")
+                | ("linux", "aarch64")
+                | ("macos", "x86_64")
+                | ("macos", "aarch64")
+        ) {
+            assert!(target.is_some(), "no asset naming for this platform");
+        }
+    }
+
+    #[test]
+    fn release_targets_match_the_published_assets() {
+        // Ties the table above to what the workflow actually uploads. Renaming an
+        // archive without updating the table would silently break `--update` for
+        // that platform, which is exactly how it broke the first time.
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/release.yml"
+        ))
+        .expect("release workflow should be readable");
+
+        for platform in [
+            "windows-x64",
+            "linux-x64",
+            "linux-arm64",
+            "macos-x64",
+            "macos-arm64",
+        ] {
+            assert!(
+                workflow.contains(&format!("shell-tunnel-{platform}.")),
+                "the release workflow publishes no asset named shell-tunnel-{platform}.*"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
