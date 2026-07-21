@@ -50,8 +50,12 @@ pub struct Args {
     pub tls_cert: Option<PathBuf>,
     /// PEM private key matching `tls_cert`.
     pub tls_key: Option<PathBuf>,
+    /// Generate a self-signed certificate when none is present.
+    pub tls_self_signed: bool,
     /// Extra PEM certificate authority to trust when dialling a relay.
     pub relay_ca: Option<PathBuf>,
+    /// Additional host names this server answers to.
+    pub allow_hosts: Vec<String>,
     /// Append an audit trail of executions and refusals to this file.
     pub audit_log: Option<PathBuf>,
     /// Rotate the audit trail once it passes this many bytes.
@@ -94,7 +98,9 @@ impl Default for Args {
             device_name: None,
             tls_cert: None,
             tls_key: None,
+            tls_self_signed: false,
             relay_ca: None,
+            allow_hosts: Vec::new(),
             audit_log: None,
             audit_max_bytes: None,
             cors_allow_any: false,
@@ -197,8 +203,15 @@ where
             Long("tls-key") => {
                 result.tls_key = Some(parser.value()?.parse()?);
             }
+            Long("tls-self-signed") => {
+                result.tls_self_signed = true;
+            }
             Long("relay-ca") => {
                 result.relay_ca = Some(parser.value()?.parse()?);
+            }
+            Long("allow-host") => {
+                let value: String = parser.value()?.parse()?;
+                result.allow_hosts.push(value);
             }
             Long("audit-log") => {
                 result.audit_log = Some(parser.value()?.parse()?);
@@ -246,6 +259,16 @@ where
     // silently falling back to plaintext would be the opposite of what was asked.
     if result.tls_cert.is_some() != result.tls_key.is_some() {
         return Err(ArgsError::Conflicting("--tls-cert", "--tls-key"));
+    }
+
+    // `--tls-self-signed` needs no paths; naming them just says where to put it.
+    if result.tls_self_signed && result.tls_cert.is_none() {
+        let defaults = (
+            std::path::PathBuf::from("shell-tunnel-cert.pem"),
+            std::path::PathBuf::from("shell-tunnel-key.pem"),
+        );
+        result.tls_cert = Some(defaults.0);
+        result.tls_key = Some(defaults.1);
     }
 
     // Relay mode serves devices, not shells: a tunnel would publish the wrong
@@ -317,6 +340,9 @@ OPTIONS:
                             unless -p says otherwise
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
+        --allow-host <HOST> Also answer to this host name. A loopback-bound
+                            server otherwise answers only to localhost, which is
+                            what stops DNS rebinding. Repeatable
         --audit-log <FILE>  Append every execution and refusal to this file
                             (JSON per line; the token itself is never written)
         --audit-max-bytes <N>
@@ -325,7 +351,11 @@ OPTIONS:
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
 
 TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
-        --tls-cert <FILE>   PEM certificate chain
+        --tls-self-signed   Serve HTTPS with a self-signed certificate,
+                            generating one on first run and reusing it after.
+                            Needs no paths; devices trust it with --relay-ca
+        --tls-cert <FILE>   PEM certificate chain [default with --tls-self-signed:
+                            shell-tunnel-cert.pem]
         --tls-key <FILE>    PEM private key matching the certificate
         --relay-ca <FILE>   Also trust this PEM authority when dialling a relay
                             (for a relay whose certificate is not publicly signed)
@@ -367,6 +397,9 @@ EXAMPLES:
 
     # Attach to a relay under a stable name
     shell-tunnel --relay https://relay.example.com --enroll-token <t> --device-name box
+
+    # Run a relay with HTTPS, generating a certificate on first run
+    shell-tunnel relay --tls-self-signed --public-base https://relay.example.com
 
     # Run a relay devices can dial out to
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com

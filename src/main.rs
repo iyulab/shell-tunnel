@@ -131,9 +131,8 @@ async fn main() -> shell_tunnel::Result<()> {
     }
     #[cfg(not(feature = "relay-client"))]
     if args.relay_url.is_some() {
-        eprintln!(
-            "Configuration error: this build has no relay client. Rebuild with              `--features relay-client`, or use --tunnel."
-        );
+        eprintln!("Configuration error: this build has no relay client.");
+        eprintln!("Rebuild with `--features relay-client`, or use --tunnel.");
         std::process::exit(1);
     }
 
@@ -150,8 +149,14 @@ async fn main() -> shell_tunnel::Result<()> {
     }
 
     // Convert to server config
+    let allowed_hosts = config.allowed_hosts(&args, public);
     let server_config = match config.to_server_config() {
-        Ok(c) => c,
+        Ok(mut c) => {
+            if let Some(hosts) = allowed_hosts {
+                c.security = c.security.with_allowed_hosts(hosts);
+            }
+            c
+        }
         Err(e) => {
             eprintln!("Configuration error: {}", e);
             std::process::exit(1);
@@ -260,8 +265,23 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         config = config.without_rate_limit();
     }
     #[cfg(feature = "tls")]
+    let mut generated_cert = false;
+    #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
-        config = config.with_tls(shell_tunnel::tls::TlsFiles::new(cert, key));
+        let files = shell_tunnel::tls::TlsFiles::new(cert, key);
+
+        if args.tls_self_signed {
+            let names = shell_tunnel::tls::certificate_names(args.public_base.as_deref(), bind);
+            match files.ensure_self_signed(&names) {
+                Ok(created) => generated_cert = created,
+                Err(e) => {
+                    eprintln!("Configuration error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        config = config.with_tls(files);
     }
     #[cfg(not(feature = "tls"))]
     if args.tls_cert.is_some() {
@@ -298,7 +318,31 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         println!("Enroll token: {enroll_token}   (generated)");
     }
     let join_url = reachable.unwrap_or_else(|| format!("{scheme}://<this-host>:{}", bind.port()));
-    println!("Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>\n");
+
+    // A self-signed certificate is trusted by nobody until its file reaches the
+    // devices. The join line therefore carries `--relay-ca` rather than handing
+    // out a command that fails on the first dial.
+    #[cfg(feature = "tls")]
+    let ca_flag = match (args.tls_self_signed, &args.tls_cert) {
+        (true, Some(cert)) => format!(" --relay-ca {}", cert.display()),
+        _ => String::new(),
+    };
+    #[cfg(not(feature = "tls"))]
+    let ca_flag = String::new();
+
+    println!(
+        "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>{ca_flag}\n"
+    );
+
+    #[cfg(feature = "tls")]
+    if args.tls_self_signed {
+        if generated_cert {
+            println!("Generated a self-signed certificate; restarts reuse it.");
+        }
+        if let Some(cert) = &args.tls_cert {
+            println!("Copy {} to each device for --relay-ca.\n", cert.display());
+        }
+    }
 
     serve_relay(config).await
 }

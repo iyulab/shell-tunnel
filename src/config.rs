@@ -265,6 +265,29 @@ impl Config {
         Ok(config)
     }
 
+    /// Host names this server should answer to, or `None` to accept any.
+    ///
+    /// Only a loopback-bound server that is not published gets a list. That is
+    /// exactly where DNS rebinding applies: a browser resolves the attacker's
+    /// name to `127.0.0.1`, so the request is same-origin and CORS never sees
+    /// it, but the `Host` header still says whose name it was. A server reached
+    /// through a tunnel or relay is deliberately published under a name we may
+    /// not know, so checking would only refuse legitimate traffic.
+    pub fn allowed_hosts(&self, args: &Args, published: bool) -> Option<Vec<String>> {
+        let host: IpAddr = self.server.host.parse().ok()?;
+        if published || !host.is_loopback() {
+            return None;
+        }
+
+        let mut hosts = vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+            "::1".to_string(),
+        ];
+        hosts.extend(args.allow_hosts.iter().cloned());
+        Some(hosts)
+    }
+
     /// Build the tunnel provider this configuration asks for, if any.
     pub fn tunnel_provider(&self) -> Result<Option<Box<dyn TunnelProvider>>, ConfigError> {
         match self.transport.mode {
@@ -832,6 +855,45 @@ mod tests {
         config.security.auth.preset = Some("operator".to_string());
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
         assert!(exposure.warnings.is_empty(), "{:?}", exposure.warnings);
+    }
+
+    #[test]
+    fn a_loopback_server_answers_only_to_local_names() {
+        let config = Config::default();
+        let hosts = config
+            .allowed_hosts(&Args::default(), false)
+            .expect("a loopback server gets a list");
+
+        assert!(hosts.contains(&"localhost".to_string()));
+        assert!(hosts.contains(&"127.0.0.1".to_string()));
+    }
+
+    #[test]
+    fn a_published_server_is_not_host_checked() {
+        // Reached under a name we may not know; checking would only refuse
+        // legitimate traffic.
+        let config = Config::default();
+        assert!(config.allowed_hosts(&Args::default(), true).is_none());
+    }
+
+    #[test]
+    fn a_non_loopback_bind_is_not_host_checked() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        assert!(config.allowed_hosts(&Args::default(), false).is_none());
+    }
+
+    #[test]
+    fn extra_allowed_hosts_join_the_defaults() {
+        let config = Config::default();
+        let args = Args {
+            allow_hosts: vec!["myapp.internal".to_string()],
+            ..Default::default()
+        };
+        let hosts = config.allowed_hosts(&args, false).unwrap();
+
+        assert!(hosts.contains(&"myapp.internal".to_string()));
+        assert!(hosts.contains(&"localhost".to_string()));
     }
 
     #[test]

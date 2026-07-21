@@ -7,6 +7,10 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Uses the `RUST_LOG` environment variable for filtering. If not set,
 /// defaults to `shell_tunnel=info`.
 ///
+/// Diagnostics go to stderr, which leaves stdout for the things a caller wants
+/// to read: the public URL, the API key, the command to try. Sharing one stream
+/// means `shell-tunnel --tunnel | grep "Public URL"` picks up log lines instead.
+///
 /// # Panics
 ///
 /// Panics if called more than once, or if another tracing subscriber
@@ -17,7 +21,11 @@ pub fn init() {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().compact())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_writer(std::io::stderr),
+        )
         .init();
 }
 
@@ -31,7 +39,11 @@ pub fn try_init() -> Result<(), tracing_subscriber::util::TryInitError> {
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(tracing_subscriber::fmt::layer().compact())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .compact()
+                .with_writer(std::io::stderr),
+        )
         .try_init()
 }
 

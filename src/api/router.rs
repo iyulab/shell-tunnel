@@ -61,6 +61,15 @@ pub struct SecurityConfig {
     pub capabilities: Option<CapabilitySet>,
     /// CORS configuration.
     pub cors: CorsConfig,
+    /// Host names this server answers to, when it is worth checking.
+    ///
+    /// `None` disables the check. It is meant for a loopback-bound server, where
+    /// DNS rebinding is the one attack CORS cannot stop: the attacker's name is
+    /// rebound to `127.0.0.1`, so the browser considers the request same-origin
+    /// and sends it. The `Host` header still carries the attacker's name, which
+    /// is what this compares. A published server is deliberately reachable under
+    /// a name we may not know, so the check does not apply there.
+    pub allowed_hosts: Option<Vec<String>>,
 }
 
 impl Default for SecurityConfig {
@@ -71,6 +80,7 @@ impl Default for SecurityConfig {
             api_keys: Vec::new(),
             capabilities: None, // Full-control by default (legacy-compatible)
             cors: CorsConfig::default(), // Restrictive by default (no permissive CORS)
+            allowed_hosts: None,
         }
     }
 }
@@ -96,6 +106,7 @@ impl SecurityConfig {
             api_keys: Vec::new(),
             capabilities: None,
             cors: CorsConfig::default(),
+            allowed_hosts: None,
         }
     }
 
@@ -107,6 +118,7 @@ impl SecurityConfig {
             api_keys: Vec::new(),
             capabilities: None,
             cors: CorsConfig::default(),
+            allowed_hosts: None,
         }
     }
 
@@ -122,6 +134,12 @@ impl SecurityConfig {
     /// key. Without this, tokens are full-control (legacy-compatible).
     pub fn with_capabilities(mut self, capabilities: CapabilitySet) -> Self {
         self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// Answer only to these host names.
+    pub fn with_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.allowed_hosts = Some(hosts);
         self
     }
 
@@ -315,6 +333,63 @@ async fn capability_auth_middleware(
     }
 }
 
+/// Whether `header` names a host this server answers to.
+///
+/// Compared without the port, since the port is not what an attacker controls
+/// in a rebinding attack, and a legitimate caller may reach the same server
+/// through different ports.
+fn host_is_allowed(header: Option<&str>, allowed: &[String]) -> bool {
+    let Some(value) = header else {
+        // HTTP/1.1 requires a Host header; its absence is not a shape any
+        // ordinary client produces.
+        return false;
+    };
+
+    let host = value
+        .rsplit_once(':')
+        .map_or(value, |(host, port)| {
+            // Only strip a trailing port, not part of a bare IPv6 address.
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                host
+            } else {
+                value
+            }
+        })
+        .trim_matches(|c| c == '[' || c == ']');
+
+    allowed
+        .iter()
+        .any(|candidate| candidate.eq_ignore_ascii_case(host))
+}
+
+/// Reject requests carrying a `Host` this server does not answer to.
+async fn host_check_middleware(
+    State(allowed): State<Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, String)> {
+    let header = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+
+    if host_is_allowed(header, &allowed) {
+        return Ok(next.run(request).await);
+    }
+
+    // Named explicitly: an operator hitting this from a container or behind a
+    // proxy needs to know which name was refused and how to permit it.
+    let seen = header.unwrap_or("(none)").to_string();
+    tracing::debug!(host = %seen, "request refused: host not allowed");
+    Err((
+        StatusCode::FORBIDDEN,
+        format!(
+            "host {seen} is not allowed; pass --allow-host {seen} to permit it
+"
+        ),
+    ))
+}
+
 /// Create the API router with security enabled.
 pub fn create_secure_router(
     state: AppState,
@@ -343,6 +418,8 @@ pub fn create_secure_router(
         .route("/ws", any(ws_oneshot_handler))
         .nest("/sessions", session_routes);
 
+    let allowed_hosts = security.allowed_hosts.clone();
+
     // Build main router with security layers
     let mut router = Router::new()
         .route("/health", get(health))
@@ -356,6 +433,15 @@ pub fn create_secure_router(
             rate_limit_middleware,
         ))
         .layer(TraceLayer::new_for_http());
+
+    // Outermost, so a rebound request is refused before it reaches the token
+    // store or the rate limiter's bookkeeping.
+    if let Some(hosts) = allowed_hosts {
+        router = router.layer(middleware::from_fn_with_state(
+            Arc::new(hosts),
+            host_check_middleware,
+        ));
+    }
 
     // Permissive CORS only when explicitly opted in (default: restrictive).
     if let Some(cors) = cors_layer(&security.cors) {

@@ -201,6 +201,19 @@ with auth off would be silently meaningless. `--no-auth` still overrides, except
 on a public path where it is refused. A key issued without either is
 full-control, so existing setups never start failing with 403.
 
+### Host checking
+
+A loopback-bound server answers only to `localhost`, `127.0.0.1`, and `::1`. This
+is the one attack CORS cannot stop: a page can have its own name resolved to
+`127.0.0.1` (DNS rebinding), which makes the request same-origin, but the `Host`
+header still carries the attacker's name. Anything else is refused with a message
+naming the host and the `--allow-host` that would permit it.
+
+The check applies only where that threat exists. A server bound to a public
+address, or published through a tunnel or relay, is deliberately reachable under
+a name shell-tunnel may not know, so checking there would refuse legitimate
+traffic instead.
+
 ### Audit trail
 
 `--audit-log <file>` appends one JSON object per line for every execution and
@@ -218,6 +231,9 @@ shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
 {"at_ms":1784646795525,"kind":"denied","identity":{"token_id":"tok_99b8787ac16b","label":"configured"},
  "route":"POST /api/v1/execute","status":403,"reason":"missing-capability:exec"}
 ```
+
+Logs go to stderr and this banner-style output to stdout, so
+`shell-tunnel --tunnel | grep "Public URL"` works.
 
 Read it with `tail -f` or `jq`; entries are appended and never rewritten, and
 each is flushed as it happens so a crash does not take the last ones with it.
@@ -277,8 +293,20 @@ A relay can terminate TLS itself, which is the difference between tokens
 travelling in clear and not:
 
 ```bash
+# With a certificate you already have
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
+
+# Or generate one, no arguments and no openssl needed
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
 ```
+
+`--tls-self-signed` writes `shell-tunnel-cert.pem` and `shell-tunnel-key.pem` on
+first run and reuses them afterwards — a relay that minted a fresh certificate on
+every restart would invalidate the trust every device was configured with. Name
+the paths with `--tls-cert`/`--tls-key` to put them elsewhere. The certificate is
+valid for `--public-base`, this machine's hostname, the bind address, and
+localhost; devices trust it by copying the certificate file and passing
+`--relay-ca`, which the startup banner spells out.
 
 A certificate without its key (or the reverse) is refused at startup, and an
 unreadable or mismatched pair stops the relay rather than letting it serve
@@ -406,7 +434,9 @@ still sees the real address.
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
-| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | - |
+| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
+| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
+| `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names only |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
 | `--audit-log <FILE>` | Append executions and refusals as JSON lines | off |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |

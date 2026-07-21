@@ -174,3 +174,60 @@ async fn a_device_attaches_over_wss() {
     };
     assert_eq!(device_id, "tls-box");
 }
+
+#[tokio::test]
+async fn a_generated_certificate_serves_and_is_trusted() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().unwrap();
+    let files = TlsFiles::new(dir.path().join("cert.pem"), dir.path().join("key.pem"));
+
+    // What `--tls-self-signed` does: no openssl, no arguments beyond the names.
+    assert!(files
+        .ensure_self_signed(&["localhost".to_string()])
+        .unwrap());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = RelayConfig::new(addr, "secret").with_tls(files.clone());
+    let service =
+        relay_router(RelayState::new(config)).into_make_service_with_connect_info::<SocketAddr>();
+    let rustls_config = shell_tunnel::tls::acceptor(files.load().unwrap());
+
+    let std_listener = listener.into_std().unwrap();
+    tokio::spawn(async move {
+        axum_server::from_tcp_rustls(std_listener, rustls_config)
+            .unwrap()
+            .serve(service)
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // A device trusts it the documented way — by naming the file, not by
+    // turning verification off.
+    let pem = std::fs::read(&files.cert).unwrap();
+    let cert_der = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .unwrap()
+        .unwrap()
+        .to_vec();
+
+    let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(client_config(cert_der)));
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls = connector
+        .connect("localhost".try_into().unwrap(), tcp)
+        .await
+        .expect("a generated certificate should be trusted once named");
+
+    tls.write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), tls.read_to_end(&mut raw))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&raw).starts_with("HTTP/1.1 200"));
+}

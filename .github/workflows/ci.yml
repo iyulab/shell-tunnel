@@ -56,3 +56,22 @@ jobs:
       - name: Clippy
         run: cargo clippy --all -- -D warnings
 
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The declared `rust-version` was reasoned from dependency manifests, not
+      # measured. Building on exactly that toolchain is what turns it from a
+      # claim into a fact.
+      - name: Install Rust 1.78
+        uses: dtolnay/rust-toolchain@1.78
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # Default features only: the optional ones pull crates that need a newer
+      # toolchain, which the manifest comment already records.
+      - name: Build with the declared MSRV
+        run: cargo build --locked

@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -66,6 +66,10 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # WebSocket upgrade path are subtle enough to be worth a maintained crate.
 axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
+# Generating a self-signed certificate. Shares `ring` with rustls, so the
+# marginal cost is small — and it removes the openssl incantation that stands
+# between an operator and an encrypted relay.
+rcgen = { version = "0.14", optional = true }
 # Public trust anchors, so naming a private CA adds to them rather than replacing them.
 webpki-roots = { version = "0.26", optional = true }
 
@@ -84,14 +88,14 @@ self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
 relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
 # Terminate TLS in-process (--tls-cert / --tls-key), no reverse proxy required.
-tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile"]
+tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
 
 [dev-dependencies]
 tokio-test = "0.4"
-# Self-signed certificates for the TLS tests; never used by the binary.
-rcgen = "0.14"
 # A TLS client for the TLS tests, so the handshake is exercised for real.
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# Reading a generated certificate back in the TLS tests.
+rustls-pemfile = "2"
 tempfile = "3"
 # WebSocket client for the end-to-end tests. The rustls feature is what lets the
 # TLS tests trust a certificate generated for that test alone.

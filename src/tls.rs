@@ -24,6 +24,12 @@ pub struct TlsFiles {
     pub key: PathBuf,
 }
 
+/// Default certificate path when the operator names none.
+pub const DEFAULT_CERT: &str = "shell-tunnel-cert.pem";
+
+/// Default private key path when the operator names none.
+pub const DEFAULT_KEY: &str = "shell-tunnel-key.pem";
+
 impl TlsFiles {
     /// Point at a certificate and key on disk.
     pub fn new(cert: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
@@ -31,6 +37,47 @@ impl TlsFiles {
             cert: cert.into(),
             key: key.into(),
         }
+    }
+
+    /// The conventional paths, so `--tls-self-signed` needs no arguments.
+    pub fn default_paths() -> Self {
+        Self::new(DEFAULT_CERT, DEFAULT_KEY)
+    }
+
+    /// Whether both files already exist.
+    pub fn exist(&self) -> bool {
+        self.cert.exists() && self.key.exists()
+    }
+
+    /// Write a self-signed certificate for `names`, unless one is already here.
+    ///
+    /// Reuse is the point of checking first: a relay that minted a fresh
+    /// certificate on every restart would invalidate the trust every device was
+    /// configured with, turning a restart into a fleet-wide reconfiguration.
+    ///
+    /// Returns whether a certificate was generated, so the caller can tell an
+    /// operator what just happened.
+    pub fn ensure_self_signed(&self, names: &[String]) -> Result<bool> {
+        if self.exist() {
+            return Ok(false);
+        }
+        if names.is_empty() {
+            return Err(ShellTunnelError::Tls(
+                "a self-signed certificate needs at least one name to be valid for".to_string(),
+            ));
+        }
+
+        let issued = rcgen::generate_simple_self_signed(names.to_vec())
+            .map_err(|e| ShellTunnelError::Tls(format!("cannot generate a certificate: {e}")))?;
+
+        write_new(&self.cert, issued.cert.pem().as_bytes())?;
+        // Written after the certificate and with restricted permissions where
+        // the platform has them: a private key readable by every local account
+        // is the kind of default that is discovered much later.
+        write_new(&self.key, issued.signing_key.serialize_pem().as_bytes())?;
+        restrict(&self.key);
+
+        Ok(true)
     }
 
     /// Load them into a server configuration.
@@ -45,6 +92,82 @@ impl TlsFiles {
             .with_single_cert(certs, key)
             .map_err(|e| ShellTunnelError::Tls(format!("certificate and key do not match: {e}")))
     }
+}
+
+/// Write a file that must not already exist, creating parent directories.
+fn write_new(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                ShellTunnelError::Tls(format!("cannot create {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    std::fs::write(path, contents)
+        .map_err(|e| ShellTunnelError::Tls(format!("cannot write {}: {e}", path.display())))
+}
+
+/// Restrict a private key to its owner, where the platform expresses that.
+fn restrict(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Names a generated certificate should be valid for.
+///
+/// A certificate is only useful at the address devices actually dial, so the
+/// public base — when the operator stated one — matters more than anything this
+/// machine knows about itself.
+pub fn certificate_names(public_base: Option<&str>, bind: std::net::SocketAddr) -> Vec<String> {
+    let mut names = Vec::new();
+
+    if let Some(base) = public_base {
+        let after_scheme = base.split_once("://").map_or(base, |(_, rest)| rest);
+        if let Some(host) = after_scheme
+            .split('/')
+            .next()
+            .map(|host| host.rsplit_once(':').map_or(host, |(h, _)| h))
+        {
+            if !host.is_empty() {
+                names.push(host.to_string());
+            }
+        }
+    }
+
+    if let Ok(hostname) = std::env::var(if cfg!(windows) {
+        "COMPUTERNAME"
+    } else {
+        "HOSTNAME"
+    }) {
+        let hostname = hostname.trim();
+        if !hostname.is_empty() && !names.iter().any(|n| n == hostname) {
+            names.push(hostname.to_string());
+        }
+    }
+
+    if !bind.ip().is_unspecified() {
+        let ip = bind.ip().to_string();
+        if !names.contains(&ip) {
+            names.push(ip);
+        }
+    }
+
+    // Always usable from the machine itself, which is where an operator checks
+    // first.
+    for fallback in ["localhost", "127.0.0.1"] {
+        if !names.iter().any(|n| n == fallback) {
+            names.push(fallback.to_string());
+        }
+    }
+
+    names
 }
 
 /// Select the TLS backend once, before any handshake.
@@ -155,6 +278,85 @@ mod tests {
         std::fs::write(&cert_path, cert.cert.pem()).unwrap();
         std::fs::write(&key_path, cert.signing_key.serialize_pem()).unwrap();
         TlsFiles::new(cert_path, key_path)
+    }
+
+    #[test]
+    fn a_generated_certificate_is_immediately_usable() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = TlsFiles::new(dir.path().join("c.pem"), dir.path().join("k.pem"));
+
+        assert!(files
+            .ensure_self_signed(&["localhost".to_string()])
+            .unwrap());
+        assert!(files.exist());
+        // Generating something that then fails to load would be worse than not
+        // generating at all.
+        assert!(files.load().is_ok());
+    }
+
+    #[test]
+    fn an_existing_certificate_is_reused_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = TlsFiles::new(dir.path().join("c.pem"), dir.path().join("k.pem"));
+        files
+            .ensure_self_signed(&["localhost".to_string()])
+            .unwrap();
+        let original = std::fs::read_to_string(&files.cert).unwrap();
+
+        // A restart must not invalidate the trust every device was configured
+        // with, which is what minting a fresh certificate each time would do.
+        assert!(!files
+            .ensure_self_signed(&["localhost".to_string()])
+            .unwrap());
+        assert_eq!(original, std::fs::read_to_string(&files.cert).unwrap());
+    }
+
+    #[test]
+    fn generating_creates_missing_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("deep").join("deeper");
+        let files = TlsFiles::new(nested.join("c.pem"), nested.join("k.pem"));
+
+        files
+            .ensure_self_signed(&["localhost".to_string()])
+            .unwrap();
+        assert!(files.load().is_ok());
+    }
+
+    #[test]
+    fn a_certificate_needs_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = TlsFiles::new(dir.path().join("c.pem"), dir.path().join("k.pem"));
+        let err = files.ensure_self_signed(&[]).unwrap_err().to_string();
+        assert!(err.contains("at least one name"), "{err}");
+    }
+
+    #[test]
+    fn the_public_base_is_the_first_name_a_certificate_gets() {
+        let bind = "0.0.0.0:8443".parse().unwrap();
+        let names = certificate_names(Some("https://relay.example.com:8443"), bind);
+
+        // Devices dial the public base, so a certificate that is not valid for
+        // it is valid for nothing that matters.
+        assert_eq!(names.first().map(String::as_str), Some("relay.example.com"));
+        assert!(names.iter().any(|n| n == "localhost"));
+    }
+
+    #[test]
+    fn without_a_public_base_the_local_names_still_work() {
+        let bind = "192.0.2.10:8443".parse().unwrap();
+        let names = certificate_names(None, bind);
+
+        assert!(names.iter().any(|n| n == "192.0.2.10"), "{names:?}");
+        assert!(names.iter().any(|n| n == "127.0.0.1"), "{names:?}");
+    }
+
+    #[test]
+    fn a_wildcard_bind_contributes_no_address() {
+        let bind = "0.0.0.0:8443".parse().unwrap();
+        let names = certificate_names(None, bind);
+        // `0.0.0.0` is not an address anyone dials.
+        assert!(!names.iter().any(|n| n == "0.0.0.0"), "{names:?}");
     }
 
     #[test]
