@@ -4,7 +4,7 @@
 //! grandchildren, so the platform-specific tree-termination and shell-invocation
 //! logic lives here rather than being duplicated per caller.
 
-use std::process::{Command as OsCommand, Stdio};
+use std::process::Command as OsCommand;
 
 /// Kill a child process and its entire descendant tree.
 ///
@@ -15,6 +15,8 @@ use std::process::{Command as OsCommand, Stdio};
 pub(crate) fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
+        use std::process::Stdio;
+
         let _ = OsCommand::new("taskkill")
             .args(["/T", "/F", "/PID", &pid.to_string()])
             .stdin(Stdio::null())
@@ -73,6 +75,7 @@ pub(crate) fn shell_command(command_line: &str) -> OsCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     #[test]
     fn shell_command_runs_a_trivial_command() {
