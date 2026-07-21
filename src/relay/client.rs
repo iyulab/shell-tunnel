@@ -183,7 +183,7 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
         connector(config)?,
     )
     .await
-    .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
+    .map_err(|e| ShellTunnelError::Tunnel(explain_dial_failure(&e, config)))?;
 
     let enroll = DeviceMessage::Enroll {
         enroll_token: config.enroll_token.clone(),
@@ -298,6 +298,58 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
     let _ = conn.send(Message::Binary(body)).await;
     let _ = conn.close(None).await;
     Ok(())
+}
+
+/// Turn a dial failure into something an operator can act on.
+///
+/// rustls reports certificate problems in its own vocabulary — `BadSignature`
+/// says nothing about the far more likely cause, which is that the file passed
+/// to `--relay-ca` is not the certificate this relay is currently serving.
+fn explain_dial_failure(
+    error: &tokio_tungstenite::tungstenite::Error,
+    config: &RelayClientConfig,
+) -> String {
+    let text = error.to_string();
+    let mut message = format!("cannot reach relay: {text}");
+
+    if text.contains("BadSignature") || text.contains("UnknownIssuer") {
+        let ca = config
+            .ca_file
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "the system trust store".to_string());
+        message.push_str(&format!(
+            "
+  {ca} does not vouch for the certificate this relay is presenting."
+        ));
+        message.push_str(
+            "
+  A relay that regenerated its certificate, or a copy taken from a different",
+        );
+        message.push_str(
+            "
+  relay directory, both look like this. Copy the relay's current",
+        );
+        message.push_str(
+            "
+  shell-tunnel-cert.pem and pass it as --relay-ca.",
+        );
+    } else if text.contains("NotValidForName") {
+        message.push_str(
+            "
+  The certificate does not cover the name being dialled.",
+        );
+        message.push_str(
+            "
+  Start the relay with --public-base for that name, after deleting",
+        );
+        message.push_str(
+            "
+  shell-tunnel-cert.pem and shell-tunnel-key.pem so it is regenerated.",
+        );
+    }
+
+    message
 }
 
 /// Build the TLS connector, adding a private authority when one is configured.
@@ -563,6 +615,47 @@ mod tests {
             device_name: None,
             ca_file: None,
         }
+    }
+
+    #[test]
+    fn a_certificate_mismatch_says_what_to_do_about_it() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let config = RelayClientConfig {
+            ca_file: Some(PathBuf::from("copied-cert.pem")),
+            ..config("wss://relay.example.com")
+        };
+        let error = Error::Io(std::io::Error::other(
+            "invalid peer certificate: BadSignature",
+        ));
+
+        let message = explain_dial_failure(&error, &config);
+        // "BadSignature" alone sends an operator looking at the wrong thing.
+        assert!(message.contains("copied-cert.pem"), "{message}");
+        assert!(message.contains("--relay-ca"), "{message}");
+    }
+
+    #[test]
+    fn a_name_mismatch_points_at_public_base() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let error = Error::Io(std::io::Error::other(
+            "invalid peer certificate: NotValidForName",
+        ));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com"));
+
+        assert!(message.contains("--public-base"), "{message}");
+    }
+
+    #[test]
+    fn an_unrelated_failure_is_left_alone() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let error = Error::Io(std::io::Error::other("connection refused"));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com"));
+
+        assert!(message.contains("connection refused"), "{message}");
+        assert!(!message.contains("--relay-ca"), "{message}");
     }
 
     #[test]

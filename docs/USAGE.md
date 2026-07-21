@@ -300,6 +300,11 @@ shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
 ```
 
+`--public-base` is required with `--tls-self-signed` on a relay that accepts
+connections from other machines: a generated certificate can only cover names it
+is told about, so without it every remote device would be refused. The startup
+banner prints which names the certificate covers.
+
 `--tls-self-signed` writes `shell-tunnel-cert.pem` and `shell-tunnel-key.pem` on
 first run and reuses them afterwards — a relay that minted a fresh certificate on
 every restart would invalidate the trust every device was configured with. Name
@@ -494,6 +499,8 @@ startup rather than serving local-only.
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
 | **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
+| `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
+| `invalid peer certificate: NotValidForName` | certificate does not cover the dialled name | restart the relay with `--public-base <name>` after deleting the certificate and key |
 | **502** from a relay URL | device is not attached | check `/relay/v1/devices` |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1` |
 | **504** from a relay URL | device did not answer in 120s | check the device |

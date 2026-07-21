@@ -267,13 +267,37 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     #[cfg(feature = "tls")]
     let mut generated_cert = false;
     #[cfg(feature = "tls")]
+    let mut cert_names: Vec<String> = Vec::new();
+    #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
         let files = shell_tunnel::tls::TlsFiles::new(cert, key);
 
         if args.tls_self_signed {
+            // A certificate is only valid for the names inside it. Without
+            // `--public-base` we know nothing but this machine's own names, so a
+            // device dialling a public hostname is refused — after the operator
+            // has already copied the file and believes the setup is done.
+            if args.public_base.is_none() && !bind.ip().is_loopback() {
+                eprintln!("Configuration error: --tls-self-signed needs --public-base here.");
+                eprintln!("This relay accepts connections from other machines, but a generated");
+                eprintln!("certificate can only cover names it is told about, so devices dialling");
+                eprintln!("any other name would be refused. For example:");
+                eprintln!();
+                eprintln!(
+                    "    shell-tunnel relay -H {} -p {} --tls-self-signed --public-base https://relay.example.com:{}",
+                    bind.ip(),
+                    bind.port(),
+                    bind.port()
+                );
+                std::process::exit(1);
+            }
+
             let names = shell_tunnel::tls::certificate_names(args.public_base.as_deref(), bind);
             match files.ensure_self_signed(&names) {
-                Ok(created) => generated_cert = created,
+                Ok(created) => {
+                    generated_cert = created;
+                    cert_names = names;
+                }
                 Err(e) => {
                     eprintln!("Configuration error: {}", e);
                     std::process::exit(1);
@@ -338,6 +362,11 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     if args.tls_self_signed {
         if generated_cert {
             println!("Generated a self-signed certificate; restarts reuse it.");
+        }
+        // Which names it covers, because a certificate that does not name the
+        // address devices dial is the failure that shows up last.
+        if !cert_names.is_empty() {
+            println!("Certificate covers: {}", cert_names.join(", "));
         }
         if let Some(cert) = &args.tls_cert {
             println!("Copy {} to each device for --relay-ca.\n", cert.display());
