@@ -128,6 +128,7 @@ pub fn relay_router(state: RelayState) -> Router {
         .route("/health", get(|| async { "OK" }))
         .route("/relay/v1/control", get(control_handler))
         .route("/relay/v1/data", get(data_handler))
+        .route("/relay/v1/devices", get(devices_handler))
         .route("/d/{*rest}", any(proxy_handler))
         .with_state(state)
 }
@@ -160,6 +161,19 @@ pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
         .await
         .map_err(|e| ShellTunnelError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
+}
+
+/// Whether `name` is usable as a routing key in `/d/<name>/…`.
+///
+/// Deliberately narrow: the name lands in a URL path, so anything that could
+/// need escaping, traverse a path, or collide with the relay's own routes is
+/// rejected rather than sanitized.
+fn is_valid_device_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// Work out how this relay was addressed, from the connection's own headers.
@@ -209,7 +223,8 @@ async fn control_session(socket: WebSocket, state: RelayState, observed: Option<
             enroll_token,
             version,
             label,
-        }) => (enroll_token, version, label),
+            device_name,
+        }) => (enroll_token, version, label, device_name),
         _ => {
             reject_and_close(
                 &mut sink,
@@ -220,7 +235,7 @@ async fn control_session(socket: WebSocket, state: RelayState, observed: Option<
             return;
         }
     };
-    let (enroll_token, version, label) = enroll;
+    let (enroll_token, version, label, device_name) = enroll;
 
     if version != PROTOCOL_VERSION {
         reject_and_close(
@@ -239,9 +254,28 @@ async fn control_session(socket: WebSocket, state: RelayState, observed: Option<
         return;
     }
 
-    // Relay-assigned, never device-chosen: an attacker cannot pick or squat on
-    // another device's routing key.
-    let device_id = generate_api_key();
+    // A named device keeps one URL across reconnects, which is what makes the
+    // relay usable when whoever calls the device cannot read its console. An
+    // unnamed one gets a random id, which nobody can guess but which changes
+    // every time it attaches.
+    let device_id = match device_name {
+        Some(name) if !is_valid_device_name(&name) => {
+            reject_and_close(
+                &mut sink,
+                reject::BAD_DEVICE_NAME,
+                "device names may use letters, digits, '-' and '_' (1-64 characters)",
+            )
+            .await;
+            return;
+        }
+        // Re-attaching under an existing name replaces the old entry rather
+        // than being refused: after a network drop the relay still holds a
+        // connection it cannot know is dead, and refusing would lock the device
+        // out until the heartbeat timeout expired. Only holders of the enrol
+        // token can do this, which is the same trust level as attaching at all.
+        Some(name) => name,
+        None => generate_api_key(),
+    };
     let public_url = state.config.public_url_for(&device_id, observed);
     let registry::DeviceHandles {
         device,
@@ -308,6 +342,41 @@ async fn control_session(socket: WebSocket, state: RelayState, observed: Option<
 
     state.devices.detach(&device_id);
     tracing::info!(target: "relay", device_id = %device_id, "device detached");
+}
+
+/// List the devices currently attached.
+///
+/// Authenticated with the enrolment token, because the answer is only useful to
+/// whoever operates this relay — and anyone holding that token could attach a
+/// device anyway, so listing them reveals nothing new.
+async fn devices_handler(State(state): State<RelayState>, headers: HeaderMap) -> Response {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_time_eq(presented, &state.config.enroll_token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
+    let base = state.config.public_base_or(observed_base(&headers));
+    let devices: Vec<_> = state
+        .devices
+        .list()
+        .into_iter()
+        .map(|device| {
+            let url = format!("{}/d/{}", base, device.id);
+            serde_json::json!({
+                "id": device.id,
+                "label": device.label,
+                "attached_secs": device.attached_secs,
+                "last_seen_secs": device.last_seen_secs,
+                "public_url": url,
+            })
+        })
+        .collect();
+
+    axum::Json(serde_json::json!({ "devices": devices })).into_response()
 }
 
 /// Accept a data connection and park it in its device's pool.
@@ -689,6 +758,20 @@ mod tests {
     #[test]
     fn no_host_header_means_nothing_observed() {
         assert!(observed_base(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn device_names_must_be_url_path_safe() {
+        assert!(is_valid_device_name("build-box"));
+        assert!(is_valid_device_name("laptop_2"));
+        assert!(is_valid_device_name("a"));
+
+        assert!(!is_valid_device_name(""));
+        assert!(!is_valid_device_name("has space"));
+        assert!(!is_valid_device_name("../escape"));
+        assert!(!is_valid_device_name("slash/inside"));
+        assert!(!is_valid_device_name("querylike?x=1"));
+        assert!(!is_valid_device_name(&"x".repeat(65)));
     }
 
     #[test]

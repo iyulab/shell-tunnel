@@ -272,6 +272,7 @@ async fn run_with_relay(
             .expect("checked before logging starts"),
         local,
         label: None,
+        device_name: args.device_name.clone(),
     };
 
     for warning in &exposure.warnings {

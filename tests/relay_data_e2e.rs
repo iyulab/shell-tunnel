@@ -55,6 +55,7 @@ async fn enroll(addr: SocketAddr) -> (String, Socket) {
         enroll_token: "secret".to_string(),
         version: PROTOCOL_VERSION,
         label: Some("fake-device".to_string()),
+        device_name: None,
     };
     control
         .send(Message::Text(serde_json::to_string(&message).unwrap()))
@@ -391,4 +392,70 @@ async fn a_websocket_to_an_unknown_device_is_refused() {
             .is_err(),
         "an unattached device cannot carry a websocket"
     );
+}
+
+// ===========================================================================
+// Device listing — how a caller finds a device without reading its console
+// ===========================================================================
+
+#[tokio::test]
+async fn the_device_list_reports_attached_devices_with_usable_urls() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+
+    let (status, body) = http_get_authed(
+        &format!("http://{addr}/relay/v1/devices"),
+        Some(("authorization", "Bearer secret")),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+    let devices = parsed["devices"].as_array().expect("devices array");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0]["id"].as_str(), Some(device_id.as_str()));
+    assert_eq!(devices[0]["label"].as_str(), Some("fake-device"));
+    // The point of the endpoint: a URL you can call, not just an id.
+    assert_eq!(
+        devices[0]["public_url"].as_str(),
+        Some(format!("https://relay.test/d/{device_id}").as_str())
+    );
+    assert!(devices[0]["last_seen_secs"].is_number());
+}
+
+#[tokio::test]
+async fn the_device_list_requires_the_enroll_token() {
+    let addr = start_relay().await;
+    let _ = enroll(addr).await;
+
+    let (status, _) = http_get_authed(&format!("http://{addr}/relay/v1/devices"), None).await;
+    assert_eq!(status, 401);
+
+    let (status, _) = http_get_authed(
+        &format!("http://{addr}/relay/v1/devices"),
+        Some(("authorization", "Bearer wrong")),
+    )
+    .await;
+    assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn the_device_list_is_empty_before_anything_attaches() {
+    let addr = start_relay().await;
+
+    let (status, body) = http_get_authed(
+        &format!("http://{addr}/relay/v1/devices"),
+        Some(("authorization", "Bearer secret")),
+    )
+    .await;
+
+    assert_eq!(status, 200);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(parsed["devices"].as_array().unwrap().is_empty());
+}
+
+/// `http_get` with an optional header, kept separate so the existing callers
+/// stay readable.
+async fn http_get_authed(url: &str, header: Option<(&str, &str)>) -> (u16, String) {
+    http_get(url, header).await
 }

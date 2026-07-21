@@ -67,6 +67,16 @@ fn enroll(token: &str) -> DeviceMessage {
         enroll_token: token.to_string(),
         version: PROTOCOL_VERSION,
         label: Some("test-device".to_string()),
+        device_name: None,
+    }
+}
+
+fn enroll_as(token: &str, name: &str) -> DeviceMessage {
+    DeviceMessage::Enroll {
+        enroll_token: token.to_string(),
+        version: PROTOCOL_VERSION,
+        label: None,
+        device_name: Some(name.to_string()),
     }
 }
 
@@ -120,6 +130,7 @@ async fn a_mismatched_protocol_version_is_refused() {
             enroll_token: "secret".to_string(),
             version: PROTOCOL_VERSION + 99,
             label: None,
+            device_name: None,
         },
     )
     .await;
@@ -207,4 +218,80 @@ async fn two_devices_get_distinct_ids() {
 
     assert_ne!(id1, id2);
     assert_eq!(state.devices().count(), 2);
+}
+
+// ===========================================================================
+// Stable device names
+// ===========================================================================
+
+#[tokio::test]
+async fn a_named_device_keeps_that_name_as_its_routing_key() {
+    let (addr, state) = start_relay("secret").await;
+    let mut device = connect(addr).await;
+
+    send(&mut device, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled {
+        device_id,
+        public_url,
+    } = recv(&mut device).await
+    else {
+        panic!("expected an enrolled message");
+    };
+
+    assert_eq!(device_id, "build-box");
+    assert_eq!(public_url, "https://relay.test/d/build-box");
+    assert!(state.devices().get("build-box").is_some());
+}
+
+#[tokio::test]
+async fn a_name_survives_a_reconnect() {
+    let (addr, _state) = start_relay("secret").await;
+
+    let mut first = connect(addr).await;
+    send(&mut first, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled { device_id: id1, .. } = recv(&mut first).await else {
+        panic!("expected an enrolled message");
+    };
+    drop(first);
+
+    // Reconnecting must land on the same URL — that is the whole point of a
+    // name, and refusing here would lock the device out until the heartbeat
+    // timeout expired.
+    let mut second = connect(addr).await;
+    send(&mut second, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled { device_id: id2, .. } = recv(&mut second).await else {
+        panic!("expected an enrolled message");
+    };
+
+    assert_eq!(
+        id1, id2,
+        "a named device must keep its URL across reconnects"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_device_name_is_refused() {
+    let (addr, state) = start_relay("secret").await;
+
+    for bad in ["../escape", "has space", "slash/inside", ""] {
+        let mut device = connect(addr).await;
+        send(&mut device, &enroll_as("secret", bad)).await;
+        let RelayMessage::Rejected { code, .. } = recv(&mut device).await else {
+            panic!("expected a rejection for {bad:?}");
+        };
+        assert_eq!(code, reject::BAD_DEVICE_NAME, "for {bad:?}");
+    }
+    assert_eq!(state.devices().count(), 0);
+}
+
+#[tokio::test]
+async fn an_unnamed_device_still_gets_a_random_id() {
+    let (addr, _state) = start_relay("secret").await;
+    let mut device = connect(addr).await;
+
+    send(&mut device, &enroll("secret")).await;
+    let RelayMessage::Enrolled { device_id, .. } = recv(&mut device).await else {
+        panic!("expected an enrolled message");
+    };
+    assert!(device_id.starts_with("st_"), "{device_id}");
 }

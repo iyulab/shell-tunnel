@@ -28,6 +28,13 @@ pub enum DeviceMessage {
         /// Free-form label to make the device recognisable in relay logs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Requested stable identifier, becoming this device's routing key.
+        ///
+        /// Without it the relay assigns a random id, which changes on every
+        /// reconnect — fine when whoever calls the device can read its console,
+        /// useless when they cannot. A name keeps one URL valid across restarts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_name: Option<String>,
     },
     /// First frame on a *data* connection: claim a slot in a device's pool.
     ///
@@ -90,6 +97,8 @@ pub mod reject {
     pub const UNSUPPORTED_VERSION: &str = "unsupported-version";
     /// The first frame was not a valid enrollment.
     pub const BAD_HANDSHAKE: &str = "bad-handshake";
+    /// The requested device name cannot be used as a routing key.
+    pub const BAD_DEVICE_NAME: &str = "bad-device-name";
 }
 
 #[cfg(test)]
@@ -102,6 +111,7 @@ mod tests {
             enroll_token: "secret".into(),
             version: PROTOCOL_VERSION,
             label: Some("build-box".into()),
+            device_name: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"enroll\""));
@@ -117,7 +127,8 @@ mod tests {
             DeviceMessage::Enroll {
                 enroll_token: "s".into(),
                 version: 1,
-                label: None
+                label: None,
+                device_name: None,
             }
         );
     }
@@ -139,6 +150,18 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<RelayMessage>(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn a_requested_device_name_survives_the_wire() {
+        let msg = DeviceMessage::Enroll {
+            enroll_token: "s".into(),
+            version: PROTOCOL_VERSION,
+            label: None,
+            device_name: Some("build-box".into()),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
     }
 
     #[test]

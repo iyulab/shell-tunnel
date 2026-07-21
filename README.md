@@ -138,13 +138,27 @@ shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
 # prints an enroll token (or pass your own with --enroll-token)
 
 # On each machine you want to reach
-shell-tunnel --relay https://relay.example.com --enroll-token <token> --preset operator
-# Public URL:  https://relay.example.com/d/<device-id>   (via relay)
+shell-tunnel --relay https://relay.example.com --enroll-token <token>              --device-name build-box --preset operator
+# Public URL:  https://relay.example.com/d/build-box   (via relay)
 ```
 
-Requests to `https://relay.example.com/d/<device-id>/api/v1/execute` reach that device.
-Unlike a quick tunnel, the device keeps its URL across reconnects, so the client reconnects
-with backoff instead of exiting.
+Requests to `https://relay.example.com/d/build-box/api/v1/execute` reach that device, from
+anywhere — the caller only makes outbound connections, so it can sit behind NAT too. Only the
+relay needs an inbound port.
+
+`--device-name` claims a stable routing key, so the URL survives restarts and reconnects.
+Without it the relay assigns a random id that changes every time the device attaches — fine
+when whoever calls the device can read its console, useless when they cannot. Re-attaching
+under a name you already hold replaces the old entry rather than being refused, so a device
+recovers immediately after a network drop instead of waiting out a heartbeat timeout.
+
+To find what is attached without logging into any device:
+
+```bash
+curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com/relay/v1/devices
+# {"devices":[{"id":"build-box","label":null,"attached_secs":42,"last_seen_secs":3,
+#              "public_url":"https://relay.example.com/d/build-box"}]}
+```
 
 **Two separate secrets, deliberately.** The enroll token only decides *which devices may
 attach* to your relay. What a caller may then do is decided by the capability token, which

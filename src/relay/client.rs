@@ -48,6 +48,9 @@ pub struct RelayClientConfig {
     pub local: SocketAddr,
     /// Optional label shown in relay logs.
     pub label: Option<String>,
+    /// Requested stable device name; without one the relay assigns a random id
+    /// that changes on every reconnect.
+    pub device_name: Option<String>,
 }
 
 impl RelayClientConfig {
@@ -131,6 +134,7 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
         enroll_token: config.enroll_token.clone(),
         version: PROTOCOL_VERSION,
         label: config.label.clone(),
+        device_name: config.device_name.clone(),
     };
     send(&mut control, &enroll).await?;
 
@@ -448,6 +452,7 @@ mod tests {
             enroll_token: "secret".to_string(),
             local: "127.0.0.1:3000".parse().unwrap(),
             label: None,
+            device_name: None,
         }
     }
 

@@ -39,6 +39,8 @@ pub struct Args {
     pub enroll_token: Option<String>,
     /// Public base URL this relay is reachable at.
     pub public_base: Option<String>,
+    /// Stable name to claim on the relay (keeps one URL across reconnects).
+    pub device_name: Option<String>,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
     pub cors_allow_any: bool,
     /// Log level (error, warn, info, debug, trace).
@@ -73,6 +75,7 @@ impl Default for Args {
             relay_url: None,
             enroll_token: None,
             public_base: None,
+            device_name: None,
             cors_allow_any: false,
             log_level: None,
             version: false,
@@ -162,6 +165,9 @@ where
             }
             Long("public-base") => {
                 result.public_base = Some(parser.value()?.parse()?);
+            }
+            Long("device-name") => {
+                result.device_name = Some(parser.value()?.parse()?);
             }
             Long("cors-allow-any") => {
                 result.cors_allow_any = true;
@@ -259,6 +265,8 @@ OPTIONS:
                             is used. Implies authentication
         --relay <URL>       Attach to a self-hosted relay (dial out, no inbound
                             port). Needs --enroll-token; implies authentication
+        --device-name <N>   Claim a stable name on the relay, so the device URL
+                            survives reconnects [default: relay-assigned random]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
 
 RELAY OPTIONS (with `relay`):
@@ -293,6 +301,9 @@ EXAMPLES:
 
     # Publish using a different tunnel client
     shell-tunnel --tunnel-command "ngrok http 3000"
+
+    # Attach to a relay under a stable name
+    shell-tunnel --relay https://relay.example.com --enroll-token <t>                  --device-name build-box --preset operator
 
     # Run a relay devices can dial out to
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com

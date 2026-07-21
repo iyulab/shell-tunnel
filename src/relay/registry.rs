@@ -24,6 +24,7 @@ pub struct Device {
     pub id: String,
     /// Optional label the device supplied, for operator-facing logs.
     pub label: Option<String>,
+    attached_at: Instant,
     last_seen: Mutex<Instant>,
     pool_tx: mpsc::Sender<WebSocket>,
     pool_rx: tokio::sync::Mutex<mpsc::Receiver<WebSocket>>,
@@ -72,6 +73,23 @@ impl Device {
     }
 }
 
+/// A point-in-time view of an attached device.
+///
+/// Separate from [`Device`] because a device owns its data connections and
+/// therefore cannot be cloned or serialized; this is what an operator asking
+/// "what is attached right now?" actually needs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceSummary {
+    /// Routing key used in `/d/<id>/…`.
+    pub id: String,
+    /// Label the device supplied, if any.
+    pub label: Option<String>,
+    /// Seconds since the device attached.
+    pub attached_secs: u64,
+    /// Seconds since its last heartbeat.
+    pub last_seen_secs: u64,
+}
+
 /// Handles handed to the control session that owns a device.
 #[derive(Debug)]
 pub struct DeviceHandles {
@@ -105,6 +123,7 @@ impl DeviceRegistry {
         let device = Arc::new(Device {
             id: id.clone(),
             label,
+            attached_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             pool_tx,
             pool_rx: tokio::sync::Mutex::new(pool_rx),
@@ -139,6 +158,28 @@ impl DeviceRegistry {
             }
             None => false,
         }
+    }
+
+    /// Snapshot of every attached device, newest attachment first.
+    pub fn list(&self) -> Vec<DeviceSummary> {
+        let mut devices: Vec<DeviceSummary> = match self.devices.read() {
+            Ok(devices) => devices
+                .values()
+                .map(|device| DeviceSummary {
+                    id: device.id.clone(),
+                    label: device.label.clone(),
+                    attached_secs: device.attached_at.elapsed().as_secs(),
+                    last_seen_secs: device
+                        .last_seen
+                        .lock()
+                        .map(|seen| seen.elapsed().as_secs())
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        devices.sort_by_key(|device| device.attached_secs);
+        devices
     }
 
     /// Number of attached devices.
@@ -245,6 +286,24 @@ mod tests {
             handles.refill_rx.try_recv().is_ok(),
             "the device should have been asked to open a connection"
         );
+    }
+
+    #[tokio::test]
+    async fn listing_reports_attached_devices() {
+        let registry = DeviceRegistry::new();
+        registry.attach("dev-1", Some("build-box".into()));
+        registry.attach("dev-2", None);
+
+        let listed = registry.list();
+        assert_eq!(listed.len(), 2);
+        let first = listed.iter().find(|d| d.id == "dev-1").unwrap();
+        assert_eq!(first.label.as_deref(), Some("build-box"));
+        assert!(first.attached_secs < 5);
+    }
+
+    #[tokio::test]
+    async fn listing_an_empty_registry_is_empty() {
+        assert!(DeviceRegistry::new().list().is_empty());
     }
 
     #[tokio::test]
