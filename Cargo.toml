@@ -1,19 +1,19 @@
 [package]
 name = "shell-tunnel"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
 # `self-update` feature pulls crates that require a newer toolchain (~1.83+).
 # Reasoned from declared dep MSRVs; toolchain-verify in CI.
 rust-version = "1.78"
-description = "Ultra-lightweight shell tunnel for AI agent integration"
+description = "Ultra-lightweight remote shell gateway with a REST/WebSocket API"
 license = "MIT"
 repository = "https://github.com/iyulab/shell-tunnel"
 homepage = "https://github.com/iyulab/shell-tunnel"
 documentation = "https://docs.rs/shell-tunnel"
 readme = "README.md"
-keywords = ["shell", "tunnel", "pty", "api", "ai-agent"]
+keywords = ["shell", "tunnel", "pty", "api", "remote"]
 categories = ["command-line-utilities", "development-tools", "api-bindings"]
 authors = ["iyulab"]
 exclude = [

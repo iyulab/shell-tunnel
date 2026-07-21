@@ -158,7 +158,7 @@ fn run_command_streaming(
     let child_pid = child.id();
 
     // stdout and stderr are merged into one output stream. True interleaving is
-    // not guaranteed (nor is it with a TTY), but agents consume a single stream.
+    // not guaranteed (nor is it with a TTY), but clients consume a single stream.
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let (tx, rx) = std_mpsc::channel::<Vec<u8>>();

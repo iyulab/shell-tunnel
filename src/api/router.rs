@@ -27,7 +27,7 @@ use crate::security::{
 
 /// Cross-Origin Resource Sharing (CORS) configuration.
 ///
-/// CORS is a browser-enforced mechanism; non-browser clients (AI agents, `curl`)
+/// CORS is a browser-enforced mechanism; non-browser clients (`curl`, SDKs)
 /// ignore it entirely. shell-tunnel therefore emits **no** permissive CORS headers
 /// by default: this blocks a malicious web page from reading responses cross-origin
 /// and, because the JSON execute endpoints require a preflight, from issuing the

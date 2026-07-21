@@ -175,7 +175,7 @@ pub fn print_help() {
 
     println!(
         r#"shell-tunnel {version}
-Ultra-lightweight shell tunnel for AI agent integration
+Ultra-lightweight remote shell gateway with a REST/WebSocket API
 
 USAGE:
     shell-tunnel [OPTIONS]
@@ -221,7 +221,7 @@ EXAMPLES:
     shell-tunnel -k readonly-key --preset read-only
 
     # Issue a token scoped to specific capabilities
-    shell-tunnel -k agent-key --capabilities exec,session.read
+    shell-tunnel -k ci-key --capabilities exec,session.read
 {update_examples}"#
     );
 }

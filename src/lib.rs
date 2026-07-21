@@ -1,10 +1,10 @@
 //! # shell-tunnel
 //!
-//! Ultra-lightweight shell tunnel for AI agent integration.
+//! Ultra-lightweight remote shell gateway with a REST/WebSocket API.
 //!
-//! This crate provides a secure, cross-platform API for AI agents to
-//! interact with system shells. It supports both Windows (ConPTY) and
-//! Unix (PTY) terminals through a unified interface.
+//! This crate provides a cross-platform API for programmatic interaction
+//! with system shells. It supports both Windows (ConPTY) and Unix (PTY)
+//! terminals through a unified interface.
 //!
 //! ## Features
 //!
