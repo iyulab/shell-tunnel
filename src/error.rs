@@ -60,6 +60,10 @@ pub enum ShellTunnelError {
     #[error("session not executable: current state is {0:?}")]
     NotExecutable(crate::session::SessionState),
 
+    /// Tunnel (reachability) error.
+    #[error("tunnel error: {0}")]
+    Tunnel(String),
+
     /// Update error.
     #[cfg(feature = "self-update")]
     #[error("update error: {0}")]

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::{CorsConfig, SecurityConfig, ServerConfig};
 use crate::cli::Args;
 use crate::security::{AuthConfig, CapabilitySet, RateLimitConfig};
+use crate::tunnel::{Cloudflared, CustomCommand, TunnelProvider};
 
 /// Application configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,8 +24,37 @@ pub struct Config {
     pub server: ServerSection,
     /// Security configuration.
     pub security: SecuritySection,
+    /// How the server is made reachable.
+    pub transport: TransportSection,
     /// Logging configuration.
     pub logging: LoggingSection,
+}
+
+/// How the server is published to the outside world.
+///
+/// A single value rather than a set of flags: two reachability paths would each
+/// allocate a different public URL for one server, so the configuration is not
+/// allowed to express that state at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TransportMode {
+    /// Bind locally only (default).
+    #[default]
+    None,
+    /// Run a Cloudflare quick tunnel.
+    Cloudflared,
+    /// Run the tunnel command in [`TransportSection::command`].
+    Command,
+}
+
+/// Reachability configuration section.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransportSection {
+    /// Which reachability path to use.
+    pub mode: TransportMode,
+    /// Tunnel command to run when `mode` is `command`.
+    pub command: Option<String>,
 }
 
 /// Server configuration section.
@@ -192,6 +222,15 @@ impl Config {
             self.security.auth.enabled = false;
         }
 
+        // CLI reachability flags override the file; the parser has already
+        // rejected asking for two at once.
+        if let Some(ref command) = args.tunnel_command {
+            self.transport.mode = TransportMode::Command;
+            self.transport.command = Some(command.clone());
+        } else if args.tunnel {
+            self.transport.mode = TransportMode::Cloudflared;
+        }
+
         if args.no_rate_limit {
             self.security.rate_limit.enabled = false;
         }
@@ -224,6 +263,78 @@ impl Config {
         config.apply_args(args);
 
         Ok(config)
+    }
+
+    /// Build the tunnel provider this configuration asks for, if any.
+    pub fn tunnel_provider(&self) -> Result<Option<Box<dyn TunnelProvider>>, ConfigError> {
+        match self.transport.mode {
+            TransportMode::None => Ok(None),
+            TransportMode::Cloudflared => Ok(Some(Box::new(Cloudflared))),
+            TransportMode::Command => {
+                let command = self
+                    .transport
+                    .command
+                    .as_deref()
+                    .filter(|c| !c.trim().is_empty())
+                    .ok_or(ConfigError::MissingTunnelCommand)?;
+                Ok(Some(Box::new(CustomCommand::new(command))))
+            }
+        }
+    }
+
+    /// Harden the configuration for a publicly reachable deployment.
+    ///
+    /// Exposing the server through a tunnel turns every weak default into an
+    /// internet-facing one, so this is enforced rather than advised:
+    /// authentication is switched on, and a key is generated when none was
+    /// supplied (the caller reports it — an unusable server would be worse).
+    /// `--no-auth` is refused outright instead of being silently overridden.
+    ///
+    /// The remaining risks are real but legitimate choices, so they are warned
+    /// about rather than blocked: a full-control token on a public URL, rate
+    /// limiting turned off, and binding a non-loopback address in addition to
+    /// the tunnel.
+    pub fn harden_for_public_exposure(
+        &mut self,
+        args: &Args,
+    ) -> Result<PublicExposure, ConfigError> {
+        if args.no_auth {
+            return Err(ConfigError::RemoteWithoutAuth);
+        }
+
+        self.security.auth.enabled = true;
+
+        let generated_key = if self.security.auth.api_keys.is_empty() {
+            let key = crate::security::generate_api_key();
+            self.security.auth.api_keys.push(key.clone());
+            Some(key)
+        } else {
+            None
+        };
+
+        let mut warnings = Vec::new();
+        if self.security.auth.preset.is_none() && self.security.auth.capabilities.is_empty() {
+            warnings.push(
+                "the issued token has full control over this machine and is reachable from the internet; scope it with --preset operator or --capabilities"
+                    .to_string(),
+            );
+        }
+        if !self.security.rate_limit.enabled {
+            warnings.push("rate limiting is disabled on a publicly reachable server".to_string());
+        }
+        if let Ok(ip) = self.server.host.parse::<IpAddr>() {
+            if !ip.is_loopback() {
+                warnings.push(format!(
+                    "binding {} exposes the server directly in addition to the tunnel; 127.0.0.1 is enough when a tunnel provides reachability",
+                    ip
+                ));
+            }
+        }
+
+        Ok(PublicExposure {
+            generated_key,
+            warnings,
+        })
     }
 
     /// Convert to ServerConfig for the API server.
@@ -312,6 +423,15 @@ fn resolve_capabilities(
     Ok(Some(set))
 }
 
+/// Outcome of hardening a configuration for public exposure.
+#[derive(Debug, Clone, Default)]
+pub struct PublicExposure {
+    /// Key generated because none was supplied — the only copy the user gets.
+    pub generated_key: Option<String>,
+    /// Risks that remain legitimate choices, reported rather than blocked.
+    pub warnings: Vec<String>,
+}
+
 /// Configuration errors.
 #[derive(Debug)]
 pub enum ConfigError {
@@ -323,6 +443,10 @@ pub enum ConfigError {
     InvalidHost(String),
     /// Unknown role preset name.
     InvalidPreset(String),
+    /// A public reachability path was requested together with `--no-auth`.
+    RemoteWithoutAuth,
+    /// `transport.mode = "command"` without a command to run.
+    MissingTunnelCommand,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -335,6 +459,14 @@ impl std::fmt::Display for ConfigError {
                 f,
                 "unknown role preset: '{}' (expected operator, read-only, or full-control)",
                 name
+            ),
+            Self::MissingTunnelCommand => write!(
+                f,
+                "transport.mode is \"command\" but transport.command is not set (or use --tunnel-command)"
+            ),
+            Self::RemoteWithoutAuth => write!(
+                f,
+                "--no-auth cannot be combined with a public tunnel: that would expose an unauthenticated shell to the internet. Drop --no-auth (a key is generated for you), or drop the tunnel"
             ),
         }
     }
@@ -611,5 +743,161 @@ mod tests {
         let json = serde_json::to_string_pretty(&config).unwrap();
         assert!(json.contains("\"host\""));
         assert!(json.contains("\"port\""));
+    }
+
+    fn tunnel_args() -> Args {
+        Args {
+            tunnel: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_public_exposure_refuses_no_auth() {
+        let mut config = Config::default();
+        let args = Args {
+            no_auth: true,
+            ..tunnel_args()
+        };
+        let err = config.harden_for_public_exposure(&args).unwrap_err();
+        assert!(matches!(err, ConfigError::RemoteWithoutAuth));
+        assert!(err.to_string().contains("unauthenticated shell"));
+    }
+
+    #[test]
+    fn test_public_exposure_enables_auth_and_generates_a_key() {
+        let mut config = Config::default();
+        assert!(!config.security.auth.enabled);
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(config.security.auth.enabled);
+        let key = exposure.generated_key.expect("a key must be generated");
+        assert!(key.starts_with("st_"));
+        assert_eq!(config.security.auth.api_keys, vec![key]);
+    }
+
+    #[test]
+    fn test_public_exposure_keeps_a_supplied_key() {
+        let mut config = Config::default();
+        config.security.auth.api_keys.push("my-key".to_string());
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(exposure.generated_key.is_none());
+        assert_eq!(config.security.auth.api_keys, vec!["my-key".to_string()]);
+    }
+
+    #[test]
+    fn test_public_exposure_warns_about_an_unscoped_token() {
+        let mut config = Config::default();
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+        assert!(
+            exposure.warnings.iter().any(|w| w.contains("full control")),
+            "{:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn test_public_exposure_does_not_warn_about_a_scoped_token() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("operator".to_string());
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+        assert!(
+            !exposure.warnings.iter().any(|w| w.contains("full control")),
+            "{:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn test_public_exposure_warns_about_disabled_rate_limit_and_public_bind() {
+        let mut config = Config::default();
+        config.security.rate_limit.enabled = false;
+        config.server.host = "0.0.0.0".to_string();
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(exposure
+            .warnings
+            .iter()
+            .any(|w| w.contains("rate limiting")));
+        assert!(exposure.warnings.iter().any(|w| w.contains("0.0.0.0")));
+    }
+
+    #[test]
+    fn test_public_exposure_is_quiet_on_a_scoped_loopback_setup() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("operator".to_string());
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+        assert!(exposure.warnings.is_empty(), "{:?}", exposure.warnings);
+    }
+
+    #[test]
+    fn test_transport_defaults_to_local_only() {
+        let config = Config::default();
+        assert_eq!(config.transport.mode, TransportMode::None);
+        assert!(config.tunnel_provider().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_transport_mode_from_config_file() {
+        let json = r#"{"transport":{"mode":"cloudflared"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.transport.mode, TransportMode::Cloudflared);
+        let provider = config.tunnel_provider().unwrap().expect("a provider");
+        assert_eq!(provider.name(), "cloudflared");
+    }
+
+    #[test]
+    fn test_transport_command_from_config_file() {
+        let json = r#"{"transport":{"mode":"command","command":"ngrok http 3000"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let provider = config.tunnel_provider().unwrap().expect("a provider");
+        assert_eq!(provider.name(), "tunnel-command");
+    }
+
+    #[test]
+    fn test_transport_command_mode_requires_a_command() {
+        let json = r#"{"transport":{"mode":"command"}}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        let err = config.tunnel_provider().unwrap_err();
+        assert!(matches!(err, ConfigError::MissingTunnelCommand));
+        assert!(err.to_string().contains("transport.command"));
+    }
+
+    #[test]
+    fn test_cli_tunnel_overrides_config_file() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"transport":{"mode":"command","command":"old"}}"#).unwrap();
+        config.apply_args(&Args {
+            tunnel: true,
+            ..Default::default()
+        });
+        assert_eq!(config.transport.mode, TransportMode::Cloudflared);
+    }
+
+    #[test]
+    fn test_cli_tunnel_command_overrides_config_file() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"transport":{"mode":"cloudflared"}}"#).unwrap();
+        config.apply_args(&Args {
+            tunnel_command: Some("bore local 3000 --to bore.pub".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(config.transport.mode, TransportMode::Command);
+        assert_eq!(
+            config.transport.command.as_deref(),
+            Some("bore local 3000 --to bore.pub")
+        );
+    }
+
+    #[test]
+    fn test_config_file_transport_survives_unrelated_args() {
+        let mut config: Config =
+            serde_json::from_str(r#"{"transport":{"mode":"cloudflared"}}"#).unwrap();
+        config.apply_args(&Args::default());
+        assert_eq!(config.transport.mode, TransportMode::Cloudflared);
     }
 }

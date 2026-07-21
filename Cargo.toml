@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -52,6 +52,11 @@ futures-util = "0.3"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 
+# Relay client (optional). Dialling out to a relay needs a WebSocket client and,
+# for wss://, a TLS stack — neither of which the local-listen core build has any
+# use for. Same shape as `self-update`: off by default, on in release binaries.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"], optional = true }
+
 # Auto-update (optional, off by default to keep the core binary zero-dependency).
 # Pulls a large transitive tree (reqwest/hyper-rustls/self_update -> quick-xml, time, number_prefix)
 # that is only needed for `--update`/`--check-update`. Enable with `--features self-update`.
@@ -63,6 +68,8 @@ self_update = { version = "0.42", default-features = false, features = ["archive
 default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
+# Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
+relay-client = ["dep:tokio-tungstenite"]
 
 [dev-dependencies]
 tokio-test = "0.4"

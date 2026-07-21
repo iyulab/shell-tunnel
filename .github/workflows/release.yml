@@ -56,16 +56,16 @@ jobs:
         with:
           tool: cross
 
-      # Release binaries bundle the opt-in `self-update` feature so downloaded
-      # binaries keep their advertised `--update` capability (the default source
-      # build stays zero-dependency).
+      # Release binaries bundle the opt-in features so a downloaded binary can do
+      # what the docs advertise — `--update` and `--relay` — while the default
+      # source build stays zero-dependency.
       - name: Build with cross
         if: matrix.cross
-        run: cross build --release --features self-update --target ${{ matrix.target }}
+        run: cross build --release --features self-update,relay-client --target ${{ matrix.target }}
 
       - name: Build
         if: ${{ !matrix.cross }}
-        run: cargo build --release --features self-update --target ${{ matrix.target }}
+        run: cargo build --release --features self-update,relay-client --target ${{ matrix.target }}
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'

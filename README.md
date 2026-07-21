@@ -16,8 +16,8 @@ multi-user collaboration surface. The consumer is a program calling an API, not 
 a terminal.
 
 **Status.** The base platform — sessions, execution, streaming, capability-scoped auth,
-rate limiting — is implemented. The control-protocol layer (audit trail, self-hosted relay,
-filesystem guards) is on the roadmap.
+rate limiting, public exposure via tunnel or self-hosted relay — is implemented. The rest of
+the control-protocol layer (audit trail, filesystem guards) is on the roadmap.
 
 ## How it works
 
@@ -29,10 +29,10 @@ and clients drive that machine by calling the API.
 client ──HTTP/WS──▶ shell-tunnel (on the target machine) ──▶ shell
 ```
 
-Reachability is *your* responsibility today. The binary binds a local port; if the target
-machine sits behind NAT, you still need port forwarding, a VPN, or an SSH/ngrok-style tunnel
-to reach it. The self-hosted relay that would remove that step is **on the roadmap, not
-implemented**.
+Behind NAT, the bound port is not reachable on its own. `--tunnel` closes that gap by running
+a tunnel client for you and printing the public URL it allocates — see
+[Public access](#public-access), or run your own [relay](#self-hosted-relay) if you want no
+third-party service in the path. Without either you are back to port forwarding or a VPN.
 
 ## Install
 
@@ -82,6 +82,82 @@ curl -X POST http://localhost:3000/api/v1/execute \
 Sessions: `POST /api/v1/sessions` → `{"session_id": 1, ...}`, then
 `POST /api/v1/sessions/1/execute`, then `DELETE /api/v1/sessions/1`.
 
+## Public access
+
+`--tunnel` runs [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)
+for you and prints the public URL it allocates. No Cloudflare account is involved:
+
+```bash
+shell-tunnel --tunnel --preset operator
+```
+
+```
+Public URL:  https://caring-brave-fox-mint.trycloudflare.com   (via cloudflared)
+API key:     st_18c432ca0b988868_1376c761ea5f8453   (generated)
+Try:         curl -X POST https://caring-brave-fox-mint.trycloudflare.com/api/v1/execute \
+               -H "Authorization: Bearer st_18c432ca0b988868_1376c761ea5f8453" \
+               -H "Content-Type: application/json" \
+               -d '{"command":"echo hi"}'
+```
+
+`cloudflared` must be installed — shell-tunnel neither bundles nor downloads it. Any other
+tunnel client works through `--tunnel-command`, which runs the command you give and picks up
+the first URL it prints:
+
+```bash
+shell-tunnel --tunnel-command "ngrok http 3000" --preset operator
+shell-tunnel --tunnel-command "bore local 3000 --to bore.pub" --preset operator
+```
+
+**A tunnel turns on authentication**, generating a key if you did not supply one (that
+printed key is your only copy). `--no-auth --tunnel` is refused rather than silently
+overridden. Scope the token with `--preset`/`--capabilities` — an unscoped token has full
+control of the machine on a public URL, and shell-tunnel warns when you leave it that way.
+
+If the tunnel cannot be established, startup fails instead of quietly serving local-only. If
+the tunnel client dies later, the server exits too: the URL it advertised is gone, and a
+restart would allocate a different one.
+
+**Quick tunnel limits** (Cloudflare's, not ours): documented as **testing/development only**,
+no SLA, a **new URL on every restart**, and a cap of ~200 concurrent in-flight requests.
+Server-sent events are unsupported; WebSockets work. For anything durable, use a Cloudflare
+named tunnel or another provider via `--tunnel-command`.
+
+> Exposing a shell on a public URL means anyone holding the token can run commands as the
+> user running shell-tunnel. Scope the token, keep rate limiting on, and treat the URL as a
+> credential.
+
+### Self-hosted relay
+
+To keep third parties out of the path entirely, run the relay yourself — it is the same
+binary. Devices dial *out* to it, so they still need no inbound port:
+
+```bash
+# On a host with a public address
+shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
+# prints an enroll token (or pass your own with --enroll-token)
+
+# On each machine you want to reach
+shell-tunnel --relay https://relay.example.com --enroll-token <token> --preset operator
+# Public URL:  https://relay.example.com/d/<device-id>   (via relay)
+```
+
+Requests to `https://relay.example.com/d/<device-id>/api/v1/execute` reach that device.
+Unlike a quick tunnel, the device keeps its URL across reconnects, so the client reconnects
+with backoff instead of exiting.
+
+**Two separate secrets, deliberately.** The enroll token only decides *which devices may
+attach* to your relay. What a caller may then do is decided by the capability token, which
+the relay forwards untouched and never inspects or logs — attaching a relay does not put it
+inside your trust boundary.
+
+The relay server runs in any build. The *device* side needs the `relay-client` feature — it is
+**bundled in the official release binaries**, and off by default from source (the core build
+links no TLS or WebSocket client): `cargo build --release --features relay-client`.
+
+**Current limitation:** the relay proxies ordinary request/response HTTP. WebSocket
+streaming (`/api/v1/ws`) works over `--tunnel` but not yet through the relay.
+
 ## API
 
 Full reference: [`docs/openapi.json`](docs/openapi.json) (OpenAPI 3.0, authoritative).
@@ -116,6 +192,10 @@ every route.
 | `--capabilities <C>` | Scope issued token(s), e.g. `exec,session.read` | full-control |
 | `--preset <NAME>` | Scope by role preset (`operator` / `read-only` / `full-control`) | full-control |
 | `--no-rate-limit` | Disable rate limiting | `false` |
+| `--tunnel` | Publish via a Cloudflare quick tunnel (needs `cloudflared`; implies auth) | `false` |
+| `--tunnel-command <C>` | Publish by running your own tunnel client; its printed URL is used | - |
+| `--relay <URL>` | Attach to a self-hosted relay (needs `--enroll-token`; implies auth) | - |
+| `relay` *(subcommand)* | Run as a relay: `shell-tunnel relay -H .. -p .. [--enroll-token T] [--public-base URL]` | - |
 | `--cors-allow-any` | Allow any CORS origin (opt-in; for browser UIs) | `false` |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds only)* | - |
 | `-h, --help` / `-V, --version` | Help / version | - |
@@ -132,9 +212,13 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
     "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 }
   },
+  "transport": { "mode": "none" },
   "logging": { "level": "info" }
 }
 ```
+
+`transport.mode` is `none` (local only), `cloudflared`, or `command` — with `command` naming
+the tunnel client to run. CLI flags override it, as with every other setting.
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json

@@ -27,6 +27,18 @@ pub struct Args {
     pub preset: Option<String>,
     /// Disable rate limiting.
     pub no_rate_limit: bool,
+    /// Expose the server through a Cloudflare quick tunnel.
+    pub tunnel: bool,
+    /// Expose the server through an arbitrary tunnel command.
+    pub tunnel_command: Option<String>,
+    /// Run as a relay server (`shell-tunnel relay`) instead of a shell gateway.
+    pub relay: bool,
+    /// Attach to this relay instead of publishing through a tunnel.
+    pub relay_url: Option<String>,
+    /// Shared secret devices present to attach to this relay.
+    pub enroll_token: Option<String>,
+    /// Public base URL this relay is reachable at.
+    pub public_base: Option<String>,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
     pub cors_allow_any: bool,
     /// Log level (error, warn, info, debug, trace).
@@ -55,6 +67,12 @@ impl Default for Args {
             capabilities: Vec::new(),
             preset: None,
             no_rate_limit: false,
+            tunnel: false,
+            tunnel_command: None,
+            relay: false,
+            relay_url: None,
+            enroll_token: None,
+            public_base: None,
             cors_allow_any: false,
             log_level: None,
             version: false,
@@ -130,6 +148,21 @@ where
             Long("no-rate-limit") => {
                 result.no_rate_limit = true;
             }
+            Long("tunnel") => {
+                result.tunnel = true;
+            }
+            Long("tunnel-command") => {
+                result.tunnel_command = Some(parser.value()?.parse()?);
+            }
+            Long("relay") => {
+                result.relay_url = Some(parser.value()?.parse()?);
+            }
+            Long("enroll-token") => {
+                result.enroll_token = Some(parser.value()?.parse()?);
+            }
+            Long("public-base") => {
+                result.public_base = Some(parser.value()?.parse()?);
+            }
             Long("cors-allow-any") => {
                 result.cors_allow_any = true;
             }
@@ -148,11 +181,35 @@ where
             Long("no-update-check") => {
                 result.no_update_check = true;
             }
+            // The only positional is the `relay` subcommand, which switches the
+            // binary into relay-server mode. Bind address and port keep using
+            // -H/-p so one CLI vocabulary covers both modes.
+            Value(val) if val == "relay" && !result.relay => {
+                result.relay = true;
+            }
             Value(val) => {
                 return Err(ArgsError::UnexpectedArgument(val.to_string_lossy().into()));
             }
             _ => return Err(arg.unexpected().into()),
         }
+    }
+
+    // Relay mode serves devices, not shells: a tunnel would publish the wrong
+    // thing entirely.
+    if result.relay && (result.tunnel || result.tunnel_command.is_some()) {
+        return Err(ArgsError::Conflicting("relay", "--tunnel"));
+    }
+    if result.relay_url.is_some() && result.tunnel {
+        return Err(ArgsError::Conflicting("--relay", "--tunnel"));
+    }
+    if result.relay_url.is_some() && result.tunnel_command.is_some() {
+        return Err(ArgsError::Conflicting("--relay", "--tunnel-command"));
+    }
+
+    // Reachability paths are mutually exclusive: two tunnels would each publish
+    // a different public URL for the same server, and only one can be reported.
+    if result.tunnel && result.tunnel_command.is_some() {
+        return Err(ArgsError::Conflicting("--tunnel", "--tunnel-command"));
     }
 
     Ok(result)
@@ -178,7 +235,8 @@ pub fn print_help() {
 Ultra-lightweight remote shell gateway with a REST/WebSocket API
 
 USAGE:
-    shell-tunnel [OPTIONS]
+    shell-tunnel [OPTIONS]              Serve a shell gateway
+    shell-tunnel relay [OPTIONS]        Serve a relay that devices dial out to
 
 OPTIONS:
     -H, --host <ADDR>       Host address to bind [default: 127.0.0.1]
@@ -193,7 +251,20 @@ OPTIONS:
         --preset <NAME>     Scope issued token(s) by role preset
                             (operator | read-only | full-control)
         --no-rate-limit     Disable rate limiting
+        --tunnel            Expose publicly via a Cloudflare quick tunnel
+                            (requires `cloudflared`; implies authentication)
+        --tunnel-command <C>
+                            Expose publicly by running an arbitrary tunnel
+                            command (ngrok, bore, frp, ...); its printed URL
+                            is used. Implies authentication
+        --relay <URL>       Attach to a self-hosted relay (dial out, no inbound
+                            port). Needs --enroll-token; implies authentication
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
+
+RELAY OPTIONS (with `relay`):
+        --enroll-token <T>  Secret devices present to attach (generated if unset)
+        --public-base <URL> Public base URL of this relay
+                            [default: http://<bind address>]
 {update_opts}    -h, --help              Print help
     -V, --version           Print version
 
@@ -216,6 +287,15 @@ EXAMPLES:
 
     # Development mode (no security)
     shell-tunnel --no-auth --no-rate-limit
+
+    # Publish on the internet with a generated key (no account needed)
+    shell-tunnel --tunnel
+
+    # Publish using a different tunnel client
+    shell-tunnel --tunnel-command "ngrok http 3000"
+
+    # Run a relay devices can dial out to
+    shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
 
     # Issue a fine-grained, read-only token
     shell-tunnel -k readonly-key --preset read-only
@@ -240,6 +320,8 @@ pub enum ArgsError {
     InvalidValue(&'static str, String),
     /// Unexpected positional argument.
     UnexpectedArgument(String),
+    /// Two mutually exclusive flags were given.
+    Conflicting(&'static str, &'static str),
 }
 
 impl std::fmt::Display for ArgsError {
@@ -251,6 +333,9 @@ impl std::fmt::Display for ArgsError {
             }
             Self::UnexpectedArgument(arg) => {
                 write!(f, "unexpected argument: '{}'", arg)
+            }
+            Self::Conflicting(a, b) => {
+                write!(f, "{} and {} cannot be used together", a, b)
             }
         }
     }
@@ -420,5 +505,49 @@ mod tests {
         assert_eq!(result.log_level, Some("debug".to_string()));
         assert!(result.no_rate_limit);
         assert!(!result.no_auth);
+    }
+
+    #[test]
+    fn test_tunnel_flag() {
+        let result = parse_args_from(vec![
+            OsString::from("shell-tunnel"),
+            OsString::from("--tunnel"),
+        ])
+        .unwrap();
+        assert!(result.tunnel);
+        assert!(result.tunnel_command.is_none());
+    }
+
+    #[test]
+    fn test_tunnel_command_flag() {
+        let result = parse_args_from(vec![
+            OsString::from("shell-tunnel"),
+            OsString::from("--tunnel-command"),
+            OsString::from("ngrok http 3000"),
+        ])
+        .unwrap();
+        assert_eq!(result.tunnel_command.as_deref(), Some("ngrok http 3000"));
+        assert!(!result.tunnel);
+    }
+
+    #[test]
+    fn test_tunnel_paths_are_mutually_exclusive() {
+        let err = parse_args_from(vec![
+            OsString::from("shell-tunnel"),
+            OsString::from("--tunnel"),
+            OsString::from("--tunnel-command"),
+            OsString::from("bore local 3000 --to bore.pub"),
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--tunnel"), "{msg}");
+        assert!(msg.contains("cannot be used together"), "{msg}");
+    }
+
+    #[test]
+    fn test_no_tunnel_by_default() {
+        let result = parse_args_from(vec![OsString::from("shell-tunnel")]).unwrap();
+        assert!(!result.tunnel);
+        assert!(result.tunnel_command.is_none());
     }
 }

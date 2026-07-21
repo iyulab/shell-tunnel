@@ -1,7 +1,7 @@
 //! Command execution engine.
 
 use std::io::Read;
-use std::process::{Command as OsCommand, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +12,7 @@ use super::command::Command;
 use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
+use crate::process::{detach_process_group, kill_tree, shell_command};
 use crate::session::{SessionState, SessionStore};
 use crate::Result;
 
@@ -28,49 +29,6 @@ const CONTROL_POLL: Duration = Duration::from_millis(5);
 /// Bounds the tail so a lingering grandchild that inherited a pipe cannot block
 /// the return past this grace period.
 const COLLECT_GRACE: Duration = Duration::from_millis(500);
-
-/// Forcibly terminate a process and all of its descendants.
-///
-/// A shell command (`cmd /c ...` / `sh -c ...`) commonly spawns grandchildren;
-/// killing only the direct child would leave them running and holding the
-/// output pipes open. On Windows this shells out to `taskkill /T /F`; on Unix
-/// it signals the child's process group (the child is made a group leader via
-/// `setsid` at spawn time).
-fn kill_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = OsCommand::new("taskkill")
-            .args(["/T", "/F", "/PID", &pid.to_string()])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(unix)]
-    {
-        // SAFETY: kill with a negative pid targets the process group; harmless
-        // if the group is already gone (returns ESRCH).
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
-    }
-}
-
-/// Build the platform shell command that runs `command_line` non-interactively.
-fn shell_command(command_line: &str) -> OsCommand {
-    #[cfg(windows)]
-    {
-        let mut c = OsCommand::new("cmd.exe");
-        c.arg("/c").arg(command_line);
-        c
-    }
-    #[cfg(unix)]
-    {
-        let mut c = OsCommand::new("/bin/sh");
-        c.arg("-c").arg(command_line);
-        c
-    }
-}
 
 /// Spawn a reader thread that pumps a pipe into `tx` until EOF.
 fn spawn_pipe_reader<R: Read + Send + 'static>(
@@ -138,21 +96,9 @@ fn run_command_streaming(
         os_cmd.env(key, value);
     }
 
-    // On Unix, put the child in its own process group so that on timeout we can
-    // signal the whole tree (a shell that spawned grandchildren) with one
-    // `kill(-pgid)`. Windows tree termination is handled via `taskkill /T`.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // SAFETY: setsid only detaches the child into a new session/group; it
-        // touches no shared state in the forked child before exec.
-        unsafe {
-            os_cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
-        }
-    }
+    // Put the child in its own process group so that on timeout we can signal
+    // the whole tree (a shell that spawned grandchildren) at once.
+    detach_process_group(&mut os_cmd);
 
     let mut child = os_cmd.spawn().map_err(ShellTunnelError::Io)?;
     let child_pid = child.id();

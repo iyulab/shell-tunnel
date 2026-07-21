@@ -61,9 +61,12 @@ pub mod error;
 pub mod execution;
 pub mod logging;
 pub mod output;
+mod process;
 pub mod pty;
+pub mod relay;
 pub mod security;
 pub mod session;
+pub mod tunnel;
 #[cfg(feature = "self-update")]
 pub mod update;
 
@@ -84,6 +87,10 @@ pub use security::{
     ApiKeyStore, AuthConfig, CapabilitySet, CommandValidator, RateLimiter, TokenRecord,
     ValidationConfig,
 };
+
+// Re-export reachability types
+pub use relay::{RelayConfig, RelayState};
+pub use tunnel::{TunnelHandle, TunnelProvider};
 
 // Re-export CLI and config types
 pub use cli::{parse_args, print_help, print_version, Args};
