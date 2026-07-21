@@ -60,6 +60,12 @@ impl AuthConfig {
 /// on what that token may do.
 #[derive(Debug, Clone)]
 pub struct TokenRecord {
+    /// Identifier for the audit trail.
+    ///
+    /// Assigned at registration and unrelated to the token's value, so a trail
+    /// can name the caller without containing the credential. Per-process:
+    /// tokens are not persisted, so neither is this.
+    pub id: String,
     /// Capabilities this token grants (spec §2 mechanism).
     pub capabilities: CapabilitySet,
     /// Human-readable label for provenance (e.g. `"legacy"`, `"operator"`).
@@ -72,6 +78,7 @@ impl TokenRecord {
     /// Create a token record with the given capabilities and label.
     pub fn new(capabilities: CapabilitySet, label: impl Into<String>) -> Self {
         Self {
+            id: generate_token_id(),
             capabilities,
             label: label.into(),
             created_at: SystemTime::now(),
@@ -160,6 +167,16 @@ impl ApiKeyStore {
             .and_then(|tokens| tokens.get(key).map(|record| record.capabilities.clone()))
     }
 
+    /// Identify a token for the audit trail, without revealing it.
+    pub fn identity(&self, key: &str) -> Option<crate::audit::Identity> {
+        self.tokens.read().ok().and_then(|tokens| {
+            tokens.get(key).map(|record| crate::audit::Identity {
+                token_id: record.id.clone(),
+                label: record.label.clone(),
+            })
+        })
+    }
+
     /// Get the number of registered tokens.
     pub fn count(&self) -> usize {
         self.tokens.read().map(|t| t.len()).unwrap_or(0)
@@ -219,6 +236,15 @@ pub async fn auth_middleware(
         }
         None => Err(StatusCode::UNAUTHORIZED),
     }
+}
+
+/// Short identifier for an audit trail entry.
+///
+/// Random rather than derived from the token: a derived value would let anyone
+/// holding the log test guesses against it.
+fn generate_token_id() -> String {
+    let full = generate_api_key();
+    format!("tok_{}", &full[full.len().saturating_sub(12)..])
 }
 
 /// Generate a random API key.

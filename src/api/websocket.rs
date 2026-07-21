@@ -21,12 +21,21 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Path(session_id): Path<u64>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id))
+    // Taken here because extensions belong to the upgrade request, not to the
+    // socket that outlives it.
+    let identity = identity.map(|axum::Extension(id)| id);
+    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, identity))
 }
 
 /// Handle WebSocket connection.
-async fn handle_socket(socket: WebSocket, state: AppState, session_id: u64) {
+async fn handle_socket(
+    socket: WebSocket,
+    state: AppState,
+    session_id: u64,
+    identity: Option<crate::audit::Identity>,
+) {
     let id = SessionId::from_raw(session_id);
 
     // Verify session exists
@@ -102,6 +111,19 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: u64) {
                         // Wait for completion and send result
                         match handle.await {
                             Ok(Ok(result)) => {
+                                state.audit.record(
+                                    crate::audit::AuditEvent::new("execute")
+                                        .with_identity(identity.clone())
+                                        .with_route("WS /api/v1/sessions/{id}/ws")
+                                        .with_command(&command)
+                                        .with_session(session_id)
+                                        .with_outcome(
+                                            result.exit_code,
+                                            result.timed_out,
+                                            result.duration.as_millis() as u64,
+                                        ),
+                                );
+
                                 // Update session context
                                 state
                                     .store
@@ -169,12 +191,18 @@ async fn handle_socket(socket: WebSocket, state: AppState, session_id: u64) {
 pub async fn ws_oneshot_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_oneshot_socket(socket, state))
+    let identity = identity.map(|axum::Extension(id)| id);
+    ws.on_upgrade(move |socket| handle_oneshot_socket(socket, state, identity))
 }
 
 /// Handle one-shot WebSocket connection.
-async fn handle_oneshot_socket(socket: WebSocket, state: AppState) {
+async fn handle_oneshot_socket(
+    socket: WebSocket,
+    state: AppState,
+    identity: Option<crate::audit::Identity>,
+) {
     let (mut sink, mut stream) = socket.split();
 
     while let Some(msg) = stream.next().await {
@@ -229,6 +257,18 @@ async fn handle_oneshot_socket(socket: WebSocket, state: AppState) {
 
                         match handle.await {
                             Ok(Ok(result)) => {
+                                state.audit.record(
+                                    crate::audit::AuditEvent::new("execute")
+                                        .with_identity(identity.clone())
+                                        .with_route("WS /api/v1/ws")
+                                        .with_command(&command)
+                                        .with_outcome(
+                                            result.exit_code,
+                                            result.timed_out,
+                                            result.duration.as_millis() as u64,
+                                        ),
+                                );
+
                                 let result_msg = WsMessage::Result {
                                     success: result.exit_code.map(|c| c == 0).unwrap_or(false)
                                         && !result.timed_out,

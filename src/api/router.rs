@@ -223,8 +223,11 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
 /// 4. `Authenticated` route → any valid token passes. `Capability(c)` route →
 ///    the token's set must satisfy `c` (membership or wildcard), else **403**.
 async fn capability_auth_middleware(
-    State(store): State<std::sync::Arc<ApiKeyStore>>,
-    request: Request,
+    State((store, audit)): State<(
+        std::sync::Arc<ApiKeyStore>,
+        std::sync::Arc<crate::audit::AuditSink>,
+    )>,
+    mut request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
     // Auth disabled → open server (existing behavior).
@@ -254,6 +257,8 @@ async fn capability_auth_middleware(
         .and_then(|v| v.to_str().ok())
         .and_then(|header| store.extract_key(header));
 
+    let identity = token.as_deref().and_then(|t| store.identity(t));
+
     let capabilities = match token.as_deref().and_then(|t| store.capabilities(t)) {
         Some(caps) => caps,
         None => {
@@ -266,9 +271,21 @@ async fn capability_auth_middleware(
                 "invalid-token"
             };
             tracing::debug!(%method, path = %matched, reason, "auth rejected (401)");
+            // Probing is exactly what an audit trail is asked about afterwards,
+            // so refusals are recorded as well as successes.
+            audit.record(
+                crate::audit::AuditEvent::new("denied")
+                    .with_route(format!("{method} {matched}"))
+                    .with_denial(401, reason),
+            );
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
+
+    // Handlers record what actually ran, and need to know who asked.
+    if let Some(identity) = identity.clone() {
+        request.extensions_mut().insert(identity);
+    }
 
     match required {
         // Already handled above, but keep the match exhaustive.
@@ -280,6 +297,12 @@ async fn capability_auth_middleware(
             if capabilities.satisfies(cap) {
                 Ok(next.run(request).await)
             } else {
+                audit.record(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_identity(identity)
+                        .with_route(format!("{method} {matched}"))
+                        .with_denial(403, format!("missing-capability:{cap}")),
+                );
                 tracing::debug!(
                     %method,
                     path = %matched,
@@ -325,7 +348,7 @@ pub fn create_secure_router(
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
         .layer(middleware::from_fn_with_state(
-            Arc::clone(&auth_store),
+            (Arc::clone(&auth_store), Arc::clone(&state.audit)),
             capability_auth_middleware,
         ))
         .layer(middleware::from_fn_with_state(

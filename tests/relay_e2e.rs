@@ -23,7 +23,12 @@ async fn start_relay(enroll_token: &str) -> (SocketAddr, RelayState) {
 
     let router = relay_router(state.clone());
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
 
     // Let the listener become ready before the first dial.

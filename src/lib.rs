@@ -55,6 +55,7 @@
 //! ```
 
 pub mod api;
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod error;
@@ -66,6 +67,8 @@ pub mod pty;
 pub mod relay;
 pub mod security;
 pub mod session;
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod tunnel;
 #[cfg(feature = "self-update")]
 pub mod update;

@@ -36,7 +36,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 
 use crate::error::ShellTunnelError;
-use crate::security::generate_api_key;
+use crate::security::{generate_api_key, rate_limit_middleware, RateLimitConfig, RateLimiter};
 use protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
@@ -58,6 +58,16 @@ pub struct RelayConfig {
     pub bind: SocketAddr,
     /// Secret a device must present to attach.
     pub enroll_token: String,
+    /// Per-IP request limiting for this relay.
+    ///
+    /// The relay is the only place this can work for proxied traffic: a device
+    /// replays requests to its own loopback listener, so *its* limiter sees
+    /// 127.0.0.1 for every caller and cannot tell them apart. Here the real
+    /// client address is still visible.
+    pub rate_limit: RateLimitConfig,
+    /// Serve HTTPS directly instead of relying on a reverse proxy.
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::tls::TlsFiles>,
     /// Public base URL of this relay, when the operator states it explicitly.
     ///
     /// Left unset, the relay derives it from each connection's `Host` (and
@@ -72,8 +82,24 @@ impl RelayConfig {
         Self {
             bind,
             enroll_token: enroll_token.into(),
+            rate_limit: RateLimitConfig::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
             public_base: None,
         }
+    }
+
+    /// Terminate TLS in-process using these files.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, files: crate::tls::TlsFiles) -> Self {
+        self.tls = Some(files);
+        self
+    }
+
+    /// Turn per-IP request limiting off.
+    pub fn without_rate_limit(mut self) -> Self {
+        self.rate_limit.enabled = false;
+        self
     }
 
     /// Set the public base URL advertised to devices.
@@ -123,19 +149,31 @@ impl RelayState {
 }
 
 /// Build the relay router.
+///
+/// Every route but `/health` is rate limited per client IP. Enrolment is the
+/// reason: without a limit, a weak enrolment token can be guessed at line speed,
+/// and the relay is the only place that sees who is asking.
 pub fn relay_router(state: RelayState) -> Router {
+    let limiter = Arc::new(RateLimiter::new(state.config.rate_limit.clone()));
+
     Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/relay/v1/control", get(control_handler))
         .route("/relay/v1/data", get(data_handler))
         .route("/relay/v1/devices", get(devices_handler))
         .route("/d/{*rest}", any(proxy_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            limiter,
+            rate_limit_middleware,
+        ))
         .with_state(state)
 }
 
 /// Run the relay server until shutdown.
 pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
     let bind = config.bind;
+    #[cfg(feature = "tls")]
+    let tls = config.tls.clone();
     let state = RelayState::new(config);
     let router = relay_router(state.clone());
 
@@ -157,7 +195,26 @@ pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .map_err(ShellTunnelError::Io)?;
-    axum::serve(listener, router)
+    // Connection info is what the rate limiter keys on; without it every caller
+    // would look identical.
+    let service = router.into_make_service_with_connect_info::<SocketAddr>();
+
+    #[cfg(feature = "tls")]
+    if let Some(files) = tls {
+        // Loaded before serving so a bad certificate stops startup rather than
+        // failing every connection at handshake time.
+        let config = crate::tls::acceptor(files.load()?);
+        // Renewal should not require a restart.
+        crate::tls::watch(files, config.clone());
+        let std_listener = listener.into_std().map_err(ShellTunnelError::Io)?;
+        return axum_server::from_tcp_rustls(std_listener, config)
+            .map_err(ShellTunnelError::Io)?
+            .serve(service)
+            .await
+            .map_err(|e| ShellTunnelError::Io(std::io::Error::other(e.to_string())));
+    }
+
+    axum::serve(listener, service)
         .await
         .map_err(|e| ShellTunnelError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
@@ -181,7 +238,7 @@ fn is_valid_device_name(name: &str) -> bool {
 /// A relay behind TLS termination sees plain HTTP on a loopback port, so the
 /// scheme and host it should advertise are only knowable from what the proxy
 /// forwards.
-fn observed_base(headers: &HeaderMap) -> Option<String> {
+fn observed_base(headers: &HeaderMap, tls: bool) -> Option<String> {
     let host = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get(axum::http::header::HOST))
@@ -189,12 +246,27 @@ fn observed_base(headers: &HeaderMap) -> Option<String> {
     if host.is_empty() {
         return None;
     }
+    // A proxy's own statement wins; failing that, the relay knows whether it
+    // terminated TLS itself. Guessing `http` while serving HTTPS would advertise
+    // a URL that the relay itself refuses.
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|value| value.to_str().ok())
         .map(|proto| proto.split(',').next().unwrap_or(proto).trim().to_string())
-        .unwrap_or_else(|| "http".to_string());
+        .unwrap_or_else(|| if tls { "https" } else { "http" }.to_string());
     Some(format!("{scheme}://{host}"))
+}
+
+/// Whether this relay terminates TLS itself.
+fn serves_tls(_state: &RelayState) -> bool {
+    #[cfg(feature = "tls")]
+    {
+        _state.config.tls.is_some()
+    }
+    #[cfg(not(feature = "tls"))]
+    {
+        false
+    }
 }
 
 /// Upgrade a device's outbound connection into the control channel.
@@ -203,7 +275,7 @@ async fn control_handler(
     State(state): State<RelayState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let observed = observed_base(&headers);
+    let observed = observed_base(&headers, serves_tls(&state));
     ws.on_upgrade(move |socket| control_session(socket, state, observed))
 }
 
@@ -359,7 +431,9 @@ async fn devices_handler(State(state): State<RelayState>, headers: HeaderMap) ->
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
-    let base = state.config.public_base_or(observed_base(&headers));
+    let base = state
+        .config
+        .public_base_or(observed_base(&headers, serves_tls(&state)));
     let devices: Vec<_> = state
         .devices
         .list()
@@ -729,14 +803,14 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(axum::http::header::HOST, "127.0.0.1:8443".parse().unwrap());
         assert_eq!(
-            observed_base(&headers).as_deref(),
+            observed_base(&headers, false).as_deref(),
             Some("http://127.0.0.1:8443")
         );
 
         headers.insert("x-forwarded-proto", "https".parse().unwrap());
         headers.insert("x-forwarded-host", "relay.example.com".parse().unwrap());
         assert_eq!(
-            observed_base(&headers).as_deref(),
+            observed_base(&headers, false).as_deref(),
             Some("https://relay.example.com")
         );
     }
@@ -750,14 +824,29 @@ mod tests {
         );
         headers.insert("x-forwarded-proto", "https, http".parse().unwrap());
         assert_eq!(
-            observed_base(&headers).as_deref(),
+            observed_base(&headers, false).as_deref(),
             Some("https://relay.example.com")
         );
     }
 
     #[test]
     fn no_host_header_means_nothing_observed() {
-        assert!(observed_base(&HeaderMap::new()).is_none());
+        assert!(observed_base(&HeaderMap::new(), false).is_none());
+    }
+
+    #[test]
+    fn terminating_tls_makes_the_advertised_url_https() {
+        // Advertising http:// while refusing plaintext would hand out a URL the
+        // relay itself rejects.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "relay.example.com".parse().unwrap(),
+        );
+        assert_eq!(
+            observed_base(&headers, true).as_deref(),
+            Some("https://relay.example.com")
+        );
     }
 
     #[test]

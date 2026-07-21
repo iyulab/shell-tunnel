@@ -60,6 +60,11 @@ pub enum ShellTunnelError {
     #[error("session not executable: current state is {0:?}")]
     NotExecutable(crate::session::SessionState),
 
+    /// TLS configuration error.
+    #[cfg(feature = "tls")]
+    #[error("tls error: {0}")]
+    Tls(String),
+
     /// Tunnel (reachability) error.
     #[error("tunnel error: {0}")]
     Tunnel(String),

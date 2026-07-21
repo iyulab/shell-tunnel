@@ -1,0 +1,459 @@
+//! Append-only audit trail.
+//!
+//! A remote shell without an audit trail leaves nothing to look at after an
+//! incident: the process logs are ephemeral, and the API returns results to the
+//! caller rather than recording them. This writes one JSON object per line —
+//! readable with `tail -f` or `jq`, appendable without a database, and never
+//! rewritten.
+//!
+//! What is deliberately *not* recorded: the bearer token itself. Events carry a
+//! per-registration `token_id` and the token's label, which identify the caller
+//! across a run without putting a credential in a file that is, by design, kept
+//! around and often shipped elsewhere.
+
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::ShellTunnelError;
+use crate::Result;
+
+/// Who made a request, in terms safe to write down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Identity {
+    /// Stable-within-this-run identifier for the token used.
+    pub token_id: String,
+    /// The token's label (`operator`, `configured`, `legacy`, …).
+    pub label: String,
+}
+
+/// One recorded event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuditEvent {
+    /// Unix milliseconds. A number rather than a formatted string so the log
+    /// stays sortable without a date parser.
+    pub at_ms: u64,
+    /// What happened: `execute`, `denied`, …
+    pub kind: String,
+    /// Caller identity, when the request was authenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
+    /// Client address as the server saw it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
+    /// Request method and path, for correlating with access logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    /// The command line, for execution events.
+    ///
+    /// This is the substance of the trail — "someone called POST /execute" says
+    /// almost nothing on its own. It also means a command that embeds a secret
+    /// puts that secret in the log, which is the trade an audit trail makes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Session the command ran in, when it was not a one-shot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<u64>,
+    /// Process exit code, when the command completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Whether the command hit its timeout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timed_out: Option<bool>,
+    /// How long it took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// HTTP status, for denial events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    /// Why a request was refused (`missing-token`, `invalid-token`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl AuditEvent {
+    /// Start an event of the given kind, stamped now.
+    pub fn new(kind: impl Into<String>) -> Self {
+        Self {
+            at_ms: now_ms(),
+            kind: kind.into(),
+            identity: None,
+            client: None,
+            route: None,
+            command: None,
+            session_id: None,
+            exit_code: None,
+            timed_out: None,
+            duration_ms: None,
+            status: None,
+            reason: None,
+        }
+    }
+
+    /// Attach the caller's identity.
+    pub fn with_identity(mut self, identity: Option<Identity>) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    /// Attach the client address.
+    pub fn with_client(mut self, client: impl Into<String>) -> Self {
+        self.client = Some(client.into());
+        self
+    }
+
+    /// Attach the request route.
+    pub fn with_route(mut self, route: impl Into<String>) -> Self {
+        self.route = Some(route.into());
+        self
+    }
+
+    /// Attach the command line that ran.
+    pub fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
+
+    /// Attach the session the command ran in.
+    pub fn with_session(mut self, session_id: u64) -> Self {
+        self.session_id = Some(session_id);
+        self
+    }
+
+    /// Attach the outcome of an execution.
+    pub fn with_outcome(
+        mut self,
+        exit_code: Option<i32>,
+        timed_out: bool,
+        duration_ms: u64,
+    ) -> Self {
+        self.exit_code = exit_code;
+        self.timed_out = Some(timed_out);
+        self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Attach a refusal.
+    pub fn with_denial(mut self, status: u16, reason: impl Into<String>) -> Self {
+        self.status = Some(status);
+        self.reason = Some(reason.into());
+        self
+    }
+}
+
+/// Where audit events go.
+///
+/// Disabled unless a path is configured: writing to a file nobody asked for
+/// would be a surprising side effect, and the operator is the one who knows
+/// where such a file belongs.
+#[derive(Debug, Default)]
+pub enum AuditSink {
+    /// Nothing is recorded.
+    #[default]
+    Disabled,
+    /// Appended to a file, one JSON object per line.
+    File {
+        /// Path being appended to, kept for diagnostics.
+        path: PathBuf,
+        /// Size at which the file is rotated, if bounded.
+        max_bytes: Option<u64>,
+        state: Mutex<FileState>,
+    },
+}
+
+/// Open file plus what has been written to it.
+#[derive(Debug)]
+pub struct FileState {
+    writer: BufWriter<File>,
+    /// Bytes in the current file, tracked rather than stat-ed so rotation costs
+    /// nothing per event.
+    written: u64,
+}
+
+impl AuditSink {
+    /// Open `path` for appending, creating it if needed.
+    pub fn file(path: impl AsRef<Path>) -> Result<Self> {
+        Self::file_with_limit(path, None)
+    }
+
+    /// Open `path`, rotating to `<path>.1` once it passes `max_bytes`.
+    ///
+    /// One generation is kept. A trail that grows without bound eventually
+    /// fills the disk it is meant to protect, and keeping several generations
+    /// would be a retention policy — which belongs to whoever runs the machine,
+    /// not to this process.
+    pub fn file_with_limit(path: impl AsRef<Path>, max_bytes: Option<u64>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let (writer, written) = open_append(&path)?;
+        Ok(Self::File {
+            path,
+            max_bytes,
+            state: Mutex::new(FileState { writer, written }),
+        })
+    }
+
+    /// Whether anything is being recorded.
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
+
+    /// Record one event.
+    ///
+    /// Flushed per event rather than buffered until convenient: a trail that
+    /// loses its last entries when the process dies is least trustworthy exactly
+    /// when it matters most.
+    pub fn record(&self, event: AuditEvent) {
+        let Self::File {
+            path,
+            max_bytes,
+            state,
+        } = self
+        else {
+            return;
+        };
+
+        let line = match serde_json::to_string(&event) {
+            Ok(line) => line,
+            Err(e) => {
+                tracing::warn!(target: "audit", "cannot encode audit event: {e}");
+                return;
+            }
+        };
+
+        let Ok(mut state) = state.lock() else {
+            tracing::warn!(target: "audit", "audit log lock poisoned; event dropped");
+            return;
+        };
+
+        // Rotated before the write, so the limit bounds the file rather than
+        // being the point at which it is already over.
+        if let Some(limit) = max_bytes {
+            if state.written + line.len() as u64 + 1 > *limit && state.written > 0 {
+                if let Err(e) = rotate(path, &mut state) {
+                    tracing::warn!(target: "audit", "cannot rotate audit log {}: {e}", path.display());
+                }
+            }
+        }
+
+        match writeln!(state.writer, "{line}").and_then(|()| state.writer.flush()) {
+            Ok(()) => state.written += line.len() as u64 + 1,
+            Err(e) => {
+                // Logged, not fatal: losing the trail should not take the server
+                // down, but it must not pass silently either.
+                tracing::warn!(target: "audit", "cannot write audit log {}: {e}", path.display());
+            }
+        }
+    }
+}
+
+/// Open a file for appending, reporting how much is already in it.
+fn open_append(path: &Path) -> Result<(BufWriter<File>, u64)> {
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            ShellTunnelError::Io(std::io::Error::new(
+                e.kind(),
+                format!("cannot open audit log {}: {e}", path.display()),
+            ))
+        })?;
+    let written = file.metadata().map(|m| m.len()).unwrap_or(0);
+    Ok((BufWriter::new(file), written))
+}
+
+/// Move the current file aside and start a fresh one.
+fn rotate(path: &Path, state: &mut FileState) -> std::io::Result<()> {
+    state.writer.flush()?;
+
+    let rotated = path.with_extension(match path.extension() {
+        Some(ext) => format!("{}.1", ext.to_string_lossy()),
+        None => "1".to_string(),
+    });
+    // Replaces the previous generation: one is kept, deliberately.
+    std::fs::rename(path, &rotated)?;
+
+    let (writer, _) = open_append(path).map_err(std::io::Error::other)?;
+    state.writer = writer;
+    state.written = 0;
+    Ok(())
+}
+
+/// Milliseconds since the Unix epoch.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_lines(path: &Path) -> Vec<AuditEvent> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("each line is one event"))
+            .collect()
+    }
+
+    #[test]
+    fn a_disabled_sink_records_nothing() {
+        let sink = AuditSink::Disabled;
+        assert!(!sink.is_enabled());
+        sink.record(AuditEvent::new("execute"));
+    }
+
+    #[test]
+    fn events_are_appended_one_per_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink = AuditSink::file(&path).unwrap();
+
+        sink.record(AuditEvent::new("execute").with_command("echo one"));
+        sink.record(AuditEvent::new("execute").with_command("echo two"));
+
+        let events = read_lines(&path);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].command.as_deref(), Some("echo one"));
+        assert_eq!(events[1].command.as_deref(), Some("echo two"));
+    }
+
+    #[test]
+    fn reopening_appends_rather_than_truncating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        AuditSink::file(&path)
+            .unwrap()
+            .record(AuditEvent::new("execute").with_command("first run"));
+        AuditSink::file(&path)
+            .unwrap()
+            .record(AuditEvent::new("execute").with_command("second run"));
+
+        // A trail that restarts empty on every restart is not a trail.
+        let events = read_lines(&path);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn an_execution_event_carries_who_what_and_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink = AuditSink::file(&path).unwrap();
+
+        sink.record(
+            AuditEvent::new("execute")
+                .with_identity(Some(Identity {
+                    token_id: "tok-1".into(),
+                    label: "operator".into(),
+                }))
+                .with_client("203.0.113.7:51000")
+                .with_route("POST /api/v1/execute")
+                .with_command("whoami")
+                .with_outcome(Some(0), false, 42),
+        );
+
+        let event = read_lines(&path).remove(0);
+        assert_eq!(event.kind, "execute");
+        assert_eq!(event.identity.unwrap().label, "operator");
+        assert_eq!(event.command.as_deref(), Some("whoami"));
+        assert_eq!(event.exit_code, Some(0));
+        assert_eq!(event.timed_out, Some(false));
+        assert_eq!(event.duration_ms, Some(42));
+        assert!(event.at_ms > 0);
+    }
+
+    #[test]
+    fn a_denial_records_why_without_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink = AuditSink::file(&path).unwrap();
+
+        sink.record(
+            AuditEvent::new("denied")
+                .with_client("198.51.100.4:40000")
+                .with_route("POST /api/v1/execute")
+                .with_denial(401, "invalid-token"),
+        );
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let event = read_lines(&path).remove(0);
+        assert_eq!(event.status, Some(401));
+        assert_eq!(event.reason.as_deref(), Some("invalid-token"));
+        // Probing is what these entries are for, and the credential that was
+        // tried must not end up in the file.
+        assert!(!raw.contains("Bearer"), "{raw}");
+    }
+
+    #[test]
+    fn a_bounded_log_rotates_instead_of_growing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        // Small enough that the second event cannot share the file.
+        let sink = AuditSink::file_with_limit(&path, Some(200)).unwrap();
+
+        for i in 0..8 {
+            sink.record(AuditEvent::new("execute").with_command(format!("command number {i}")));
+        }
+
+        let current = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            current <= 200,
+            "current file should stay under the limit: {current}"
+        );
+
+        // The previous generation is kept, so the most recent history survives
+        // a rotation rather than being discarded.
+        let rotated = dir.path().join("audit.jsonl.1");
+        assert!(rotated.exists(), "one generation should be kept");
+    }
+
+    #[test]
+    fn an_unbounded_log_never_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let sink = AuditSink::file(&path).unwrap();
+
+        for i in 0..20 {
+            sink.record(AuditEvent::new("execute").with_command(format!("command {i}")));
+        }
+
+        assert_eq!(read_lines(&path).len(), 20);
+        assert!(!dir.path().join("audit.jsonl.1").exists());
+    }
+
+    #[test]
+    fn rotation_keeps_counting_from_an_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+
+        // A restart must not forget how full the file already is, or the limit
+        // would only apply to whatever this process wrote.
+        AuditSink::file(&path)
+            .unwrap()
+            .record(AuditEvent::new("execute").with_command("x".repeat(150)));
+        let sink = AuditSink::file_with_limit(&path, Some(200)).unwrap();
+        sink.record(AuditEvent::new("execute").with_command("second"));
+
+        assert!(dir.path().join("audit.jsonl.1").exists());
+    }
+
+    #[test]
+    fn absent_fields_are_omitted_rather_than_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        AuditSink::file(&path)
+            .unwrap()
+            .record(AuditEvent::new("execute"));
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("null"), "{raw}");
+    }
+}

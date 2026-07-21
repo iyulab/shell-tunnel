@@ -46,6 +46,16 @@ pub struct Args {
     pub public_base: Option<String>,
     /// Stable name to claim on the relay (keeps one URL across reconnects).
     pub device_name: Option<String>,
+    /// PEM certificate chain for serving HTTPS directly.
+    pub tls_cert: Option<PathBuf>,
+    /// PEM private key matching `tls_cert`.
+    pub tls_key: Option<PathBuf>,
+    /// Extra PEM certificate authority to trust when dialling a relay.
+    pub relay_ca: Option<PathBuf>,
+    /// Append an audit trail of executions and refusals to this file.
+    pub audit_log: Option<PathBuf>,
+    /// Rotate the audit trail once it passes this many bytes.
+    pub audit_max_bytes: Option<u64>,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
     pub cors_allow_any: bool,
     /// Log level (error, warn, info, debug, trace).
@@ -82,6 +92,11 @@ impl Default for Args {
             enroll_token: None,
             public_base: None,
             device_name: None,
+            tls_cert: None,
+            tls_key: None,
+            relay_ca: None,
+            audit_log: None,
+            audit_max_bytes: None,
             cors_allow_any: false,
             log_level: None,
             version: false,
@@ -176,6 +191,26 @@ where
             Long("device-name") => {
                 result.device_name = Some(parser.value()?.parse()?);
             }
+            Long("tls-cert") => {
+                result.tls_cert = Some(parser.value()?.parse()?);
+            }
+            Long("tls-key") => {
+                result.tls_key = Some(parser.value()?.parse()?);
+            }
+            Long("relay-ca") => {
+                result.relay_ca = Some(parser.value()?.parse()?);
+            }
+            Long("audit-log") => {
+                result.audit_log = Some(parser.value()?.parse()?);
+            }
+            Long("audit-max-bytes") => {
+                let value: String = parser.value()?.parse()?;
+                result.audit_max_bytes = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ArgsError::InvalidValue("audit-max-bytes", value))?,
+                );
+            }
             Long("cors-allow-any") => {
                 result.cors_allow_any = true;
             }
@@ -205,6 +240,12 @@ where
             }
             _ => return Err(arg.unexpected().into()),
         }
+    }
+
+    // A certificate without its key (or the reverse) cannot serve anything, and
+    // silently falling back to plaintext would be the opposite of what was asked.
+    if result.tls_cert.is_some() != result.tls_key.is_some() {
+        return Err(ArgsError::Conflicting("--tls-cert", "--tls-key"));
     }
 
     // Relay mode serves devices, not shells: a tunnel would publish the wrong
@@ -276,7 +317,18 @@ OPTIONS:
                             unless -p says otherwise
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
+        --audit-log <FILE>  Append every execution and refusal to this file
+                            (JSON per line; the token itself is never written)
+        --audit-max-bytes <N>
+                            Rotate the audit trail to <FILE>.1 past this size
+                            [default: unbounded]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
+
+TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
+        --tls-cert <FILE>   PEM certificate chain
+        --tls-key <FILE>    PEM private key matching the certificate
+        --relay-ca <FILE>   Also trust this PEM authority when dialling a relay
+                            (for a relay whose certificate is not publicly signed)
 
 RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay
@@ -355,6 +407,9 @@ impl std::fmt::Display for ArgsError {
             }
             Self::UnexpectedArgument(arg) => {
                 write!(f, "unexpected argument: '{}'", arg)
+            }
+            Self::Conflicting(a, b) if a.starts_with("--tls") => {
+                write!(f, "{} and {} must be given together", a, b)
             }
             Self::Conflicting(a, b) => {
                 write!(f, "{} and {} cannot be used together", a, b)

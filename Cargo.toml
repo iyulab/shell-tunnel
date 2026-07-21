@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -61,6 +61,14 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # connection panics at runtime rather than failing gracefully.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
 
+# Serving TLS directly (optional). Terminating TLS in-process is what lets a
+# relay run without a reverse proxy in front of it; the accept loop and the
+# WebSocket upgrade path are subtle enough to be worth a maintained crate.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"], optional = true }
+rustls-pemfile = { version = "2", optional = true }
+# Public trust anchors, so naming a private CA adds to them rather than replacing them.
+webpki-roots = { version = "0.26", optional = true }
+
 # Auto-update (optional, off by default to keep the core binary zero-dependency).
 # Pulls a large transitive tree (reqwest/hyper-rustls/self_update -> quick-xml, time, number_prefix)
 # that is only needed for `--update`/`--check-update`. Enable with `--features self-update`.
@@ -74,13 +82,20 @@ default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
-relay-client = ["dep:tokio-tungstenite", "dep:rustls"]
+relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+# Terminate TLS in-process (--tls-cert / --tls-key), no reverse proxy required.
+tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile"]
 
 [dev-dependencies]
 tokio-test = "0.4"
+# Self-signed certificates for the TLS tests; never used by the binary.
+rcgen = "0.14"
+# A TLS client for the TLS tests, so the handshake is exercised for real.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tempfile = "3"
-# WebSocket client for end-to-end streaming tests (plain ws://, no TLS backend).
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake"] }
+# WebSocket client for the end-to-end tests. The rustls feature is what lets the
+# TLS tests trust a certificate generated for that test alone.
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 
 [profile.release]
 lto = true

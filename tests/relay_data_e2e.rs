@@ -25,7 +25,12 @@ async fn start_relay() -> SocketAddr {
     let config = RelayConfig::new(addr, "secret").with_public_base("https://relay.test");
     let router = relay_router(RelayState::new(config));
     tokio::spawn(async move {
-        axum::serve(listener, router).await.unwrap();
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     addr
@@ -458,4 +463,75 @@ async fn the_device_list_is_empty_before_anything_attaches() {
 /// stay readable.
 async fn http_get_authed(url: &str, header: Option<(&str, &str)>) -> (u16, String) {
     http_get(url, header).await
+}
+
+// ===========================================================================
+// Rate limiting — the relay is the only place a caller's real IP is visible
+// ===========================================================================
+
+/// Start a relay whose limit is low enough to reach in a test.
+async fn start_throttled_relay(max_requests: u32) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let mut config = RelayConfig::new(addr, "secret").with_public_base("https://relay.test");
+    config.rate_limit.max_requests = max_requests;
+
+    let router = relay_router(RelayState::new(config));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    addr
+}
+
+#[tokio::test]
+async fn hammering_the_relay_is_throttled() {
+    let addr = start_throttled_relay(3).await;
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+
+    // Within the limit the answers are normal.
+    for attempt in 1..=3 {
+        let (status, _) = http_get(&url, auth).await;
+        assert_eq!(status, 200, "request {attempt} should be allowed");
+    }
+
+    // Past it, the relay refuses rather than letting a caller guess forever.
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(status, 429);
+}
+
+#[tokio::test]
+async fn enrolment_attempts_are_throttled() {
+    // A weak enrolment token is only as safe as the number of guesses allowed,
+    // and the control endpoint is where those guesses land.
+    let addr = start_throttled_relay(2).await;
+    let url = format!("ws://{addr}/relay/v1/control");
+
+    for _ in 0..2 {
+        let _ = tokio_tungstenite::connect_async(&url).await;
+    }
+
+    assert!(
+        tokio_tungstenite::connect_async(&url).await.is_err(),
+        "a third dial in the window should be refused"
+    );
+}
+
+#[tokio::test]
+async fn health_is_never_throttled() {
+    // Monitoring must not be the thing that trips the limit.
+    let addr = start_throttled_relay(1).await;
+    let url = format!("http://{addr}/health");
+
+    for attempt in 1..=5 {
+        let (status, _) = http_get(&url, None).await;
+        assert_eq!(status, 200, "health check {attempt} should always answer");
+    }
 }

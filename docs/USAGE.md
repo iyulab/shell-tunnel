@@ -201,6 +201,43 @@ with auth off would be silently meaningless. `--no-auth` still overrides, except
 on a public path where it is refused. A key issued without either is
 full-control, so existing setups never start failing with 403.
 
+### Audit trail
+
+`--audit-log <file>` appends one JSON object per line for every execution and
+every refusal. Off unless a path is given — creating a file nobody asked for is
+its own kind of surprise.
+
+```bash
+shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
+```
+
+```json
+{"at_ms":1784646769697,"kind":"execute","identity":{"token_id":"tok_78c6b1db17d3","label":"configured"},
+ "route":"POST /api/v1/execute","command":"echo audited","exit_code":0,"timed_out":false,"duration_ms":170}
+{"at_ms":1784646769917,"kind":"denied","route":"POST /api/v1/execute","status":401,"reason":"invalid-token"}
+{"at_ms":1784646795525,"kind":"denied","identity":{"token_id":"tok_99b8787ac16b","label":"configured"},
+ "route":"POST /api/v1/execute","status":403,"reason":"missing-capability:exec"}
+```
+
+Read it with `tail -f` or `jq`; entries are appended and never rewritten, and
+each is flushed as it happens so a crash does not take the last ones with it.
+Executions over WebSocket are recorded the same way — a trail that only saw the
+REST path would miss whichever caller preferred streaming.
+
+`--audit-max-bytes <N>` rotates the file to `<file>.1` once it passes that size,
+keeping one generation. Unbounded by default; a trail that grows forever
+eventually fills the disk it was meant to protect, but how much history to keep
+belongs to whoever runs the machine.
+
+**The token is never written.** Entries carry a `token_id` assigned at
+registration and the token's label, which identify a caller across a run without
+putting a credential in a file that tends to be kept and copied. That id is
+per-process: tokens are not persisted, so neither is it.
+
+**Commands are written in full**, which is the substance of the trail — "someone
+called `/execute`" says almost nothing. A command that embeds a secret therefore
+puts that secret in the log; that is the trade an audit trail makes.
+
 Command *content* is not filtered. A `CommandValidator` primitive ships in the
 crate but no handler calls it: a token holding `exec` can run any command. The
 capability token is the access control — withhold `exec` to deny execution.
@@ -233,6 +270,35 @@ relay.example.com { reverse_proxy 127.0.0.1:8443 }
 The relay derives the URL it advertises from each connection's `Host` /
 `X-Forwarded-*` headers, so nothing else is needed behind a proxy.
 `--public-base https://relay.example.com` pins a canonical one.
+
+### TLS without a proxy
+
+A relay can terminate TLS itself, which is the difference between tokens
+travelling in clear and not:
+
+```bash
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
+```
+
+A certificate without its key (or the reverse) is refused at startup, and an
+unreadable or mismatched pair stops the relay rather than letting it serve
+plaintext. The advertised URL becomes `https://…` automatically.
+
+Renewed certificates are picked up without a restart: the files are checked once
+a minute, and a replacement is loaded for new handshakes while existing
+connections keep the certificate they started with. A file that is unreadable
+mid-renewal leaves the previous certificate in place rather than serving none.
+
+If the certificate is not signed by a public authority, devices need to be told
+which authority to trust — the check stays on rather than being disabled:
+
+```bash
+shell-tunnel --relay https://relay.internal:8443 --enroll-token <t> --relay-ca ca.pem
+```
+
+`--relay-ca` *adds* to the public trust anchors, so a mixed fleet does not become
+an all-or-nothing choice. Requires the `tls` build feature on the relay and
+`relay-client` on the device; both ship in the release binaries.
 
 ### Attaching a device
 
@@ -297,6 +363,18 @@ proxy in front of the relay.
 attach connections for any device on that relay. Run a relay for devices you
 own; it does not isolate tenants from each other.
 
+### Rate limiting on the relay
+
+Every relay route except `/health` is limited per client IP (100/minute by
+default, `--no-rate-limit` to disable). This is not decoration: enrolment
+attempts land on `/relay/v1/control`, so without a limit a weak enrolment token
+can be guessed at line speed.
+
+It is also the *only* place per-caller limiting can work for proxied traffic. A
+device replays each request to its own loopback listener, so the device's own
+limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
+still sees the real address.
+
 ### Relay endpoints
 
 | Method | Path | Auth |
@@ -328,6 +406,10 @@ own; it does not isolate tenants from each other.
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
+| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | - |
+| `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
+| `--audit-log <FILE>` | Append executions and refusals as JSON lines | off |
+| `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
 `shell-tunnel relay [OPTIONS]` additionally accepts:
@@ -401,6 +483,7 @@ The default build links no TLS stack, HTTP client, or WebSocket client.
 |---|---|---|
 | *(default)* | nothing | ✅ |
 | `self-update` | `--update` / `--check-update` | ✅ |
+| `tls` | `--tls-cert` / `--tls-key` (serve HTTPS in-process) | ✅ |
 | `relay-client` | `--relay` (device side; TLS + WS client) | ✅ |
 
 ```bash

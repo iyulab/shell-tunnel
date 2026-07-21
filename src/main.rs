@@ -6,7 +6,7 @@ use std::time::Duration;
 use shell_tunnel::config::PublicExposure;
 use shell_tunnel::relay::{serve_relay, RelayConfig};
 use shell_tunnel::tunnel::{self, TunnelHandle};
-use shell_tunnel::{api::serve, logging, parse_args, print_help, print_version, Args, Config};
+use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -119,6 +119,16 @@ async fn main() -> shell_tunnel::Result<()> {
         eprintln!("Configuration error: --relay requires --enroll-token");
         std::process::exit(1);
     }
+
+    // Serving TLS is a relay-mode capability. Ignoring the flag here would start
+    // a plaintext server for someone who asked for an encrypted one — the exact
+    // silent failure every other path in this binary refuses to make.
+    if args.tls_cert.is_some() {
+        eprintln!("Configuration error: --tls-cert/--tls-key apply to `shell-tunnel relay`.");
+        eprintln!("A gateway is reached through a tunnel or a relay, which carry their own TLS;");
+        eprintln!("to expose one directly, put a reverse proxy in front.");
+        std::process::exit(1);
+    }
     #[cfg(not(feature = "relay-client"))]
     if args.relay_url.is_some() {
         eprintln!(
@@ -153,20 +163,42 @@ async fn main() -> shell_tunnel::Result<()> {
     // port, so this line used to announce 3000 while the server bound something
     // else entirely.
 
+    // Opened before serving so a path that cannot be written stops startup,
+    // rather than leaving an operator believing there is a trail.
+    let audit = match &args.audit_log {
+        Some(path) => {
+            match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_max_bytes) {
+                Ok(sink) => std::sync::Arc::new(sink),
+                Err(e) => {
+                    eprintln!("Configuration error: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        None => std::sync::Arc::new(shell_tunnel::audit::AuditSink::Disabled),
+    };
+    if audit.is_enabled() {
+        info!(
+            "audit trail: {}",
+            args.audit_log.as_ref().unwrap().display()
+        );
+    }
+    let state = shell_tunnel::AppState::new().with_audit(audit);
+
     #[cfg(feature = "relay-client")]
     if let Some(relay_url) = args.relay_url.clone() {
-        return run_with_relay(server_config, &args, relay_url, exposure).await;
+        return run_with_relay(server_config, &args, relay_url, exposure, state).await;
     }
 
     let Some(provider) = provider else {
-        return serve(server_config).await;
+        return shell_tunnel::api::serve_with_state(server_config, state).await;
     };
 
     let local: SocketAddr = server_config
         .bind_address()
         .parse()
         .expect("bind address is built from a parsed IpAddr and a u16 port");
-    let server = tokio::spawn(serve(server_config));
+    let server = tokio::spawn(shell_tunnel::api::serve_with_state(server_config, state));
 
     // Open the tunnel only once the port actually accepts, so the provider is
     // not racing the listener and reporting connection failures.
@@ -224,6 +256,19 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     if let Some(base) = &args.public_base {
         config = config.with_public_base(base);
     }
+    if args.no_rate_limit {
+        config = config.without_rate_limit();
+    }
+    #[cfg(feature = "tls")]
+    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+        config = config.with_tls(shell_tunnel::tls::TlsFiles::new(cert, key));
+    }
+    #[cfg(not(feature = "tls"))]
+    if args.tls_cert.is_some() {
+        eprintln!("Configuration error: this build cannot serve TLS.");
+        eprintln!("Rebuild with `--features tls`, or put a reverse proxy in front.");
+        std::process::exit(1);
+    }
     std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
     logging::init();
 
@@ -232,8 +277,15 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     // so a wildcard bind reports what it is listening on and leaves the address
     // to them. (Devices themselves are told the address their own connection
     // observed, which is what works behind TLS termination.)
-    let reachable = if args.public_base.is_some() || !bind.ip().is_unspecified() {
+    let scheme = if args.tls_cert.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let reachable = if args.public_base.is_some() {
         Some(config.public_base_or(None))
+    } else if !bind.ip().is_unspecified() {
+        Some(format!("{scheme}://{bind}"))
     } else {
         None
     };
@@ -245,7 +297,7 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     if generated {
         println!("Enroll token: {enroll_token}   (generated)");
     }
-    let join_url = reachable.unwrap_or_else(|| format!("http://<this-host>:{}", bind.port()));
+    let join_url = reachable.unwrap_or_else(|| format!("{scheme}://<this-host>:{}", bind.port()));
     println!("Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>\n");
 
     serve_relay(config).await
@@ -262,6 +314,7 @@ async fn run_with_relay(
     args: &Args,
     relay_url: String,
     exposure: PublicExposure,
+    state: shell_tunnel::AppState,
 ) -> shell_tunnel::Result<()> {
     use shell_tunnel::relay::client::{run as run_relay_client, RelayClientConfig};
 
@@ -278,11 +331,7 @@ async fn run_with_relay(
     let local = listener
         .local_addr()
         .map_err(shell_tunnel::ShellTunnelError::Io)?;
-    let server = tokio::spawn(shell_tunnel::api::serve_on(
-        listener,
-        server_config,
-        shell_tunnel::AppState::new(),
-    ));
+    let server = tokio::spawn(shell_tunnel::api::serve_on(listener, server_config, state));
 
     let client_config = RelayClientConfig {
         relay_url,
@@ -298,6 +347,7 @@ async fn run_with_relay(
             .device_name
             .clone()
             .or_else(shell_tunnel::relay::client::default_device_name),
+        ca_file: args.relay_ca.clone(),
     };
 
     for warning in &exposure.warnings {

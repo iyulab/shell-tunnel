@@ -21,14 +21,53 @@ use crate::session::{SessionConfig, SessionId, SessionState, SessionStore};
 pub struct AppState {
     pub store: Arc<SessionStore>,
     pub executor: Arc<CommandExecutor>,
+    /// Where execution events are recorded; disabled unless configured.
+    pub audit: Arc<crate::audit::AuditSink>,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let store = Arc::new(SessionStore::new());
         let executor = Arc::new(CommandExecutor::new(Arc::clone(&store)));
-        Self { store, executor }
+        Self {
+            store,
+            executor,
+            audit: Arc::new(crate::audit::AuditSink::Disabled),
+        }
     }
+
+    /// Record execution events to `sink`.
+    pub fn with_audit(mut self, sink: Arc<crate::audit::AuditSink>) -> Self {
+        self.audit = sink;
+        self
+    }
+}
+
+/// Build the execution event for a finished command.
+///
+/// Written from the handler rather than from middleware because only here are
+/// the command and its outcome both in hand — an entry saying a request reached
+/// `/execute` would say almost nothing about what ran.
+fn execution_event(
+    identity: Option<crate::audit::Identity>,
+    route: &str,
+    command: &str,
+    session_id: Option<u64>,
+    result: &crate::execution::ExecutionResult,
+) -> crate::audit::AuditEvent {
+    let mut event = crate::audit::AuditEvent::new("execute")
+        .with_identity(identity)
+        .with_route(route)
+        .with_command(command)
+        .with_outcome(
+            result.exit_code,
+            result.timed_out,
+            result.duration.as_millis() as u64,
+        );
+    if let Some(id) = session_id {
+        event = event.with_session(id);
+    }
+    event
 }
 
 impl Default for AppState {
@@ -172,6 +211,7 @@ pub async fn delete_session(
 pub async fn execute_command(
     State(state): State<AppState>,
     Path(session_id): Path<u64>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
     Json(req): Json<ExecuteCommandRequest>,
 ) -> Result<Json<ExecuteCommandResponse>, (StatusCode, Json<ErrorResponse>)> {
     let id = SessionId::from_raw(session_id);
@@ -224,6 +264,14 @@ pub async fn execute_command(
             )
         })?;
 
+    state.audit.record(execution_event(
+        identity.map(|axum::Extension(id)| id),
+        "POST /api/v1/sessions/{id}/execute",
+        &req.command,
+        Some(session_id),
+        &result,
+    ));
+
     // Update session context
     state
         .store
@@ -238,6 +286,7 @@ pub async fn execute_command(
 /// Execute a command without session (one-shot).
 pub async fn execute_oneshot(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
     Json(req): Json<ExecuteCommandRequest>,
 ) -> Result<Json<ExecuteCommandResponse>, (StatusCode, Json<ErrorResponse>)> {
     // Build command
@@ -259,6 +308,14 @@ pub async fn execute_oneshot(
             Json(ErrorResponse::internal_error(e.to_string())),
         )
     })?;
+
+    state.audit.record(execution_event(
+        identity.map(|axum::Extension(id)| id),
+        "POST /api/v1/execute",
+        &req.command,
+        None,
+        &result,
+    ));
 
     Ok(Json(ExecuteCommandResponse::from_result(&result)))
 }

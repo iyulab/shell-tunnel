@@ -11,6 +11,7 @@
 //! a firewall.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -51,6 +52,13 @@ pub struct RelayClientConfig {
     /// Requested stable device name; without one the relay assigns a random id
     /// that changes on every reconnect.
     pub device_name: Option<String>,
+    /// Extra PEM certificate authority to trust, for a relay whose certificate
+    /// is not signed by a public CA.
+    ///
+    /// Without this a private or self-signed relay certificate is refused —
+    /// correctly, since the alternative is trusting whatever answers. Naming the
+    /// authority keeps that check intact instead of disabling it.
+    pub ca_file: Option<PathBuf>,
 }
 
 impl RelayClientConfig {
@@ -165,9 +173,17 @@ pub async fn run(config: RelayClientConfig) -> Result<()> {
 /// Returns `Ok(())` when the relay closed the channel cleanly.
 pub async fn attach(config: &RelayClientConfig) -> Result<()> {
     install_crypto_provider();
-    let (mut control, _) = tokio_tungstenite::connect_async(config.control_url())
-        .await
-        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
+    let (mut control, _) = tokio_tungstenite::connect_async_tls_with_config(
+        config
+            .control_url()
+            .into_client_request()
+            .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
+        None,
+        false,
+        connector(config)?,
+    )
+    .await
+    .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
 
     let enroll = DeviceMessage::Enroll {
         enroll_token: config.enroll_token.clone(),
@@ -233,9 +249,17 @@ fn spawn_data_connection(config: RelayClientConfig, device_id: String) {
 
 /// Wait for one proxied request, replay it locally, return the response.
 async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
-    let (mut conn, _) = tokio_tungstenite::connect_async(config.data_url())
-        .await
-        .map_err(|e| ShellTunnelError::Tunnel(format!("data connection refused: {e}")))?;
+    let (mut conn, _) = tokio_tungstenite::connect_async_tls_with_config(
+        config
+            .data_url()
+            .into_client_request()
+            .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
+        None,
+        false,
+        connector(config)?,
+    )
+    .await
+    .map_err(|e| ShellTunnelError::Tunnel(format!("data connection refused: {e}")))?;
 
     let attach = DeviceMessage::Attach {
         device_id: device_id.to_string(),
@@ -274,6 +298,51 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
     let _ = conn.send(Message::Binary(body)).await;
     let _ = conn.close(None).await;
     Ok(())
+}
+
+/// Build the TLS connector, adding a private authority when one is configured.
+///
+/// Returning `None` means "use the defaults", which is what a relay with a
+/// publicly-signed certificate needs.
+fn connector(config: &RelayClientConfig) -> Result<Option<tokio_tungstenite::Connector>> {
+    let Some(path) = &config.ca_file else {
+        return Ok(None);
+    };
+
+    let pem = std::fs::read(path)
+        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot read CA {}: {e}", path.display())))?;
+    let mut roots = rustls::RootCertStore::empty();
+    let mut added = 0usize;
+    for cert in rustls_pemfile_certs(&pem) {
+        if roots.add(cert).is_ok() {
+            added += 1;
+        }
+    }
+    if added == 0 {
+        return Err(ShellTunnelError::Tunnel(format!(
+            "{} contains no usable certificate authority",
+            path.display()
+        )));
+    }
+
+    // Public roots stay trusted as well, so one flag does not turn a mixed fleet
+    // into an all-or-nothing choice.
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(Some(tokio_tungstenite::Connector::Rustls(
+        std::sync::Arc::new(tls),
+    )))
+}
+
+/// Parse every certificate in a PEM blob, ignoring anything that is not one.
+fn rustls_pemfile_certs(pem: &[u8]) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    let mut cursor = pem;
+    rustls_pemfile::certs(&mut cursor)
+        .filter_map(|cert| cert.ok())
+        .collect()
 }
 
 /// Open the local WebSocket the request is really for, then join the two.
@@ -492,6 +561,7 @@ mod tests {
             local: "127.0.0.1:3000".parse().unwrap(),
             label: None,
             device_name: None,
+            ca_file: None,
         }
     }
 
