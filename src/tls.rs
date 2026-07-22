@@ -80,6 +80,15 @@ impl TlsFiles {
         Ok(true)
     }
 
+    /// The SHA-256 fingerprint of the certificate on disk.
+    pub fn fingerprint(&self) -> Result<String> {
+        let certs = read_certs(&self.cert)?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| ShellTunnelError::Tls("certificate file is empty".to_string()))?;
+        Ok(crate::fingerprint::of_certificate(leaf.as_ref()))
+    }
+
     /// Load them into a server configuration.
     pub fn load(&self) -> Result<ServerConfig> {
         install_crypto_provider();

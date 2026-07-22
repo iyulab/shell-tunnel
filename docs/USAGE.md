@@ -300,11 +300,6 @@ shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
 ```
 
-`--public-base` is required with `--tls-self-signed` on a relay that accepts
-connections from other machines: a generated certificate can only cover names it
-is told about, so without it every remote device would be refused. The startup
-banner prints which names the certificate covers.
-
 `--tls-self-signed` writes `shell-tunnel-cert.pem` and `shell-tunnel-key.pem` on
 first run and reuses them afterwards — a relay that minted a fresh certificate on
 every restart would invalidate the trust every device was configured with. Name
@@ -322,15 +317,39 @@ a minute, and a replacement is loaded for new handshakes while existing
 connections keep the certificate they started with. A file that is unreadable
 mid-renewal leaves the previous certificate in place rather than serving none.
 
-If the certificate is not signed by a public authority, devices need to be told
-which authority to trust — the check stays on rather than being disabled:
+A certificate that is not publicly signed has to be vouched for somehow, and
+there are two ways. The banner suggests the first:
+
+**Pin the certificate** (`--relay-fingerprint`). The relay prints a fingerprint;
+the device is told to expect exactly that certificate:
+
+```bash
+shell-tunnel --relay https://relay.internal:8443 --enroll-token <t>              --relay-fingerprint sha256:9f2a1c...
+```
+
+This is the SSH model. Nothing is copied but the string — which travels in the
+same block of text as the enrolment token — and the certificate does not need to
+name the address being dialled, because the certificate itself is what was
+verified. Use it for self-signed relays. Do **not** use it for a publicly-signed
+certificate, which is replaced on every renewal; there the authority is the
+stable thing.
+
+**Name the authority** (`--relay-ca`), for a private CA that signs several
+relays:
 
 ```bash
 shell-tunnel --relay https://relay.internal:8443 --enroll-token <t> --relay-ca ca.pem
 ```
 
 `--relay-ca` *adds* to the public trust anchors, so a mixed fleet does not become
-an all-or-nothing choice. Requires the `tls` build feature on the relay and
+an all-or-nothing choice. Unlike a fingerprint, it requires the certificate to
+name the address being dialled — start the relay with `--public-base` for that
+name.
+
+There is deliberately no option to skip verification. Encryption without
+authentication stops passive eavesdropping but not an active intermediary, who
+would read the enrolment and capability tokens in the clear — and those are
+shell access. Requires the `tls` build feature on the relay and
 `relay-client` on the device; both ship in the release binaries.
 
 ### Attaching a device
@@ -442,6 +461,7 @@ still sees the real address.
 | `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
 | `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 | `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names only |
+| `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
 | `--audit-log <FILE>` | Append executions and refusals as JSON lines | off |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |

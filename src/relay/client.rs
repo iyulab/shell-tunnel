@@ -52,6 +52,13 @@ pub struct RelayClientConfig {
     /// Requested stable device name; without one the relay assigns a random id
     /// that changes on every reconnect.
     pub device_name: Option<String>,
+    /// Expect exactly this certificate, identified by its SHA-256 fingerprint.
+    ///
+    /// The alternative to naming an authority, and the better fit for a
+    /// self-signed relay: nothing has to be copied to the device but the string
+    /// itself, and the certificate need not name the address being dialled,
+    /// because the certificate *is* what was verified.
+    pub fingerprint: Option<String>,
     /// Extra PEM certificate authority to trust, for a relay whose certificate
     /// is not signed by a public CA.
     ///
@@ -352,11 +359,97 @@ fn explain_dial_failure(
     message
 }
 
-/// Build the TLS connector, adding a private authority when one is configured.
+/// Accepts one exact certificate and nothing else.
+///
+/// Deliberately the whole of the check: the presented certificate either has the
+/// fingerprint the operator pinned or it does not. Name validity and chain
+/// building are not consulted, because pinning already answers the question they
+/// exist to answer — is this the peer I meant? A mistake here fails closed: an
+/// unexpected certificate is rejected, never waved through.
+#[derive(Debug)]
+struct PinnedCertificate {
+    expected: Vec<u8>,
+    provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        let presented = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
+        if presented.as_ref() == self.expected.as_slice() {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        } else {
+            Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            ))
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+/// Build the TLS connector this configuration calls for.
 ///
 /// Returning `None` means "use the defaults", which is what a relay with a
 /// publicly-signed certificate needs.
 fn connector(config: &RelayClientConfig) -> Result<Option<tokio_tungstenite::Connector>> {
+    if let Some(fingerprint) = &config.fingerprint {
+        let expected = crate::fingerprint::parse(fingerprint)
+            .map_err(|e| ShellTunnelError::Tunnel(format!("bad --relay-fingerprint: {e}")))?;
+        let provider = rustls::crypto::CryptoProvider::get_default()
+            .cloned()
+            .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::ring::default_provider()));
+
+        let tls = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertificate {
+                expected,
+                provider,
+            }))
+            .with_no_client_auth();
+        return Ok(Some(tokio_tungstenite::Connector::Rustls(
+            std::sync::Arc::new(tls),
+        )));
+    }
+
     let Some(path) = &config.ca_file else {
         return Ok(None);
     };
@@ -613,8 +706,35 @@ mod tests {
             local: "127.0.0.1:3000".parse().unwrap(),
             label: None,
             device_name: None,
+            fingerprint: None,
             ca_file: None,
         }
+    }
+
+    #[test]
+    fn a_fingerprint_is_what_the_connector_uses_when_given() {
+        // Both configured: pinning is the stronger statement — it names the
+        // certificate itself rather than something allowed to issue one.
+        let config = RelayClientConfig {
+            fingerprint: Some(crate::fingerprint::of_certificate(b"whatever")),
+            ca_file: Some(PathBuf::from("unused.pem")),
+            ..config("wss://relay.example.com")
+        };
+        // The CA file does not exist; reaching for it would fail here.
+        assert!(matches!(connector(&config), Ok(Some(_))));
+    }
+
+    #[test]
+    fn a_malformed_fingerprint_is_refused_before_dialling() {
+        let config = RelayClientConfig {
+            fingerprint: Some("sha256:not-a-real-digest".to_string()),
+            ..config("wss://relay.example.com")
+        };
+        let err = match connector(&config) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a malformed fingerprint must not produce a connector"),
+        };
+        assert!(err.contains("--relay-fingerprint"), "{err}");
     }
 
     #[test]

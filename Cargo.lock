@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "shell-tunnel"
-version = "0.8.1"
+version = "0.9.0"
 dependencies = [
  "axum",
  "axum-server",
@@ -1804,6 +1804,7 @@ dependencies = [
  "libc",
  "portable-pty",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-pemfile",
  "self_update",

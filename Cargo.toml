@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -70,6 +70,9 @@ rustls-pemfile = { version = "2", optional = true }
 # marginal cost is small — and it removes the openssl incantation that stands
 # between an operator and an encrypted relay.
 rcgen = { version = "0.14", optional = true }
+# SHA-256 for certificate fingerprints. Already in the tree under rustls, so
+# naming it explicitly costs nothing and avoids reaching through a dependency.
+ring = { version = "0.17", optional = true }
 # Public trust anchors, so naming a private CA adds to them rather than replacing them.
 webpki-roots = { version = "0.26", optional = true }
 
@@ -86,9 +89,9 @@ default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
-relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots"]
+relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:ring"]
 # Terminate TLS in-process (--tls-cert / --tls-key), no reverse proxy required.
-tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen"]
+tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:ring"]
 
 [dev-dependencies]
 tokio-test = "0.4"

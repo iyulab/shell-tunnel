@@ -60,6 +60,8 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod execution;
+#[cfg(any(feature = "tls", feature = "relay-client"))]
+pub mod fingerprint;
 pub mod logging;
 pub mod output;
 mod process;

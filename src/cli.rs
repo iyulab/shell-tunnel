@@ -52,6 +52,8 @@ pub struct Args {
     pub tls_key: Option<PathBuf>,
     /// Generate a self-signed certificate when none is present.
     pub tls_self_signed: bool,
+    /// Expect exactly this certificate fingerprint from the relay.
+    pub relay_fingerprint: Option<String>,
     /// Extra PEM certificate authority to trust when dialling a relay.
     pub relay_ca: Option<PathBuf>,
     /// Additional host names this server answers to.
@@ -99,6 +101,7 @@ impl Default for Args {
             tls_cert: None,
             tls_key: None,
             tls_self_signed: false,
+            relay_fingerprint: None,
             relay_ca: None,
             allow_hosts: Vec::new(),
             audit_log: None,
@@ -205,6 +208,9 @@ where
             }
             Long("tls-self-signed") => {
                 result.tls_self_signed = true;
+            }
+            Long("relay-fingerprint") => {
+                result.relay_fingerprint = Some(parser.value()?.parse()?);
             }
             Long("relay-ca") => {
                 result.relay_ca = Some(parser.value()?.parse()?);
@@ -357,8 +363,13 @@ TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
         --tls-cert <FILE>   PEM certificate chain [default with --tls-self-signed:
                             shell-tunnel-cert.pem]
         --tls-key <FILE>    PEM private key matching the certificate
+        --relay-fingerprint <FP>
+                            Expect exactly this certificate from the relay, as
+                            printed by `shell-tunnel relay --tls-self-signed`.
+                            Nothing to copy but the string, and the certificate
+                            need not name the address being dialled
         --relay-ca <FILE>   Also trust this PEM authority when dialling a relay
-                            (for a relay whose certificate is not publicly signed)
+                            (the alternative to a fingerprint, for a private CA)
 
 RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay

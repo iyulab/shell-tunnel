@@ -269,34 +269,20 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     #[cfg(feature = "tls")]
     let mut cert_names: Vec<String> = Vec::new();
     #[cfg(feature = "tls")]
+    let mut cert_fingerprint: Option<String> = None;
+    #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
         let files = shell_tunnel::tls::TlsFiles::new(cert, key);
 
         if args.tls_self_signed {
-            // A certificate is only valid for the names inside it. Without
-            // `--public-base` we know nothing but this machine's own names, so a
-            // device dialling a public hostname is refused — after the operator
-            // has already copied the file and believes the setup is done.
-            if args.public_base.is_none() && !bind.ip().is_loopback() {
-                eprintln!("Configuration error: --tls-self-signed needs --public-base here.");
-                eprintln!("This relay accepts connections from other machines, but a generated");
-                eprintln!("certificate can only cover names it is told about, so devices dialling");
-                eprintln!("any other name would be refused. For example:");
-                eprintln!();
-                eprintln!(
-                    "    shell-tunnel relay -H {} -p {} --tls-self-signed --public-base https://relay.example.com:{}",
-                    bind.ip(),
-                    bind.port(),
-                    bind.port()
-                );
-                std::process::exit(1);
-            }
-
             let names = shell_tunnel::tls::certificate_names(args.public_base.as_deref(), bind);
             match files.ensure_self_signed(&names) {
                 Ok(created) => {
                     generated_cert = created;
                     cert_names = names;
+                    // Read back rather than remembering what was written: on a
+                    // reused certificate there is nothing in memory to remember.
+                    cert_fingerprint = files.fingerprint().ok();
                 }
                 Err(e) => {
                     eprintln!("Configuration error: {}", e);
@@ -346,10 +332,14 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     // A self-signed certificate is trusted by nobody until its file reaches the
     // devices. The join line therefore carries `--relay-ca` rather than handing
     // out a command that fails on the first dial.
+    // A self-signed certificate is trusted by nobody until the device is told
+    // what to expect. The fingerprint is what goes in the join line: it travels
+    // as one string in the text being copied anyway, and it does not care
+    // whether the certificate names the address being dialled.
     #[cfg(feature = "tls")]
-    let ca_flag = match (args.tls_self_signed, &args.tls_cert) {
-        (true, Some(cert)) => format!(" --relay-ca {}", cert.display()),
-        _ => String::new(),
+    let ca_flag = match &cert_fingerprint {
+        Some(fp) => format!(" --relay-fingerprint {fp}"),
+        None => String::new(),
     };
     #[cfg(not(feature = "tls"))]
     let ca_flag = String::new();
@@ -420,6 +410,7 @@ async fn run_with_relay(
             .device_name
             .clone()
             .or_else(shell_tunnel::relay::client::default_device_name),
+        fingerprint: args.relay_fingerprint.clone(),
         ca_file: args.relay_ca.clone(),
     };
 
