@@ -4,6 +4,7 @@ Complete reference for running shell-tunnel and calling its API. The
 [README](../README.md) is the introduction; this is the working document.
 [`openapi.json`](openapi.json) is the machine-readable contract for the HTTP API.
 
+- [0. Quickest start](#0-quickest-start)
 - [1. Choosing how to reach the machine](#1-choosing-how-to-reach-the-machine)
 - [2. Running it](#2-running-it)
 - [3. Calling the API](#3-calling-the-api)
@@ -14,6 +15,33 @@ Complete reference for running shell-tunnel and calling its API. The
 - [8. Failure modes](#8-failure-modes)
 - [9. Build features](#9-build-features)
 - [10. Limits](#10-limits)
+
+---
+
+## 0. Quickest start
+
+Local, no configuration:
+
+```bash
+shell-tunnel                                   # 127.0.0.1:3000, no auth
+curl -X POST http://127.0.0.1:3000/api/v1/execute \
+  -H "Content-Type: application/json" -d '{"command":"echo hello"}'
+```
+
+Reachable from the internet, one relay and one flag — the relay prints the exact
+command each target needs:
+
+```bash
+# on a host with a public address
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
+
+# on the machine you want to reach (behind NAT is fine)
+shell-tunnel --relay https://relay.example.com:8443 --enroll-token <printed> \
+             --relay-fingerprint <printed> -k <your-key> --preset operator
+```
+
+Everything after this adds one capability at a time. Pick the row that matches
+your situation in §1, then read the section it points to.
 
 ---
 
@@ -296,17 +324,21 @@ travelling in clear and not:
 # With a certificate you already have
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
 
-# Or generate one, no arguments and no openssl needed
+# Or generate one, no openssl needed. --public-base only sets the advertised URL;
+# with fingerprint pinning (below) it is optional.
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
 ```
 
 `--tls-self-signed` writes `shell-tunnel-cert.pem` and `shell-tunnel-key.pem` on
 first run and reuses them afterwards — a relay that minted a fresh certificate on
 every restart would invalidate the trust every device was configured with. Name
-the paths with `--tls-cert`/`--tls-key` to put them elsewhere. The certificate is
-valid for `--public-base`, this machine's hostname, the bind address, and
-localhost; devices trust it by copying the certificate file and passing
-`--relay-ca`, which the startup banner spells out.
+the paths with `--tls-cert`/`--tls-key` to put them elsewhere.
+
+The startup banner prints the join command a device needs, including a
+`--relay-fingerprint` that pins this exact certificate — so a device trusts it by
+copying one string, not a file, and the certificate does not need to name the
+public address (see below). `--public-base` only sets the URL the banner
+advertises; with fingerprint pinning it is optional.
 
 A certificate without its key (or the reverse) is refused at startup, and an
 unreadable or mismatched pair stops the relay rather than letting it serve
@@ -324,7 +356,7 @@ there are two ways. The banner suggests the first:
 the device is told to expect exactly that certificate:
 
 ```bash
-shell-tunnel --relay https://relay.internal:8443 --enroll-token <t>              --relay-fingerprint sha256:9f2a1c...
+shell-tunnel --relay https://relay.internal:8443 --enroll-token <t> --relay-fingerprint sha256:9f2a1c...
 ```
 
 This is the SSH model. Nothing is copied but the string — which travels in the

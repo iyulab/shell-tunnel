@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.9.0"
+version = "0.9.1"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
