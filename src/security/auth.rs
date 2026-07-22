@@ -249,19 +249,20 @@ fn generate_token_id() -> String {
 
 /// Generate a random API key.
 pub fn generate_api_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-
-    // Simple but unique key generation
-    // Format: st_<timestamp_hex>_<random_hex>
-    let random: u64 = (timestamp as u64)
-        .wrapping_mul(0x5DEECE66D)
-        .wrapping_add(0xB);
-    format!("st_{:x}_{:016x}", timestamp as u64, random)
+    // 128 bits of OS entropy, printed in the shape keys have always had
+    // (`st_<16 hex>_<16 hex>`). The shape is all that survives of the old
+    // scheme: its second half was an affine function of its first (a
+    // timestamp), which made every issued key recoverable from a guess at
+    // the clock. An entropy source that fails stops key issuance here,
+    // rather than shipping a credential weaker than it looks.
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("the OS entropy source is unavailable");
+    let (a, b) = bytes.split_at(8);
+    format!(
+        "st_{:016x}_{:016x}",
+        u64::from_be_bytes(a.try_into().expect("split_at(8) yields 8 bytes")),
+        u64::from_be_bytes(b.try_into().expect("split_at(8) yields 8 bytes"))
+    )
 }
 
 #[cfg(test)]
@@ -319,8 +320,36 @@ mod tests {
 
         assert!(key1.starts_with("st_"));
         assert!(key2.starts_with("st_"));
-        // Keys should be unique (unless generated in same nanosecond)
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn the_secret_half_is_not_a_function_of_the_printed_half() {
+        // The vulnerability this pins down: keys were
+        // `st_<timestamp>_<timestamp * 0x5DEECE66D + 0xB>`, so the "secret"
+        // half was recoverable from the half printed next to it — and the
+        // whole key from a guess at the clock. The halves must be
+        // independent; under a random key this relation holds with
+        // probability 2^-64.
+        let key = generate_api_key();
+        let mut halves = key.trim_start_matches("st_").split('_');
+        let printed = u64::from_str_radix(halves.next().unwrap(), 16).unwrap();
+        let secret = u64::from_str_radix(halves.next().unwrap(), 16).unwrap();
+        assert_ne!(
+            secret,
+            printed.wrapping_mul(0x5DEECE66D).wrapping_add(0xB),
+            "the second half of {key} is derived from the first"
+        );
+    }
+
+    #[test]
+    fn keys_generated_back_to_back_are_all_distinct() {
+        // The macOS CI failure: two calls inside one clock tick produced the
+        // same key, because the clock was the only entropy. A tight loop must
+        // never collide.
+        let keys: std::collections::HashSet<String> =
+            (0..1000).map(|_| generate_api_key()).collect();
+        assert_eq!(keys.len(), 1000);
     }
 
     #[test]
