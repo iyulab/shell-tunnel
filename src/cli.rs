@@ -410,9 +410,9 @@ EXAMPLES:
     shell-tunnel --relay https://relay.example.com --enroll-token <t> --device-name box
 
     # Run a relay with HTTPS, generating a certificate on first run
-    shell-tunnel relay --tls-self-signed --public-base https://relay.example.com
+    shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com:8443
 
-    # Run a relay devices can dial out to
+    # Run a relay behind a proxy that forwards port 443 to it
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
 
     # Issue a fine-grained, read-only token

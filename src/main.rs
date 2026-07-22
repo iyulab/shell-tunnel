@@ -9,8 +9,7 @@ use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
 
-#[tokio::main]
-async fn main() -> shell_tunnel::Result<()> {
+fn main() -> shell_tunnel::Result<()> {
     // Parse command-line arguments
     let args = match parse_args() {
         Ok(args) => args,
@@ -32,7 +31,10 @@ async fn main() -> shell_tunnel::Result<()> {
         return Ok(());
     }
 
-    // Handle update commands (only compiled with the `self-update` feature)
+    // Handle update commands (only compiled with the `self-update` feature).
+    // These must run before the async runtime exists: the updater's HTTP
+    // client is a blocking one, and creating and dropping it inside a runtime
+    // is the panic that took `--check-update` down with it.
     #[cfg(feature = "self-update")]
     {
         use shell_tunnel::update;
@@ -74,6 +76,15 @@ async fn main() -> shell_tunnel::Result<()> {
         }
     }
 
+    // Everything past this point serves connections; the async runtime starts
+    // here, once the blocking update paths above have returned.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // Relay mode serves devices rather than shells, so it shares only the
     // bind/logging vocabulary with the gateway and returns before any of the
     // gateway's own configuration is resolved.
@@ -348,6 +359,30 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>{ca_flag}\n"
     );
 
+    // A base URL without a port implies the scheme default, so a relay
+    // listening elsewhere is handing out URLs that only work if a proxy
+    // forwards that default port here. That setup is legitimate and cannot be
+    // detected, so this warns instead of rewriting what the operator stated.
+    if let Some(corrected) = config
+        .public_base
+        .as_deref()
+        .and_then(|base| shell_tunnel::relay::public_base_port_hint(base, bind.port()))
+    {
+        let implied = if corrected.starts_with("https") {
+            443
+        } else {
+            80
+        };
+        eprintln!("Note: the public base has no port, so the URLs above imply port {implied},");
+        eprintln!("      but this relay listens on port {}.", bind.port());
+        eprintln!(
+            "      Unless a proxy forwards {implied} -> {}, restart with:",
+            bind.port()
+        );
+        eprintln!("          --public-base {corrected}");
+        eprintln!();
+    }
+
     #[cfg(feature = "tls")]
     if args.tls_self_signed {
         if generated_cert {
@@ -358,8 +393,23 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         if !cert_names.is_empty() {
             println!("Certificate covers: {}", cert_names.join(", "));
         }
+        // The join line already carries the trust anchor when the fingerprint
+        // is known; telling the operator to copy the certificate as well
+        // contradicts it, and that contradiction is exactly what a first-time
+        // operator trips over. The copy instruction survives only as the
+        // fallback for a certificate whose fingerprint could not be read.
         if let Some(cert) = &args.tls_cert {
-            println!("Copy {} to each device for --relay-ca.\n", cert.display());
+            if cert_fingerprint.is_some() {
+                println!(
+                    "Nothing needs copying: the fingerprint in the join line is the trust anchor."
+                );
+                println!(
+                    "(Alternative: copy {} to devices and join with --relay-ca.)\n",
+                    cert.display()
+                );
+            } else {
+                println!("Copy {} to each device for --relay-ca.\n", cert.display());
+            }
         }
     }
 

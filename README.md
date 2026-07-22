@@ -75,7 +75,7 @@ target (NAT) ──dials out──▶ relay (public) ◀──you call── cal
 **On the relay host** — the only machine that needs an inbound port:
 
 ```bash
-shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com:8443
 ```
 
 It generates a certificate and an enrolment token on first run and prints the exact command a

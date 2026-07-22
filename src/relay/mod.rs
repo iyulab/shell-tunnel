@@ -126,6 +126,42 @@ impl RelayConfig {
     }
 }
 
+/// The corrected `--public-base` to suggest when the stated base implies a
+/// port nobody is listening on.
+///
+/// A base URL with no explicit port implies the scheme default, so when the
+/// relay listens elsewhere every printed URL points at a port that only works
+/// if a proxy or NAT forwards the default port to it. That setup is
+/// legitimate and undetectable, so the correction is a suggestion for the
+/// startup banner — the stated base is never rewritten silently. An explicit
+/// port, even a mismatched one, is the operator stating intent.
+pub fn public_base_port_hint(base: &str, listen_port: u16) -> Option<String> {
+    let (scheme, rest) = base.split_once("://")?;
+    let default_port: u16 = match scheme {
+        "https" => 443,
+        "http" => 80,
+        _ => return None,
+    };
+    if listen_port == default_port {
+        return None;
+    }
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    // The port separator is the colon after the host — for an IPv6 literal
+    // that means after the closing bracket, not one inside it.
+    let has_port = match authority.rfind(']') {
+        Some(bracket) => authority[bracket..].contains(':'),
+        None => authority.contains(':'),
+    };
+    if has_port {
+        return None;
+    }
+    Some(format!(
+        "{scheme}://{authority}:{listen_port}{}",
+        &rest[authority_end..]
+    ))
+}
+
 /// Shared relay state.
 #[derive(Debug, Clone)]
 pub struct RelayState {
@@ -760,6 +796,69 @@ mod tests {
 
     fn config() -> RelayConfig {
         RelayConfig::new("127.0.0.1:0".parse().unwrap(), "secret")
+    }
+
+    #[test]
+    fn a_portless_base_on_a_nondefault_port_gets_a_corrected_suggestion() {
+        // The failure this pins down: `--public-base https://labs.example.com`
+        // with the relay listening on 8443 printed join and device URLs that
+        // imply port 443, which nobody was serving. The hint is the corrected
+        // value to suggest — never applied silently, because a proxy or NAT
+        // forwarding 443 -> 8443 makes the portless form legitimate.
+        assert_eq!(
+            public_base_port_hint("https://labs.example.com", 8443).as_deref(),
+            Some("https://labs.example.com:8443")
+        );
+        assert_eq!(
+            public_base_port_hint("http://relay.local", 8080).as_deref(),
+            Some("http://relay.local:8080")
+        );
+    }
+
+    #[test]
+    fn a_base_matching_the_scheme_default_needs_no_hint() {
+        assert_eq!(public_base_port_hint("https://labs.example.com", 443), None);
+        assert_eq!(public_base_port_hint("http://relay.local", 80), None);
+    }
+
+    #[test]
+    fn an_explicit_port_is_the_operator_stating_intent() {
+        // Explicit ports are never second-guessed: a proxy may remap them.
+        assert_eq!(
+            public_base_port_hint("https://labs.example.com:8443", 8443),
+            None
+        );
+        assert_eq!(
+            public_base_port_hint("https://labs.example.com:9000", 8443),
+            None
+        );
+        assert_eq!(
+            public_base_port_hint("https://labs.example.com:443", 8443),
+            None
+        );
+    }
+
+    #[test]
+    fn the_port_is_spliced_into_the_authority_not_the_tail() {
+        // A base may carry a path prefix; the port belongs after the host.
+        assert_eq!(
+            public_base_port_hint("https://labs.example.com/relay", 8443).as_deref(),
+            Some("https://labs.example.com:8443/relay")
+        );
+    }
+
+    #[test]
+    fn ipv6_literals_look_for_the_port_after_the_bracket() {
+        assert_eq!(
+            public_base_port_hint("https://[::1]", 8443).as_deref(),
+            Some("https://[::1]:8443")
+        );
+        assert_eq!(public_base_port_hint("https://[::1]:8443", 8443), None);
+    }
+
+    #[test]
+    fn an_unrecognized_scheme_is_left_alone() {
+        assert_eq!(public_base_port_hint("ws://relay.local", 8443), None);
     }
 
     #[test]

@@ -79,6 +79,26 @@ pub fn check_update() -> Result<UpdateInfo> {
     })
 }
 
+/// Pick the release tag `--update` should install, or `None` when the
+/// current build is already the newest.
+///
+/// `self_update`'s default release selection filters through its semver
+/// compatibility rule, which for 0.x versions admits only same-minor patch
+/// bumps — under this project's 0.X.X-only versioning that made every minor
+/// release unreachable in a single `--update` run. Targeting the latest
+/// release by tag skips that filter entirely.
+///
+/// The returned string is the git tag (`v{version}`): `ReleaseList` strips
+/// the leading `v` from `tag_name`, but `get_release_version()` resolves
+/// `releases/tags/{ver}` verbatim, so the stripped form would 404.
+fn select_update_tag(current: &str, latest: &str) -> Option<String> {
+    if is_newer_version(current, latest) {
+        Some(format!("v{}", latest.trim_start_matches('v')))
+    } else {
+        None
+    }
+}
+
 /// Perform self-update if a newer version is available.
 ///
 /// Returns `Ok(true)` if updated, `Ok(false)` if already up to date.
@@ -91,12 +111,20 @@ pub fn self_update() -> Result<bool> {
         ))
     })?;
 
+    // Presentation stays with the caller: main.rs already reports the
+    // up-to-date case, and a second line here would tell the story twice.
+    let info = check_update()?;
+    let Some(tag) = select_update_tag(&info.current, &info.latest) else {
+        return Ok(false);
+    };
+
     let status = Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .target(target)
         .current_version(cargo_crate_version!())
+        .target_version_tag(&tag)
         .show_download_progress(true)
         .no_confirm(true)
         .build()
@@ -196,6 +224,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn update_selects_latest_release_across_minor_bumps() {
+        // The regression this pins down: from v0.8.0, `--update` installed
+        // v0.8.1 and silently ignored v0.9.1, because self_update's default
+        // compat filter treats a 0.x minor bump as breaking. Under this
+        // project's versioning policy every release lives in 0.X.X, so
+        // `--update` must always target the latest release outright.
+        assert_eq!(
+            select_update_tag("0.8.0", "0.9.1"),
+            Some("v0.9.1".to_string())
+        );
+    }
+
+    #[test]
+    fn update_is_a_noop_when_already_latest() {
+        assert_eq!(select_update_tag("0.9.1", "0.9.1"), None);
+        // A stale or reordered release list must never downgrade.
+        assert_eq!(select_update_tag("0.9.1", "0.8.1"), None);
+    }
+
+    #[test]
+    fn update_tag_tolerates_a_v_prefix_from_the_api() {
+        // ReleaseList strips the leading `v` from tag_name, but
+        // get_release_version() resolves `releases/tags/{ver}` verbatim —
+        // passing the stripped form would 404 silently. Both inputs must
+        // normalize to the real tag.
+        assert_eq!(
+            select_update_tag("0.8.0", "v0.9.1"),
+            Some("v0.9.1".to_string())
+        );
+    }
+
+    #[test]
+    fn release_workflow_tags_are_v_prefixed() {
+        // select_update_tag reconstructs the git tag as `v{version}`. That
+        // only holds while the release workflow triggers on v-prefixed tags;
+        // this ties the assumption to the workflow the same way the asset
+        // naming test does.
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/release.yml"
+        ))
+        .expect("release workflow should be readable");
+
+        assert!(
+            workflow.contains("- 'v*'"),
+            "release workflow no longer triggers on v-prefixed tags; \
+             select_update_tag's tag reconstruction is broken"
+        );
+    }
 
     #[test]
     fn test_version_comparison() {

@@ -33,7 +33,7 @@ command each target needs:
 
 ```bash
 # on a host with a public address
-shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com:8443
 
 # on the machine you want to reach (behind NAT is fine)
 shell-tunnel --relay https://relay.example.com:8443 --enroll-token <printed> \
@@ -324,9 +324,10 @@ travelling in clear and not:
 # With a certificate you already have
 shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-cert fullchain.pem --tls-key key.pem
 
-# Or generate one, no openssl needed. --public-base only sets the advertised URL;
-# with fingerprint pinning (below) it is optional.
-shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
+# Or generate one, no openssl needed. --public-base only sets the advertised URL
+# (include the port unless a proxy forwards the default one); with fingerprint
+# pinning (below) it is optional.
+shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com:8443
 ```
 
 `--tls-self-signed` writes `shell-tunnel-cert.pem` and `shell-tunnel-key.pem` on
