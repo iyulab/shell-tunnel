@@ -375,8 +375,9 @@ RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay
                             (generated if unset). Distinct from --api-key, which
                             is what callers present to a device
-        --public-base <URL> Public base URL of this relay
-                            [default: http://<bind address>]
+        --public-base <URL> Public base URL of this relay. A URL with no port
+                            uses this relay's listen port; name a port only when
+                            a proxy remaps it [default: http://<bind address>]
 {update_opts}    -h, --help              Print help
     -V, --version           Print version
 
@@ -409,11 +410,12 @@ EXAMPLES:
     # Attach to a relay under a stable name
     shell-tunnel --relay https://relay.example.com --enroll-token <t> --device-name box
 
-    # Run a relay with HTTPS, generating a certificate on first run
-    shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com:8443
+    # Run a relay with HTTPS, generating a certificate on first run.
+    # --public-base names the host; the URL uses this relay's port (8443).
+    shell-tunnel relay -H 0.0.0.0 -p 8443 --tls-self-signed --public-base https://relay.example.com
 
-    # Run a relay behind a proxy that forwards port 443 to it
-    shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com
+    # Behind a proxy that forwards 443 here, name the port devices dial
+    shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com:443
 
     # Issue a fine-grained, read-only token
     shell-tunnel -k readonly-key --preset read-only

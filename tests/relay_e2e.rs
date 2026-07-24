@@ -100,7 +100,11 @@ async fn a_device_enrolls_and_is_registered() {
     };
 
     assert!(!device_id.is_empty());
-    assert_eq!(public_url, format!("https://relay.test/d/{device_id}"));
+    // The port-less --public-base inherits this relay's ephemeral listen port.
+    assert_eq!(
+        public_url,
+        format!("https://relay.test:{}/d/{device_id}", addr.port())
+    );
     assert_eq!(state.devices().count(), 1);
     assert_eq!(
         state.devices().get(&device_id).unwrap().label.as_deref(),
@@ -244,7 +248,10 @@ async fn a_named_device_keeps_that_name_as_its_routing_key() {
     };
 
     assert_eq!(device_id, "build-box");
-    assert_eq!(public_url, "https://relay.test/d/build-box");
+    assert_eq!(
+        public_url,
+        format!("https://relay.test:{}/d/build-box", addr.port())
+    );
     assert!(state.devices().get("build-box").is_some());
 }
 

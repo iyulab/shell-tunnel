@@ -108,14 +108,29 @@ impl RelayConfig {
         self
     }
 
+    /// The operator-configured base with this relay's listen port filled in when
+    /// the base named no port.
+    ///
+    /// A base written without a port (`https://relay.example.com`) means the
+    /// scheme default to a browser, but an operator who bound 8443 and named no
+    /// proxy meant *this* relay — so the listen port is the least-surprising
+    /// fill, and every advertised URL then reaches something. An explicit port is
+    /// intent and is left untouched, which is how a reverse proxy on 443 keeps a
+    /// port-less base. `observed` bases are never touched here: they already name
+    /// a reachable authority.
+    pub fn resolved_public_base(&self) -> Option<String> {
+        self.public_base.as_deref().map(|base| {
+            public_base_port_hint(base, self.bind.port()).unwrap_or_else(|| base.to_string())
+        })
+    }
+
     /// The base URL to advertise, preferring what the operator configured.
     ///
     /// `observed` is what the connection itself says this relay is reachable at.
     /// Falling back to the bind address is a last resort — it is right only when
     /// nothing is in front of the relay.
     pub fn public_base_or(&self, observed: Option<String>) -> String {
-        self.public_base
-            .clone()
+        self.resolved_public_base()
             .or(observed)
             .unwrap_or_else(|| format!("http://{}", self.bind))
     }
@@ -863,10 +878,53 @@ mod tests {
 
     #[test]
     fn public_url_uses_the_device_path_prefix() {
-        let config = config().with_public_base("https://relay.example.com/");
+        // Bound to the https default port, so no port is spliced in and the test
+        // stays about the path prefix and the trailing-slash trim.
+        let config = RelayConfig::new("127.0.0.1:443".parse().unwrap(), "secret")
+            .with_public_base("https://relay.example.com/");
         assert_eq!(
             config.public_url_for("dev-1", None),
             "https://relay.example.com/d/dev-1"
+        );
+    }
+
+    #[test]
+    fn a_portless_base_inherits_the_listen_port() {
+        // A안: the operator named the host but not the port and bound 8443 with
+        // no proxy in sight, so every advertised URL uses 8443 — not the 443 a
+        // bare `https://` would otherwise imply and nobody would be serving.
+        let config = RelayConfig::new("0.0.0.0:8443".parse().unwrap(), "secret")
+            .with_public_base("https://labs.example.com");
+        assert_eq!(
+            config.resolved_public_base().as_deref(),
+            Some("https://labs.example.com:8443")
+        );
+        assert_eq!(
+            config.public_url_for("dev-1", None),
+            "https://labs.example.com:8443/d/dev-1"
+        );
+    }
+
+    #[test]
+    fn an_explicit_port_survives_resolution() {
+        // A reverse proxy on 443 forwarding to 8443 keeps a base that names 443;
+        // the stated port is intent and is never rewritten to the listen port.
+        let config = RelayConfig::new("0.0.0.0:8443".parse().unwrap(), "secret")
+            .with_public_base("https://labs.example.com:443");
+        assert_eq!(
+            config.resolved_public_base().as_deref(),
+            Some("https://labs.example.com:443")
+        );
+    }
+
+    #[test]
+    fn resolution_leaves_a_default_port_base_alone() {
+        // Listening on the scheme default means the bare base is already right.
+        let config = RelayConfig::new("0.0.0.0:443".parse().unwrap(), "secret")
+            .with_public_base("https://labs.example.com");
+        assert_eq!(
+            config.resolved_public_base().as_deref(),
+            Some("https://labs.example.com")
         );
     }
 
@@ -890,7 +948,8 @@ mod tests {
 
     #[test]
     fn a_configured_base_wins_over_what_the_connection_observed() {
-        let config = config().with_public_base("https://canonical.example");
+        let config = RelayConfig::new("127.0.0.1:443".parse().unwrap(), "secret")
+            .with_public_base("https://canonical.example");
         assert_eq!(
             config.public_url_for("dev-1", Some("https://whatever.invalid".into())),
             "https://canonical.example/d/dev-1"

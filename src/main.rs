@@ -359,10 +359,12 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>{ca_flag}\n"
     );
 
-    // A base URL without a port implies the scheme default, so a relay
-    // listening elsewhere is handing out URLs that only work if a proxy
-    // forwards that default port here. That setup is legitimate and cannot be
-    // detected, so this warns instead of rewriting what the operator stated.
+    // A port-less --public-base now inherits this relay's listen port (see
+    // RelayConfig::resolved_public_base), so the URLs above already name a port
+    // that something is serving — no restart needed for the common direct-expose
+    // case. The one setup that wanted the port-less form is a proxy forwarding
+    // the scheme default here; that operator names the port explicitly, so tell
+    // them what was assumed rather than leaving it silent.
     if let Some(corrected) = config
         .public_base
         .as_deref()
@@ -373,13 +375,13 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         } else {
             80
         };
-        eprintln!("Note: the public base has no port, so the URLs above imply port {implied},");
-        eprintln!("      but this relay listens on port {}.", bind.port());
         eprintln!(
-            "      Unless a proxy forwards {implied} -> {}, restart with:",
+            "Note: --public-base named no port, so the URLs above use this relay's port {}.",
             bind.port()
         );
-        eprintln!("          --public-base {corrected}");
+        eprintln!(
+            "      Fronted by a proxy on port {implied}? Re-run with that port in --public-base."
+        );
         eprintln!();
     }
 

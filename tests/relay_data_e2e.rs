@@ -420,10 +420,12 @@ async fn the_device_list_reports_attached_devices_with_usable_urls() {
     assert_eq!(devices.len(), 1);
     assert_eq!(devices[0]["id"].as_str(), Some(device_id.as_str()));
     assert_eq!(devices[0]["label"].as_str(), Some("fake-device"));
-    // The point of the endpoint: a URL you can call, not just an id.
+    // The point of the endpoint: a URL you can call, not just an id. The
+    // port-less --public-base inherits this relay's listen port, so the URL
+    // names the port the caller must actually dial.
     assert_eq!(
         devices[0]["public_url"].as_str(),
-        Some(format!("https://relay.test/d/{device_id}").as_str())
+        Some(format!("https://relay.test:{}/d/{device_id}", addr.port()).as_str())
     );
     assert!(devices[0]["last_seen_secs"].is_number());
 }
