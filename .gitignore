@@ -24,3 +24,8 @@ Thumbs.db
 local-docs/
 CLAUDE.md
 tmpclaude-*-cwd
+
+# Local-only dev tracking (not for the public repo)
+claudedocs/
+HANDOFF.md
+ROADMAP.md
