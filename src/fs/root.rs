@@ -86,31 +86,53 @@ impl FsRoot {
 
     /// Resolve a path that must already exist.
     ///
-    /// Canonicalisation is what decides escape: it resolves `..` *and* follows
-    /// symlinks, so a link pointing out of the jail is caught by the same check
-    /// that catches `../`. A substring rule catches neither reliably.
+    /// Containment is decided by canonicalising the deepest part of the path
+    /// that exists, never by the *kind* of error a full canonicalisation
+    /// returned. Branching on the error kind is what leaks: a path whose parent
+    /// is a file fails with ENOTDIR while a path whose parent is absent fails
+    /// with NotFound, so answering differently tells the caller which files
+    /// exist outside the jail. It also mishandles a symlink that points out of
+    /// the root — the link resolves, the target does not exist, and a lexical
+    /// check sees a path that never left.
+    ///
+    /// Walking down instead means every real directory on the way is resolved
+    /// through its symlinks and checked, and the verdict never depends on an
+    /// errno. `resolve_for_create` uses the same discipline.
     pub fn resolve_existing(&self, rel: &str) -> Result<PathBuf, FsError> {
         let parts = Self::components(rel)?;
-        let joined = parts.iter().fold(self.root.clone(), |acc, p| acc.join(p));
 
-        let resolved = match joined.canonicalize() {
-            Ok(resolved) => resolved,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Report NotFound only for a path that would have been inside
-                // the jail; otherwise the distinction leaks what is outside.
-                return match Self::lexical_within(&self.root, &joined) {
-                    true => Err(FsError::NotFound),
-                    false => Err(FsError::Escapes),
-                };
+        let mut base = self.root.clone();
+        let mut missing = false;
+        for part in &parts {
+            let candidate = base.join(part);
+            match candidate.canonicalize() {
+                Ok(resolved) => {
+                    // Checked at every level, so a symlink out of the jail is
+                    // caught the moment it is traversed rather than at the end.
+                    if !resolved.starts_with(&self.root) {
+                        return Err(FsError::Escapes);
+                    }
+                    base = resolved;
+                }
+                Err(_) => {
+                    // Nothing further can be resolved. Whether this is a
+                    // refusal or a plain miss is decided lexically from here,
+                    // identically for every error the OS might have given.
+                    missing = true;
+                    break;
+                }
             }
-            Err(_) => return Err(FsError::NotFound),
-        };
-
-        if resolved.starts_with(&self.root) {
-            Ok(resolved)
-        } else {
-            Err(FsError::Escapes)
         }
+
+        if missing {
+            let joined = parts.iter().fold(self.root.clone(), |acc, p| acc.join(p));
+            return match Self::lexical_within(&self.root, &joined) {
+                true => Err(FsError::NotFound),
+                false => Err(FsError::Escapes),
+            };
+        }
+
+        Ok(base)
     }
 
     /// Resolve a path that does not exist yet (an upload target).
@@ -272,6 +294,50 @@ mod tests {
             root.resolve_existing("app/absent.json"),
             Err(FsError::NotFound)
         );
+    }
+
+    #[test]
+    fn an_escape_looks_the_same_whether_or_not_the_target_exists() {
+        // The oracle this guards against: if a caller can tell "outside and
+        // real" from "outside and absent", the jail reports on the filesystem
+        // beyond it.
+        let (dir, root) = root_with(&["app/config.json"]);
+
+        let present = dir
+            .path()
+            .parent()
+            .expect("parent")
+            .join("st-probe-present.txt");
+        std::fs::write(&present, b"secret").expect("write probe");
+
+        let existing = root.resolve_existing("../st-probe-present.txt");
+        let absent = root.resolve_existing("../st-probe-absent.txt");
+
+        assert_eq!(existing, Err(FsError::Escapes));
+        assert_eq!(absent, Err(FsError::Escapes));
+        assert_eq!(existing, absent, "the refusal must not reveal existence");
+
+        std::fs::remove_file(&present).ok();
+    }
+
+    #[test]
+    fn an_escape_through_an_existing_directory_is_refused() {
+        // Exercises the walk's containment check directly rather than the
+        // lexical fallback: every component here resolves to something that
+        // is really on disk, so the "missing" branch never trips and the
+        // verdict can only come from `!resolved.starts_with(&self.root)`. If
+        // that check were removed, this would resolve successfully to a real
+        // file outside the jail instead of failing.
+        let (dir, root) = root_with(&["app/config.json"]);
+        let sibling = dir.path().parent().expect("parent").join("st-sibling-dir");
+        std::fs::create_dir_all(&sibling).expect("mkdir sibling");
+        std::fs::write(sibling.join("target.txt"), b"secret").expect("write sibling file");
+
+        let result = root.resolve_existing("app/../../st-sibling-dir/target.txt");
+
+        assert_eq!(result, Err(FsError::Escapes));
+
+        std::fs::remove_dir_all(&sibling).ok();
     }
 
     #[test]
