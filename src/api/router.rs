@@ -178,6 +178,7 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .route("/", get(api_info))
         .route("/execute", post(execute_oneshot))
         .route("/ws", any(ws_oneshot_handler))
+        .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
     // Build main router. This "no security" convenience constructor uses the
@@ -228,6 +229,15 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
         (&Method::DELETE, "/api/v1/sessions/{id}") => Capability("session.manage"),
         (&Method::POST, "/api/v1/sessions/{id}/execute") => Capability("exec"),
         (_, "/api/v1/sessions/{id}/ws") => Capability("exec"),
+        (&Method::GET, "/api/v1/fs/list") => Capability("fs.read"),
+        (&Method::GET, "/api/v1/fs/stat") => Capability("fs.read"),
+        (&Method::GET, "/api/v1/fs/file") => Capability("fs.read"),
+        (&Method::DELETE, "/api/v1/fs/file") => Capability("fs.write"),
+        (&Method::POST, "/api/v1/fs/uploads") => Capability("fs.write"),
+        (&Method::GET, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        (&Method::PATCH, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        (&Method::POST, "/api/v1/fs/uploads/{id}/complete") => Capability("fs.write"),
+        (&Method::DELETE, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
         _ => Authenticated,
     }
 }
@@ -416,6 +426,7 @@ pub fn create_secure_router(
         .route("/", get(api_info))
         .route("/execute", post(execute_oneshot))
         .route("/ws", any(ws_oneshot_handler))
+        .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
     let allowed_hosts = security.allowed_hosts.clone();
@@ -616,6 +627,14 @@ async fn shutdown_signal() {
             tracing::info!("Received SIGTERM, initiating graceful shutdown...");
         }
     }
+}
+
+/// Filesystem routes, shared by the plain and the secured router.
+///
+/// Built in one place so the two constructors cannot drift apart — a route
+/// present in only one of them is reachable in only one deployment shape.
+fn fs_routes() -> Router<AppState> {
+    Router::new().route("/stat", get(super::fs::stat))
 }
 
 #[cfg(test)]

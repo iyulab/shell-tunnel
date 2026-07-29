@@ -201,6 +201,30 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
     let state = shell_tunnel::AppState::new().with_audit(audit);
 
+    // A root that exists but is a plain file canonicalises fine and then fails
+    // every resolve afterward with a confusing 404 — caught here instead, at
+    // startup, where an operator will actually see it.
+    let state = if let Some(fs_root) = args.fs_root.as_ref() {
+        if !fs_root.is_dir() {
+            eprintln!(
+                "--fs-root {} cannot be used: not a directory",
+                fs_root.display()
+            );
+            eprintln!("The directory must exist and be readable.");
+            std::process::exit(2);
+        }
+        match shell_tunnel::FsRoot::new(fs_root) {
+            Ok(root) => state.with_fs_root(root),
+            Err(e) => {
+                eprintln!("--fs-root {} cannot be used: {e}", fs_root.display());
+                eprintln!("The directory must exist and be readable.");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        state
+    };
+
     #[cfg(feature = "relay-client")]
     if let Some(relay_url) = args.relay_url.clone() {
         return run_with_relay(server_config, &args, relay_url, exposure, state).await;

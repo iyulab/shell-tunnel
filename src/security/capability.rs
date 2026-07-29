@@ -82,6 +82,21 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 /// Presets are a **non-contract** convenience mapping — they may change freely
 /// and are not part of the frozen wire contract. Returns `None` for an unknown
 /// name so the caller can surface a clear error.
+/// Capability strings the router currently maps routes onto.
+///
+/// Vocabulary, not mechanism — additive by design (see the module header).
+/// `fs.read` and `fs.write` are deliberately absent from every preset: adding
+/// them to `operator` would hand file access to tokens already issued, which is
+/// a privilege change nobody asked for. They are granted only by naming them,
+/// e.g. `--capabilities fs.read,fs.write`.
+pub const KNOWN_CAPABILITIES: &[&str] = &[
+    "exec",
+    "session.read",
+    "session.manage",
+    "fs.read",
+    "fs.write",
+];
+
 pub fn preset(name: &str) -> Option<CapabilitySet> {
     match name {
         "operator" => Some(

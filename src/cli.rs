@@ -60,6 +60,8 @@ pub struct Args {
     pub allow_hosts: Vec<String>,
     /// Append an audit trail of executions and refusals to this file.
     pub audit_log: Option<PathBuf>,
+    /// Directory the filesystem API is confined to. `None` disables the API.
+    pub fs_root: Option<PathBuf>,
     /// Rotate the audit trail once it passes this many bytes.
     pub audit_max_bytes: Option<u64>,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
@@ -106,6 +108,7 @@ impl Default for Args {
             allow_hosts: Vec::new(),
             audit_log: None,
             audit_max_bytes: None,
+            fs_root: None,
             cors_allow_any: false,
             log_level: None,
             version: false,
@@ -233,6 +236,9 @@ where
             Long("cors-allow-any") => {
                 result.cors_allow_any = true;
             }
+            Long("fs-root") => {
+                result.fs_root = Some(parser.value()?.parse()?);
+            }
             Short('l') | Long("log-level") => {
                 result.log_level = Some(parser.value()?.parse()?);
             }
@@ -355,6 +361,7 @@ OPTIONS:
                             Rotate the audit trail to <FILE>.1 past this size
                             [default: unbounded]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
+        --fs-root <PATH>       Enable the file API, confined to this directory
 
 TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
         --tls-self-signed   Serve HTTPS with a self-signed certificate,

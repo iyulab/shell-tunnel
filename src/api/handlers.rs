@@ -23,6 +23,11 @@ pub struct AppState {
     pub executor: Arc<CommandExecutor>,
     /// Where execution events are recorded; disabled unless configured.
     pub audit: Arc<crate::audit::AuditSink>,
+    /// The directory the filesystem API may touch.
+    ///
+    /// `None` means the API is off. Off by default: a gateway that starts
+    /// serving files because it was started is not what an operator asked for.
+    pub fs: Option<Arc<crate::fs::FsRoot>>,
 }
 
 impl AppState {
@@ -33,12 +38,19 @@ impl AppState {
             store,
             executor,
             audit: Arc::new(crate::audit::AuditSink::Disabled),
+            fs: None,
         }
     }
 
     /// Record execution events to `sink`.
     pub fn with_audit(mut self, sink: Arc<crate::audit::AuditSink>) -> Self {
         self.audit = sink;
+        self
+    }
+
+    /// Enable the filesystem API, confined to `root`.
+    pub fn with_fs_root(mut self, root: crate::fs::FsRoot) -> Self {
+        self.fs = Some(Arc::new(root));
         self
     }
 }
