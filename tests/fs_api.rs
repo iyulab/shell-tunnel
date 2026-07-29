@@ -2,6 +2,7 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use shell_tunnel::api::fs::MAX_LIST_LIMIT;
 use shell_tunnel::api::handlers::AppState;
 use shell_tunnel::api::router::create_router_with_state;
 use shell_tunnel::FsRoot;
@@ -287,7 +288,14 @@ async fn list_hashes_only_when_asked() {
         .await
         .expect("response");
     let json = body_json(plain).await;
-    assert!(json["entries"][0]["sha256"].is_null());
+    // Not just `.is_null()`: `Value`'s `Index` returns `Value::Null` for a
+    // missing key too, so that assertion would stay green even if the
+    // `skip_serializing_if` on `FsEntry::sha256` were deleted. The key must be
+    // genuinely absent (see `stat_reports_a_file`'s identical check).
+    assert!(!json["entries"][0]
+        .as_object()
+        .expect("object")
+        .contains_key("sha256"));
 
     let hashed = create_router_with_state(state)
         .oneshot(
@@ -304,6 +312,71 @@ async fn list_hashes_only_when_asked() {
         json["entries"][0]["sha256"],
         "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
     );
+}
+
+/// Create a symlink for a test, tolerating the privilege some Windows
+/// accounts and CI runners lack (`SeCreateSymbolicLinkPrivilege`). Mirrors the
+/// helper of the same name in `src/fs/root.rs`'s test module — duplicated
+/// rather than exported, since it exists only so a test here can skip
+/// cleanly when the runner cannot create one.
+fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_file(target, link).is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
+#[tokio::test]
+async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
+    // `stat` already refuses a path outside the root (403 path-escapes-root).
+    // `list`'s hashing must refuse the same *content* even when the path it
+    // is asked to hash never left the root lexically — a symlink inside the
+    // tree pointing outward is exactly that case, and `walk`'s `relative()`
+    // check cannot catch it: it is a lexical strip_prefix, not a
+    // canonicalising one.
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+
+    let outside_dir = tempfile::tempdir().expect("outside tempdir");
+    let secret = outside_dir.path().join("secret.txt");
+    std::fs::write(&secret, b"outside-secret").expect("write outside file");
+
+    let root = state.fs.as_ref().expect("fs root enabled");
+    let link = root.path().join("app").join("linked.txt");
+    if !try_symlink(&secret, &link) {
+        return; // symlink privilege unavailable on this runner; skip
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&recursive=true&hash=sha256")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let json = body_json(response).await;
+    let entries = json["entries"].as_array().expect("entries");
+    let linked = entries
+        .iter()
+        .find(|e| e["path"] == "app/linked.txt")
+        .expect("the symlink is still listed — only its hash is refused");
+
+    // Never the outside file's digest, and in fact never any digest at all:
+    // `resolve_existing` on this same relative path finds it resolves outside
+    // the root and refuses it, exactly as `stat` would.
+    assert!(linked["sha256"].is_null());
 }
 
 #[tokio::test]
@@ -352,10 +425,20 @@ async fn list_paginates_and_the_cursor_covers_everything_once() {
 
 #[tokio::test]
 async fn list_caps_the_limit() {
-    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    // A one-file fixture cannot distinguish "clamped to MAX_LIST_LIMIT" from
+    // "limit ignored entirely" or "unpaginated" — all three return the same
+    // single entry. Proving the ceiling is real needs a fixture bigger than
+    // it.
+    let files: Vec<(String, Vec<u8>)> = (0..=MAX_LIST_LIMIT)
+        .map(|i| (format!("app/f{i:05}.txt"), vec![b'x']))
+        .collect();
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_slice()))
+        .collect();
+    let (_dir, state) = state_with_files(&borrowed);
 
-    let response = app
+    let response = create_router_with_state(state.clone())
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/list?path=app&limit=999999")
@@ -365,8 +448,100 @@ async fn list_caps_the_limit() {
         .await
         .expect("response");
 
-    // Clamped, not refused: a caller asking for too much gets the maximum.
+    // Clamped, not refused: a caller asking for too much gets the ceiling,
+    // not an error and not the unbounded whole tree.
     assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    let entries = json["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), MAX_LIST_LIMIT);
+    assert!(
+        !json["next_cursor"].is_null(),
+        "MAX_LIST_LIMIT+1 files exist; a real cap must leave one for the next page"
+    );
+
+    // The lower bound is enforced too: `limit=0` must not mean "empty page".
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&limit=0")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let json = body_json(response).await;
+    let entries = json["entries"].as_array().expect("entries");
+    assert_eq!(
+        entries.len(),
+        1,
+        "limit=0 is clamped up to 1, not down to 0"
+    );
+}
+
+#[tokio::test]
+async fn list_cursor_survives_a_plus_in_the_filename_at_a_page_boundary() {
+    // Regression: axum's `Query` extractor decodes form-urlencoded input,
+    // where `+` means a space, and `+` is a legal, ordinary filename
+    // character (`libstdc++`). A cursor built from the raw path would come
+    // back decoded to a different (lexically smaller) string than the one
+    // that produced it, so the same page would repeat forever. Bounded at 10
+    // iterations rather than truly unbounded, so a regression fails loudly
+    // instead of hanging the suite.
+    let (_dir, state) = state_with_files(&[
+        ("app/a.txt", b"a"),
+        ("app/data+1.csv", b"b"),
+        ("app/z.txt", b"z"),
+    ]);
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..10 {
+        assert!(page < 9, "cursor did not terminate after 10 pages");
+
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/fs/list?path=app&limit=2&cursor={c}"),
+            None => "/api/v1/fs/list?path=app&limit=2".to_string(),
+        };
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let json = body_json(response).await;
+        for entry in json["entries"].as_array().expect("entries") {
+            seen.push(entry["path"].as_str().expect("path").to_string());
+        }
+        match json["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen, vec!["app/a.txt", "app/data+1.csv", "app/z.txt"]);
+}
+
+#[tokio::test]
+async fn list_refuses_a_bad_cursor() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&cursor=not-a-real-cursor")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "bad-cursor");
 }
 
 #[tokio::test]
@@ -410,6 +585,10 @@ async fn list_hides_the_upload_staging_directory() {
         .iter()
         .map(|e| e["path"].as_str().expect("path").to_string())
         .collect();
+    // Not vacuously true on an empty list: prove the listing actually ran
+    // (`walk` did not simply skip everything) before trusting the negative
+    // assertion below.
+    assert!(paths.contains(&"app/a.txt".to_string()));
     assert!(paths
         .iter()
         .all(|p| !p.starts_with(".shell-tunnel-uploads")));

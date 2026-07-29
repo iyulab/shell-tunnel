@@ -161,6 +161,25 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         return fs_not_enabled();
     };
 
+    // Resolving `path`, walking the tree, and hashing whole files are all
+    // blocking I/O. Same convention as `execution::executor::execute`
+    // (`src/execution/executor.rs:209-215`): run it on `spawn_blocking` so a
+    // large tree, a slow filesystem, or — absent the `is_file()` guard below
+    // — a FIFO can never starve the tokio worker pool that also runs
+    // `/health` and the accept loop.
+    match tokio::task::spawn_blocking(move || list_blocking(&root, &query)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "list-failed",
+            "listing the directory failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `list`. Blocking throughout — see `list`, which
+/// runs this via `spawn_blocking` rather than directly on the async runtime.
+fn list_blocking(root: &FsRoot, query: &ListQuery) -> Response {
     let base = match root.resolve_existing(&query.path) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
@@ -185,7 +204,7 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
     let want_hash = query.hash.as_deref() == Some("sha256");
 
     let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
-    if let Err(WalkError::Unreadable) = walk(&root, &base, query.recursive, &mut collected) {
+    if let Err(WalkError::Unreadable) = walk(root, &base, query.recursive, &mut collected) {
         return error_response(StatusCode::FORBIDDEN, "unreadable", "directory unreadable");
     }
     collected.sort_by(|a, b| a.0.cmp(&b.0));
@@ -193,22 +212,46 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
     // Strictly greater than the cursor, so the page boundary cannot repeat an
     // entry or skip one.
     let start = match query.cursor.as_deref() {
-        Some(cursor) => collected.partition_point(|(path, _, _)| path.as_str() <= cursor),
+        Some(token) => match decode_cursor(token) {
+            Some(cursor) => {
+                collected.partition_point(|(path, _, _)| path.as_str() <= cursor.as_str())
+            }
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "bad-cursor",
+                    "cursor is not a value this endpoint produced",
+                )
+            }
+        },
         None => 0,
     };
 
     let end = (start + limit).min(collected.len());
-    let next_cursor = (end < collected.len()).then(|| collected[end - 1].0.clone());
+    let next_cursor = (end < collected.len()).then(|| encode_cursor(&collected[end - 1].0));
 
     let mut entries = Vec::with_capacity(end.saturating_sub(start));
-    for (_, absolute, meta) in &collected[start..end] {
+    for (relative, absolute, meta) in &collected[start..end] {
         // Hashing is per page, never per tree: a recursive hashed walk of a
         // large root would otherwise outrun the relay's 120s request timeout.
         let sha256 = match want_hash && !meta.is_dir() {
-            true => crate::fs::sha256::hash_file(absolute).ok(),
+            // `walk` produced this path from a directory scan, so it has never
+            // been through the jail — `relative()` is a lexical strip_prefix and
+            // `DirEntry::metadata` is lstat, so a symlink looks in-root while
+            // `File::open` would follow it out. Re-resolve, and hash only what
+            // the jail hands back.
+            true => match root.resolve_existing(relative) {
+                Ok(canonical) => match std::fs::metadata(&canonical) {
+                    // A FIFO or character device never reaches EOF, so hashing
+                    // one blocks forever. Only regular files are hashable.
+                    Ok(target) if target.is_file() => crate::fs::sha256::hash_file(&canonical).ok(),
+                    _ => None,
+                },
+                Err(_) => None,
+            },
             false => None,
         };
-        entries.push(entry_for(&root, absolute, meta, sha256));
+        entries.push(entry_for(root, absolute, meta, sha256));
     }
 
     Json(ListResponse {
@@ -216,6 +259,40 @@ pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>)
         next_cursor,
     })
     .into_response()
+}
+
+/// Encode a relative path as an opaque cursor.
+///
+/// Not for confidentiality — hex has no special characters, and that is the
+/// point: axum's `Query` decodes form-urlencoded input, where `+` means a
+/// space, and `+` is a legal, ordinary filename character (`libstdc++`). A
+/// cursor built from the raw path would decode back to a different string
+/// than the one that produced it, sort earlier than the real entry, and
+/// repeat the same page forever. Hex removes the ambiguity instead of
+/// chasing every character `Query` might reinterpret.
+fn encode_cursor(path: &str) -> String {
+    let mut out = String::with_capacity(path.len() * 2);
+    for byte in path.as_bytes() {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+/// Decode a cursor produced by `encode_cursor`. `None` for anything else —
+/// including a raw path a caller might paste in by hand — so a malformed
+/// cursor is refused with 400 `bad-cursor` rather than silently resetting to
+/// page one.
+fn decode_cursor(token: &str) -> Option<String> {
+    if token.is_empty() || token.len() % 2 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(token.len() / 2);
+    for pair in token.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        bytes.push((hi * 16 + lo) as u8);
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The one fatal outcome `walk` can report.
@@ -231,8 +308,13 @@ enum WalkError {
 
 /// Collect entries under `base`, skipping the upload staging directory.
 ///
-/// Errors on individual entries are skipped rather than fatal: one unreadable
-/// file should not make an otherwise good listing fail.
+/// Only `base` itself being unreadable is fatal, and only to the caller of
+/// this exact invocation — `list`'s top-level call turns that into a 403.
+/// Below that, nothing is fatal: an entry whose metadata cannot be read is
+/// skipped, and so is a nested subdirectory that fails to open. A
+/// permission-restricted subdirectory is ordinary in a real deployment tree;
+/// one bad subtree, however deep, must not discard everything already
+/// collected from the rest of the walk.
 fn walk(
     root: &FsRoot,
     base: &std::path::Path,
@@ -255,7 +337,9 @@ fn walk(
         let is_dir = meta.is_dir();
         out.push((relative, absolute.clone(), meta));
         if recursive && is_dir {
-            walk(root, &absolute, true, out)?;
+            // Discarded, not propagated with `?`: only the top-level `base`
+            // being unreadable is fatal (see the doc comment above).
+            let _ = walk(root, &absolute, true, out);
         }
     }
     Ok(())
@@ -282,4 +366,71 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>)
     let _ = platform::file_identity(&meta);
 
     Json(entry_for(&root, &resolved, &meta, None)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    // Scoped to unix: the only test in this module needs it, and an
+    // unconditional `use super::*` would be an unused-import warning on a
+    // platform where that test doesn't compile at all.
+    #[cfg(unix)]
+    use super::*;
+
+    /// Regression for the bug where a nested `read_dir` failure propagated
+    /// with `?` all the way out of `walk`, discarding every entry the walk
+    /// had already collected. Only the top-level directory being unreadable
+    /// should be fatal; a permission-restricted subdirectory further down is
+    /// ordinary in a real deployment tree.
+    ///
+    /// `#[cfg(unix)]` because removing read permission from a directory has
+    /// no direct `std::fs` equivalent on Windows (ACLs, not a mode bit) —
+    /// same constraint the existing `a_symlink_out_of_the_root_is_refused`
+    /// test in `src/fs/root.rs` already accepts.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_nested_subdirectory_does_not_abort_the_whole_walk() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("app/locked")).expect("mkdir locked");
+        std::fs::write(dir.path().join("app/locked/secret.txt"), b"x").expect("write secret");
+        std::fs::write(dir.path().join("app/visible.txt"), b"y").expect("write visible");
+        std::fs::write(dir.path().join("app/zzz.txt"), b"z").expect("write zzz");
+
+        let root = FsRoot::new(dir.path()).expect("root");
+        let locked = dir.path().join("app/locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod locked");
+
+        // A privileged account (root, or a runner that ignores the mode bit)
+        // can still read a "locked" directory — nothing to verify then.
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+            return;
+        }
+
+        let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
+        let result = walk(&root, &dir.path().join("app"), true, &mut collected);
+
+        // Restore permissions before any assertion can panic and leak a
+        // directory the temp-dir cleanup would otherwise be unable to remove.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+            .expect("restore permissions");
+
+        assert!(
+            result.is_ok(),
+            "an unreadable nested subdirectory must not fail the whole walk"
+        );
+        let paths: Vec<&str> = collected.iter().map(|(p, _, _)| p.as_str()).collect();
+        assert!(paths.contains(&"app/visible.txt"));
+        assert!(paths.contains(&"app/zzz.txt"));
+        assert!(
+            paths.contains(&"app/locked"),
+            "the locked directory itself is still listed — only its contents are unreachable"
+        );
+        assert!(
+            !paths.iter().any(|p| p.starts_with("app/locked/")),
+            "contents of the unreadable subdirectory are simply absent, not fatal"
+        );
+    }
 }
