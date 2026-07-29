@@ -4,7 +4,6 @@
 //! The handlers hold no path logic of their own — that separation is what makes
 //! the jail auditable by reading one file.
 
-use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 
 use axum::extract::{Query, State};
@@ -74,19 +73,19 @@ pub fn fs_error_response(error: FsError) -> Response {
     }
 }
 
-/// The configured root, or the refusal to send when the API is off.
+/// The refusal sent when no `--fs-root` was configured.
 ///
-/// The refusal is boxed: every fs handler calls this first, so `Response`
-/// (much larger than the `Arc<FsRoot>` success case) would otherwise size the
-/// `Result` itself to its worst case on every call.
-pub fn require_root(state: &AppState) -> Result<Arc<FsRoot>, Box<Response>> {
-    state.fs.clone().ok_or_else(|| {
-        Box::new(error_response(
-            StatusCode::FORBIDDEN,
-            "fs-not-enabled",
-            "the filesystem API is disabled; start with --fs-root <path> to enable it",
-        ))
-    })
+/// A function rather than a `Result`-returning guard: handlers return `Response`
+/// directly, so `?` never applies and a `Result` buys nothing — it only makes
+/// the error variant large enough to trip `clippy::result_large_err`, which
+/// invites boxing a problem that need not exist. Callers pair this with
+/// `let Some(root) = state.fs.clone() else { return fs_not_enabled(); }`.
+pub fn fs_not_enabled() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "fs-not-enabled",
+        "the filesystem API is disabled; start with --fs-root <path> to enable it",
+    )
 }
 
 /// Milliseconds since the Unix epoch, or zero when the clock says otherwise.
@@ -116,9 +115,8 @@ pub fn entry_for(
 
 /// `GET /api/v1/fs/stat` — one entry, file or directory.
 pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
-    let root = match require_root(&state) {
-        Ok(root) => root,
-        Err(response) => return *response,
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
     };
 
     let resolved = match root.resolve_existing(&query.path) {
