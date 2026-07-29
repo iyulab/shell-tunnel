@@ -77,11 +77,6 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
     }
 }
 
-/// Resolve a role **preset** name to its capability set (spec §6).
-///
-/// Presets are a **non-contract** convenience mapping — they may change freely
-/// and are not part of the frozen wire contract. Returns `None` for an unknown
-/// name so the caller can surface a clear error.
 /// Capability strings the router currently maps routes onto.
 ///
 /// Vocabulary, not mechanism — additive by design (see the module header).
@@ -97,6 +92,11 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "fs.write",
 ];
 
+/// Resolve a role **preset** name to its capability set (spec §6).
+///
+/// Presets are a **non-contract** convenience mapping — they may change freely
+/// and are not part of the frozen wire contract. Returns `None` for an unknown
+/// name so the caller can surface a clear error.
 pub fn preset(name: &str) -> Option<CapabilitySet> {
     match name {
         "operator" => Some(
