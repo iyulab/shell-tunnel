@@ -115,6 +115,20 @@ impl FsRoot {
                     base = resolved;
                 }
                 Err(_) => {
+                    // A name that exists as a symlink but will not canonicalise
+                    // is a dangling link, and where it points cannot be checked
+                    // — `canonicalize` fails outright on one, revealing neither
+                    // that a link was involved nor its target. Refuse it.
+                    //
+                    // Uniformly `Escapes`, never a split on where the target
+                    // would have been: deciding that lexically would answer
+                    // differently for a link pointing inside than for one
+                    // pointing outside, which is the existence oracle again by
+                    // another route. Over-refusing a broken link inside the
+                    // jail is the cheap side of that trade.
+                    if candidate.symlink_metadata().is_ok() {
+                        return Err(FsError::Escapes);
+                    }
                     // Nothing further can be resolved. Whether this is a
                     // refusal or a plain miss is decided lexically from here,
                     // identically for every error the OS might have given.
@@ -160,6 +174,13 @@ impl FsRoot {
                     base = resolved;
                 }
                 Err(_) => {
+                    // Same dangling-symlink refusal as `resolve_existing`, and
+                    // load-bearing here rather than merely tidy: handing back a
+                    // path whose last existing component is a link pointing out
+                    // of the jail means whatever writes to it writes outside.
+                    if candidate.symlink_metadata().is_ok() {
+                        return Err(FsError::Escapes);
+                    }
                     tail = parts[index..].to_vec();
                     break;
                 }
@@ -228,6 +249,53 @@ mod tests {
         }
         let root = FsRoot::new(dir.path()).expect("root");
         (dir, root)
+    }
+
+    /// Like `root_with`, but for a test that also needs to place something
+    /// *outside* the jail (a probe file, a sibling directory, a symlink
+    /// target).
+    ///
+    /// The jail root is a subdirectory of the returned `TempDir` rather than
+    /// the `TempDir` itself, so anything a test writes as a sibling of the
+    /// root is still inside the fixture that auto-cleans on drop. Without
+    /// this, a test that panics before a manual cleanup line runs — which is
+    /// exactly what these tests are designed to do when `FsRoot` regresses —
+    /// leaks a file into the shared OS temp directory permanently.
+    fn root_with_outside(files: &[&str]) -> (tempfile::TempDir, FsRoot) {
+        let outer = tempfile::tempdir().expect("tempdir");
+        let root_dir = outer.path().join("root");
+        for file in files {
+            let path = root_dir.join(file);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir");
+            }
+            std::fs::write(&path, b"x").expect("write");
+        }
+        let root = FsRoot::new(&root_dir).expect("root");
+        (outer, root)
+    }
+
+    /// Create a symlink for a test, tolerating the privilege some Windows
+    /// accounts and CI runners lack (`SeCreateSymbolicLinkPrivilege`).
+    ///
+    /// Returns whether the link was created. A caller uses this to skip the
+    /// test body early rather than let a missing privilege turn into a
+    /// failing suite — the check under test is about path containment, not
+    /// about the environment's symlink permissions.
+    fn try_symlink(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            false
+        }
     }
 
     #[test]
@@ -301,13 +369,9 @@ mod tests {
         // The oracle this guards against: if a caller can tell "outside and
         // real" from "outside and absent", the jail reports on the filesystem
         // beyond it.
-        let (dir, root) = root_with(&["app/config.json"]);
+        let (outer, root) = root_with_outside(&["app/config.json"]);
 
-        let present = dir
-            .path()
-            .parent()
-            .expect("parent")
-            .join("st-probe-present.txt");
+        let present = outer.path().join("st-probe-present.txt");
         std::fs::write(&present, b"secret").expect("write probe");
 
         let existing = root.resolve_existing("../st-probe-present.txt");
@@ -316,8 +380,6 @@ mod tests {
         assert_eq!(existing, Err(FsError::Escapes));
         assert_eq!(absent, Err(FsError::Escapes));
         assert_eq!(existing, absent, "the refusal must not reveal existence");
-
-        std::fs::remove_file(&present).ok();
     }
 
     #[test]
@@ -328,16 +390,53 @@ mod tests {
         // verdict can only come from `!resolved.starts_with(&self.root)`. If
         // that check were removed, this would resolve successfully to a real
         // file outside the jail instead of failing.
-        let (dir, root) = root_with(&["app/config.json"]);
-        let sibling = dir.path().parent().expect("parent").join("st-sibling-dir");
+        let (outer, root) = root_with_outside(&["app/config.json"]);
+        let sibling = outer.path().join("st-sibling-dir");
         std::fs::create_dir_all(&sibling).expect("mkdir sibling");
         std::fs::write(sibling.join("target.txt"), b"secret").expect("write sibling file");
 
         let result = root.resolve_existing("app/../../st-sibling-dir/target.txt");
 
         assert_eq!(result, Err(FsError::Escapes));
+    }
 
-        std::fs::remove_dir_all(&sibling).ok();
+    #[test]
+    fn a_dangling_symlink_pointing_outside_the_root_is_refused_by_resolve_existing() {
+        // `canonicalize` fails outright on a dangling link, handing back
+        // nothing to decide containment from — the exact gap that let a
+        // dangling link into a missing outside target through as `NotFound`
+        // instead of `Escapes`.
+        let (outer, root) = root_with_outside(&["app/config.json"]);
+        let link = root.path().join("dangle-existing");
+        let missing_target = outer.path().join("st-dangling-target.txt"); // never created
+
+        if !try_symlink(&missing_target, &link) {
+            return; // symlink privilege unavailable on this runner; skip
+        }
+
+        assert_eq!(
+            root.resolve_existing("dangle-existing"),
+            Err(FsError::Escapes)
+        );
+    }
+
+    #[test]
+    fn a_dangling_symlink_pointing_outside_the_root_is_refused_by_resolve_for_create() {
+        // Load-bearing rather than merely tidy: `resolve_for_create` feeds
+        // upload destinations, so handing back a path through this link would
+        // mean the write itself lands outside the root.
+        let (outer, root) = root_with_outside(&["app/config.json"]);
+        let link = root.path().join("dangle-create");
+        let missing_target = outer.path().join("st-dangling-target-2.txt"); // never created
+
+        if !try_symlink(&missing_target, &link) {
+            return; // symlink privilege unavailable on this runner; skip
+        }
+
+        assert_eq!(
+            root.resolve_for_create("dangle-create/new.bin"),
+            Err(FsError::Escapes)
+        );
     }
 
     #[test]
