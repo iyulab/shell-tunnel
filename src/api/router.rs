@@ -634,7 +634,9 @@ async fn shutdown_signal() {
 /// Built in one place so the two constructors cannot drift apart — a route
 /// present in only one of them is reachable in only one deployment shape.
 fn fs_routes() -> Router<AppState> {
-    Router::new().route("/stat", get(super::fs::stat))
+    Router::new()
+        .route("/list", get(super::fs::list))
+        .route("/stat", get(super::fs::stat))
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@
 
 pub mod platform;
 pub mod root;
+pub mod sha256;
 
 pub use root::{FsError, FsRoot};
 

@@ -99,6 +99,22 @@ impl FsRoot {
     /// through its symlinks and checked, and the verdict never depends on an
     /// errno. `resolve_for_create` uses the same discipline.
     pub fn resolve_existing(&self, rel: &str) -> Result<PathBuf, FsError> {
+        // `.` names the root itself. Addressing the root is part of the jail's
+        // addressing scheme, so it is answered here rather than special-cased by
+        // each handler that needs it — `list` needs it first, but it is not the
+        // only caller that ever will.
+        //
+        // `""` deliberately stays an error: an API where an omitted or empty
+        // parameter silently means "the entire tree" is a footgun. Naming the
+        // root should be explicit.
+        //
+        // Only the bare `.` needs this. `./app` and `app/.` already work —
+        // `components` strips `.` as a no-op, leaving a non-empty path.
+        if rel == "." {
+            // Already canonicalised in `new`, so containment holds trivially.
+            return Ok(self.root.clone());
+        }
+
         let parts = Self::components(rel)?;
 
         let mut base = self.root.clone();
@@ -362,6 +378,24 @@ mod tests {
             root.resolve_existing("app/absent.json"),
             Err(FsError::NotFound)
         );
+    }
+
+    #[test]
+    fn a_single_dot_names_the_root_itself() {
+        // `list` needs to enumerate the root; without this there is no way to
+        // name it at all.
+        let (_dir, root) = root_with(&["app/config.json"]);
+        assert_eq!(root.resolve_existing("."), Ok(root.path().to_path_buf()));
+
+        // An empty path stays an error: "the whole tree" must be asked for
+        // explicitly, never by omission.
+        assert!(matches!(
+            root.resolve_existing(""),
+            Err(FsError::Malformed(_))
+        ));
+
+        // The root is not a creatable target.
+        assert!(root.resolve_for_create(".").is_err());
     }
 
     #[test]

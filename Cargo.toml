@@ -35,6 +35,12 @@ portable-pty = "0.9"
 # has already shipped as a predictable-credential bug.
 getrandom = "0.3"
 
+# SHA-256 for transfer integrity. `ring` is only present under the tls/relay
+# features, so the default build has no hash available — and hand-rolling one
+# means owning 150 lines of bit twiddling forever. Same call as `getrandom`:
+# a single small crate, taken deliberately.
+sha2 = "0.10"
+
 # Error handling
 thiserror = "2.0"
 

@@ -192,6 +192,229 @@ async fn stat_allows_a_token_holding_fs_read() {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+#[tokio::test]
+async fn list_forbids_a_token_lacking_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_get("/api/v1/fs/list?path=app", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn list_allows_a_token_holding_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_get("/api/v1/fs/list?path=app", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn list_reports_entries_sorted_by_path() {
+    let (_dir, state) = state_with_files(&[
+        ("app/b.txt", b"bb"),
+        ("app/a.txt", b"a"),
+        ("top.txt", b"ttt"),
+    ]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    let entries = json["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0]["path"], "app/a.txt");
+    assert_eq!(entries[1]["path"], "app/b.txt");
+    assert!(json["next_cursor"].is_null());
+}
+
+#[tokio::test]
+async fn list_recurses_when_asked() {
+    let (_dir, state) = state_with_files(&[("app/nested/deep.txt", b"d"), ("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let json = body_json(response).await;
+    let paths: Vec<String> = json["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["path"].as_str().expect("path").to_string())
+        .collect();
+    assert!(paths.contains(&"app/a.txt".to_string()));
+    assert!(paths.contains(&"app/nested/deep.txt".to_string()));
+}
+
+#[tokio::test]
+async fn list_hashes_only_when_asked() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"abc")]);
+    let app = create_router_with_state(state.clone());
+
+    let plain = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let json = body_json(plain).await;
+    assert!(json["entries"][0]["sha256"].is_null());
+
+    let hashed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&hash=sha256")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let json = body_json(hashed).await;
+    // SHA-256 of "abc" — the canonical NIST vector.
+    assert_eq!(
+        json["entries"][0]["sha256"],
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+}
+
+#[tokio::test]
+async fn list_paginates_and_the_cursor_covers_everything_once() {
+    let files: Vec<(String, Vec<u8>)> = (0..25)
+        .map(|i| (format!("app/f{i:03}.txt"), vec![b'x']))
+        .collect();
+    let borrowed: Vec<(&str, &[u8])> = files
+        .iter()
+        .map(|(name, body)| (name.as_str(), body.as_slice()))
+        .collect();
+    let (_dir, state) = state_with_files(&borrowed);
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/fs/list?path=app&limit=10&cursor={c}"),
+            None => "/api/v1/fs/list?path=app&limit=10".to_string(),
+        };
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let json = body_json(response).await;
+        for entry in json["entries"].as_array().expect("entries") {
+            seen.push(entry["path"].as_str().expect("path").to_string());
+        }
+        match json["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), 25, "every entry returned exactly once");
+    let mut unique = seen.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), 25, "no duplicates across pages");
+}
+
+#[tokio::test]
+async fn list_caps_the_limit() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app&limit=999999")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Clamped, not refused: a caller asking for too much gets the maximum.
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn list_refuses_a_file_path() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=app/a.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn list_hides_the_upload_staging_directory() {
+    let (_dir, state) =
+        state_with_files(&[("app/a.txt", b"a"), (".shell-tunnel-uploads/x.part", b"p")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/list?path=.&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let json = body_json(response).await;
+    let paths: Vec<String> = json["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["path"].as_str().expect("path").to_string())
+        .collect();
+    assert!(paths
+        .iter()
+        .all(|p| !p.starts_with(".shell-tunnel-uploads")));
+}
+
 /// Guards the fail-closed trap in `required_capability`: an unmapped route
 /// silently falls back to `Authenticated`, which would open every fs route to
 /// any valid token. The compiler cannot catch it, so this does.

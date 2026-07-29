@@ -113,6 +113,154 @@ pub fn entry_for(
     }
 }
 
+/// Default page size for `list`.
+///
+/// The relay buffers whole bodies with an 8 MiB ceiling (`relay::MAX_BODY`), so
+/// an unpaginated listing of a real deployment tree would 413 — on exactly the
+/// tree sizes this endpoint exists to serve.
+pub const DEFAULT_LIST_LIMIT: usize = 1_000;
+
+/// Largest page a caller may ask for. Requests above it are clamped, not refused.
+pub const MAX_LIST_LIMIT: usize = 10_000;
+
+/// Where in-flight uploads are staged. Never reported by `list`.
+pub use crate::fs::UPLOAD_DIR;
+
+/// Query parameters for `list`.
+#[derive(Debug, Deserialize)]
+pub struct ListQuery {
+    pub path: String,
+    #[serde(default)]
+    pub recursive: bool,
+    /// Only `sha256` is understood; anything else is ignored.
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Resume point: the last path returned by the previous page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One page of entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListResponse {
+    pub entries: Vec<FsEntry>,
+    /// Pass back as `cursor` to continue. `None` means this was the last page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+/// `GET /api/v1/fs/list` — one page of a directory's contents.
+///
+/// The cursor is the last path returned, not an offset: entries are ordered by
+/// path, so a file added or removed mid-walk shifts offsets but never
+/// invalidates a path.
+pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
+    };
+
+    let base = match root.resolve_existing(&query.path) {
+        Ok(path) => path,
+        Err(error) => return fs_error_response(error),
+    };
+
+    match std::fs::metadata(&base) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "not-a-directory",
+                "path is a file; use /api/v1/fs/stat for a single entry",
+            )
+        }
+        Err(_) => return fs_error_response(FsError::NotFound),
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
+    let want_hash = query.hash.as_deref() == Some("sha256");
+
+    let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
+    if let Err(WalkError::Unreadable) = walk(&root, &base, query.recursive, &mut collected) {
+        return error_response(StatusCode::FORBIDDEN, "unreadable", "directory unreadable");
+    }
+    collected.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Strictly greater than the cursor, so the page boundary cannot repeat an
+    // entry or skip one.
+    let start = match query.cursor.as_deref() {
+        Some(cursor) => collected.partition_point(|(path, _, _)| path.as_str() <= cursor),
+        None => 0,
+    };
+
+    let end = (start + limit).min(collected.len());
+    let next_cursor = (end < collected.len()).then(|| collected[end - 1].0.clone());
+
+    let mut entries = Vec::with_capacity(end.saturating_sub(start));
+    for (_, absolute, meta) in &collected[start..end] {
+        // Hashing is per page, never per tree: a recursive hashed walk of a
+        // large root would otherwise outrun the relay's 120s request timeout.
+        let sha256 = match want_hash && !meta.is_dir() {
+            true => crate::fs::sha256::hash_file(absolute).ok(),
+            false => None,
+        };
+        entries.push(entry_for(&root, absolute, meta, sha256));
+    }
+
+    Json(ListResponse {
+        entries,
+        next_cursor,
+    })
+    .into_response()
+}
+
+/// The one fatal outcome `walk` can report.
+///
+/// A dedicated enum rather than `Result<(), Response>`: the latter trips
+/// `clippy::result_large_err` (a `Response` is well over the 128-byte
+/// threshold) for exactly the reason `fs_not_enabled`'s doc comment already
+/// explains — the caller builds the actual `Response` once it knows which
+/// refusal applies.
+enum WalkError {
+    Unreadable,
+}
+
+/// Collect entries under `base`, skipping the upload staging directory.
+///
+/// Errors on individual entries are skipped rather than fatal: one unreadable
+/// file should not make an otherwise good listing fail.
+fn walk(
+    root: &FsRoot,
+    base: &std::path::Path,
+    recursive: bool,
+    out: &mut Vec<(String, std::path::PathBuf, std::fs::Metadata)>,
+) -> Result<(), WalkError> {
+    let read = std::fs::read_dir(base).map_err(|_| WalkError::Unreadable)?;
+
+    for entry in read.flatten() {
+        let absolute = entry.path();
+        let Some(relative) = root.relative(&absolute) else {
+            continue;
+        };
+        if relative == UPLOAD_DIR || relative.starts_with(&format!("{UPLOAD_DIR}/")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let is_dir = meta.is_dir();
+        out.push((relative, absolute.clone(), meta));
+        if recursive && is_dir {
+            walk(root, &absolute, true, out)?;
+        }
+    }
+    Ok(())
+}
+
 /// `GET /api/v1/fs/stat` — one entry, file or directory.
 pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let Some(root) = state.fs.clone() else {
