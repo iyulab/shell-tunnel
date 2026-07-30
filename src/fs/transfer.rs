@@ -340,11 +340,15 @@ impl UploadStore {
     /// insert, `take_for_complete`'s or `sweep`'s remove), `std::sync::RwLock`
     /// poisons permanently — every later `.read()` and `.write()` on it,
     /// including this method's and `sweep`'s own, then fails identically and
-    /// forever, not "eventually swept once the panic clears." No write-lock
-    /// section in this file does disk I/O or anything else that panics today
-    /// (each is a plain insert/remove), so this is unreachable rather than a
-    /// live gap — worth stating outright rather than leaving "the lock could
-    /// get poisoned" to imply a transient condition sweeping would clear.
+    /// forever, not "eventually swept once the panic clears." Unreachable
+    /// today, specifically because every write-lock section in this file is a
+    /// plain `HashMap` insert or remove with no disk I/O and nothing else
+    /// that can panic — not because poisoning itself is impossible. That is
+    /// the condition this note depends on, not a permanent property of the
+    /// type: if a future change adds a fallible operation (a write, a
+    /// panicking conversion, anything that can unwind) inside one of those
+    /// three write-lock sections, this analysis no longer holds and the
+    /// unreachability claim needs re-checking against whatever was added.
     pub fn append(&self, id: &str, offset: u64, bytes: &[u8]) -> Result<u64, UploadError> {
         if bytes.len() > self.chunk_size {
             return Err(UploadError::TooLarge);
@@ -594,11 +598,18 @@ pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> Vec<(String, u64)> {
         // still open elsewhere for writing (verified: a session whose
         // staging file was just appended to and never closed reported `0`
         // bytes here, on this platform, until this was changed to a fresh
-        // stat). Not reachable in production — the whole reason a `.part`
-        // file is orphaned is that the process that held it open is gone —
-        // but a test exercising this without a real restart can still hit
-        // it, and the fresh call costs one extra syscall per file, on a path
-        // that runs once at startup.
+        // stat). A second, different way the same `DirEntry` API is not what
+        // it appears to be: `list`'s own walk (`src/api/fs.rs`) already notes
+        // that `DirEntry::metadata` is lstat-like there, so a symlink looks
+        // in-root when `metadata` would follow it out — that one is about
+        // *which* file the metadata describes, this one is about *how current*
+        // it is, but both come from trusting the enumeration's cached view
+        // instead of asking the filesystem again. Not reachable in
+        // production here — the whole reason a `.part` file is orphaned is
+        // that the process that held it open is gone — but a test exercising
+        // this without a real restart can still hit it, and the fresh call
+        // costs one extra syscall per file, on a path that runs once at
+        // startup.
         let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             // Not a name this process ever generated (`up-{serial:016x}.part`

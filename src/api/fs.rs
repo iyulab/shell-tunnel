@@ -1363,7 +1363,8 @@ fn complete_upload_blocking(
                         .with_identity(identity)
                         .with_route("POST /api/v1/fs/uploads/{id}/complete")
                         .with_file(dest_rel.clone(), None)
-                        .with_digest(false),
+                        .with_digest(false)
+                        .with_upload_id(id),
                 );
             }
             return upload_error_response(error);
@@ -1387,7 +1388,8 @@ fn complete_upload_blocking(
                     .with_identity(identity)
                     .with_route("POST /api/v1/fs/uploads/{id}/complete")
                     .with_file(finished.dest_rel.clone(), Some(finished.bytes))
-                    .with_denial(response.status().as_u16(), "destination-resolve-failed"),
+                    .with_denial(response.status().as_u16(), "destination-resolve-failed")
+                    .with_upload_id(id),
             );
             return response;
         }
@@ -1413,7 +1415,8 @@ fn complete_upload_blocking(
                     .with_identity(identity)
                     .with_route("POST /api/v1/fs/uploads/{id}/complete")
                     .with_file(finished.dest_rel.clone(), Some(finished.bytes))
-                    .with_denial(status.as_u16(), "directory-creation-failed"),
+                    .with_denial(status.as_u16(), "directory-creation-failed")
+                    .with_upload_id(id),
             );
             return error_response(
                 status,
@@ -1443,7 +1446,8 @@ fn complete_upload_blocking(
                 .with_identity(identity)
                 .with_route("POST /api/v1/fs/uploads/{id}/complete")
                 .with_file(finished.dest_rel.clone(), Some(finished.bytes))
-                .with_denial(status.as_u16(), "rename-failed"),
+                .with_denial(status.as_u16(), "rename-failed")
+                .with_upload_id(id),
         );
         return error_response(
             status,
@@ -1458,7 +1462,8 @@ fn complete_upload_blocking(
             .with_identity(identity)
             .with_route("POST /api/v1/fs/uploads/{id}/complete")
             .with_file(finished.dest_rel.clone(), Some(finished.bytes))
-            .with_digest(true),
+            .with_digest(true)
+            .with_upload_id(id),
     );
 
     Json(serde_json::json!({
@@ -1523,7 +1528,8 @@ fn cancel_upload_blocking(
                 crate::audit::AuditEvent::new("upload.cancel")
                     .with_identity(identity)
                     .with_route("DELETE /api/v1/fs/uploads/{id}")
-                    .with_file(destination, Some(bytes)),
+                    .with_file(destination, Some(bytes))
+                    .with_upload_id(id),
             );
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1565,10 +1571,11 @@ pub fn sweep_expired_uploads(
     ttl: std::time::Duration,
 ) -> usize {
     let expired = uploads.sweep(ttl);
-    for (_id, destination, bytes) in &expired {
+    for (id, destination, bytes) in &expired {
         audit.record(
             crate::audit::AuditEvent::new("upload.expired")
-                .with_file(destination.clone(), Some(*bytes)),
+                .with_file(destination.clone(), Some(*bytes))
+                .with_upload_id(id.clone()),
         );
     }
     expired.len()

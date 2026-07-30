@@ -2466,6 +2466,10 @@ async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
     // below), which cannot carry `file` at all and correlates back to this
     // event by `upload_id` alone.
     assert_eq!(start["upload_id"], id);
+    // `complete` carries it too: `file` alone is ambiguous the moment a
+    // destination is uploaded to more than once over the life of the
+    // process, since the path is reused but the id is not.
+    assert_eq!(complete["upload_id"], id);
 }
 
 #[tokio::test]
@@ -2522,6 +2526,9 @@ async fn an_abandoned_session_is_audited_when_it_is_swept() {
         .expect("an abandoned session must leave a terminal event");
     assert_eq!(expired["file"], "abandoned.bin");
     assert_eq!(expired["bytes"], 6);
+    // `file` alone is ambiguous the moment "abandoned.bin" is uploaded to
+    // more than once over the process's life; `upload_id` disambiguates.
+    assert_eq!(expired["upload_id"], id);
 }
 
 /// The task brief for this feature names three events explicitly: "Record
@@ -2592,6 +2599,7 @@ async fn a_cancelled_upload_is_audited() {
     // grepping the trail for a path must see the session end, not just begin.
     assert_eq!(cancel["file"], "cancelled.bin");
     assert_eq!(cancel["bytes"], 6);
+    assert_eq!(cancel["upload_id"], id);
 }
 
 /// A checksum mismatch at `complete` is also terminal for the session —
@@ -2661,6 +2669,7 @@ async fn a_checksum_mismatch_is_audited_as_rejected() {
     // `UploadError::Checksum` carries `dest_rel` precisely so this event can
     // name its subject, like every other terminal upload event.
     assert_eq!(rejected["file"], "corrupt.bin");
+    assert_eq!(rejected["upload_id"], id);
 }
 
 #[tokio::test]
