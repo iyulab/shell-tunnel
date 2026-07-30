@@ -3,6 +3,23 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.12.1 — 2026-07-31
+
+### Fixed
+
+- **Data loss: a second upload into the same directory destroyed the first.** Without
+  `--fs-root`, staging follows the destination, so uploads heading for one directory
+  share a staging directory — and opening a session swept that directory
+  unconditionally, removing an in-flight session's staging file. The session kept its
+  open handle, so nothing looked wrong until the end: every chunk answered 200 with an
+  advancing offset and the session reported the full size received, then `complete`
+  failed with a "file not found" error after the whole file had been uploaded. Affects
+  0.12.0 only. The sweep now leaves any staging file younger than the session TTL, and
+  leaves any whose age cannot be read.
+
+  If you ran 0.12.0 with concurrent uploads into one directory, transfers that reported
+  every chunk accepted but failed at `complete` were lost and need re-sending.
+
 ## 0.12.0 — 2026-07-31
 
 ### Changed
