@@ -659,15 +659,24 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
 /// Only a *real* directory is refused. Recursive removal is a destructive
 /// operation that wants the guards (dry-run, backup, approval) this layer
 /// does not have; a convenience flag here would hand out that power without
-/// them. Everything else the entry could be — a regular file, a symlink (to
-/// a file or to a directory), a FIFO, a socket, a device node — is removed,
-/// provided the link itself resolves inside the root — see the accepted
-/// limitation on escaping and dangling links below: unlike `download`, this
-/// handler never reads the entry's contents, so `download`'s reason for
-/// gating on `is_file()` (a FIFO never reaches EOF) does not apply here. And
-/// refusing a non-regular entry would leave it permanently undeletable
-/// through this API, the same trap that decided the symlink question below
-/// in favour of acting on the named entry.
+/// them.
+///
+/// Everything else the entry could be — a regular file, a symlink (to a file
+/// or to a directory), a FIFO, a socket, a device node — is removed. Unlike
+/// `download`, this handler never reads the entry's contents, so
+/// `download`'s reason for gating on `is_file()` (a FIFO never reaches EOF)
+/// does not apply here; and refusing a non-regular entry would leave it
+/// permanently undeletable through this API, the same trap that decided the
+/// symlink question below in favour of acting on the named entry.
+///
+/// Accepted limitation: the paragraph above holds only for a link that
+/// itself resolves inside the root. A symlink pointing outside the root, or
+/// a dangling one, stays undeletable through this route — both are refused
+/// with `Escapes` before the named-entry logic below ever runs, because the
+/// jail's verdict on the full path is final, and reaching either kind of
+/// link would mean overriding it. That is the property every other route in
+/// this feature rests on, so it is not relaxed here just to reach a broken
+/// link; an operator has to remove those directly.
 pub async fn delete_file(
     State(state): State<AppState>,
     Query(query): Query<PathQuery>,
@@ -730,13 +739,10 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 /// two jail-approved paths to act on — the request's own final component, not
 /// whatever that component's target happens to be.
 ///
-/// Accepted limitation: a symlink pointing outside the root, and a dangling
-/// symlink, both stay undeletable through this route. The very first line of
-/// this function already refuses both with `Escapes` — the jail's verdict on
-/// the full path is final, and reaching either kind of link would mean
-/// overriding it. That is the property every other route in this feature
-/// rests on, so it is not relaxed here just to reach a broken link; an
-/// operator has to remove those directly.
+/// The very first line below is what enforces `delete_file`'s documented
+/// "accepted limitation": a symlink pointing outside the root, or a
+/// dangling one, is refused with `Escapes` right there, before any of the
+/// named-entry logic that follows ever runs.
 fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     if let Err(error) = root.resolve_existing(&query.path) {
         return fs_error_response(error);
@@ -785,6 +791,26 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
         return fs_error_response(FsError::Malformed(
             "delete target must name an entry, not `.`",
         ));
+    }
+
+    // `named` below joins `name` onto `parent` assuming it appends exactly
+    // one ordinary component. It does not: `PathBuf::join` discards `parent`
+    // entirely for an argument carrying a prefix (verified: `Path::new(r"C:
+    // \root\app").join("C:evil")` is `"C:evil"`, `parent` gone). A `name`
+    // containing `:` would drop the jail-resolved parent and hand
+    // `remove_file` an arbitrary drive-relative path.
+    //
+    // `FsRoot::components` already runs `check_component` (which rejects `:`,
+    // for Alternate Data Streams — a different reason) over every component
+    // of the full path, `name` included, so step 1 above already refuses this
+    // exact input today — this call is currently unreachable for any request
+    // that also passes step 1, and disabling it does not turn a same-shaped
+    // test red. It is deliberate defense in depth rather than a currently
+    // live gap: it stops depending on `FsRoot::components` continuing to
+    // apply that check to the *last* component specifically, which is a
+    // policy of the caller, not a guarantee `check_component` itself makes.
+    if let Err(reason) = platform::check_component(name) {
+        return fs_error_response(FsError::Malformed(reason));
     }
 
     let parent = match root.resolve_existing(parent_rel) {

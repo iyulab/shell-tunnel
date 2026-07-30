@@ -411,8 +411,11 @@ fn require_symlink(created: std::io::Result<()>, test_name: &str) -> bool {
     match created {
         Ok(()) => true,
         #[cfg(windows)]
-        Err(_) => {
-            eprintln!("SKIPPED {test_name}: symlink privilege unavailable on this runner");
+        Err(e) => {
+            // Not necessarily a privilege gap — could be a real failure (disk
+            // full, bad target). Carrying `{e}` is what makes this
+            // diagnosable instead of a bare "it failed" guess.
+            eprintln!("SKIPPED {test_name}: symlink creation failed: {e}");
             false
         }
         #[cfg(not(windows))]
@@ -1391,6 +1394,45 @@ async fn delete_refuses_a_path_ending_in_dot() {
         std::fs::symlink_metadata(&link).is_ok(),
         "the symlink itself must survive — the request was refused, not acted on"
     );
+}
+
+/// A third accident in the same shape as the `..` and `.` guards: `named =
+/// parent.join(name)` assumes `name` appends exactly one ordinary component,
+/// but `PathBuf::join` discards `parent` entirely for an argument carrying a
+/// prefix (`Path::new(r"C:\root\app").join("C:evil")` is `"C:evil"` — the
+/// parent is gone).
+///
+/// Unlike the `..`/`.` cases, this one is not currently reachable: the
+/// full-path `resolve_existing` call at the top of `delete_file_blocking`
+/// already runs `check_component` (which rejects `:`) over the same last
+/// component before this handler's own local guard is ever reached, so
+/// removing that local guard does not turn this test red today — confirmed
+/// by disabling it and re-running. This test pins the outcome (400) that
+/// must hold regardless of which layer produces it, so a future change to
+/// `FsRoot::components`'s policy of validating the last component (not to
+/// `check_component` itself, but to whether the caller still applies it
+/// there) cannot silently make `path=app/C:evil` succeed.
+///
+/// `:` is a legal filename character on Unix, so no fixture there can ever
+/// contain such a file — the guard must fire on the string alone, which is
+/// exactly what this test asserts (400), not a filesystem outcome.
+#[tokio::test]
+async fn delete_refuses_a_path_component_containing_a_colon() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/C:evil")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
