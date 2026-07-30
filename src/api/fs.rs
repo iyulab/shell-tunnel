@@ -1467,12 +1467,13 @@ pub async fn cancel_upload(
 ///
 /// An explicit cancel is as terminal as a sweep-driven expiry, and without a
 /// recorded event here the trail would show a session starting and then
-/// nothing — indistinguishable from one still in progress. Unlike `sweep`,
-/// which returns `(id, destination, bytes_received)` for exactly this reason,
-/// `UploadStore::cancel` reports only whether a session existed — so this
-/// event carries no `file`/`bytes`. Widening `cancel`'s return type to match
-/// `sweep`'s is a plausible follow-up; left alone here since it touches
-/// `UploadStore`, which this task was not asked to change.
+/// nothing — indistinguishable from one still in progress. `UploadStore::cancel`
+/// returns `(destination, bytes_received)` for the same reason `sweep` returns
+/// `(id, destination, bytes_received)`: the primary question an audit trail
+/// answers is "what happened to this file", and a reader grepping for a path
+/// would otherwise see `upload.start` and then silence for a cancelled
+/// session, the same failure this task's sweep-driven `upload.expired` event
+/// exists to rule out.
 fn cancel_upload_blocking(
     uploads: &crate::fs::UploadStore,
     audit: &crate::audit::AuditSink,
@@ -1480,15 +1481,16 @@ fn cancel_upload_blocking(
     id: &str,
 ) -> Response {
     match uploads.cancel(id) {
-        true => {
+        Some((destination, bytes)) => {
             audit.record(
                 crate::audit::AuditEvent::new("upload.cancel")
                     .with_identity(identity)
-                    .with_route("DELETE /api/v1/fs/uploads/{id}"),
+                    .with_route("DELETE /api/v1/fs/uploads/{id}")
+                    .with_file(destination, Some(bytes)),
             );
             StatusCode::NO_CONTENT.into_response()
         }
-        false => upload_error_response(crate::fs::UploadError::NotFound),
+        None => upload_error_response(crate::fs::UploadError::NotFound),
     }
 }
 

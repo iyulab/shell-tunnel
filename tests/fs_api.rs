@@ -2547,6 +2547,18 @@ async fn a_cancelled_upload_is_audited() {
         .expect("upload_id")
         .to_string();
 
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-5/11")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
     let cancelled = create_router_with_state(state)
         .oneshot(
             Request::builder()
@@ -2562,10 +2574,14 @@ async fn a_cancelled_upload_is_audited() {
     let events = audit_lines(&log);
     let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
     assert!(kinds.contains(&"upload.start"), "got {kinds:?}");
-    assert!(
-        kinds.contains(&"upload.cancel"),
-        "an explicit cancel must leave a terminal event: got {kinds:?}"
-    );
+    let cancel = events
+        .iter()
+        .find(|e| e["kind"] == "upload.cancel")
+        .expect("an explicit cancel must leave a terminal event");
+    // Same subject a `sweep`-driven `upload.expired` would carry: a reader
+    // grepping the trail for a path must see the session end, not just begin.
+    assert_eq!(cancel["file"], "cancelled.bin");
+    assert_eq!(cancel["bytes"], 6);
 }
 
 /// A checksum mismatch at `complete` is also terminal for the session —

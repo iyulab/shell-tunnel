@@ -428,14 +428,22 @@ impl UploadStore {
         self.release(dest_rel);
     }
 
-    /// Discard a session and its staging file. Returns whether it existed.
-    pub fn cancel(&self, id: &str) -> bool {
+    /// Discard a session and its staging file.
+    ///
+    /// Returns the destination and bytes received so far when a session
+    /// existed to cancel — `None` means no such session (unknown, already
+    /// completed, already cancelled, or already expired). Widened from a
+    /// plain `bool` for the same reason `sweep` returns
+    /// `(id, destination, bytes_received)` instead of just dropping what it
+    /// finds: the caller (`cancel_upload` in `src/api/fs.rs`) records a
+    /// terminal audit event, and an event that cannot name which file was
+    /// cancelled answers only "a session ended", not "what happened to this
+    /// file" — the question an audit trail exists to answer.
+    pub fn cancel(&self, id: &str) -> Option<(String, u64)> {
         let Ok(mut sessions) = self.sessions.write() else {
-            return false;
+            return None;
         };
-        let Some(cell) = sessions.remove(id) else {
-            return false;
-        };
+        let cell = sessions.remove(id)?;
         // Load-bearing, not tidiness: `release` below takes the `claimed`
         // lock, and `UploadStore`'s struct-level invariant is that `sessions`
         // and `claimed` are never held at once. Removing this `drop` would
@@ -444,11 +452,11 @@ impl UploadStore {
         // breaking that invariant silently.
         drop(sessions);
         let Ok(session) = cell.into_inner() else {
-            return false;
+            return None;
         };
         self.release(&session.dest_rel);
         std::fs::remove_file(&session.part_path).ok();
-        true
+        Some((session.dest_rel, session.offset))
     }
 
     /// Drop sessions idle for longer than `ttl`.
@@ -687,7 +695,11 @@ mod tests {
         let id = store
             .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
             .expect("create");
-        assert!(store.cancel(&id));
+        store.append(&id, 0, b"hello ").expect("append");
+
+        let (destination, bytes) = store.cancel(&id).expect("session existed");
+        assert_eq!(destination, "out.bin");
+        assert_eq!(bytes, 6);
         assert_eq!(store.offset(&id), None);
         // The destination is claimable again.
         assert!(store
@@ -773,7 +785,7 @@ mod tests {
         );
 
         // Freeing one slot makes room for exactly one more.
-        assert!(store.cancel(&ids[0]));
+        assert!(store.cancel(&ids[0]).is_some());
         assert!(store
             .create(&root, "one-too-many.bin".into(), 1, HELLO_DIGEST.into())
             .is_ok());
