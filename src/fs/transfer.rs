@@ -626,15 +626,37 @@ pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> Vec<(String, u64)> {
     let Some(jail) = root.jail_path() else {
         return Vec::new();
     };
-    sweep_orphan_parts_in(&jail.join(UPLOAD_DIR))
+    // No age floor: this runs at startup and on an interval against a jail's
+    // single staging directory, where "a `.part` exists" already implies no
+    // session owns it — sessions do not survive a restart, and the interval
+    // caller sweeps expired sessions first.
+    sweep_orphan_parts_in(&jail.join(UPLOAD_DIR), Duration::ZERO)
 }
 
-/// [`sweep_orphan_parts`] against one staging directory, whatever its scope.
+/// [`sweep_orphan_parts`] against one staging directory, removing only files
+/// that have been untouched for at least `min_age`.
 ///
 /// Split out so machine-wide uploads have a reclaim path at all: the caller
 /// that knows a destination knows its staging directory, even though no
 /// startup path can enumerate every such directory.
-pub fn sweep_orphan_parts_in(staging: &Path) -> Vec<(String, u64)> {
+///
+/// **`min_age` is what keeps this from destroying a live upload, and it is not
+/// optional for a runtime caller.** Machine-wide staging is shared by every
+/// upload heading for the same directory, so a sweep run when a second session
+/// is created will see the *first* session's `.part` — a file that is very much
+/// owned. Removing it does not fail the writes that follow: the session holds
+/// an open handle, so `append` keeps succeeding against a name that no longer
+/// exists, every chunk answers 200, and only `complete` fails, with
+/// `ENOENT` — after the client has uploaded the whole file. That shape (accept
+/// everything, then lose it at publication) is the worst available, and it is
+/// what an unconditional sweep here produced.
+///
+/// A live session's file is protected because writing to it updates its mtime,
+/// and a session that has gone quiet for longer than the caller's floor has
+/// already been reclaimed by `sweep_expired_uploads`, which the API layer runs
+/// first. An orphan from a previous run has no such protection, which is the
+/// point.
+pub fn sweep_orphan_parts_in(staging: &Path, min_age: Duration) -> Vec<(String, u64)> {
     let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
     };
@@ -664,7 +686,27 @@ pub fn sweep_orphan_parts_in(staging: &Path) -> Vec<(String, u64)> {
         // this without a real restart can still hit it, and the fresh call
         // costs one extra syscall per file, on a path that runs once at
         // startup.
-        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let meta = std::fs::metadata(&path);
+        // Age is read from the same fresh stat, and a file whose age cannot be
+        // established is left alone rather than removed: this is the guard that
+        // stands between a runtime sweep and a live upload, and a guard that
+        // fails open is not one. `Duration::ZERO` makes it a no-op for the
+        // startup caller, where nothing can be live.
+        if !min_age.is_zero() {
+            // `map_or(true, ..)` rather than `is_none_or`: the latter is stable
+            // since 1.82 and this crate's MSRV is 1.78. Same meaning — an
+            // unreadable or unknowable age counts as young, so the file stays.
+            let young_or_unknown = meta
+                .as_ref()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|modified| modified.elapsed().ok())
+                .map_or(true, |age| age < min_age);
+            if young_or_unknown {
+                continue;
+            }
+        }
+        let bytes = meta.map(|m| m.len()).unwrap_or(0);
         let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
             // Not a name this process ever generated (`up-{serial:016x}.part`
             // is always valid UTF-8) — nothing to correlate an event to, so

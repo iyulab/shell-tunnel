@@ -274,6 +274,89 @@ async fn create_test_upload(state: AppState, path: &str, payload: &[u8]) -> Stri
         .to_string()
 }
 
+/// An app state with no `--fs-root`, plus a scratch directory to aim at.
+///
+/// Machine-wide scope takes absolute paths, so the destination is returned as
+/// a string in the form the API expects rather than left for each test to
+/// assemble.
+fn machine_wide_state() -> (tempfile::TempDir, AppState, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/");
+    (
+        dir,
+        AppState::new().with_fs_root(FsRoot::machine_wide()),
+        base,
+    )
+}
+
+/// Opening a second upload into a directory must not destroy the first.
+///
+/// With no `--fs-root`, staging follows the destination, so every upload
+/// heading for one directory shares one staging directory. `create` sweeps
+/// that directory for orphans left by a previous run — and an unconditional
+/// sweep there removes the *live* session's `.part` too. The damage is
+/// invisible until the end: the session holds an open handle, so every
+/// subsequent chunk still answers 200 with an advancing offset, and only
+/// `complete` fails, with `ENOENT`, after the whole file has been sent.
+///
+/// Found by a real transfer over a relay, not by this suite — a 5 MiB upload
+/// reported every chunk accepted and then could not be published. The sweep's
+/// age floor is what makes it safe; this test fails without it.
+#[tokio::test]
+async fn a_second_upload_into_the_same_directory_leaves_the_first_intact() {
+    let (_dir, state, base) = machine_wide_state();
+    let first =
+        create_test_upload(state.clone(), &format!("{base}/first.bin"), b"hello world").await;
+
+    // Same directory, so the same staging directory: this is the call that
+    // used to sweep `first`'s staging file out from under it.
+    let _second =
+        create_test_upload(state.clone(), &format!("{base}/second.bin"), b"hello world").await;
+
+    let patched = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{first}"))
+                .header("content-type", "application/octet-stream")
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(patched.status(), StatusCode::OK);
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{first}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    // The assertion that bites: an accepted chunk that cannot be published is
+    // worse than a refused one, so this is checked on the publication step
+    // rather than on the 200 above.
+    assert_eq!(
+        completed.status(),
+        StatusCode::OK,
+        "the first upload must still be publishable after a second one opened"
+    );
+    assert_eq!(
+        std::fs::read(_dir.path().join("first.bin")).expect("published file"),
+        b"hello world"
+    );
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);

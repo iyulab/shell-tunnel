@@ -1322,7 +1322,15 @@ fn create_upload_blocking(
     // `sweep_orphan_parts`'s doc for why it cannot be done globally.
     if root.jail_path().is_none() {
         let staging = crate::fs::UploadStore::staging_dir(root, &resolved);
-        record_orphans(&crate::fs::sweep_orphan_parts_in(&staging), audit);
+        // `SESSION_TTL`, not zero: this staging directory is shared with every
+        // other upload heading for the same destination directory, and one of
+        // those may be in flight right now. `sweep_expired_uploads` above has
+        // already reclaimed anything a live session no longer owns, so a
+        // `.part` younger than the TTL still belongs to somebody.
+        record_orphans(
+            &crate::fs::sweep_orphan_parts_in(&staging, crate::fs::SESSION_TTL),
+            audit,
+        );
     }
 
     match uploads.create(
