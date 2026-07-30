@@ -942,6 +942,19 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
             "chunk-too-large",
             "chunk exceeds the advertised chunk_size",
         ),
+        // Distinct code from `TooLarge`: that one is "this single chunk is
+        // bigger than the configured chunk_size", a protocol-level ceiling
+        // unrelated to any particular session. This one is "the bytes this
+        // session has now received, plus this chunk, exceed what *this*
+        // session declared at creation" — a session-level contract
+        // violation. Conflating the two would leave a client unable to tell
+        // "resize your chunk" from "abort, you have already overrun what
+        // you said you'd send".
+        UploadError::SizeExceeded => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "declared-size-exceeded",
+            "chunk would exceed the size declared when the session was created",
+        ),
         // Distinct from `Conflict` (409, same path contested): this is a
         // capacity refusal, not a path collision, so it gets its own code and
         // status — a client should back off and retry rather than pick a
@@ -961,13 +974,21 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
             })),
         )
             .into_response(),
+        // Always 500. An earlier version tried to detect "out of space" by
+        // matching substrings like "space" or "full" in `detail` to answer
+        // with 507 — locale-dependent (the OS renders `io::Error`'s message
+        // in the system locale), and it would also trip on an ordinary error
+        // that happens to name a directory "full". Telling ENOSPC apart
+        // reliably needs the original `std::io::Error`'s `raw_os_error()`,
+        // which `UploadError::Io` does not carry (it stores an
+        // already-formatted `String`); carrying it would mean reshaping this
+        // variant and adding the OS-code-to-condition mapping to
+        // `platform.rs`, the one place this codebase reaches for
+        // OS-specific detail — out of scope for this pass. A uniform 500 is
+        // more honest than a text match that is wrong on some locales and
+        // some ordinary messages.
         UploadError::Io(detail) => {
-            let out_of_space = detail.contains("space") || detail.contains("full");
-            let status = match out_of_space {
-                true => StatusCode::INSUFFICIENT_STORAGE,
-                false => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            error_response(status, "io-error", &detail)
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "io-error", &detail)
         }
     }
 }
@@ -1009,9 +1030,77 @@ fn create_upload_blocking(
 ) -> Response {
     // Validate the destination before claiming anything, so a bad path cannot
     // leave a staging file or a claim behind.
-    if let Err(error) = root.resolve_for_create(&body.path) {
-        return fs_error_response(error);
+    let resolved = match root.resolve_for_create(&body.path) {
+        Ok(path) => path,
+        Err(error) => return fs_error_response(error),
+    };
+
+    // Canonical, not the raw request string: `body.path` is whatever the
+    // caller spelled it (`./app/x.bin`, `app\x.bin`, `app//x.bin` — the last
+    // one is refused by `resolve_for_create` itself, since `check_component`
+    // rejects the empty component it produces). Two different spellings of
+    // one destination discarding `resolved` here (an earlier version did)
+    // would claim it under two different keys, so both sessions proceed,
+    // both eventually `complete`, and both `rename` onto the same file —
+    // exactly the last-writer-wins data loss `UploadStore`'s destination
+    // claim exists to prevent. `root.relative` on the path `resolve_for_create`
+    // already produced is this function's only source of that canonical
+    // form.
+    let dest_rel = match root.relative(&resolved) {
+        Some(rel) => rel,
+        // `resolve_for_create` already established that `resolved` is under
+        // `root`, so `relative` returning `None` here should not be
+        // reachable — handled rather than unwrapped so a future change to
+        // either function cannot turn this into a panic.
+        None => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "path-resolution-failed",
+                "could not compute the destination's canonical path",
+            )
+        }
+    };
+
+    // The upload staging directory is reserved: `list` deliberately hides it
+    // (`src/api/fs.rs`'s `walk`), so a file published inside it could never be
+    // reported back through this API, and a destination shaped like
+    // `up-{serial:016x}.part` could collide with a future session's own
+    // staging file, making that session's `create_new` fail for a reason
+    // that has nothing to do with it.
+    // The upload staging directory is reserved: `list` deliberately hides it
+    // (`src/api/fs.rs`'s `walk`), so a file published inside it could never be
+    // reported back through this API, and a destination shaped like
+    // `up-{serial:016x}.part` could collide with a future session's own
+    // staging file, making that session's `create_new` fail for a reason
+    // that has nothing to do with it.
+    if dest_rel == crate::fs::UPLOAD_DIR
+        || dest_rel.starts_with(&format!("{}/", crate::fs::UPLOAD_DIR))
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "reserved-path",
+            "path resolves into the upload staging directory, which is reserved",
+        );
     }
+
+    // Checked before the digest/size validation below, and before claiming
+    // anything: a real directory at the destination is not something
+    // `rename` at `complete` time can replace (`EISDIR`/`ENOTDIR`), so
+    // finding out only then means the client has already uploaded the whole
+    // file for nothing. `symlink_metadata` (lstat), not `metadata` (stat): a
+    // *symlink* to a directory is not refused here — `rename` never follows
+    // a symlink on either operand (see `complete_upload_blocking`'s doc
+    // comment), so it simply replaces the link rather than failing.
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
+        if meta.is_dir() {
+            return error_response(
+                StatusCode::CONFLICT,
+                "destination-is-directory",
+                "the destination path already exists as a directory",
+            );
+        }
+    }
+
     if body.sha256.len() != 64 || !body.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -1020,7 +1109,7 @@ fn create_upload_blocking(
         );
     }
 
-    match uploads.create(root, body.path, body.size, body.sha256.to_ascii_lowercase()) {
+    match uploads.create(root, dest_rel, body.size, body.sha256.to_ascii_lowercase()) {
         Ok(upload_id) => (
             StatusCode::CREATED,
             Json(UploadState {

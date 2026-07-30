@@ -2191,3 +2191,142 @@ async fn cancel_upload_allows_a_token_holding_fs_write() {
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
+
+/// Review finding: `create_upload_blocking` used to key the destination
+/// claim on the raw request string, so `app/x.bin`, `./app/x.bin`, and
+/// `app\x.bin` claimed three *different* keys for what `resolve_for_create`
+/// resolves to one file. Two sessions under aliased spellings could both
+/// reach `complete` and both `rename` onto the same path — the exact
+/// last-writer-wins data loss the claim exists to prevent. Fixed by keying
+/// on `root.relative(&resolved)` instead of the raw string.
+#[tokio::test]
+async fn two_sessions_for_aliased_spellings_of_one_destination_are_refused() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let create = |path: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/fs/uploads")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "path": path,
+                    "size": 11,
+                    "sha256": HELLO_DIGEST,
+                })
+                .to_string(),
+            ))
+            .expect("request")
+    };
+
+    let first = create_router_with_state(state.clone())
+        .oneshot(create("app/aliased.bin"))
+        .await
+        .expect("response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    for alias in ["./app/aliased.bin", "app\\aliased.bin", "app/./aliased.bin"] {
+        let response = create_router_with_state(state.clone())
+            .oneshot(create(alias))
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::CONFLICT,
+            "{alias:?} must claim the same destination as app/aliased.bin"
+        );
+    }
+}
+
+/// Review finding: nothing proved the raised body limit was scoped to only
+/// the chunk-upload route. `route_layer` vs. `.layer()` on the wrong router
+/// (or the limit hoisted any higher than `upload_session_routes`) would let
+/// this leak to unrelated routes, `/api/v1/execute` included, with the
+/// suite otherwise staying green — `a_chunk_at_the_advertised_chunk_size_...`
+/// only proves the limit was *raised*, not that it was raised nowhere else.
+#[tokio::test]
+async fn the_upload_body_limit_does_not_leak_to_other_routes() {
+    // Comfortably above axum-core's own 2 MiB default, comfortably below
+    // MAX_CHUNK_SIZE — if this ever stopped 413ing, the raised limit reached
+    // a route it must not have.
+    let oversized = vec![0_u8; 3 * 1024 * 1024];
+
+    let response = create_router_with_state(AppState::new())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/execute")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// Review finding: a real directory at the destination was only ever
+/// detected at `complete` time, when `rename` fails `EISDIR`/`ENOTDIR` —
+/// after the client has already uploaded the whole file. `create_upload`
+/// now refuses it upfront.
+#[tokio::test]
+async fn create_upload_refuses_a_destination_that_is_already_a_directory() {
+    let (_dir, state) = state_with_files(&[("app/existing_dir/inside.txt", b"x")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/existing_dir",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "destination-is-directory");
+}
+
+/// Review finding: nothing refused a destination inside the upload staging
+/// directory. `list` deliberately hides it, so a file published there could
+/// never be reported back through this API, and a caller-chosen name shaped
+/// like a real staging filename could collide with a future session's own
+/// `create_new`.
+#[tokio::test]
+async fn create_upload_refuses_a_destination_inside_the_staging_directory() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": ".shell-tunnel-uploads/sneaky.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "reserved-path");
+}

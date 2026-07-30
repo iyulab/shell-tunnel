@@ -4,7 +4,7 @@
 //! transfer verifies. A partial file therefore never appears at the destination
 //! — a consumer polling that path sees nothing or sees the finished article.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::{Mutex, RwLock};
@@ -57,6 +57,8 @@ pub enum UploadError {
     Conflict,
     /// The chunk exceeds the advertised chunk size.
     TooLarge,
+    /// This chunk would push the session past the size declared at creation.
+    SizeExceeded,
     /// Too many sessions are already open (see `MAX_CONCURRENT_UPLOADS`).
     TooManySessions,
     /// The assembled bytes do not hash to what was declared.
@@ -115,14 +117,17 @@ pub struct UploadStore {
     sessions: RwLock<HashMap<String, Mutex<Session>>>,
     /// Destinations currently claimed, so two sessions cannot race to one path.
     ///
-    /// Its length also doubles as the live-session count for
-    /// `MAX_CONCURRENT_UPLOADS`: every live session claims exactly one
-    /// destination and every destination is claimed by at most one session,
-    /// so checking `claimed.len()` under `claimed`'s own lock is an atomic
-    /// admission check — two concurrent callers cannot both read a count
-    /// under the cap and then both insert, because the check and the insert
-    /// share one critical section.
-    claimed: Mutex<HashMap<String, String>>,
+    /// A set, not a map: no caller has ever read a value out of this (an
+    /// earlier version stored the claiming session's id as the value, but
+    /// nothing looked it up — `sessions` is the source of truth for which
+    /// id owns which destination). Its length also doubles as the
+    /// live-session count for `MAX_CONCURRENT_UPLOADS`: every live session
+    /// claims exactly one destination and every destination is claimed by
+    /// at most one session, so checking `claimed.len()` under `claimed`'s
+    /// own lock is an atomic admission check — two concurrent callers
+    /// cannot both read a count under the cap and then both insert, because
+    /// the check and the insert share one critical section.
+    claimed: Mutex<HashSet<String>>,
     chunk_size: usize,
     counter: std::sync::atomic::AtomicU64,
 }
@@ -131,8 +136,16 @@ impl UploadStore {
     pub fn new(chunk_size: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            claimed: Mutex::new(HashMap::new()),
-            chunk_size: chunk_size.clamp(1, MAX_CHUNK_SIZE),
+            claimed: Mutex::new(HashSet::new()),
+            // Upper bound one *less* than `MAX_CHUNK_SIZE`, matching what
+            // `--fs-chunk-size`'s own startup check enforces (`main.rs`
+            // exits for `size >= MAX_CHUNK_SIZE`). Clamping to
+            // `MAX_CHUNK_SIZE` itself (an earlier version did) is not
+            // reachable through the CLI today, but it is worse than
+            // unreachable: it would silently *accept* exactly the value the
+            // CLI's own check exists to refuse, for any future caller that
+            // constructs a store directly rather than through the CLI.
+            chunk_size: chunk_size.clamp(1, MAX_CHUNK_SIZE - 1),
             counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -168,13 +181,13 @@ impl UploadStore {
         // silent-overwrite race, and last-writer-wins loses data quietly.
         {
             let mut claimed = self.claimed.lock().map_err(|_| poisoned())?;
-            if claimed.contains_key(&dest_rel) {
+            if claimed.contains(&dest_rel) {
                 return Err(UploadError::Conflict);
             }
             if claimed.len() >= MAX_CONCURRENT_UPLOADS {
                 return Err(UploadError::TooManySessions);
             }
-            claimed.insert(dest_rel.clone(), String::new());
+            claimed.insert(dest_rel.clone());
         }
 
         let staging = Self::staging_dir(root);
@@ -228,12 +241,27 @@ impl UploadStore {
             touched: Instant::now(),
         };
 
-        self.sessions
-            .write()
-            .map_err(|_| poisoned())?
-            .insert(id.clone(), Mutex::new(session));
+        // Matched rather than `?`-chained (an earlier version chained
+        // `.write().map_err(...)?.insert(...)`): a poisoned `sessions` lock
+        // must not leak the claim or the staging file already created above
+        // — `session` is not moved into the map on this path, so its
+        // `part_path` is still reachable to clean up. `sweep`/`cancel` only
+        // ever reclaim a claim through a *live* entry in `sessions`; if this
+        // session never made it into that map, nothing else will ever
+        // release it.
+        let mut sessions = match self.sessions.write() {
+            Ok(sessions) => sessions,
+            Err(_) => {
+                std::fs::remove_file(&session.part_path).ok();
+                self.release(&dest_rel);
+                return Err(poisoned());
+            }
+        };
+        sessions.insert(id.clone(), Mutex::new(session));
+        drop(sessions);
+
         if let Ok(mut claimed) = self.claimed.lock() {
-            claimed.insert(dest_rel, id.clone());
+            claimed.insert(dest_rel);
         }
         Ok(id)
     }
@@ -243,13 +271,6 @@ impl UploadStore {
         let sessions = self.sessions.read().ok()?;
         let session = sessions.get(id)?.lock().ok()?;
         Some(session.offset)
-    }
-
-    /// The destination a session is writing to.
-    pub fn destination(&self, id: &str) -> Option<String> {
-        let sessions = self.sessions.read().ok()?;
-        let session = sessions.get(id)?.lock().ok()?;
-        Some(session.dest_rel.clone())
     }
 
     /// Append one chunk, returning the offset to send next.
@@ -266,10 +287,17 @@ impl UploadStore {
     /// session id (nothing else can, since only one request should ever be
     /// live per session anyway). Concurrent `append` calls for *different*
     /// sessions are unaffected — `RwLock` read access is shared. Accepted:
-    /// bounded by one write's duration, and the alternative — dropping the
-    /// session out of the map, writing, then reinserting it — would let a
-    /// second chunk for the same session interleave with the first, which is
-    /// exactly the offset race this function exists to prevent.
+    /// bounded by one write's duration. This is not the only possible
+    /// shape, though: `HashMap<String, Arc<Mutex<Session>>>` would let this
+    /// function clone the `Arc`, drop the `sessions` read guard immediately,
+    /// and hold only the session's own `Mutex` across the write — removing
+    /// the contention with `sweep`/`create` entirely while keeping the same
+    /// per-session serialization (two chunks for the *same* session still
+    /// cannot interleave, since the session `Mutex` alone already prevents
+    /// that). That is a real improvement, tracked separately rather than
+    /// made here: it restructures the state machine's storage at the tail
+    /// of an already-large task, and the contention it would remove is
+    /// bounded and documented, not a correctness gap.
     pub fn append(&self, id: &str, offset: u64, bytes: &[u8]) -> Result<u64, UploadError> {
         if bytes.len() > self.chunk_size {
             return Err(UploadError::TooLarge);
@@ -283,6 +311,25 @@ impl UploadStore {
             return Err(UploadError::OffsetMismatch {
                 expected: session.offset,
             });
+        }
+
+        // Refused before a single byte is written: without this, a session
+        // can stream arbitrarily far past what it declared, and the mismatch
+        // is only ever caught at `complete` — after every byte has already
+        // hit disk. `checked_add` rather than a plain `+`: `offset` is
+        // caller-supplied (via `Content-Range`) and could in principle be
+        // adversarially close to `u64::MAX`; overflow is treated the same as
+        // exceeding the declared size, not as a wrapped-around pass.
+        // Refused before a single byte is written: without this, a session
+        // can stream arbitrarily far past what it declared, and the mismatch
+        // is only ever caught at `complete` — after every byte has already
+        // hit disk. `checked_add` rather than a plain `+`: `offset` is
+        // caller-supplied (via `Content-Range`) and could in principle be
+        // adversarially close to `u64::MAX`; overflow is treated the same as
+        // exceeding the declared size, not as a wrapped-around pass.
+        let next_offset = offset.checked_add(bytes.len() as u64);
+        if next_offset.map_or(true, |next| next > session.declared_size) {
+            return Err(UploadError::SizeExceeded);
         }
 
         session
@@ -462,6 +509,14 @@ fn poisoned() -> UploadError {
 ///
 /// Sessions do not survive a restart, so any `.part` still present is
 /// unreachable — nothing can resume it and nothing will complete it.
+///
+/// Returns `0` both when there was nothing to sweep and when the staging
+/// directory could not be read at all (most commonly: no upload has ever
+/// run against this root, so it was never created). Not distinguished:
+/// `main.rs`'s only use of the return value is to log a positive count, and
+/// "nothing there" vs. "unreadable" both mean nothing to log. Telling them
+/// apart would need a richer return type for a distinction the one caller
+/// does not consume.
 pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> usize {
     let staging = UploadStore::staging_dir(root);
     let Ok(entries) = std::fs::read_dir(&staging) else {
@@ -582,6 +637,34 @@ mod tests {
             .expect("create");
         let oversized = vec![0_u8; DEFAULT_CHUNK_SIZE + 1];
         assert_eq!(store.append(&id, 0, &oversized), Err(UploadError::TooLarge));
+    }
+
+    #[test]
+    fn a_chunk_that_would_exceed_the_declared_size_is_refused() {
+        let (_dir, root, store) = store();
+        // Declares 5 bytes; the digest is irrelevant here since the size
+        // check runs at `append` time, well before any checksum comparison.
+        let id = store
+            .create(&root, "out.bin".into(), 5, HELLO_DIGEST.into())
+            .expect("create");
+        assert_eq!(
+            store.append(&id, 0, b"hello world"),
+            Err(UploadError::SizeExceeded)
+        );
+        // Refused before anything was written: the offset must not have moved.
+        assert_eq!(store.offset(&id), Some(0));
+    }
+
+    #[test]
+    fn a_chunk_landing_exactly_on_the_declared_size_is_accepted() {
+        let (_dir, root, store) = store();
+        let id = store
+            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .expect("create");
+        // Exactly 11 bytes against a declared size of 11 — the boundary
+        // `a_chunk_that_would_exceed_the_declared_size_is_refused` does not
+        // cover, and the one `>` (not `>=`) in the check depends on.
+        assert_eq!(store.append(&id, 0, b"hello world").expect("append"), 11);
     }
 
     #[test]
@@ -706,5 +789,75 @@ mod tests {
         assert!(store
             .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
             .is_ok());
+    }
+
+    #[test]
+    fn sweep_orphan_parts_removes_leftover_part_files_and_nothing_else() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = FsRoot::new(dir.path()).expect("root");
+        let staging = UploadStore::staging_dir(&root);
+        std::fs::create_dir_all(&staging).expect("mkdir staging");
+        std::fs::write(staging.join("up-0000000000000000.part"), b"leftover")
+            .expect("write orphan");
+        std::fs::write(staging.join("up-0000000000000001.part"), b"leftover2")
+            .expect("write second orphan");
+        // Not a `.part` file — proves the extension filter, not "delete
+        // everything in the directory".
+        std::fs::write(staging.join("keep.txt"), b"not a part file").expect("write keep");
+
+        assert_eq!(sweep_orphan_parts(&root), 2);
+        assert!(!staging.join("up-0000000000000000.part").exists());
+        assert!(!staging.join("up-0000000000000001.part").exists());
+        assert!(
+            staging.join("keep.txt").exists(),
+            "only .part files are orphans; anything else in staging must survive"
+        );
+    }
+
+    #[test]
+    fn a_poisoned_sessions_lock_does_not_leak_the_claim_or_the_staging_file() {
+        let (_dir, root, store) = store();
+
+        // Poison `sessions` by panicking while holding its write guard.
+        // `catch_unwind` keeps the panic from taking the test process down;
+        // the guard's `Drop` still runs during the unwind and marks the
+        // lock poisoned regardless of the panic being caught afterward.
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.sessions.write().expect("lock not yet poisoned");
+            panic!("poison it");
+        }));
+        assert!(
+            poisoned.is_err(),
+            "the closure must have panicked while holding the write guard"
+        );
+
+        let outcome = store.create(&root, "out.bin".into(), 11, HELLO_DIGEST.into());
+        assert!(
+            matches!(outcome, Err(UploadError::Io(_))),
+            "a poisoned sessions lock must surface as an Io error, got {outcome:?}"
+        );
+
+        // Recover the lock — a real caller cannot do this, but the test does,
+        // purely to inspect whether the failed attempt above left anything
+        // behind. If it did, this second `create` for the same destination
+        // would come back `Err(Conflict)` instead of succeeding.
+        store.sessions.clear_poison();
+        assert!(
+            store
+                .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+                .is_ok(),
+            "the destination must not still be claimed by the failed attempt"
+        );
+
+        let staging = UploadStore::staging_dir(&root);
+        let leftover_parts = std::fs::read_dir(&staging)
+            .expect("staging dir")
+            .flatten()
+            .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("part"))
+            .count();
+        assert_eq!(
+            leftover_parts, 1,
+            "only the second, successful session's staging file should remain"
+        );
     }
 }
