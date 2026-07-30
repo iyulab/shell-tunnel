@@ -3,6 +3,32 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.12.3 — 2026-07-31
+
+### Fixed
+
+- **Relay: a request carrying `Expect: 100-continue` came back `500` even though the
+  device handled it.** The relay replayed the header onto the device's own local HTTP
+  call; that server answered with an interim `100 Continue`, the device reported the
+  interim response as the response, and the relay tried to return `100` as a final
+  status — which cannot be written as one, so an empty `500` was substituted.
+
+  The request always succeeded. Only the status the caller saw was wrong, which is the
+  worst way for this to fail: a non-idempotent `execute` reported as failed *after it
+  had already run*, and an upload chunk written but reported lost. `curl` adds the
+  header automatically for bodies over roughly a kilobyte, so this affected every
+  sizeable upload while small `execute` payloads did not. Present since 0.10.0.
+
+  If you saw `500` from a relay and retried, check whether the first attempt had
+  already taken effect.
+
+### Changed
+
+- CI now runs tests and clippy with `relay-client` enabled, and lints test targets.
+  Both relay end-to-end files are gated behind that feature, so the previous
+  configuration compiled them to zero tests and reported green without running them —
+  which is how the defect above survived three minor versions.
+
 ## 0.12.2 — 2026-07-31
 
 ### Fixed
