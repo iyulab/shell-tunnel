@@ -679,12 +679,14 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
 /// link; an operator has to remove those directly.
 pub async fn delete_file(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
     Query(query): Query<PathQuery>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
     };
     let audit = state.audit.clone();
+    let identity = identity.map(|axum::Extension(id)| id);
 
     // Resolving the path and removing the file are both blocking I/O. Same
     // convention as `list`/`list_blocking` and `download`/`download_blocking`
@@ -694,7 +696,9 @@ pub async fn delete_file(
     // (`AuditSink::record` opens/writes/flushes a file), so it is recorded
     // from `delete_file_blocking` rather than back here — same reason the
     // upload handlers thread it into their own `_blocking` bodies.
-    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &audit, &query)).await {
+    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &audit, identity, &query))
+        .await
+    {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -750,6 +754,7 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 fn delete_file_blocking(
     root: &FsRoot,
     audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
     query: &PathQuery,
 ) -> Response {
     if let Err(error) = root.resolve_existing(&query.path) {
@@ -877,6 +882,7 @@ fn delete_file_blocking(
             // final component) rather than whatever a symlink resolves to.
             audit.record(
                 crate::audit::AuditEvent::new("fs.delete")
+                    .with_identity(identity)
                     .with_route("DELETE /api/v1/fs/file")
                     .with_file(query.path.clone(), None),
             );
@@ -1041,6 +1047,7 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
 /// `/health` and the accept loop.
 pub async fn create_upload(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
     Json(body): Json<CreateUpload>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
@@ -1048,9 +1055,12 @@ pub async fn create_upload(
     };
     let uploads = state.uploads.clone();
     let audit = state.audit.clone();
+    let identity = identity.map(|axum::Extension(id)| id);
 
-    match tokio::task::spawn_blocking(move || create_upload_blocking(&root, &uploads, &audit, body))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        create_upload_blocking(&root, &uploads, &audit, identity, body)
+    })
+    .await
     {
         Ok(response) => response,
         Err(_) => error_response(
@@ -1072,6 +1082,7 @@ fn create_upload_blocking(
     root: &FsRoot,
     uploads: &crate::fs::UploadStore,
     audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
     body: CreateUpload,
 ) -> Response {
     // Validate the destination before claiming anything, so a bad path cannot
@@ -1160,6 +1171,7 @@ fn create_upload_blocking(
         Ok(upload_id) => {
             audit.record(
                 crate::audit::AuditEvent::new("upload.start")
+                    .with_identity(identity)
                     .with_route("POST /api/v1/fs/uploads")
                     .with_file(dest_for_audit, Some(body.size)),
             );
@@ -1285,15 +1297,17 @@ pub fn parse_content_range_start(header: &str) -> Option<u64> {
 pub async fn complete_upload(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
     };
     let uploads = state.uploads.clone();
     let audit = state.audit.clone();
+    let identity = identity.map(|axum::Extension(id)| id);
 
     match tokio::task::spawn_blocking(move || {
-        complete_upload_blocking(&root, &uploads, &audit, &id)
+        complete_upload_blocking(&root, &uploads, &audit, identity, &id)
     })
     .await
     {
@@ -1321,6 +1335,7 @@ fn complete_upload_blocking(
     root: &FsRoot,
     uploads: &crate::fs::UploadStore,
     audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
     id: &str,
 ) -> Response {
     let finished = match uploads.take_for_complete(id) {
@@ -1337,6 +1352,7 @@ fn complete_upload_blocking(
             if let crate::fs::UploadError::Checksum { .. } = &error {
                 audit.record(
                     crate::audit::AuditEvent::new("upload.rejected")
+                        .with_identity(identity)
                         .with_route("POST /api/v1/fs/uploads/{id}/complete")
                         .with_digest(false),
                 );
@@ -1402,6 +1418,7 @@ fn complete_upload_blocking(
 
     audit.record(
         crate::audit::AuditEvent::new("upload.complete")
+            .with_identity(identity)
             .with_route("POST /api/v1/fs/uploads/{id}/complete")
             .with_file(finished.dest_rel.clone(), Some(finished.bytes))
             .with_digest(true),
@@ -1422,13 +1439,19 @@ fn complete_upload_blocking(
 pub async fn cancel_upload(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
 ) -> Response {
     if state.fs.is_none() {
         return fs_not_enabled();
     }
     let uploads = state.uploads.clone();
     let audit = state.audit.clone();
-    match tokio::task::spawn_blocking(move || cancel_upload_blocking(&uploads, &audit, &id)).await {
+    let identity = identity.map(|axum::Extension(id)| id);
+    match tokio::task::spawn_blocking(move || {
+        cancel_upload_blocking(&uploads, &audit, identity, &id)
+    })
+    .await
+    {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1453,12 +1476,14 @@ pub async fn cancel_upload(
 fn cancel_upload_blocking(
     uploads: &crate::fs::UploadStore,
     audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
     id: &str,
 ) -> Response {
     match uploads.cancel(id) {
         true => {
             audit.record(
                 crate::audit::AuditEvent::new("upload.cancel")
+                    .with_identity(identity)
                     .with_route("DELETE /api/v1/fs/uploads/{id}"),
             );
             StatusCode::NO_CONTENT.into_response()
@@ -1480,6 +1505,11 @@ fn cancel_upload_blocking(
 /// wrap this in `spawn_blocking` (see `main.rs`); a test calling it directly
 /// from a `#[tokio::test]` body does not need that ceremony to observe what
 /// it records.
+///
+/// The recorded event carries no `route` (there is no request driving this —
+/// it runs off a timer) and no `identity` (the session was opened by some
+/// caller, long since disconnected; nothing here still knows who that was).
+/// Every other event this task adds carries both.
 pub fn sweep_expired_uploads(state: &AppState, ttl: std::time::Duration) -> usize {
     let expired = state.uploads.sweep(ttl);
     for (_id, destination, bytes) in &expired {

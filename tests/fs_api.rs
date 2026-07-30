@@ -2659,3 +2659,31 @@ async fn a_deleted_file_is_audited() {
         .expect("a deletion must leave an audit event");
     assert_eq!(deleted["file"], "old.dll");
 }
+
+/// The audit module's own contract (`src/audit.rs`'s header) is that every
+/// event identifies who made the request, not just what happened. Routed
+/// through the real capability-checking router (`secure_app_with_token`, used
+/// throughout this file for the auth tests above) rather than
+/// `create_router_with_state`, which never inserts an identity extension at
+/// all — that gap would make this pass even if `delete_file` dropped the
+/// extractor entirely.
+#[tokio::test]
+async fn a_deleted_files_audit_event_carries_the_callers_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("secret.bin"), b"x").expect("write");
+    let (state, log) = audited_state(&dir);
+    let app = secure_app_with_token(state, "op-token", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_delete("/api/v1/fs/file?path=secret.bin", "op-token"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let events = audit_lines(&log);
+    let deleted = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete")
+        .expect("a deletion must leave an audit event");
+    assert_eq!(deleted["identity"]["label"], "test");
+}
