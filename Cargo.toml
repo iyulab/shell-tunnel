@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -34,6 +34,12 @@ portable-pty = "0.9"
 # is allowed to lean on: key material derived from anything cheaper (the clock)
 # has already shipped as a predictable-credential bug.
 getrandom = "0.3"
+
+# SHA-256 for transfer integrity. `ring` is only present under the tls/relay
+# features, so the default build has no hash available — and hand-rolling one
+# means owning 150 lines of bit twiddling forever. Same call as `getrandom`:
+# a single small crate, taken deliberately.
+sha2 = "0.10"
 
 # Error handling
 thiserror = "2.0"

@@ -73,6 +73,22 @@ pub struct AuditEvent {
     /// Why a request was refused (`missing-token`, `invalid-token`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Path a file operation touched, relative to the configured root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Bytes transferred. Present on terminal transfer events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Whether the declared digest matched what arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_ok: Option<bool>,
+    /// The upload session's id.
+    ///
+    /// Recorded on `upload.start` and on any event that cannot carry `file`
+    /// (see `with_upload_id`'s doc comment) so the two can still be joined
+    /// into one session's story.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -91,6 +107,10 @@ impl AuditEvent {
             duration_ms: None,
             status: None,
             reason: None,
+            file: None,
+            bytes: None,
+            digest_ok: None,
+            upload_id: None,
         }
     }
 
@@ -141,6 +161,39 @@ impl AuditEvent {
     pub fn with_denial(mut self, status: u16, reason: impl Into<String>) -> Self {
         self.status = Some(status);
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Attach the file a transfer touched, and how many bytes moved.
+    ///
+    /// Recorded on terminal events only. A chunk-level trail would turn one
+    /// gigabyte-scale transfer into hundreds of lines and bury everything else
+    /// in the log.
+    pub fn with_file(mut self, path: impl Into<String>, bytes: Option<u64>) -> Self {
+        self.file = Some(path.into());
+        self.bytes = bytes;
+        self
+    }
+
+    /// Record whether the declared digest matched.
+    pub fn with_digest(mut self, verified: bool) -> Self {
+        self.digest_ok = Some(verified);
+        self
+    }
+
+    /// Attach the upload session's id.
+    ///
+    /// Every terminal upload event but one can name its subject through
+    /// `file` (the destination). The exception is `upload.orphaned`: a
+    /// `.part` staging file found at startup carries only the id encoded in
+    /// its own filename — the destination it was headed for lived in the
+    /// in-memory session that a restart already discarded, so there is
+    /// nothing left to attach as `file`. `upload_id` is how a reader
+    /// recovers that link anyway: it is also recorded on `upload.start`
+    /// (which does have `file`), so grepping the trail for one upload's id
+    /// still surfaces both ends of its story.
+    pub fn with_upload_id(mut self, id: impl Into<String>) -> Self {
+        self.upload_id = Some(id.into());
         self
     }
 }

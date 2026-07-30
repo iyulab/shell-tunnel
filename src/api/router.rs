@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, MatchedPath, Request, State},
+    extract::{
+        connect_info::IntoMakeServiceWithConnectInfo, DefaultBodyLimit, MatchedPath, Request, State,
+    },
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -178,6 +180,7 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .route("/", get(api_info))
         .route("/execute", post(execute_oneshot))
         .route("/ws", any(ws_oneshot_handler))
+        .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
     // Build main router. This "no security" convenience constructor uses the
@@ -217,17 +220,38 @@ pub enum RequiredCapability {
 pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapability {
     use RequiredCapability::{Authenticated, Capability, Public};
 
+    // HEAD is GET without a body, and axum's `get()` serves it automatically, so
+    // its authorization must equal GET's. Keyed separately below, every GET
+    // route would need a twin HEAD arm — and a forgotten twin falls through to
+    // the closed default `Authenticated`, which means any valid token, not the
+    // capability GET requires. Normalising here is the one place it cannot be
+    // forgotten. Matched as `&str` (rather than comparing `Method` values) so
+    // the table below stays exactly as it reads for every other method.
+    let method = match method.as_str() {
+        "HEAD" => "GET",
+        other => other,
+    };
+
     match (method, matched_path) {
         (_, "/health") => Public,
-        (&Method::GET, "/api/v1") => Authenticated,
-        (&Method::POST, "/api/v1/execute") => Capability("exec"),
+        ("GET", "/api/v1") => Authenticated,
+        ("POST", "/api/v1/execute") => Capability("exec"),
         (_, "/api/v1/ws") => Capability("exec"),
-        (&Method::GET, "/api/v1/sessions") => Capability("session.read"),
-        (&Method::POST, "/api/v1/sessions") => Capability("session.manage"),
-        (&Method::GET, "/api/v1/sessions/{id}") => Capability("session.read"),
-        (&Method::DELETE, "/api/v1/sessions/{id}") => Capability("session.manage"),
-        (&Method::POST, "/api/v1/sessions/{id}/execute") => Capability("exec"),
+        ("GET", "/api/v1/sessions") => Capability("session.read"),
+        ("POST", "/api/v1/sessions") => Capability("session.manage"),
+        ("GET", "/api/v1/sessions/{id}") => Capability("session.read"),
+        ("DELETE", "/api/v1/sessions/{id}") => Capability("session.manage"),
+        ("POST", "/api/v1/sessions/{id}/execute") => Capability("exec"),
         (_, "/api/v1/sessions/{id}/ws") => Capability("exec"),
+        ("GET", "/api/v1/fs/list") => Capability("fs.read"),
+        ("GET", "/api/v1/fs/stat") => Capability("fs.read"),
+        ("GET", "/api/v1/fs/file") => Capability("fs.read"),
+        ("DELETE", "/api/v1/fs/file") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/uploads") => Capability("fs.write"),
+        ("GET", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        ("PATCH", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/uploads/{id}/complete") => Capability("fs.write"),
+        ("DELETE", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
         _ => Authenticated,
     }
 }
@@ -416,6 +440,7 @@ pub fn create_secure_router(
         .route("/", get(api_info))
         .route("/execute", post(execute_oneshot))
         .route("/ws", any(ws_oneshot_handler))
+        .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
     let allowed_hosts = security.allowed_hosts.clone();
@@ -618,6 +643,47 @@ async fn shutdown_signal() {
     }
 }
 
+/// Filesystem routes, shared by the plain and the secured router.
+///
+/// Built in one place so the two constructors cannot drift apart — a route
+/// present in only one of them is reachable in only one deployment shape.
+fn fs_routes() -> Router<AppState> {
+    // The chunk-upload route carries request bodies up to `MAX_CHUNK_SIZE` (8
+    // MiB) — well above axum-core's own default body limit (2 MiB, axum-core
+    // 0.5.6's `DEFAULT_LIMIT`), which this app otherwise never overrides. A
+    // client sending a chunk at the server's own advertised `chunk_size` (4
+    // MiB default) would have it rejected before `append_chunk` ever ran.
+    //
+    // Raised only for this one path, via a merged sub-router, rather than
+    // `.layer()` on the whole `fs_routes` router: the latter would also raise
+    // the limit for `/list`, `/stat`, and `/file`, none of which need an 8
+    // MiB body, and a limit set any higher up would reach `/api/v1/execute`
+    // too. Set at the hard ceiling (`MAX_CHUNK_SIZE`) rather than the
+    // *configured* `chunk_size`, so a chunk larger than configured but still
+    // under the ceiling reaches `append_chunk`'s own `TooLarge` check and
+    // gets a 413 with a machine-readable body — if axum's limit cut it off
+    // first, the caller would get a bodyless 413 with no way to tell why.
+    let upload_session_routes = Router::new()
+        .route(
+            "/uploads/{id}",
+            get(super::fs::upload_status)
+                .patch(super::fs::append_chunk)
+                .delete(super::fs::cancel_upload),
+        )
+        .route_layer(DefaultBodyLimit::max(crate::fs::MAX_CHUNK_SIZE));
+
+    Router::new()
+        .route("/list", get(super::fs::list))
+        .route("/stat", get(super::fs::stat))
+        .route(
+            "/file",
+            get(super::fs::download).delete(super::fs::delete_file),
+        )
+        .route("/uploads", post(super::fs::create_upload))
+        .merge(upload_session_routes)
+        .route("/uploads/{id}/complete", post(super::fs::complete_upload))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -740,6 +806,13 @@ mod tests {
             RequiredCapability::Authenticated
         );
     }
+
+    // A direct unit-level check of the `HEAD` normalisation lived here once,
+    // hardcoding three fs paths. It is superseded by
+    // `every_get_fs_route_authorizes_head_identically` in `tests/fs_api.rs`,
+    // which derives the same check from the one authoritative route table
+    // (shared with `every_fs_route_declares_a_capability`) instead of a
+    // second, hand-maintained list that could drift from it.
 
     #[test]
     fn test_secure_router_creation() {

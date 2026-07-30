@@ -188,8 +188,92 @@ relay. Server-sent events do not pass through the relay.
 | `POST` | `/api/v1/sessions/{id}/execute` | `exec` |
 | `POST` | `/api/v1/execute` | `exec` |
 | `WS` | `/api/v1/ws`, `/api/v1/sessions/{id}/ws` | `exec` |
+| `GET` | `/api/v1/fs/list`, `/api/v1/fs/stat`, `/api/v1/fs/file` | `fs.read` |
+| `DELETE` | `/api/v1/fs/file` | `fs.write` |
+| `POST` | `/api/v1/fs/uploads`, `/api/v1/fs/uploads/{id}/complete` | `fs.write` |
+| `GET`, `PATCH`, `DELETE` | `/api/v1/fs/uploads/{id}` | `fs.write` |
 
-Relay-only endpoints are in [§5](#5-self-hosted-relay).
+`GET /api/v1/fs/uploads/{id}` needs `fs.write`, not `fs.read` — an upload session is a
+write operation end to end, including checking where it left off. See [§3.1](#31-files)
+for the file endpoints in full, and [§4](#4-authentication-and-capabilities) for why
+`fs.read`/`fs.write` need to be requested explicitly. Relay-only endpoints are in
+[§5](#5-self-hosted-relay).
+
+### 3.1 Files
+
+Off unless the server was started with `--fs-root <dir>`; every path below is confined
+to that directory. `stat` and `list` share one entry shape:
+
+```bash
+curl "$BASE/api/v1/fs/stat?path=app/payload.bin"
+# {"path":"app/payload.bin","size":6291456,"mtime_ms":1785399156632,"is_dir":false}
+
+curl "$BASE/api/v1/fs/list?path=app"
+# {"entries":[{"path":"app/payload.bin","size":6291456,"mtime_ms":1785399156632,"is_dir":false}]}
+```
+
+`list` is paginated by an opaque path cursor (`?cursor=...&limit=...`), not an offset —
+the tree is walked and sorted once per page, so a file added or removed mid-walk shifts
+which entries fall on which page but never invalidates a cursor already handed out. Add
+`&recursive=true` to walk subdirectories, `&hash=sha256` to get a content hash on every
+file in that page (never per whole tree, so a large recursive listing cannot outrun the
+relay's 120s request timeout).
+
+`GET /api/v1/fs/file?path=...` serves the whole file, or a `Range` of it — ordinary HTTP,
+so any client that already speaks `Range`/`If-Range` gets resumable downloads for free.
+`DELETE` removes one entry (not a real directory — recursive removal needs guards this
+layer does not have yet).
+
+**The full upload round trip**, run against a local server with `--fs-root` set and no
+auth (the same commands work with an `Authorization: Bearer <key>` header once auth is
+on). Real output from a 6 MiB file, split into the default 4 MiB chunk size:
+
+```bash
+sha256sum payload.bin
+# 94efbf93ba2381251901f7f7a62fe7d57647d3ea17714d6aa5e4f720aa7c210e
+
+split -b 4194304 -d -a 3 payload.bin chunk-
+```
+
+```bash
+# Open the session: declare the destination, total size, and whole-file digest.
+curl -s -X POST "$BASE/api/v1/fs/uploads" \
+  -H 'content-type: application/json' \
+  -d '{"path":"app/payload.bin","size":6291456,"sha256":"94efbf93ba2381251901f7f7a62fe7d57647d3ea17714d6aa5e4f720aa7c210e"}'
+# {"upload_id":"up-0000000000000000","offset":0,"chunk_size":4194304}
+```
+
+```bash
+# Send each chunk. Content-Range names the offset the chunk starts at; a chunk
+# that arrives twice is refused by position (409 offset-mismatch), not silently
+# re-appended.
+curl -s -X PATCH "$BASE/api/v1/fs/uploads/up-0000000000000000" \
+  -H 'content-range: bytes 0-4194303/6291456' --data-binary @chunk-000
+# {"upload_id":"up-0000000000000000","offset":4194304,"chunk_size":4194304}
+
+curl -s -X PATCH "$BASE/api/v1/fs/uploads/up-0000000000000000" \
+  -H 'content-range: bytes 4194304-6291455/6291456' --data-binary @chunk-001
+# {"upload_id":"up-0000000000000000","offset":6291456,"chunk_size":4194304}
+```
+
+```bash
+# After a drop, ask where to resume from instead of resending from zero.
+curl -s "$BASE/api/v1/fs/uploads/up-0000000000000000"
+# {"upload_id":"up-0000000000000000","offset":6291456,"chunk_size":4194304}
+```
+
+```bash
+# Verify the digest and publish. Nothing appears at the destination before this
+# call succeeds — the assembled bytes are renamed onto it atomically.
+curl -s -X POST "$BASE/api/v1/fs/uploads/up-0000000000000000/complete"
+# {"path":"app/payload.bin","sha256":"94efbf93ba2381251901f7f7a62fe7d57647d3ea17714d6aa5e4f720aa7c210e","size":6291456}
+```
+
+A checksum mismatch at `complete` returns `422 checksum-mismatch` with `expected` and
+`actual` in the body and discards the session — there is nothing to resume, only a new
+one to open. `DELETE .../uploads/{id}` abandons a session early, freeing its staged
+bytes; an idle session is swept automatically after an hour either way, so an abandoned
+transfer never accumulates forever.
 
 ---
 
@@ -206,6 +290,8 @@ Each token carries a set of capabilities; each route declares the one it needs:
 | `exec` | run commands (HTTP and WebSocket) |
 | `session.read` | list and inspect sessions |
 | `session.manage` | create and delete sessions |
+| `fs.read` | `list`, `stat`, read/download a file |
+| `fs.write` | delete a file, and the whole upload-session lifecycle (including reading a session's own resume point) |
 | `*` | everything |
 
 Missing or unknown token → **401**. Valid token without the capability → **403**
@@ -219,9 +305,16 @@ Presets are a convenience, not a wire contract:
 | `read-only` | `session.read` |
 | `full-control` | `*` |
 
+**`fs.read` and `fs.write` are absent from `operator` and `read-only`, deliberately.**
+Enabling `--fs-root` on a server whose `operator` or `read-only` tokens were issued
+before file access existed must not silently hand those tokens file access — so the two
+capabilities have to be named explicitly for either preset. `full-control`'s wildcard
+already covers them, as it does every capability; there is nothing to add there:
+
 ```bash
 shell-tunnel -k readonly-key --preset read-only
 shell-tunnel -k ci-key --capabilities exec,session.read
+shell-tunnel --fs-root /srv/deploy -k files-key --capabilities fs.read,fs.write
 ```
 
 Passing `--capabilities` or `--preset` turns authentication on, since a scope
@@ -247,6 +340,11 @@ traffic instead.
 `--audit-log <file>` appends one JSON object per line for every execution and
 every refusal. Off unless a path is given — creating a file nobody asked for is
 its own kind of surprise.
+
+If `--fs-root` is also given, the audit log may not resolve inside it: startup
+is refused rather than allowed, since an `fs.write` token could otherwise delete
+or overwrite the trail recording its own actions. Point `--audit-log` at a
+directory outside the fs root.
 
 ```bash
 shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
@@ -498,6 +596,8 @@ still sees the real address.
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
 | `--audit-log <FILE>` | Append executions and refusals as JSON lines | off |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
+| `--fs-root <PATH>` | Enable the filesystem API, confined to this directory | off |
+| `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
 `shell-tunnel relay [OPTIONS]` additionally accepts:
@@ -557,7 +657,10 @@ startup rather than serving local-only.
 | **502** from a relay URL | device is not attached | check `/relay/v1/devices` |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1` |
 | **504** from a relay URL | device did not answer in 120s | check the device |
-| **413** | request body over 8 MiB | split the request |
+| **413** | request body over 8 MiB, or an upload chunk over `chunk_size` | split the request |
+| **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
+| **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
+| **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
 
 A relay connection that drops is retried with exponential backoff (1s→60s); the
 device keeps its URL, so callers need no change. A *tunnel* that dies takes the
@@ -595,6 +698,10 @@ documented here.
 - **8 MiB** request body limit through the relay.
 - Each device keeps **4 idle connections** pre-opened; beyond that, requests wait
   briefly for a refill and get **503** after 5 seconds.
+- **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a
+  value one byte under the ceiling (`8388607`) is accepted and sits directly against the
+  relay's own body limit, leaving no margin. The default (4 MiB) is the one to keep for
+  anything that will ever run behind a relay.
 - Quick tunnels change URL on every restart and are documented by Cloudflare as
   testing-only.
 - Command content is not filtered; capability scoping is the control.

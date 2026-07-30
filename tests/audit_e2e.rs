@@ -107,6 +107,29 @@ async fn an_execution_is_recorded_with_who_and_what() {
         .identity
         .expect("an authenticated call has an identity");
     assert!(identity.token_id.starts_with("tok_"), "{identity:?}");
+
+    // Round-tripping through `AuditEvent` (as `events()` does above, and as
+    // every test in this file does) cannot tell "absent" from "present but
+    // null": every fs-only field is an `Option`, and `serde_json` maps both
+    // shapes to `None` on the way in. That makes this file, despite its
+    // name, a strong *behaviour* test and a near-worthless *shape* test —
+    // dropping `skip_serializing_if` from `file`/`bytes`/`digest_ok`/
+    // `upload_id` would make every event in this file grow
+    // `"file":null,"bytes":null,"digest_ok":null,"upload_id":null` and all
+    // six tests here would still pass. Parsing the raw line as a bare
+    // `Value` instead — the same `contains_key` pattern `tests/fs_api.rs`
+    // already uses to prove `upload.orphaned` omits `file` — is the only way
+    // to prove these keys are genuinely missing from an execute event, not
+    // merely null.
+    let raw_line = std::fs::read_to_string(&trail).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(raw_line.lines().next().unwrap()).unwrap();
+    let object = raw.as_object().expect("object");
+    for key in ["file", "bytes", "digest_ok", "upload_id"] {
+        assert!(
+            !object.contains_key(key),
+            "an execute event must not carry the fs-only `{key}` key at all"
+        );
+    }
 }
 
 #[tokio::test]
@@ -183,13 +206,29 @@ async fn the_token_never_reaches_the_file() {
     assert!(!raw.contains("Bearer"), "{raw}");
 }
 
-#[tokio::test]
-async fn nothing_is_written_when_no_trail_is_configured() {
-    // The default has to stay silent: creating files nobody asked for is its own
-    // kind of surprise.
+#[test]
+fn nothing_is_written_when_no_trail_is_configured() {
+    // The default has to stay silent: creating files nobody asked for is its
+    // own kind of surprise. The previous version of this test asserted
+    // `!sink.is_enabled()`, called `record()`, and checked no filesystem
+    // state at all afterward — it would have passed unchanged even if
+    // `Disabled::record` wrote to some hardcoded path, since nothing was
+    // ever compared against anything. `Disabled` takes no path to point it
+    // at directly, so the check available here is that a directory nobody
+    // told it about stays empty. Plain `#[test]`, not `#[tokio::test]`: the
+    // body has never awaited anything — the async marker was a copy
+    // artefact from its neighbours in this file.
+    let dir = tempfile::tempdir().unwrap();
+
     let sink = AuditSink::Disabled;
     assert!(!sink.is_enabled());
     sink.record(AuditEvent::new("execute").with_command("echo nothing"));
+
+    let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+    assert!(
+        entries.is_empty(),
+        "a disabled sink must create nothing, anywhere: {entries:?}"
+    );
 }
 
 #[tokio::test]

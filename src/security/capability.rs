@@ -77,6 +77,24 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
     }
 }
 
+/// Capability strings the router currently maps routes onto.
+///
+/// Vocabulary, not mechanism — additive by design (see the module header).
+/// `fs.read` and `fs.write` are deliberately absent from the `operator` and
+/// `read-only` presets: adding them there would hand file access to tokens
+/// already issued, which is a privilege change nobody asked for. An existing
+/// `operator` or `read-only` token must name them explicitly, e.g.
+/// `--capabilities fs.read,fs.write`. `full-control`'s [`CapabilitySet::wildcard`]
+/// already covers both, as it does every capability — there is no way to keep
+/// a `full-control` token from gaining file access once `--fs-root` is set.
+pub const KNOWN_CAPABILITIES: &[&str] = &[
+    "exec",
+    "session.read",
+    "session.manage",
+    "fs.read",
+    "fs.write",
+];
+
 /// Resolve a role **preset** name to its capability set (spec §6).
 ///
 /// Presets are a **non-contract** convenience mapping — they may change freely

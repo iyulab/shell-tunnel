@@ -62,6 +62,7 @@ pub mod error;
 pub mod execution;
 #[cfg(any(feature = "tls", feature = "relay-client"))]
 pub mod fingerprint;
+pub mod fs;
 pub mod logging;
 pub mod output;
 mod process;
@@ -78,6 +79,7 @@ pub mod update;
 // Re-export commonly used types
 pub use error::{Result, ShellTunnelError};
 pub use execution::{Command, CommandExecutor, ExecutionResult};
+pub use fs::{FsError, FsRoot};
 pub use output::{OutputSanitizer, VirtualScreen};
 pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
 pub use session::{

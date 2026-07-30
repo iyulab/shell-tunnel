@@ -3,6 +3,34 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.11.0 — 2026-07-30
+
+### Added
+
+- **Filesystem API** — list, stat, download, upload, and delete inside a directory named
+  by `--fs-root`. Off entirely unless that flag is given at startup.
+- Downloads use HTTP `Range`, so resuming needs no client-side protocol beyond what any
+  HTTP client already speaks; `If-Range` refuses to stitch a stale prefix onto a file
+  that changed mid-transfer, falling back to the whole file instead of serving
+  mismatched bytes.
+- Uploads run as sessions: declare a size and a whole-file SHA-256, send chunks at
+  per-chunk offsets, and the file is verified end to end and renamed into place
+  atomically — a partial file never appears at the destination. `--fs-chunk-size` sets
+  the advertised chunk size (default 4 MiB); refused at startup at or above the relay's
+  8 MiB request-body ceiling, since a chunk that size could never cross a relay anyway.
+- `list` is paginated by an opaque path cursor rather than an offset, so a file added or
+  removed mid-walk cannot invalidate a page already handed out. An unpaginated listing
+  would also exceed the relay's body ceiling on exactly the directory sizes this
+  endpoint exists to serve.
+- New capabilities `fs.read` and `fs.write`, deliberately absent from the `operator` and
+  `read-only` presets: adding them there would hand file access to tokens already issued
+  for a server that had none. Request them explicitly — `--capabilities fs.read,fs.write`.
+  `full-control`'s wildcard already covers both, as it does every capability.
+- Transfers are audited at session granularity — start, completion, checksum rejection,
+  and cancellation all leave an entry — including sessions abandoned and later swept for
+  being idle too long, so the trail never shows a session starting with no matching end.
+- New default dependency: `sha2`, for the upload integrity check.
+
 ## 0.10.0 — 2026-07-24
 
 ### Breaking
