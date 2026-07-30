@@ -135,7 +135,10 @@ pub struct ListQuery {
     /// Only `sha256` is understood; anything else is ignored.
     #[serde(default)]
     pub hash: Option<String>,
-    /// Resume point: the last path returned by the previous page.
+    /// Resume point: the opaque token from the previous page's `next_cursor`.
+    ///
+    /// Echo it back verbatim. It is not a path, and a hand-built value is
+    /// refused with `400 bad-cursor`.
     #[serde(default)]
     pub cursor: Option<String>,
     #[serde(default)]
@@ -153,9 +156,15 @@ pub struct ListResponse {
 
 /// `GET /api/v1/fs/list` — one page of a directory's contents.
 ///
-/// The cursor is the last path returned, not an offset: entries are ordered by
-/// path, so a file added or removed mid-walk shifts offsets but never
-/// invalidates a path.
+/// Paging is by opaque cursor, which encodes the last path returned rather than
+/// an offset: entries are ordered by path, so a file added or removed mid-walk
+/// shifts every offset but cannot invalidate a path.
+///
+/// The encoding is what makes the token opaque, and it is not decoration. A raw
+/// path on the wire passes through form-urlencoded decoding, where `+` becomes a
+/// space — so a file named `data+1.csv` at a page boundary produced a cursor that
+/// decoded to a name sorting *before* the real entry, and a client looping until
+/// `next_cursor` was `None` re-fetched the same page forever.
 pub async fn list(State(state): State<AppState>, Query(query): Query<ListQuery>) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
@@ -228,7 +237,12 @@ fn list_blocking(root: &FsRoot, query: &ListQuery) -> Response {
     };
 
     let end = (start + limit).min(collected.len());
-    let next_cursor = (end < collected.len()).then(|| encode_cursor(&collected[end - 1].0));
+    // `saturating_sub` rather than `end - 1`: the index is safe only because the
+    // clamp keeps `limit` at 1 or more, which is a guarantee living in a
+    // different expression. A future edit that relaxes the clamp would turn this
+    // into a panic, and a panicking handler is a 500.
+    let next_cursor =
+        (end < collected.len()).then(|| encode_cursor(&collected[end.saturating_sub(1)].0));
 
     let mut entries = Vec::with_capacity(end.saturating_sub(start));
     for (relative, absolute, meta) in &collected[start..end] {
