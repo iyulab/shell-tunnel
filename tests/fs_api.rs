@@ -2776,6 +2776,7 @@ async fn a_directory_creation_failure_at_complete_is_audited_as_failed() {
     assert_eq!(failed["bytes"], 11);
     assert_eq!(failed["reason"], "directory-creation-failed");
     assert_eq!(failed["status"], 500);
+    assert_eq!(failed["upload_id"], id);
 }
 
 /// Same failure family as the test above, different branch: `rename` itself
@@ -2827,6 +2828,7 @@ async fn a_rename_failure_at_complete_is_audited_as_failed() {
     assert_eq!(failed["bytes"], 11);
     assert_eq!(failed["reason"], "rename-failed");
     assert_eq!(failed["status"], 500);
+    assert_eq!(failed["upload_id"], id);
 }
 
 /// The third and hardest-to-reach branch: `resolve_for_create` itself fails
@@ -2905,6 +2907,7 @@ async fn a_resolve_failure_at_complete_is_audited_as_failed() {
     assert_eq!(failed["bytes"], 11);
     assert_eq!(failed["reason"], "destination-resolve-failed");
     assert_eq!(failed["status"], 403);
+    assert_eq!(failed["upload_id"], id);
 }
 
 /// `main.rs` runs `sweep_orphaned_uploads` once at startup, after a restart
