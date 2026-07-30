@@ -53,6 +53,25 @@ pub struct ProxyResponse {
 ///
 /// Hop-by-hop headers describe *this* connection, not the message; forwarding
 /// them makes the device answer about a connection it is not part of.
+///
+/// `expect` is here for the same reason, and it is not merely tidy — leaving it
+/// in produced a 500 for every body-carrying request a normal client made.
+/// The relay buffers the entire body before it forwards anything (see
+/// `MAX_BODY`), so by the time the device sees the request the expectation has
+/// already been met: there is nothing left for the device to decide. Replaying
+/// `Expect: 100-continue` onto the device's own local HTTP call instead made
+/// that server answer with an interim `100 Continue`, which the device
+/// reported back as the response, which the relay then tried to return as a
+/// final status — and hyper cannot write a 1xx as a final response, so it
+/// substituted an empty `500`.
+///
+/// The request itself always succeeded. The device ran the command or wrote the
+/// chunk and answered 200; only the status the caller saw was wrong, which is
+/// the worst way for this to fail — a non-idempotent `execute` reported as
+/// failed after it had already run. `curl` adds this header automatically for
+/// bodies over about a kilobyte, so every upload chunk tripped it while small
+/// `execute` payloads did not, which is why it stayed hidden until the file
+/// API made large bodies ordinary.
 const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
@@ -63,6 +82,7 @@ const HOP_BY_HOP: &[&str] = &[
     "transfer-encoding",
     "upgrade",
     "host",
+    "expect",
 ];
 
 /// Whether a header may be forwarded across the relay boundary.
