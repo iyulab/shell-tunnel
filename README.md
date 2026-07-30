@@ -110,6 +110,22 @@ No public relay of your own? `shell-tunnel --tunnel --preset operator` runs `clo
 prints a `trycloudflare.com` URL instead — quick to try, but Cloudflare documents it as
 testing-only. See [docs/USAGE.md](docs/USAGE.md) for both paths in full.
 
+## Moving files
+
+Point the server at a directory and it will serve and accept files inside it — and
+nowhere else:
+
+```bash
+shell-tunnel --fs-root /srv/deploy --require-auth --capabilities fs.read,fs.write
+```
+
+Downloads are ordinary HTTP with `Range`, so an interrupted transfer resumes with the
+same header any HTTP client already speaks. Uploads run as a session: declare the size
+and SHA-256, send chunks, and the file appears at its destination only once the whole
+thing verifies.
+
+Without `--fs-root` the file endpoints stay off.
+
 ## A word on exposure
 
 Publishing a shell means anyone holding the token can run commands as the user running
@@ -130,8 +146,9 @@ flag, and the fingerprint it prints keeps the connection authenticated, not just
 
 Implemented: sessions, one-shot and streaming execution, WebSocket, capability-scoped auth,
 rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS with
-self-signed generation and fingerprint pinning, host-header checking, and an append-only audit
-trail. On the roadmap: filesystem operations and native MCP tools.
+self-signed generation and fingerprint pinning, host-header checking, an append-only audit
+trail, and filesystem operations (list, read, write, delete, confined to `--fs-root`). On the
+roadmap: native MCP tools.
 
 ## License
 

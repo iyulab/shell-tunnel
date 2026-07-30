@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.9.1",
+    "version": "0.11.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -31,6 +31,10 @@
     {
       "name": "Execution",
       "description": "Command execution endpoints"
+    },
+    {
+      "name": "Filesystem",
+      "description": "List, read, write, and delete files inside a directory named by --fs-root. Disabled entirely unless that flag was given at startup."
     }
   ],
   "paths": {
@@ -396,6 +400,675 @@
           }
         }
       }
+    },
+    "/api/v1/fs/list": {
+      "get": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "List a directory",
+        "description": "Returns one page of a directory's contents. Paginated by an opaque path cursor rather than an offset, so a file added or removed mid-walk cannot invalidate a page already returned — an unpaginated listing would also exceed the relay's 8 MiB body ceiling on exactly the trees this endpoint exists to serve.\n\nRequired capability: `fs.read`.",
+        "operationId": "fsList",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Root-relative directory to list.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "app"
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Walk subdirectories too. Default false (one level only).",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "hash",
+            "in": "query",
+            "description": "Set to `sha256` to include a content hash on every file entry in this page. Hashing is per page, never per tree, so a large recursive listing cannot outrun the relay's 120s request timeout. Any other value is ignored.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "sha256"
+              ]
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Resume point: the opaque `next_cursor` from the previous page. Echo it back verbatim; a hand-built value is refused with 400 `bad-cursor`.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Page size. Clamped to [1, 10000] rather than refused; default 1000.",
+            "schema": {
+              "type": "integer",
+              "default": 1000,
+              "minimum": 1,
+              "maximum": 10000
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One page of entries.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path` (malformed path), `not-a-directory` (path names a file; use `/api/v1/fs/stat`), or `bad-cursor` (cursor is not a value this endpoint produced).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` (no `--fs-root` configured), `path-escapes-root`, or `unreadable` (directory could not be opened) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found` — no such directory.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`list-failed` — the walk panicked unexpectedly."
+          }
+        }
+      }
+    },
+    "/api/v1/fs/stat": {
+      "get": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Stat one entry",
+        "description": "Returns one filesystem entry, file or directory — the same shape `list` reports, so a consumer can hold results from either in one type.\n\nRequired capability: `fs.read`.",
+        "operationId": "fsStat",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Root-relative path to stat.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "app/config.json"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FsEntry"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path` — malformed path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          }
+        }
+      }
+    },
+    "/api/v1/fs/file": {
+      "get": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Download a file, or a range of it",
+        "description": "Returns the whole file, or one byte range of it via `Range`. Supports resumable downloads without any client-side protocol beyond ordinary HTTP: `If-Range` compares against the returned `etag` and refuses to stitch a stale prefix onto a file that changed mid-transfer, falling back to the whole file (200) rather than serving mismatched bytes.\n\n`HEAD` reaches this same route (axum serves it automatically) and reports identical status and headers with no body — same capability, `fs.read`.\n\nRequired capability: `fs.read`.",
+        "operationId": "fsDownload",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Root-relative file to read.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "app/build.zip"
+          },
+          {
+            "name": "Range",
+            "in": "header",
+            "description": "Single-range `bytes=<start>-<end>` (open-ended and suffix forms accepted). A syntactically invalid or multi-range spec is ignored, not refused — the whole file is served instead.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "bytes=0-4194303"
+          },
+          {
+            "name": "If-Range",
+            "in": "header",
+            "description": "An `etag` previously returned for this path. When it no longer matches, the `Range` is ignored and the whole file is served (200) rather than resuming onto a file that changed.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The whole file. Headers: `content-type: application/octet-stream`, `accept-ranges: bytes`, `etag`, `content-length`."
+          },
+          "206": {
+            "description": "The requested byte range. Headers as for 200, plus `content-range: bytes <start>-<end>/<size>`."
+          },
+          "400": {
+            "description": "`not-a-file` — path is a directory or other non-regular entry; use `/api/v1/fs/list`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "416": {
+            "description": "Range Not Satisfiable — a well-formed `bytes` range naming bytes the file does not currently have. Header: `content-range: bytes */<size>`."
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`download-failed` — reading the file panicked unexpectedly."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Delete one entry",
+        "description": "Removes the named entry — a file, a symlink, or any other non-directory node. A *real* directory is refused: recursive removal needs the destructive-operation guards (dry-run, backup, approval) this layer does not yet have.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsDelete",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "description": "Root-relative entry to remove.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "app/stale.log"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed."
+          },
+          "400": {
+            "description": "`bad-path`, or `not-a-file` (path is a real directory; recursive removal is not supported).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`delete-failed` (the OS refused the removal) or `delete-panicked` (unexpected failure)."
+          }
+        }
+      }
+    },
+    "/api/v1/fs/uploads": {
+      "post": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Open an upload session",
+        "description": "Declares a destination, a total size, and a whole-file SHA-256, and opens a session to receive it in chunks. Nothing is written to the destination until `POST /api/v1/fs/uploads/{id}/complete` verifies the digest and renames the staged bytes into place atomically — a partial file never appears at the destination.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsCreateUpload",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUpload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Session opened.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path`, or `bad-digest` (`sha256` is not 64 lowercase hex characters).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (destination resolves into the upload staging directory) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`destination-busy` (another session already targets this path) or `destination-is-directory` (the destination already exists as a directory).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too-many-uploads` — too many sessions are open; finish or cancel one and retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`io-error` (destination directory could not be created, or another OS failure) or `create-upload-failed` (unexpected failure). See 507 for the out-of-space case."
+          },
+          "507": {
+            "description": "`io-error` — the destination's filesystem is out of space or quota (Unix `EDQUOT`; Windows quota reporting is tracked separately)."
+          }
+        }
+      }
+    },
+    "/api/v1/fs/uploads/{id}": {
+      "get": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Read a session's resume point",
+        "description": "Reports the next byte offset the server expects — where to resume an interrupted upload from. Reads only in-memory session state; never touches disk.\n\nRequired capability: `fs.write` (not `fs.read` — an upload session is a write operation end to end, including checking where it left off).",
+        "operationId": "fsUploadStatus",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/uploadId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current session state.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadState"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`no-such-upload` — unknown, completed, or expired session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "description": "`fs-not-enabled` — a JSON body. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Append one chunk",
+        "description": "Appends `chunk_size` (or fewer) bytes at the offset named by `Content-Range`. The offset must equal the session's current offset exactly — a chunk that arrives twice is refused by position, not silently re-appended.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsAppendChunk",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/uploadId"
+          },
+          {
+            "name": "Content-Range",
+            "in": "header",
+            "required": true,
+            "description": "`bytes <start>-<end>/<total>`. Only `<start>` is consulted; the chunk's length is the request body's own length.",
+            "schema": {
+              "type": "string"
+            },
+            "example": "bytes 0-4194303/209715200"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Chunk accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadState"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-content-range` — the `Content-Range` header is missing or not of the form `bytes <start>-<end>/<total>`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` — a JSON body. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`no-such-upload` — unknown, completed, or expired session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`offset-mismatch` — the chunk does not continue from the session's current offset. `offset` in the body names the position to resend from.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OffsetMismatchError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`chunk-too-large` (this request body exceeds the advertised `chunk_size`) or `declared-size-exceeded` (this chunk, added to bytes already received, would exceed the `size` declared when the session was created).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`io-error` (write failed for a reason other than disk space) or `append-failed` (unexpected failure). See 507 for the out-of-space case."
+          },
+          "507": {
+            "description": "`io-error` — the destination's filesystem is out of space or quota."
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Abandon a session",
+        "description": "Cancels an in-progress upload and removes its staged bytes. As terminal for the audit trail as letting the session expire on its own — an explicit cancel is recorded the same way a sweep-driven expiry is, so the trail never shows a session starting with no matching end.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsCancelUpload",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/uploadId"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Cancelled."
+          },
+          "404": {
+            "description": "`no-such-upload` — unknown, completed, or expired session.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "description": "`fs-not-enabled` — a JSON body. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`cancel-failed` — unexpected failure."
+          }
+        }
+      }
+    },
+    "/api/v1/fs/uploads/{id}/complete": {
+      "post": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Verify and publish an upload",
+        "description": "Verifies the assembled bytes against the SHA-256 declared at session creation, then renames the staged file onto its destination atomically — the destination holds either the old file or the new one, never a half-written one.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsCompleteUpload",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/uploadId"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Published.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadComplete"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`no-such-upload` (unknown, completed, or expired session) or `not-found` (the destination's parent directory disappeared between create and complete).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`checksum-mismatch` — the assembled bytes do not match the declared digest. The session is discarded; start a new one.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChecksumMismatchError"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`io-error` (directory creation or rename failed for a reason other than disk space) or `complete-upload-failed` (unexpected failure). See 507 for the out-of-space case."
+          },
+          "507": {
+            "description": "`io-error` — the destination's filesystem is out of space or quota."
+          }
+        }
+      }
     }
   },
   "components": {
@@ -403,7 +1076,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator, read-only, full-control."
+        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator, read-only, full-control — fs.read and fs.write are in none of them and must be requested explicitly (e.g. --capabilities fs.read,fs.write), so an already-issued operator token does not silently gain file access when --fs-root is later enabled."
       }
     },
     "parameters": {
@@ -412,6 +1085,15 @@
         "in": "path",
         "required": true,
         "description": "Session identifier",
+        "schema": {
+          "type": "string"
+        }
+      },
+      "uploadId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Upload session identifier, returned as `upload_id` by `POST /api/v1/fs/uploads`.",
         "schema": {
           "type": "string"
         }
@@ -427,7 +1109,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.9.1"
+            "example": "0.11.0"
           },
           "status": {
             "type": "string",
@@ -704,6 +1386,179 @@
             }
           }
         ]
+      },
+      "FsEntry": {
+        "type": "object",
+        "description": "One filesystem entry, as reported by `stat` and by each `list` item — the same shape in both, so a consumer can hold results from either in one type.",
+        "required": [
+          "path",
+          "size",
+          "mtime_ms",
+          "is_dir"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Root-relative path with POSIX separators.",
+            "example": "app/config.json"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Size in bytes. Zero for directories.",
+            "example": 5
+          },
+          "mtime_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Modification time, Unix milliseconds."
+          },
+          "is_dir": {
+            "type": "boolean"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Content hash, present only when the caller asked for it (`list`'s `hash=sha256`; never on `stat`).",
+            "example": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+          }
+        }
+      },
+      "ListResponse": {
+        "type": "object",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FsEntry"
+            }
+          },
+          "next_cursor": {
+            "type": "string",
+            "description": "Opaque token to pass back as `cursor` for the next page. Absent on the last page."
+          }
+        }
+      },
+      "CreateUpload": {
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Destination, root-relative.",
+            "example": "app/build.zip"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total size the caller intends to send.",
+            "example": 209715200
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 of the whole file, lowercase hex (64 characters)."
+          }
+        }
+      },
+      "UploadState": {
+        "type": "object",
+        "description": "A session's current state, returned by create, status, and each chunk append.",
+        "required": [
+          "upload_id",
+          "offset",
+          "chunk_size"
+        ],
+        "properties": {
+          "upload_id": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Next byte the server expects."
+          },
+          "chunk_size": {
+            "type": "integer",
+            "description": "Largest chunk the caller may send, in bytes. Advertised rather than assumed, and always below the relay's 8 MiB body ceiling.",
+            "example": 4194304
+          }
+        }
+      },
+      "UploadComplete": {
+        "type": "object",
+        "required": [
+          "path",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The destination the file was published to."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "The verified digest — equal to the value declared when the session was created."
+          }
+        }
+      },
+      "OffsetMismatchError": {
+        "type": "object",
+        "required": [
+          "error",
+          "message",
+          "offset"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "example": "offset-mismatch"
+          },
+          "message": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The offset the session actually expects; resend the chunk from here."
+          }
+        }
+      },
+      "ChecksumMismatchError": {
+        "type": "object",
+        "required": [
+          "error",
+          "message",
+          "expected",
+          "actual"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "example": "checksum-mismatch"
+          },
+          "message": {
+            "type": "string"
+          },
+          "expected": {
+            "type": "string",
+            "description": "The sha256 declared when the session was created."
+          },
+          "actual": {
+            "type": "string",
+            "description": "The sha256 actually computed over the assembled bytes."
+          }
+        }
       }
     },
     "responses": {
