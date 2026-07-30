@@ -94,6 +94,23 @@ struct Session {
 /// processes, which is a durability feature nobody has asked for yet. The
 /// staging files a restart leaves behind are swept on startup
 /// (`sweep_orphan_parts`).
+///
+/// Invariant: no method ever holds the `sessions` lock and the `claimed`
+/// lock at the same time. `create` takes `claimed` (in its own block, which
+/// closes before anything else runs) and only later, separately, takes
+/// `sessions`; `cancel`, `sweep`, and `take_for_complete` take `sessions`
+/// first and always drop that guard — explicitly, where it is not the last
+/// use in the enclosing statement — before reaching `claimed` through
+/// `release`/`release_destination`. That the two methods' orderings are
+/// opposite (`claimed` before `sessions` in one, `sessions` before `claimed`
+/// in the other) would be a textbook two-lock deadlock *if* either ever held
+/// both at once; because neither does, the orderings never actually nest and
+/// there is nothing to cycle on. Preserving this is what makes `sessions`
+/// vs. `claimed` safe to reason about independently of `append`'s
+/// documented (non-deadlocking) contention with `sweep` — see `append`'s
+/// doc comment for that argument. Breaking this invariant — folding a
+/// `claimed` access inside a still-held `sessions` guard, or vice versa —
+/// would reintroduce a real deadlock that no existing test would catch.
 pub struct UploadStore {
     sessions: RwLock<HashMap<String, Mutex<Session>>>,
     /// Destinations currently claimed, so two sessions cannot race to one path.
@@ -361,6 +378,12 @@ impl UploadStore {
         let Some(cell) = sessions.remove(id) else {
             return false;
         };
+        // Load-bearing, not tidiness: `release` below takes the `claimed`
+        // lock, and `UploadStore`'s struct-level invariant is that `sessions`
+        // and `claimed` are never held at once. Removing this `drop` would
+        // still compile — `sessions` is unused after this point — but would
+        // hold the `sessions` write guard across the `claimed` acquisition,
+        // breaking that invariant silently.
         drop(sessions);
         let Ok(session) = cell.into_inner() else {
             return false;
@@ -389,6 +412,10 @@ impl UploadStore {
             })
             .map(|(id, _)| id.clone())
             .collect();
+        // Load-bearing: `std::sync::RwLock` has no upgrade from a read guard
+        // to a write guard, so holding this one into the loop below (which
+        // needs `sessions.write()`) would deadlock this thread against
+        // itself — a different hazard from the `drop` inside the loop below.
         drop(sessions);
 
         for id in stale {
@@ -398,6 +425,10 @@ impl UploadStore {
             let Some(cell) = sessions.remove(&id) else {
                 continue;
             };
+            // Load-bearing, not tidiness — same reason as `cancel`'s:
+            // `release` below takes `claimed`, and `UploadStore`'s
+            // struct-level invariant is that `sessions` and `claimed` are
+            // never held at once.
             drop(sessions);
             if let Ok(session) = cell.into_inner() {
                 self.release(&session.dest_rel);
