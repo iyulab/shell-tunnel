@@ -12,8 +12,8 @@ pub mod transfer;
 
 pub use root::{FsError, FsRoot};
 pub use transfer::{
-    sweep_orphan_parts, FinishedUpload, UploadError, UploadStore, DEFAULT_CHUNK_SIZE,
-    MAX_CHUNK_SIZE, SESSION_TTL,
+    sweep_orphan_parts, sweep_orphan_parts_in, FinishedUpload, UploadError, UploadStore,
+    DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, SESSION_TTL,
 };
 
 /// Directory under the root where in-flight uploads are staged.

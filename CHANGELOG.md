@@ -3,6 +3,46 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.12.0 — 2026-07-31
+
+### Changed
+
+- **The file API no longer needs `--fs-root`, and no longer confines itself to one
+  directory by default.** It now reaches whatever the account running the server
+  reaches — the same places a command it runs would. `path` is an absolute path when
+  no root is set (`C:/data/x.bin`, `/srv/deploy/x.bin`), and stays root-relative when
+  one is. The startup banner names the effective scope on every run.
+
+  The previous default confined the file API while `exec` — which every preset carrying
+  file capabilities also carries — could already read and write anything the server
+  could. That combination withheld no access; it only forced large transfers onto a
+  slower route for any destination outside the chosen directory, which is the opposite
+  of what these endpoints exist for. `--fs-root` still confines, for the case where
+  confinement is a real boundary: a token granted `fs.read`/`fs.write` and **not**
+  `exec`.
+
+  On Windows the old shape could not express the common case at all: there is no path
+  above `C:\` and `D:\`, so `--fs-root C:\` could never reach a second drive.
+
+- **`operator` now carries `fs.read` and `fs.write`.** Same reasoning: the preset
+  already grants `exec`. `read-only` still carries neither, and there the exclusion is
+  a genuine boundary — that preset has no `exec` and so no other route to a file's
+  contents.
+
+- **`fs-not-enabled` (403) is no longer reachable from the binary.** There is no longer
+  a configuration in which the file API is absent; a token either holds `fs.read`/
+  `fs.write` or is refused for the capability it lacks. Deliberate: with `exec` present,
+  a switch that turned off the file API would have suggested a protection it could not
+  provide. Library callers building an `AppState` without a root still get it.
+
+- `--audit-log` is only checked against `--fs-root` when that flag narrows the scope.
+  Machine-wide there is nowhere outside to point the log at; the banner says so rather
+  than implying a containment that is not there.
+
+### Fixed
+
+- `--help` aligned the two file-API flags with the rest of the option list.
+
 ## 0.11.0 — 2026-07-30
 
 ### Added

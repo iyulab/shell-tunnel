@@ -34,7 +34,7 @@
     },
     {
       "name": "Filesystem",
-      "description": "List, read, write, and delete files inside a directory named by --fs-root. Disabled entirely unless that flag was given at startup."
+      "description": "List, read, write, and delete files. By default these reach whatever the account running the server reaches, and `path` is absolute (`C:/data/x.bin`, `/srv/deploy/x.bin`; either separator). Starting with --fs-root <dir> confines them to that directory, and `path` becomes relative to it. The startup banner names the effective scope."
     }
   ],
   "paths": {
@@ -482,7 +482,7 @@
             }
           },
           "403": {
-            "description": "`fs-not-enabled` (no `--fs-root` configured), `path-escapes-root`, or `unreadable` (directory could not be opened) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "description": "`path-escapes-root` (only reachable when `--fs-root` confines the scope) or `unreadable` (directory could not be opened) — a JSON body in either case. Also reached, with an empty body, when the token lacks `fs.read`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1079,7 +1079,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator, read-only, full-control. fs.read and fs.write are absent from operator and read-only and must be requested explicitly (e.g. --capabilities fs.read,fs.write), so an already-issued operator or read-only token does not silently gain file access when --fs-root is later enabled. full-control's wildcard already covers both, as it does every capability."
+        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator (exec, session.read, session.manage, fs.read, fs.write), read-only (session.read), full-control (*). operator carries the file capabilities because it already carries exec, which reaches every file the server can; withholding them confined nothing. read-only carries neither, and there the exclusion is a real boundary — with no exec it has no other route to a file's contents — so name fs.read explicitly if a read-only token should read files."
       }
     },
     "parameters": {
@@ -1454,7 +1454,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "description": "Destination, root-relative.",
+            "description": "Destination. Absolute by default; relative to --fs-root when that flag confines the scope.",
             "example": "app/build.zip"
           },
           "size": {

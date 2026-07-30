@@ -81,12 +81,29 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 ///
 /// Vocabulary, not mechanism — additive by design (see the module header).
 /// `fs.read` and `fs.write` are deliberately absent from the `operator` and
-/// `read-only` presets: adding them there would hand file access to tokens
-/// already issued, which is a privilege change nobody asked for. An existing
-/// `operator` or `read-only` token must name them explicitly, e.g.
-/// `--capabilities fs.read,fs.write`. `full-control`'s [`CapabilitySet::wildcard`]
-/// already covers both, as it does every capability — there is no way to keep
-/// a `full-control` token from gaining file access once `--fs-root` is set.
+/// `read-only` presets, but what that buys differs sharply between the two,
+/// and it is worth being exact rather than claiming a boundary twice:
+///
+/// - `read-only` holds `session.read` and **no `exec`**, so withholding
+///   `fs.read` is a real containment boundary: such a token genuinely cannot
+///   read a file on this machine, and adding `fs.read` to the preset would
+///   have granted an access it did not have.
+/// - `operator` holds `exec`. A token that can run commands can already read
+///   and write anything the process can reach — `Get-Content`, `cp`, a
+///   redirect. Withholding `fs.*` there contains **nothing**; it keeps an
+///   issued token's capability surface from changing under it, which is a
+///   least-surprise property, not a security one. Do not describe it as
+///   confinement.
+///
+/// `full-control`'s [`CapabilitySet::wildcard`] covers both, as it does every
+/// capability — there is no way to keep such a token from the file API once
+/// `--fs-root` is set, and no reason to try, since `exec` already dominates it.
+///
+/// The practical consequence: `--fs-root` is a meaningful jail only for a
+/// token that has `fs.*` **without** `exec` (`--capabilities fs.write` for a
+/// deploy push, say). Against `operator` or `full-control` it is a convenience
+/// boundary — chunked, resumable, checksummed transfer instead of piping bytes
+/// through a command — not a containment one.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",
@@ -102,11 +119,25 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// name so the caller can surface a clear error.
 pub fn preset(name: &str) -> Option<CapabilitySet> {
     match name {
+        // `fs.read`/`fs.write` sit alongside `exec` here rather than being
+        // withheld from it: this preset already grants command execution, which
+        // reaches every file this process can. Withholding the file API from it
+        // confined nothing and only pushed callers onto the slow path — see
+        // `KNOWN_CAPABILITIES` above.
         "operator" => Some(
-            ["exec", "session.read", "session.manage"]
-                .into_iter()
-                .collect(),
+            [
+                "exec",
+                "session.read",
+                "session.manage",
+                "fs.read",
+                "fs.write",
+            ]
+            .into_iter()
+            .collect(),
         ),
+        // Not given `fs.read`, and this one is a real boundary: `read-only`
+        // has no `exec`, so a token holding it genuinely cannot read a file on
+        // this machine. Adding it here would be a grant, not a convenience.
         "read-only" => Some(["session.read"].into_iter().collect()),
         "full-control" => Some(CapabilitySet::wildcard()),
         _ => None,
@@ -170,12 +201,21 @@ mod tests {
         assert!(operator.satisfies("exec"));
         assert!(operator.satisfies("session.read"));
         assert!(operator.satisfies("session.manage"));
+        // Carried because `exec` above already reaches every file this process
+        // can: withholding them confined nothing. Asserted rather than left
+        // implicit so removing them again has to be a deliberate act.
+        assert!(operator.satisfies("fs.read"));
+        assert!(operator.satisfies("fs.write"));
         assert!(!operator.is_wildcard());
 
         let read_only = preset("read-only").unwrap();
         assert!(read_only.satisfies("session.read"));
         assert!(!read_only.satisfies("session.manage"));
         assert!(!read_only.satisfies("exec"));
+        // The one preset where withholding the file API is a real boundary:
+        // with no `exec`, this token has no other route to a file's contents.
+        assert!(!read_only.satisfies("fs.read"));
+        assert!(!read_only.satisfies("fs.write"));
 
         let full = preset("full-control").unwrap();
         assert!(full.is_wildcard());

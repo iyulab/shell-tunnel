@@ -201,8 +201,16 @@ for the file endpoints in full, and [§4](#4-authentication-and-capabilities) fo
 
 ### 3.1 Files
 
-Off unless the server was started with `--fs-root <dir>`; every path below is confined
-to that directory. `stat` and `list` share one entry shape:
+By default these reach whatever the account running the server reaches, and `path` is an
+absolute path (`C:/data/x.bin`, `/srv/deploy/x.bin`; either separator works). Start with
+`--fs-root <dir>` to confine them to one directory instead, and `path` becomes relative
+to it. The startup banner names the effective scope either way.
+
+The confinement is worth something for a token holding `fs.read`/`fs.write` and **not**
+`exec`. It is not a boundary against a token that can run commands, which can already
+read and write anything the server can — see [§4](#4-authentication-and-capabilities).
+
+`stat` and `list` share one entry shape:
 
 ```bash
 curl "$BASE/api/v1/fs/stat?path=app/payload.bin"
@@ -301,20 +309,24 @@ Presets are a convenience, not a wire contract:
 
 | Preset | Capabilities |
 |---|---|
-| `operator` | `exec`, `session.read`, `session.manage` |
+| `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write` |
 | `read-only` | `session.read` |
 | `full-control` | `*` |
 
-**`fs.read` and `fs.write` are absent from `operator` and `read-only`, deliberately.**
-Enabling `--fs-root` on a server whose `operator` or `read-only` tokens were issued
-before file access existed must not silently hand those tokens file access — so the two
-capabilities have to be named explicitly for either preset. `full-control`'s wildcard
-already covers them, as it does every capability; there is nothing to add there:
+**`operator` carries the file capabilities; `read-only` does not, and the difference is
+`exec`.** A token that can run commands can already read and write every file the server
+can, so withholding the file API from `operator` confined nothing — it only pushed
+callers onto a slower route to the same bytes. `read-only` has no `exec`, so withholding
+`fs.read` there is a real boundary: such a token has no other way to a file's contents.
+Name the capability explicitly if you want a read-only token to read files.
+
+That also means `--fs-root` is a meaningful jail only for a token holding `fs.*` without
+`exec` — a deploy push, say:
 
 ```bash
 shell-tunnel -k readonly-key --preset read-only
 shell-tunnel -k ci-key --capabilities exec,session.read
-shell-tunnel --fs-root /srv/deploy -k files-key --capabilities fs.read,fs.write
+shell-tunnel --fs-root /srv/deploy -k deploy-key --capabilities fs.write
 ```
 
 Passing `--capabilities` or `--preset` turns authentication on, since a scope

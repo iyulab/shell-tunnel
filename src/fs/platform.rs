@@ -56,6 +56,35 @@ pub fn check_component(component: &str) -> Result<(), &'static str> {
 /// handle), so it contributes nothing there and the ETag rests on size and
 /// mtime alone. Recorded rather than worked around: a validator that claims
 /// more than the platform gives is worse than one that is honest.
+/// The filesystem roots a machine-wide scope is measured against.
+///
+/// Unix has exactly one; every mount hangs below it. Windows has one per
+/// drive and nothing above them, which is the whole reason a machine-wide
+/// scope cannot be expressed as a single path there — `--fs-root C:\` can
+/// never reach `D:`, by construction rather than by policy.
+///
+/// Probed once, by asking whether each letter is a directory. A drive that
+/// appears afterwards is deliberately not picked up: a server should reach
+/// what it was started with, not silently widen when someone plugs in a disk.
+/// Canonicalised, which on Windows means the verbatim form (`\\?\C:\`).
+/// `Path::canonicalize` returns verbatim paths, so an anchor left in its
+/// plain `C:\` form would fail `starts_with` against every resolved path and
+/// the containment check would refuse everything that actually exists.
+#[cfg(windows)]
+pub fn filesystem_anchors() -> Vec<std::path::PathBuf> {
+    (b'A'..=b'Z')
+        .map(|letter| std::path::PathBuf::from(format!("{}:\\", letter as char)))
+        .filter(|anchor| anchor.is_dir())
+        .filter_map(|anchor| anchor.canonicalize().ok())
+        .collect()
+}
+
+/// See the Windows variant: one root, and everything hangs below it.
+#[cfg(not(windows))]
+pub fn filesystem_anchors() -> Vec<std::path::PathBuf> {
+    vec![std::path::PathBuf::from("/")]
+}
+
 #[cfg(unix)]
 pub fn file_identity(meta: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
