@@ -420,6 +420,19 @@ enum WalkError {
 /// permission-restricted subdirectory is ordinary in a real deployment tree;
 /// one bad subtree, however deep, must not discard everything already
 /// collected from the rest of the walk.
+///
+/// **`base` must already have been resolved through `root`** — as
+/// `list_blocking` does with `resolve_existing` before calling this. Every
+/// entry is named by `root.relative`, which is a pure `strip_prefix` and does
+/// no resolution of its own, so a `base` that merely *points* inside the root
+/// without being its canonical form yields `None` for every entry and this
+/// returns `Ok(())` with **nothing collected** — an empty listing rather than
+/// an error. That failure is invisible on a platform where the paths in play
+/// are already canonical and loud on one where they are not: passing an
+/// unresolved temp-dir path here read as a product bug on macOS, where
+/// `/var/folders/…` canonicalises to `/private/var/folders/…`, while the same
+/// code was silently fine on Linux. Resolve first; do not hand this a path
+/// assembled by `join`.
 fn walk(
     root: &FsRoot,
     base: &std::path::Path,
@@ -1940,8 +1953,21 @@ mod tests {
             return;
         }
 
+        // Resolved through the root rather than assembled with `join`, which
+        // is what `list_blocking` does and what `walk` documents as its
+        // precondition. Handing `walk` a raw `dir.path().join("app")` made
+        // this test fail on macOS for a reason that had nothing to do with
+        // permissions: `FsRoot::new` canonicalises, `/var/folders/…` becomes
+        // `/private/var/folders/…`, and `root.relative` (a pure
+        // `strip_prefix`) then returned `None` for every entry — so the walk
+        // collected nothing at all and the assertion below read as "the
+        // unreadable subdirectory aborted the walk". It had not; the test was
+        // asking about a tree the root could not name. Linux hid this because
+        // `/tmp` canonicalises to itself.
+        let base = root.resolve_existing("app").expect("app resolves");
+
         let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
-        let result = walk(&root, &dir.path().join("app"), true, &mut collected);
+        let result = walk(&root, &base, true, &mut collected);
 
         // Restore permissions before any assertion can panic and leak a
         // directory the temp-dir cleanup would otherwise be unable to remove.
