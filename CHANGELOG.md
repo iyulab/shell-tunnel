@@ -29,6 +29,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 - Transfers are audited at session granularity — start, completion, checksum rejection,
   and cancellation all leave an entry — including sessions abandoned and later swept for
   being idle too long, so the trail never shows a session starting with no matching end.
+- `--audit-log` may not resolve inside `--fs-root`; startup is refused rather than allowed,
+  naming both paths. An `fs.write` token could otherwise delete or overwrite the trail
+  recording its own actions. The check runs before the log file is opened, so a refused
+  startup never leaves a stray file inside the root it declined to trust.
 - New default dependency: `sha2`, for the upload integrity check.
 
 ## 0.10.0 — 2026-07-24
