@@ -67,6 +67,47 @@ pub fn file_identity(_meta: &std::fs::Metadata) -> u64 {
     0
 }
 
+/// Remove one filesystem entry, choosing the syscall a symlink actually needs.
+///
+/// `meta` must come from `symlink_metadata` (lstat), never `metadata` (stat)
+/// — the caller needs to know about the entry itself, not whatever it points
+/// to, or every symlink looks identical to its target and this can never
+/// tell a directory symlink from a real directory.
+#[cfg(unix)]
+pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::io::Result<()> {
+    // `unlink` removes the link itself no matter what it points to — file,
+    // directory, or nothing — so there is no branch to make here.
+    std::fs::remove_file(path)
+}
+
+/// Windows counterpart of the Unix `remove_entry` above.
+///
+/// `DeleteFileW` (which `std::fs::remove_file` wraps) refuses a directory
+/// reparse point outright, even though unlinking one is exactly as safe as
+/// unlinking a file symlink — nothing under it is touched either way.
+/// `RemoveDirectoryW` (`std::fs::remove_dir`) is what actually unlinks a
+/// directory reparse point without recursing into it; it only recurses into
+/// a *real* directory's contents, which is why the `not-a-file` refusal in
+/// `api::fs::delete_file` runs before this is ever reached.
+#[cfg(windows)]
+pub fn remove_entry(path: &std::path::Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
+    if meta.is_symlink() {
+        // Follows the link on purpose — the one place in this function that
+        // means to — to learn whether the target is a directory.
+        if let Ok(target) = std::fs::metadata(path) {
+            if target.is_dir() {
+                return std::fs::remove_dir(path);
+            }
+        }
+    }
+    std::fs::remove_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

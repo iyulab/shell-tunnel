@@ -682,28 +682,77 @@ pub async fn delete_file(
     }
 }
 
+/// Split a root-relative request path into (parent, last component).
+///
+/// `"."` names the root itself when there is no separator — `resolve_existing`
+/// already gives that string a defined meaning (`src/fs/root.rs:113`), so this
+/// reuses it rather than inventing a second convention for "no parent".
+fn split_last_component(rel: &str) -> (&str, &str) {
+    match rel.rfind(['/', '\\']) {
+        Some(idx) => (&rel[..idx], &rel[idx + 1..]),
+        None => (".", rel),
+    }
+}
+
 /// The synchronous body of `delete_file`. Blocking throughout — see
 /// `delete_file`, which runs this via `spawn_blocking` rather than directly on
 /// the async runtime.
+///
+/// Deliberately does not act on what `resolve_existing(&query.path)` returns:
+/// that path follows symlinks all the way to their target
+/// (`src/fs/root.rs:122-132`), so for a same-root symlink it would remove
+/// whatever the link points to and leave the link itself behind — dangling,
+/// and undeletable afterward, since `resolve_existing` refuses every dangling
+/// symlink (`src/fs/root.rs:145-147`). A caller who named a link would see a
+/// different file disappear and the one they named survive.
+///
+/// Instead: resolve the request path in full once, purely to get
+/// `FsRoot`'s Malformed/Escapes/NotFound verdict exactly as every other
+/// route does. Then split the *request string* into its parent and final
+/// component, resolve only the parent through the jail, and rejoin the
+/// literal final component onto that canonical parent. The result names
+/// whatever the caller actually asked for — a symlink stays a symlink — while
+/// every directory on the way there has still been walked through
+/// `FsRoot::resolve_existing` and had `check_component` applied to it.
+///
+/// This does not weaken containment: splitting a string that has already
+/// passed the first resolution cannot manufacture a component that didn't
+/// already pass `check_component` during that walk. It only decides which of
+/// two jail-approved paths to act on — the request's own final component, not
+/// whatever that component's target happens to be.
 fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
-    let resolved = match root.resolve_existing(&query.path) {
+    if let Err(error) = root.resolve_existing(&query.path) {
+        return fs_error_response(error);
+    }
+
+    let (parent_rel, name) = split_last_component(&query.path);
+    let parent = match root.resolve_existing(parent_rel) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
     };
+    let named = parent.join(name);
 
-    match std::fs::metadata(&resolved) {
-        Ok(meta) if meta.is_file() => {}
-        Ok(_) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "not-a-file",
-                "path is a directory; recursive removal is not supported",
-            )
-        }
+    // `symlink_metadata` (lstat), not `metadata` (stat): the latter follows
+    // the link and would report a symlink as whatever it points to, making a
+    // symlink-to-directory indistinguishable from a real directory below.
+    let meta = match std::fs::symlink_metadata(&named) {
+        Ok(meta) => meta,
         Err(_) => return fs_error_response(FsError::NotFound),
+    };
+
+    // Refused only when `named` is a *real* directory. A symlink is never
+    // refused here regardless of what it points to — removing a link is
+    // removing one directory entry, not a recursive walk, so it carries none
+    // of the risk the directory refusal above exists to guard against.
+    if meta.is_dir() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "not-a-file",
+            "path is a directory; recursive removal is not supported",
+        );
     }
 
-    match std::fs::remove_file(&resolved) {
+    match platform::remove_entry(&named, &meta) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

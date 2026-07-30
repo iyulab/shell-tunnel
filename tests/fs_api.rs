@@ -362,6 +362,25 @@ fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
     }
 }
 
+/// Like `try_symlink`, but for a target that is a directory. Windows
+/// distinguishes file-symlinks from directory-symlinks at creation time
+/// (`symlink_file` vs `symlink_dir`); Unix does not.
+fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(target, link).is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (target, link);
+        false
+    }
+}
+
 #[tokio::test]
 async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
     // `stat` already refuses a path outside the root (403 path-escapes-root).
@@ -1304,4 +1323,77 @@ async fn delete_allows_a_token_holding_fs_write() {
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(!dir.path().join("app/old.dll").exists());
+}
+
+/// The discriminating case the naive `resolve_existing`-only implementation
+/// gets backwards: `resolve_existing` follows a symlink to its canonical
+/// target, so acting on what it returns would delete `real.txt` (never named
+/// in the request) and leave `link` behind, dangling. Both assertions matter
+/// — either alone would miss half of that failure.
+#[tokio::test]
+async fn delete_removes_a_symlink_without_touching_its_target() {
+    let (dir, state) = state_with_files(&[("app/real.txt", b"keep me")]);
+    let target = dir.path().join("app/real.txt");
+    let link = dir.path().join("link");
+    if !try_symlink(&target, &link) {
+        return; // symlink privilege unavailable on this runner; skip
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=link")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        target.exists(),
+        "the symlink's target was never named in the request and must survive"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the symlink itself is what was named, and must be gone"
+    );
+}
+
+/// The directory-symlink arm `platform::remove_entry` exists for: a symlink
+/// pointing at a directory is not a directory itself (`symlink_metadata`
+/// reports the link's own type), so it must be removable — and removing it
+/// must not recurse into what it points to.
+#[tokio::test]
+async fn delete_removes_a_directory_symlink_without_recursing() {
+    let (dir, state) = state_with_files(&[("app/real/inside.txt", b"keep me")]);
+    let target = dir.path().join("app/real");
+    let link = dir.path().join("linkdir");
+    if !try_symlink_dir(&target, &link) {
+        return; // symlink privilege unavailable on this runner; skip
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=linkdir")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        target.join("inside.txt").exists(),
+        "the symlinked directory and its contents must survive"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the directory symlink itself is what was named, and must be gone"
+    );
 }
