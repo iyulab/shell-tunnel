@@ -22,10 +22,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   removed mid-walk cannot invalidate a page already handed out. An unpaginated listing
   would also exceed the relay's body ceiling on exactly the directory sizes this
   endpoint exists to serve.
-- New capabilities `fs.read` and `fs.write`, deliberately absent from every preset
-  (`operator`, `read-only`, `full-control`): adding them to an existing preset would
-  hand file access to tokens already issued for a server that had none. Request them
-  explicitly — `--capabilities fs.read,fs.write`.
+- New capabilities `fs.read` and `fs.write`, deliberately absent from the `operator` and
+  `read-only` presets: adding them there would hand file access to tokens already issued
+  for a server that had none. Request them explicitly — `--capabilities fs.read,fs.write`.
+  `full-control`'s wildcard already covers both, as it does every capability.
 - Transfers are audited at session granularity — start, completion, checksum rejection,
   and cancellation all leave an entry — including sessions abandoned and later swept for
   being idle too long, so the trail never shows a session starting with no matching end.

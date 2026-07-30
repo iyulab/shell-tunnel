@@ -407,7 +407,7 @@
           "Filesystem"
         ],
         "summary": "List a directory",
-        "description": "Returns one page of a directory's contents. Paginated by an opaque path cursor rather than an offset, so a file added or removed mid-walk cannot invalidate a page already returned — an unpaginated listing would also exceed the relay's 8 MiB body ceiling on exactly the trees this endpoint exists to serve.\n\nRequired capability: `fs.read`.",
+        "description": "Returns one page of a directory's contents. Paginated by an opaque path cursor rather than an offset, so a file added or removed mid-walk cannot invalidate a page already returned — an unpaginated listing would also exceed the relay's 8 MiB body ceiling on exactly the trees this endpoint exists to serve.\n\n`HEAD` reaches this same route (axum serves it automatically for every `GET` route) with the same `fs.read` capability.\n\nRequired capability: `fs.read`.",
         "operationId": "fsList",
         "parameters": [
           {
@@ -516,7 +516,7 @@
           "Filesystem"
         ],
         "summary": "Stat one entry",
-        "description": "Returns one filesystem entry, file or directory — the same shape `list` reports, so a consumer can hold results from either in one type.\n\nRequired capability: `fs.read`.",
+        "description": "Returns one filesystem entry, file or directory — the same shape `list` reports, so a consumer can hold results from either in one type.\n\n`HEAD` reaches this same route (axum serves it automatically for every `GET` route) with the same `fs.read` capability.\n\nRequired capability: `fs.read`.",
         "operationId": "fsStat",
         "parameters": [
           {
@@ -622,7 +622,7 @@
             "description": "The requested byte range. Headers as for 200, plus `content-range: bytes <start>-<end>/<size>`."
           },
           "400": {
-            "description": "`not-a-file` — path is a directory or other non-regular entry; use `/api/v1/fs/list`.",
+            "description": "`bad-path` (malformed path), or `not-a-file` (path is a directory or other non-regular entry; use `/api/v1/fs/list`).",
             "content": {
               "application/json": {
                 "schema": {
@@ -797,7 +797,7 @@
             "$ref": "#/components/responses/UnauthorizedError"
           },
           "500": {
-            "description": "`io-error` (destination directory could not be created, or another OS failure) or `create-upload-failed` (unexpected failure). See 507 for the out-of-space case."
+            "description": "`io-error` (destination directory could not be created, or another OS failure), `path-resolution-failed` (defensive: the destination's canonical path could not be recomputed after `resolve_for_create` already accepted it), or `create-upload-failed` (unexpected failure). See 507 for the out-of-space case."
           },
           "507": {
             "description": "`io-error` — the destination's filesystem is out of space or quota (Unix `EDQUOT`; Windows quota reporting is tracked separately)."
@@ -1039,7 +1039,7 @@
             }
           },
           "404": {
-            "description": "`no-such-upload` (unknown, completed, or expired session) or `not-found` (the destination's parent directory disappeared between create and complete).",
+            "description": "`no-such-upload` — unknown, completed, or expired session.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1076,7 +1076,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator, read-only, full-control — fs.read and fs.write are in none of them and must be requested explicitly (e.g. --capabilities fs.read,fs.write), so an already-issued operator token does not silently gain file access when --fs-root is later enabled."
+        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator, read-only, full-control. fs.read and fs.write are absent from operator and read-only and must be requested explicitly (e.g. --capabilities fs.read,fs.write), so an already-issued operator or read-only token does not silently gain file access when --fs-root is later enabled. full-control's wildcard already covers both, as it does every capability."
       }
     },
     "parameters": {
@@ -1462,7 +1462,7 @@
           },
           "sha256": {
             "type": "string",
-            "description": "SHA-256 of the whole file, lowercase hex (64 characters)."
+            "description": "SHA-256 of the whole file, 64 hexadecimal characters. Case-insensitive on input — the server normalises to lowercase before comparing at `complete`."
           }
         }
       },

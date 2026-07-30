@@ -305,10 +305,11 @@ Presets are a convenience, not a wire contract:
 | `read-only` | `session.read` |
 | `full-control` | `*` |
 
-**`fs.read` and `fs.write` are in none of these presets, deliberately.** Enabling
-`--fs-root` on a server whose `operator` tokens were issued before file access existed
-must not silently hand those tokens file access — so the two capabilities have to be
-named explicitly:
+**`fs.read` and `fs.write` are absent from `operator` and `read-only`, deliberately.**
+Enabling `--fs-root` on a server whose `operator` or `read-only` tokens were issued
+before file access existed must not silently hand those tokens file access — so the two
+capabilities have to be named explicitly for either preset. `full-control`'s wildcard
+already covers them, as it does every capability; there is nothing to add there:
 
 ```bash
 shell-tunnel -k readonly-key --preset read-only
