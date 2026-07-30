@@ -184,6 +184,16 @@ fn authed_head(uri: &str, token: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// A bearer-authenticated DELETE request.
+fn authed_delete(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("DELETE")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request")
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
@@ -681,8 +691,8 @@ fn every_get_fs_route_authorizes_head_identically() {
         }
     }
     // A table with no GET rows would let this pass having checked nothing —
-    // the loop's `if` makes that silent rather than an obvious 0-iteration
-    // loop would be.
+    // the loop's `if` makes that silent, rather than the obvious no-op a
+    // zero-iteration loop would be.
     assert!(
         checked > 0,
         "no GET rows in the table — the assertion ran on nothing"
@@ -872,6 +882,60 @@ async fn download_head_does_not_read_a_file_it_lacks_permission_to_open() {
         response.status(),
         StatusCode::OK,
         "HEAD must succeed without ever attempting to read the file's contents"
+    );
+}
+
+/// The ranged twin of the test above. That one proves a whole-file `HEAD`
+/// skips the read, but axum strips the body from every `HEAD` response at the
+/// router level regardless of what the handler does — so a `HEAD` that forced
+/// the read anyway would still come back with an empty body and could pass
+/// `download_head_honours_a_range_without_reading_the_body` (which never
+/// touches an unreadable file) without the skip actually happening.
+///
+/// A permission-denied file discriminates: the `Satisfiable` arm only calls
+/// `read_span` when `include_body` is true. If that guard were lost, a
+/// ranged `HEAD` would attempt the read, hit `EACCES`, and this would 404
+/// instead of 206 — the same failure mode
+/// `download_head_does_not_read_a_file_it_lacks_permission_to_open` catches
+/// for the whole-file arm, here for the ranged one.
+#[cfg(unix)]
+#[tokio::test]
+async fn download_head_with_a_range_does_not_read_a_file_it_lacks_permission_to_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let path = dir.path().join("app/a.bin");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // A privileged account (root, or a runner that ignores the mode bit) can
+    // still open the file — nothing to verify then.
+    if std::fs::File::open(&path).is_ok() {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        return;
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=6-10")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Restore permissions before any assertion can panic and leak a file the
+    // temp-dir cleanup would otherwise be unable to remove.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore permissions");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::PARTIAL_CONTENT,
+        "a ranged HEAD must succeed without ever attempting to read the file's contents"
     );
 }
 
@@ -1128,4 +1192,116 @@ async fn list_head_allows_a_token_holding_fs_read() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_removes_a_file() {
+    let (dir, state) = state_with_files(&[("app/old.dll", b"stale")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/old.dll")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!dir.path().join("app/old.dll").exists());
+}
+
+#[tokio::test]
+async fn delete_refuses_a_directory() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Recursive directory removal is deliberately out of scope: it belongs
+    // with the destructive-operation guards, not with transfer.
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn delete_refuses_a_path_outside_the_root() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=../outside.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_reports_not_found_for_a_missing_file() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/absent.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// The first `fs.write` route. Every prior fs route only ever checked
+/// `fs.read`, so this is the first proof that `required_capability` actually
+/// distinguishes the two — a table keyed on path alone (ignoring `DELETE`
+/// versus `GET` on the same `/file` string) would let a `fs.read`-only token
+/// delete, or would need a second, easy-to-forget row that nobody has
+/// exercised yet.
+#[tokio::test]
+async fn delete_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/old.dll", b"stale")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_delete("/api/v1/fs/file?path=app/old.dll", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_allows_a_token_holding_fs_write() {
+    let (dir, state) = state_with_files(&[("app/old.dll", b"stale")]);
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_delete("/api/v1/fs/file?path=app/old.dll", "writer"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!dir.path().join("app/old.dll").exists());
 }

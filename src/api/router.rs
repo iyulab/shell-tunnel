@@ -649,7 +649,10 @@ fn fs_routes() -> Router<AppState> {
     Router::new()
         .route("/list", get(super::fs::list))
         .route("/stat", get(super::fs::stat))
-        .route("/file", get(super::fs::download))
+        .route(
+            "/file",
+            get(super::fs::download).delete(super::fs::delete_file),
+        )
 }
 
 #[cfg(test)]

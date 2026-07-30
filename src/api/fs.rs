@@ -654,6 +654,65 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
     Ok(buffer)
 }
 
+/// `DELETE /api/v1/fs/file` — remove one file.
+///
+/// Files only. Recursive directory removal is a destructive operation that
+/// wants the guards (dry-run, backup, approval) this layer does not have; a
+/// convenience flag here would hand out that power without them.
+pub async fn delete_file(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
+    };
+
+    // Resolving the path and removing the file are both blocking I/O. Same
+    // convention as `list`/`list_blocking` and `download`/`download_blocking`
+    // above (`src/execution/executor.rs:209-215`): run it on `spawn_blocking`
+    // so a slow filesystem can never starve the tokio worker pool that also
+    // runs `/health` and the accept loop.
+    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &query)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete-panicked",
+            "removing the file failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `delete_file`. Blocking throughout — see
+/// `delete_file`, which runs this via `spawn_blocking` rather than directly on
+/// the async runtime.
+fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
+    let resolved = match root.resolve_existing(&query.path) {
+        Ok(path) => path,
+        Err(error) => return fs_error_response(error),
+    };
+
+    match std::fs::metadata(&resolved) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "not-a-file",
+                "path is a directory; recursive removal is not supported",
+            )
+        }
+        Err(_) => return fs_error_response(FsError::NotFound),
+    }
+
+    match std::fs::remove_file(&resolved) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "delete-failed",
+            &format!("could not remove the file: {e}"),
+        ),
+    }
+}
+
 /// `GET /api/v1/fs/stat` — one entry, file or directory.
 pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let Some(root) = state.fs.clone() else {
