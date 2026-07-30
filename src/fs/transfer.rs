@@ -349,6 +349,13 @@ impl UploadStore {
     /// panicking conversion, anything that can unwind) inside one of those
     /// three write-lock sections, this analysis no longer holds and the
     /// unreachability claim needs re-checking against whatever was added.
+    ///
+    /// This says nothing about the per-session `Mutex` acquired below, which
+    /// *is* held across the `seek`+`write_all` disk I/O this doc comment
+    /// itself describes. It is unreachable for the same underlying reason,
+    /// not the same argument: `seek` and `write_all` report failure through
+    /// `Result`, propagated with `?` rather than unwound, so nothing in that
+    /// critical section can panic either.
     pub fn append(&self, id: &str, offset: u64, bytes: &[u8]) -> Result<u64, UploadError> {
         if bytes.len() > self.chunk_size {
             return Err(UploadError::TooLarge);

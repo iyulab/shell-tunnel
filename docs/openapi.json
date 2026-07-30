@@ -552,7 +552,7 @@
             }
           },
           "403": {
-            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (path resolves into the upload staging directory) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.read`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -573,6 +573,9 @@
           },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "500": {
+            "description": "`stat-failed` — reading the entry panicked unexpectedly."
           }
         }
       }
@@ -632,7 +635,7 @@
             }
           },
           "403": {
-            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (path resolves into the upload staging directory) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.read`.",
             "content": {
               "application/json": {
                 "schema": {
@@ -696,7 +699,7 @@
             }
           },
           "403": {
-            "description": "`fs-not-enabled` or `path-escapes-root` — a JSON body in both cases. Also reached, with an empty body, when the token lacks `fs.write`.",
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (path resolves into the upload staging directory) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.write`.",
             "content": {
               "application/json": {
                 "schema": {

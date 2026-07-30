@@ -2354,6 +2354,131 @@ async fn create_upload_refuses_a_destination_inside_the_staging_directory() {
     assert_eq!(json["error"], "reserved-path");
 }
 
+/// Whole-branch final review finding: `create_upload` refuses the staging
+/// directory as a *destination* and `list` hides it from listings, but
+/// `stat`, `GET /fs/file`, and `DELETE /fs/file` checked nothing — a caller
+/// could name a `.part` file directly. Session ids are a predictable
+/// per-process counter (`up-{serial:016x}`), so this was not a theoretical
+/// gap: an `fs.read` token could read another caller's in-progress partial
+/// content, and an `fs.write` token could delete another session's staging
+/// file out from under it. These three tests reproduce the reviewer's probe
+/// against a real file placed in the staging directory the way an in-flight
+/// upload actually leaves one, rather than only asserting the route string
+/// shape.
+///
+/// A real staging file, not a plain file dropped in a subdirectory named
+/// `.shell-tunnel-uploads` by `state_with_files`: the two are
+/// indistinguishable to `is_reserved_path`, but going through the real
+/// session lifecycle up to `PATCH` is what proves the guard fires on the
+/// exact artifact the finding was about, not merely a similarly-named one.
+///
+/// The returned path is built from the `upload_id` the server actually
+/// handed back, not a hardcoded serial: the counter behind `up-{serial:016x}`
+/// is one atomic shared by every test in this binary, so its value here
+/// depends on how many other tests already created a session, not on this
+/// test alone.
+async fn state_with_a_staged_upload() -> (tempfile::TempDir, AppState, String) {
+    let (dir, state) = state_with_files(&[]);
+
+    let create = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/upload.bin",
+                        "size": 6,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(create.status(), StatusCode::CREATED);
+    let upload_id = body_json(create).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    let patch = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{upload_id}"))
+                .header("content-range", "bytes 0-5/6")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(patch.status(), StatusCode::OK);
+
+    let staging_path = format!(".shell-tunnel-uploads/{upload_id}.part");
+    (dir, state, staging_path)
+}
+
+#[tokio::test]
+async fn stat_refuses_a_path_inside_the_staging_directory() {
+    let (_dir, state, staging_path) = state_with_a_staged_upload().await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/stat?path={staging_path}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "reserved-path");
+}
+
+#[tokio::test]
+async fn download_refuses_a_path_inside_the_staging_directory() {
+    let (_dir, state, staging_path) = state_with_a_staged_upload().await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/file?path={staging_path}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "reserved-path");
+}
+
+#[tokio::test]
+async fn delete_refuses_a_path_inside_the_staging_directory() {
+    let (_dir, state, staging_path) = state_with_a_staged_upload().await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={staging_path}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "reserved-path");
+}
+
 /// Audit events written by a state whose sink is a file in `dir`.
 fn audited_state(dir: &tempfile::TempDir) -> (AppState, std::path::PathBuf) {
     let log = dir.path().join("audit.jsonl");

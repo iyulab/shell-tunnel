@@ -139,6 +139,59 @@ fn resolve_limit(requested: Option<usize>) -> usize {
 /// Where in-flight uploads are staged. Never reported by `list`.
 pub use crate::fs::UPLOAD_DIR;
 
+/// Whether a root-relative path names the upload staging directory itself, or
+/// anything inside it.
+///
+/// One helper rather than one inline copy per handler that takes a `path`.
+/// Before this existed, `list`'s walk hid the directory from listings and
+/// `create_upload` refused it as a destination, but `stat`, `download`, and
+/// `delete_file` checked nothing — each of those was added in a different
+/// task, correct in its own scope, and none of them noticed the other two
+/// routes exposing the same directory the first two were built to protect.
+/// A sixth route taking a `path` calls this too, instead of becoming the
+/// place someone forgets it a third time.
+fn is_reserved_path(rel: &str) -> bool {
+    rel == UPLOAD_DIR || rel.starts_with(&format!("{UPLOAD_DIR}/"))
+}
+
+/// The refusal for a path that names the upload staging directory, or
+/// something inside it. Same code and wording `create_upload` already used
+/// for refusing it as a destination — kept identical rather than letting each
+/// caller invent its own phrasing for the same condition.
+fn reserved_path_response() -> Response {
+    error_response(
+        StatusCode::FORBIDDEN,
+        "reserved-path",
+        "path resolves into the upload staging directory, which is reserved",
+    )
+}
+
+/// Refuse `resolved` if it names the reserved upload staging directory, or
+/// something inside it. `None` means proceed.
+///
+/// Every call site passes a path already established to be under `root` —
+/// via `resolve_existing` (`stat`, `download`), or via the postcondition just
+/// above this call in `delete_file_blocking` — so `root.relative` returning
+/// `None` here should not be reachable. Handled as a 500 rather than treated
+/// as "not reserved, proceed" regardless: `create_upload_blocking`'s own
+/// `dest_rel` binding faces the identical call and already answers `None`
+/// with a 500 rather than silently continuing, and this follows that
+/// precedent rather than the opposite one. A broken invariant must not
+/// degrade into serving or removing the very file this check exists to
+/// refuse — that would be fail-*open*, the wrong direction for a guard whose
+/// only job is refusing.
+fn refuse_if_reserved(root: &FsRoot, resolved: &std::path::Path) -> Option<Response> {
+    match root.relative(resolved) {
+        Some(rel) if is_reserved_path(&rel) => Some(reserved_path_response()),
+        Some(_) => None,
+        None => Some(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "path-resolution-failed",
+            "could not compute the entry's canonical path",
+        )),
+    }
+}
+
 /// Query parameters for `list`.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -352,7 +405,7 @@ fn walk(
         let Some(relative) = root.relative(&absolute) else {
             continue;
         };
-        if relative == UPLOAD_DIR || relative.starts_with(&format!("{UPLOAD_DIR}/")) {
+        if is_reserved_path(&relative) {
             continue;
         }
         let Ok(meta) = entry.metadata() else {
@@ -537,6 +590,16 @@ fn download_blocking(
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
     };
+
+    // Same reservation `create_upload` enforces on the way in and `list`
+    // enforces on the way out: without it, a predictable session id
+    // (`up-{serial:016x}.part`, a per-process counter from zero) let an
+    // `fs.read` token read another caller's in-progress partial upload —
+    // exactly the exposure `crate::fs::transfer`'s module doc says the
+    // staging design prevents.
+    if let Some(response) = refuse_if_reserved(root, &resolved) {
+        return response;
+    }
 
     // Metadata of the path the jail handed back, not the caller's string —
     // and `is_file()` gates every read below. A FIFO blocks `File::open`
@@ -849,6 +912,16 @@ fn delete_file_blocking(
         return fs_error_response(FsError::Escapes);
     }
 
+    // Same reservation `create_upload` enforces on the way in and `list`
+    // enforces on the way out: without it, a predictable session id let an
+    // `fs.write` token delete another caller's in-progress `.part` file —
+    // the open staging handle survives the removal on Windows, so the
+    // upload later fails `complete` with an opaque 500 instead of the
+    // caller ever seeing a clean refusal.
+    if let Some(response) = refuse_if_reserved(root, &named) {
+        return response;
+    }
+
     // `symlink_metadata` (lstat), not `metadata` (stat): the latter follows
     // the link and would report a symlink as whatever it points to, making a
     // symlink-to-directory indistinguishable from a real directory below.
@@ -897,15 +970,44 @@ fn delete_file_blocking(
 }
 
 /// `GET /api/v1/fs/stat` — one entry, file or directory.
+///
+/// Resolving the path and reading its metadata are both blocking I/O. Same
+/// convention as `list`/`list_blocking`, `download`/`download_blocking`, and
+/// `delete_file`/`delete_file_blocking` above (`src/execution/executor.rs:209-215`):
+/// run it on `spawn_blocking` so a slow filesystem can never starve the tokio
+/// worker pool that also runs `/health` and the accept loop. This was, until
+/// now, the one route in this module that called `resolve_existing` and
+/// `std::fs::metadata` directly on the async runtime.
 pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
     };
 
+    match tokio::task::spawn_blocking(move || stat_blocking(&root, &query)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stat-failed",
+            "reading the entry failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `stat`. Blocking throughout — see `stat`, which
+/// runs this via `spawn_blocking` rather than directly on the async runtime.
+fn stat_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     let resolved = match root.resolve_existing(&query.path) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
     };
+
+    // Same reservation `create_upload` enforces on the way in and `list`
+    // enforces on the way out: a caller must not be able to read an
+    // in-progress upload's staging file, or its metadata, by guessing a
+    // session id — session ids are a predictable per-process counter.
+    if let Some(response) = refuse_if_reserved(root, &resolved) {
+        return response;
+    }
 
     let meta = match std::fs::metadata(&resolved) {
         Ok(meta) => meta,
@@ -916,7 +1018,7 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>)
     // being the only place that reaches for OS-specific metadata.
     let _ = platform::file_identity(&meta);
 
-    Json(entry_for(&root, &resolved, &meta, None)).into_response()
+    Json(entry_for(root, &resolved, &meta, None)).into_response()
 }
 
 /// Body of `POST /api/v1/fs/uploads`.
@@ -1126,14 +1228,8 @@ fn create_upload_blocking(
     // `up-{serial:016x}.part` could collide with a future session's own
     // staging file, making that session's `create_new` fail for a reason
     // that has nothing to do with it.
-    if dest_rel == crate::fs::UPLOAD_DIR
-        || dest_rel.starts_with(&format!("{}/", crate::fs::UPLOAD_DIR))
-    {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "reserved-path",
-            "path resolves into the upload staging directory, which is reserved",
-        );
+    if is_reserved_path(&dest_rel) {
+        return reserved_path_response();
     }
 
     // Checked before the digest/size validation below, and before claiming
@@ -1666,6 +1762,28 @@ mod tests {
         assert_eq!(resolve_limit(Some(999_999)), MAX_LIST_LIMIT);
         // Pass-through within bounds.
         assert_eq!(resolve_limit(Some(50)), 50);
+    }
+
+    /// `refuse_if_reserved`'s `None` arm — `root.relative` failing to strip
+    /// the root prefix — has no route to it through any HTTP request: every
+    /// call site passes a path already established to be under `root`. That
+    /// is exactly why it needs a direct test: nothing at the HTTP level can
+    /// ever exercise it, so a silent flip from this 500 to "not reserved,
+    /// proceed" (fail-open, serving or removing a file this check exists to
+    /// refuse) would ship with the whole suite green.
+    #[test]
+    fn refuse_if_reserved_fails_closed_when_relative_cannot_be_computed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = FsRoot::new(dir.path()).expect("root");
+
+        // A path with no relationship to `root` at all — `relative` returns
+        // `None` for it the same way it would for any path this function's
+        // callers should never be able to construct.
+        let unrelated = std::env::temp_dir().join("definitely-not-under-the-root");
+
+        let response =
+            refuse_if_reserved(&root, &unrelated).expect("None must refuse, not silently allow");
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
