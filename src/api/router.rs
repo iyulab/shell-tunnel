@@ -218,26 +218,38 @@ pub enum RequiredCapability {
 pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapability {
     use RequiredCapability::{Authenticated, Capability, Public};
 
+    // HEAD is GET without a body, and axum's `get()` serves it automatically, so
+    // its authorization must equal GET's. Keyed separately below, every GET
+    // route would need a twin HEAD arm — and a forgotten twin falls through to
+    // the closed default `Authenticated`, which means any valid token, not the
+    // capability GET requires. Normalising here is the one place it cannot be
+    // forgotten. Matched as `&str` (rather than comparing `Method` values) so
+    // the table below stays exactly as it reads for every other method.
+    let method = match method.as_str() {
+        "HEAD" => "GET",
+        other => other,
+    };
+
     match (method, matched_path) {
         (_, "/health") => Public,
-        (&Method::GET, "/api/v1") => Authenticated,
-        (&Method::POST, "/api/v1/execute") => Capability("exec"),
+        ("GET", "/api/v1") => Authenticated,
+        ("POST", "/api/v1/execute") => Capability("exec"),
         (_, "/api/v1/ws") => Capability("exec"),
-        (&Method::GET, "/api/v1/sessions") => Capability("session.read"),
-        (&Method::POST, "/api/v1/sessions") => Capability("session.manage"),
-        (&Method::GET, "/api/v1/sessions/{id}") => Capability("session.read"),
-        (&Method::DELETE, "/api/v1/sessions/{id}") => Capability("session.manage"),
-        (&Method::POST, "/api/v1/sessions/{id}/execute") => Capability("exec"),
+        ("GET", "/api/v1/sessions") => Capability("session.read"),
+        ("POST", "/api/v1/sessions") => Capability("session.manage"),
+        ("GET", "/api/v1/sessions/{id}") => Capability("session.read"),
+        ("DELETE", "/api/v1/sessions/{id}") => Capability("session.manage"),
+        ("POST", "/api/v1/sessions/{id}/execute") => Capability("exec"),
         (_, "/api/v1/sessions/{id}/ws") => Capability("exec"),
-        (&Method::GET, "/api/v1/fs/list") => Capability("fs.read"),
-        (&Method::GET, "/api/v1/fs/stat") => Capability("fs.read"),
-        (&Method::GET, "/api/v1/fs/file") => Capability("fs.read"),
-        (&Method::DELETE, "/api/v1/fs/file") => Capability("fs.write"),
-        (&Method::POST, "/api/v1/fs/uploads") => Capability("fs.write"),
-        (&Method::GET, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
-        (&Method::PATCH, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
-        (&Method::POST, "/api/v1/fs/uploads/{id}/complete") => Capability("fs.write"),
-        (&Method::DELETE, "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        ("GET", "/api/v1/fs/list") => Capability("fs.read"),
+        ("GET", "/api/v1/fs/stat") => Capability("fs.read"),
+        ("GET", "/api/v1/fs/file") => Capability("fs.read"),
+        ("DELETE", "/api/v1/fs/file") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/uploads") => Capability("fs.write"),
+        ("GET", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        ("PATCH", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/uploads/{id}/complete") => Capability("fs.write"),
+        ("DELETE", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
         _ => Authenticated,
     }
 }
@@ -760,6 +772,27 @@ mod tests {
         assert_eq!(
             required_capability(&Method::GET, "/api/v1/unknown"),
             RequiredCapability::Authenticated
+        );
+    }
+
+    #[test]
+    fn test_required_capability_head_matches_get() {
+        use RequiredCapability::Capability;
+
+        // `axum`'s `get()` serves `HEAD` automatically; its authorization must
+        // be identical to `GET`'s, not the fail-closed `Authenticated` default
+        // an unmapped method/path pair would otherwise fall back to.
+        assert_eq!(
+            required_capability(&Method::HEAD, "/api/v1/fs/file"),
+            Capability("fs.read")
+        );
+        assert_eq!(
+            required_capability(&Method::HEAD, "/api/v1/fs/stat"),
+            Capability("fs.read")
+        );
+        assert_eq!(
+            required_capability(&Method::HEAD, "/api/v1/fs/list"),
+            Capability("fs.read")
         );
     }
 

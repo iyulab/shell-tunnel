@@ -167,6 +167,24 @@ fn authed_get(uri: &str, token: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// A bearer-authenticated HEAD request.
+///
+/// `axum`'s `get()` serves `HEAD` automatically (runs the handler, discards the
+/// body), and `required_capability` has no separate `HEAD` entries in its
+/// table — it normalises `HEAD` to `GET` before matching. These tests exist
+/// because that normalisation is the only thing standing between a
+/// `session.read`-only token and a `fs.read`-gated route: without it, `HEAD`
+/// falls through the table to the fail-closed default `Authenticated`, which
+/// admits any valid token.
+fn authed_head(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("HEAD")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request")
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
@@ -800,6 +818,90 @@ async fn download_allows_a_token_holding_fs_read() {
 
     let response = app
         .oneshot(authed_get("/api/v1/fs/file?path=app/a.bin", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn download_head_forbids_a_token_lacking_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_head("/api/v1/fs/file?path=app/a.bin", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn download_head_allows_a_token_holding_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_head("/api/v1/fs/file?path=app/a.bin", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn stat_head_forbids_a_token_lacking_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_head(
+            "/api/v1/fs/stat?path=app/config.json",
+            "reader",
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn stat_head_allows_a_token_holding_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_head(
+            "/api/v1/fs/stat?path=app/config.json",
+            "reader",
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn list_head_forbids_a_token_lacking_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_head("/api/v1/fs/list?path=app", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn list_head_allows_a_token_holding_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_head("/api/v1/fs/list?path=app", "reader"))
         .await
         .expect("response");
 
