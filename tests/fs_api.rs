@@ -381,6 +381,37 @@ fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
     }
 }
 
+/// Turns a `try_symlink`/`try_symlink_dir` result into "continue" or "stop",
+/// visibly either way — an unmarked early return is indistinguishable from
+/// the test having run and passed, which is the same silently-vacuous shape
+/// this file's `every_get_fs_route_authorizes_head_identically` guards
+/// against for a table-driven loop. "Confirmed executing by name" does not
+/// prove the body ran either; only an explicit marker does.
+///
+/// Unix has no equivalent of Windows's `SeCreateSymbolicLinkPrivilege` gate
+/// for an ordinary user creating a symlink, so a failure there almost
+/// certainly means something is actually broken, not that the privilege is
+/// missing — treated as a hard test failure rather than a silent skip.
+/// Windows commonly denies it to an unprivileged, non-developer-mode
+/// account, so that platform gets a clearly marked skip instead. CI's ubuntu
+/// and macos runners always have the privilege, so on CI these assertions
+/// execute rather than skip; only a privilege-restricted local Windows
+/// session skips.
+fn require_symlink(created: bool, test_name: &str) -> bool {
+    if created {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        eprintln!("SKIPPED {test_name}: symlink privilege unavailable on this runner");
+        false
+    }
+    #[cfg(not(windows))]
+    {
+        panic!("{test_name}: symlink creation failed unexpectedly on a non-Windows platform");
+    }
+}
+
 #[tokio::test]
 async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
     // `stat` already refuses a path outside the root (403 path-escapes-root).
@@ -1235,7 +1266,7 @@ async fn delete_removes_a_file() {
 
 #[tokio::test]
 async fn delete_refuses_a_directory() {
-    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let (dir, state) = state_with_files(&[("app/a.txt", b"a")]);
     let app = create_router_with_state(state);
 
     let response = app
@@ -1252,6 +1283,7 @@ async fn delete_refuses_a_directory() {
     // Recursive directory removal is deliberately out of scope: it belongs
     // with the destructive-operation guards, not with transfer.
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(dir.path().join("app/a.txt").exists());
 }
 
 #[tokio::test]
@@ -1271,6 +1303,35 @@ async fn delete_refuses_a_path_outside_the_root() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// A request whose final component is `..` passes the full-path resolution
+/// (`resolve_existing("app/..")` walks straight back to a real directory —
+/// the root itself here — not out of the root), so nothing upstream refuses
+/// it. Without an explicit check, the only thing standing between this and
+/// deleting the root is that `X/..` always names a directory — an accident
+/// that disappears the day recursive directory removal ships. See the
+/// comment in `delete_file_blocking` for why a containment check on the
+/// joined path cannot substitute for refusing `..` outright.
+#[tokio::test]
+async fn delete_refuses_a_path_ending_in_dot_dot() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/..")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "path-escapes-root");
 }
 
 #[tokio::test]
@@ -1335,8 +1396,11 @@ async fn delete_removes_a_symlink_without_touching_its_target() {
     let (dir, state) = state_with_files(&[("app/real.txt", b"keep me")]);
     let target = dir.path().join("app/real.txt");
     let link = dir.path().join("link");
-    if !try_symlink(&target, &link) {
-        return; // symlink privilege unavailable on this runner; skip
+    if !require_symlink(
+        try_symlink(&target, &link),
+        "delete_removes_a_symlink_without_touching_its_target",
+    ) {
+        return;
     }
 
     let app = create_router_with_state(state);
@@ -1371,8 +1435,11 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
     let (dir, state) = state_with_files(&[("app/real/inside.txt", b"keep me")]);
     let target = dir.path().join("app/real");
     let link = dir.path().join("linkdir");
-    if !try_symlink_dir(&target, &link) {
-        return; // symlink privilege unavailable on this runner; skip
+    if !require_symlink(
+        try_symlink_dir(&target, &link),
+        "delete_removes_a_directory_symlink_without_recursing",
+    ) {
+        return;
     }
 
     let app = create_router_with_state(state);

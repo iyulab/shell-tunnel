@@ -654,11 +654,18 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
     Ok(buffer)
 }
 
-/// `DELETE /api/v1/fs/file` — remove one file.
+/// `DELETE /api/v1/fs/file` — remove one named entry.
 ///
-/// Files only. Recursive directory removal is a destructive operation that
-/// wants the guards (dry-run, backup, approval) this layer does not have; a
-/// convenience flag here would hand out that power without them.
+/// Only a *real* directory is refused. Recursive removal is a destructive
+/// operation that wants the guards (dry-run, backup, approval) this layer
+/// does not have; a convenience flag here would hand out that power without
+/// them. Everything else the entry could be — a regular file, a symlink (to
+/// a file or to a directory), a FIFO, a socket, a device node — is removed:
+/// unlike `download`, this handler never reads the entry's contents, so
+/// `download`'s reason for gating on `is_file()` (a FIFO never reaches EOF)
+/// does not apply here. And refusing a non-regular entry would leave it
+/// permanently undeletable through this API, the same trap that decided the
+/// symlink question below in favour of acting on the named entry.
 pub async fn delete_file(
     State(state): State<AppState>,
     Query(query): Query<PathQuery>,
@@ -726,6 +733,31 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     }
 
     let (parent_rel, name) = split_last_component(&query.path);
+
+    // `name` can be `..` (`path=app/..` passes the full-path resolution
+    // above — `resolve_existing` walks it back up to a real directory, not
+    // out of the root, so nothing refuses it there). `named` below is built
+    // with a lexical `PathBuf::join`, which never resolves `..`, so joining
+    // `..` onto an in-root `parent` produces a path whose *actual* location —
+    // once something reads it — is one level above `parent`, without ever
+    // having gone through the jail. Today the directory refusal further down
+    // happens to catch this anyway, since `X/..` always names a directory;
+    // that is an accident of recursive removal not being supported yet, not
+    // a reason, so it is checked here explicitly instead: `..` is refused as
+    // a delete target outright, before it is ever joined.
+    //
+    // A containment check on the joined path instead of this would not work:
+    // `Path::starts_with` is a pure component-prefix comparison that does not
+    // resolve `..` either (verified: `Path::new("/root/app").join("..")
+    // .starts_with("/root")` is `true`), so `named` always "starts with"
+    // `root` regardless of a trailing `..`. And canonicalising `named` to get
+    // a real answer would defeat the reason this function builds it lexically
+    // in the first place — it would resolve the very symlink this handler
+    // exists to leave untouched.
+    if name == ".." {
+        return fs_error_response(FsError::Escapes);
+    }
+
     let parent = match root.resolve_existing(parent_rel) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
