@@ -359,6 +359,199 @@ fn walk(
     Ok(())
 }
 
+/// A validator that changes whenever the bytes at a path might have changed.
+///
+/// Size and mtime on every platform, plus the inode on Unix. Windows has no
+/// equivalent reachable from `std::fs::metadata`, so the validator is weaker
+/// there — stated rather than papered over, because a validator that claims
+/// more than the platform delivers is worse than one that is honest.
+pub fn etag_for(meta: &std::fs::Metadata) -> String {
+    format!(
+        "\"{:x}-{:x}-{:x}\"",
+        meta.len(),
+        mtime_ms(meta),
+        platform::file_identity(meta)
+    )
+}
+
+/// Parse a single-range `Range` header into an inclusive `(start, end)`.
+///
+/// Only one range is supported. Multipart ranges would need a multipart body,
+/// which buys nothing for resumable transfer and costs a second encoding to
+/// defend.
+pub fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (from, to) = spec.split_once('-')?;
+    let (start, end) = match (from.trim(), to.trim()) {
+        ("", "") => return None,
+        // `bytes=-N`: the last N bytes.
+        ("", suffix) => {
+            let n: u64 = suffix.parse().ok()?;
+            if n == 0 || size == 0 {
+                return None;
+            }
+            (size.saturating_sub(n), size - 1)
+        }
+        (first, "") => (first.parse().ok()?, size.checked_sub(1)?),
+        (first, last) => (first.parse().ok()?, last.parse().ok()?),
+    };
+    if start > end || start >= size {
+        return None;
+    }
+    Some((start, end.min(size - 1)))
+}
+
+/// `GET /api/v1/fs/file` — the whole file, or a range of it.
+pub async fn download(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<PathQuery>,
+) -> Response {
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
+    };
+
+    // Everything this handler needs from the headers, extracted before
+    // handing off to `spawn_blocking` — the blocking body below has no access
+    // to the request beyond what it is passed.
+    let header_str = |name: axum::http::HeaderName| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+    };
+    let range_header = header_str(axum::http::header::RANGE);
+    let if_range_header = header_str(axum::http::header::IF_RANGE);
+
+    // Resolving the path, `stat`-ing it, and reading the bytes (whole file or
+    // a span) are all blocking I/O. Same convention as `execution::executor::execute`
+    // (`src/execution/executor.rs:209-215`) and `list`/`list_blocking` above:
+    // run it on `spawn_blocking` so a large file, a slow filesystem, or —
+    // absent the `is_file()` guard below — a FIFO or character device can
+    // never starve the tokio worker pool that also runs `/health` and the
+    // accept loop.
+    match tokio::task::spawn_blocking(move || {
+        download_blocking(
+            &root,
+            &query,
+            range_header.as_deref(),
+            if_range_header.as_deref(),
+        )
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "download-failed",
+            "reading the file failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `download`. Blocking throughout — see `download`,
+/// which runs this via `spawn_blocking` rather than directly on the async
+/// runtime.
+fn download_blocking(
+    root: &FsRoot,
+    query: &PathQuery,
+    range_header: Option<&str>,
+    if_range_header: Option<&str>,
+) -> Response {
+    let resolved = match root.resolve_existing(&query.path) {
+        Ok(path) => path,
+        Err(error) => return fs_error_response(error),
+    };
+
+    // Metadata of the path the jail handed back, not the caller's string —
+    // and `is_file()` gates every read below. A FIFO blocks `File::open`
+    // indefinitely and a character device never reaches EOF, so without this
+    // check a path like `/dev/zero` inside the root would hang the request
+    // forever instead of failing fast.
+    let meta = match std::fs::metadata(&resolved) {
+        Ok(meta) if meta.is_file() => meta,
+        Ok(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "not-a-file",
+                "path is a directory; use /api/v1/fs/list",
+            )
+        }
+        Err(_) => return fs_error_response(FsError::NotFound),
+    };
+
+    let size = meta.len();
+    let etag = etag_for(&meta);
+
+    // A stale `If-Range` means the caller's prefix belongs to a different file.
+    // Serving the range anyway would let them stitch two files together and
+    // notice only when the checksum failed, if they checked at all.
+    let range_allowed = match if_range_header {
+        Some(sent) => sent == etag,
+        None => true,
+    };
+
+    let requested = range_header.filter(|_| range_allowed);
+
+    match requested {
+        Some(raw) => match parse_range(raw, size) {
+            Some((start, end)) => {
+                let length = end - start + 1;
+                let bytes = match read_span(&resolved, start, length) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return fs_error_response(FsError::NotFound),
+                };
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        ("content-type", "application/octet-stream".to_string()),
+                        ("accept-ranges", "bytes".to_string()),
+                        ("etag", etag),
+                        ("content-range", format!("bytes {start}-{end}/{size}")),
+                    ],
+                    bytes,
+                )
+                    .into_response()
+            }
+            None => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [("content-range", format!("bytes */{size}"))],
+            )
+                .into_response(),
+        },
+        None => {
+            let bytes = match std::fs::read(&resolved) {
+                Ok(bytes) => bytes,
+                Err(_) => return fs_error_response(FsError::NotFound),
+            };
+            (
+                StatusCode::OK,
+                [
+                    ("content-type", "application/octet-stream".to_string()),
+                    ("accept-ranges", "bytes".to_string()),
+                    ("etag", etag),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Read `length` bytes starting at `start`.
+fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buffer = vec![0_u8; length as usize];
+    file.read_exact(&mut buffer)?;
+    Ok(buffer)
+}
+
 /// `GET /api/v1/fs/stat` — one entry, file or directory.
 pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>) -> Response {
     let Some(root) = state.fs.clone() else {
@@ -384,11 +577,28 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>)
 
 #[cfg(test)]
 mod tests {
-    // Scoped to unix: the only test in this module needs it, and an
-    // unconditional `use super::*` would be an unused-import warning on a
-    // platform where that test doesn't compile at all.
-    #[cfg(unix)]
     use super::*;
+
+    #[test]
+    fn ranges_parse_into_inclusive_bounds() {
+        assert_eq!(parse_range("bytes=0-4", 11), Some((0, 4)));
+        assert_eq!(parse_range("bytes=6-10", 11), Some((6, 10)));
+        // Open-ended: to the last byte.
+        assert_eq!(parse_range("bytes=6-", 11), Some((6, 10)));
+        // Suffix: the last N bytes.
+        assert_eq!(parse_range("bytes=-3", 11), Some((8, 10)));
+        // Clamped to the file, not refused.
+        assert_eq!(parse_range("bytes=0-999", 11), Some((0, 10)));
+    }
+
+    #[test]
+    fn unsatisfiable_or_unsupported_ranges_are_rejected() {
+        assert_eq!(parse_range("bytes=11-20", 11), None);
+        assert_eq!(parse_range("bytes=5-2", 11), None);
+        assert_eq!(parse_range("bytes=0-1,4-5", 11), None);
+        assert_eq!(parse_range("items=0-4", 11), None);
+        assert_eq!(parse_range("bytes=-", 11), None);
+    }
 
     /// Regression for the bug where a nested `read_dir` failure propagated
     /// with `?` all the way out of `walk`, discarding every entry the walk

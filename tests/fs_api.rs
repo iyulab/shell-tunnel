@@ -622,3 +622,186 @@ fn every_fs_route_declares_a_capability() {
         );
     }
 }
+
+async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
+    axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body")
+        .to_vec()
+}
+
+#[tokio::test]
+async fn download_returns_the_whole_file_with_an_etag() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("accept-ranges")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes")
+    );
+    assert!(response.headers().get("etag").is_some());
+    assert_eq!(body_bytes(response).await, b"hello world");
+}
+
+#[tokio::test]
+async fn download_honours_a_range() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=6-10")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 6-10/11")
+    );
+    assert_eq!(body_bytes(response).await, b"world");
+}
+
+#[tokio::test]
+async fn an_unsatisfiable_range_is_refused() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=99-200")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+#[tokio::test]
+async fn if_range_falls_back_to_the_whole_file_when_it_changed() {
+    let (dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state.clone());
+
+    let first = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let etag = first
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_string();
+
+    // Change the file, so the stale validator must be rejected.
+    std::fs::write(dir.path().join("app/a.bin"), b"COMPLETELY DIFFERENT").expect("rewrite");
+
+    let second = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=0-4")
+                .header("if-range", etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // 200, not 206: stitching the old prefix to new content would corrupt silently.
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(body_bytes(second).await, b"COMPLETELY DIFFERENT");
+}
+
+#[tokio::test]
+async fn if_range_serves_the_range_when_unchanged() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+
+    let first = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let etag = first
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag")
+        .to_string();
+
+    let second = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=0-4")
+                .header("if-range", etag)
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(second).await, b"hello");
+}
+
+#[tokio::test]
+async fn download_forbids_a_token_lacking_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_get("/api/v1/fs/file?path=app/a.bin", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn download_allows_a_token_holding_fs_read() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_get("/api/v1/fs/file?path=app/a.bin", "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
