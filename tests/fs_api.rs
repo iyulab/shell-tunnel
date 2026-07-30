@@ -1400,18 +1400,25 @@ async fn delete_refuses_a_path_ending_in_dot() {
 /// parent.join(name)` assumes `name` appends exactly one ordinary component,
 /// but `PathBuf::join` discards `parent` entirely for an argument carrying a
 /// prefix (`Path::new(r"C:\root\app").join("C:evil")` is `"C:evil"` — the
-/// parent is gone).
+/// parent is gone). `delete_file_blocking` catches this as a postcondition
+/// (`!named.starts_with(&parent)`) rather than by re-running
+/// `platform::check_component` on `name` — a precondition re-running that
+/// same rule would be defeated by the very future change (relaxing `:` in
+/// `check_component`) it exists to guard against, since both calls consult
+/// the identical rule; the postcondition does not consult it at all.
 ///
-/// Unlike the `..`/`.` cases, this one is not currently reachable: the
-/// full-path `resolve_existing` call at the top of `delete_file_blocking`
-/// already runs `check_component` (which rejects `:`) over the same last
-/// component before this handler's own local guard is ever reached, so
-/// removing that local guard does not turn this test red today — confirmed
-/// by disabling it and re-running. This test pins the outcome (400) that
-/// must hold regardless of which layer produces it, so a future change to
-/// `FsRoot::components`'s policy of validating the last component (not to
-/// `check_component` itself, but to whether the caller still applies it
-/// there) cannot silently make `path=app/C:evil` succeed.
+/// This request is refused before the postcondition is ever reached, though:
+/// the full-path `resolve_existing` call at the top of `delete_file_blocking`
+/// already runs `check_component` over every component of the full path,
+/// `name` included, so `path=app/C:evil` is refused there today (400
+/// `bad-path`) regardless of the postcondition below it. Confirmed by
+/// disabling the postcondition guard and re-running — still 400, unchanged.
+/// This test pins that outcome so a future narrowing of what the full-path
+/// resolution validates cannot silently make `path=app/C:evil` succeed; it
+/// does not by itself prove the postcondition guard fires, which is not
+/// reachable from any request admitted today. See
+/// `postcondition_catches_a_drive_prefix_join_even_without_check_component`
+/// below for a direct check of that guard's own logic instead.
 ///
 /// `:` is a legal filename character on Unix, so no fixture there can ever
 /// contain such a file — the guard must fire on the string alone, which is

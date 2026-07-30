@@ -770,6 +770,13 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     // a real answer would defeat the reason this function builds it lexically
     // in the first place — it would resolve the very symlink this handler
     // exists to leave untouched.
+    //
+    // A *`parent`-based* postcondition check (`named.starts_with(&parent)`,
+    // below, after `named` is built) is a different check from the
+    // `root`-based one just ruled out — it does not rule out `..` either
+    // (`join("..")` on Unix does not collapse, so `named` is literally
+    // `parent/..` and does start with `parent`), so this guard stays
+    // load-bearing for `..` regardless.
     if name == ".." {
         return fs_error_response(FsError::Escapes);
     }
@@ -793,31 +800,41 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
         ));
     }
 
-    // `named` below joins `name` onto `parent` assuming it appends exactly
-    // one ordinary component. It does not: `PathBuf::join` discards `parent`
-    // entirely for an argument carrying a prefix (verified: `Path::new(r"C:
-    // \root\app").join("C:evil")` is `"C:evil"`, `parent` gone). A `name`
-    // containing `:` would drop the jail-resolved parent and hand
-    // `remove_file` an arbitrary drive-relative path.
-    //
-    // `FsRoot::components` already runs `check_component` (which rejects `:`,
-    // for Alternate Data Streams — a different reason) over every component
-    // of the full path, `name` included, so step 1 above already refuses this
-    // exact input today — this call is currently unreachable for any request
-    // that also passes step 1, and disabling it does not turn a same-shaped
-    // test red. It is deliberate defense in depth rather than a currently
-    // live gap: it stops depending on `FsRoot::components` continuing to
-    // apply that check to the *last* component specifically, which is a
-    // policy of the caller, not a guarantee `check_component` itself makes.
-    if let Err(reason) = platform::check_component(name) {
-        return fs_error_response(FsError::Malformed(reason));
-    }
-
     let parent = match root.resolve_existing(parent_rel) {
         Ok(path) => path,
         Err(error) => return fs_error_response(error),
     };
     let named = parent.join(name);
+
+    // `named` above assumes `join` appends exactly one ordinary component. It
+    // does not: `PathBuf::join` discards `parent` entirely for an argument
+    // carrying a Windows drive prefix (verified: `Path::new(r"C:\root\app")
+    // .join("C:evil")` is `"C:evil"`, `parent` gone). A `name` containing `:`
+    // would drop the jail-resolved parent and hand `remove_file` an arbitrary
+    // drive-relative path.
+    //
+    // Checked as a postcondition of the join rather than as a precondition on
+    // `name`, deliberately: `platform::check_component` already rejects `:`
+    // (for Alternate Data Streams, an unrelated reason), and an earlier
+    // version of this guard called it here directly — but that only restates
+    // the dependency, it does not remove it. Relax `:` in `check_component`
+    // for its own purpose (a plausible future change, since Unix has no
+    // Alternate Data Streams to protect) and a precondition re-running the
+    // same rule is defeated identically; this postcondition is not, because
+    // it does not consult that rule at all — it only asks whether the result
+    // of the join still extends `parent`, which is true or false independent
+    // of why `check_component` currently rejects `:`.
+    //
+    // Not currently reachable from any request that also passes the
+    // full-path resolution at the top of this function: that resolution
+    // already runs `check_component` over every component including this
+    // one, so `path=app/C:evil` is refused there today regardless of this
+    // line. Kept anyway as the thing that keeps working if that upstream
+    // check's scope narrows for a reason that has nothing to do with this
+    // handler.
+    if !named.starts_with(&parent) {
+        return fs_error_response(FsError::Escapes);
+    }
 
     // `symlink_metadata` (lstat), not `metadata` (stat): the latter follows
     // the link and would report a symlink as whatever it points to, making a
@@ -1027,5 +1044,36 @@ mod tests {
             !paths.iter().any(|p| p.starts_with("app/locked/")),
             "contents of the unreadable subdirectory are simply absent, not fatal"
         );
+    }
+
+    /// Direct check of the postcondition `delete_file_blocking` relies on to
+    /// catch a drive-prefix `name` — no HTTP request reaches this today (the
+    /// full-path resolution ahead of it already refuses `:` via
+    /// `platform::check_component`, see
+    /// `delete_refuses_a_path_component_containing_a_colon` in
+    /// `tests/fs_api.rs`), so this pins the raw `Path` arithmetic the guard
+    /// depends on instead of contorting an HTTP test to reach it.
+    ///
+    /// Deliberately does not call `platform::check_component` at all: the
+    /// whole point of checking this as a postcondition of `join` is that it
+    /// holds independent of whatever `check_component` currently rejects.
+    ///
+    /// `#[cfg(windows)]`: the discarding behavior is specific to Windows path
+    /// prefixes (a drive letter, or a UNC/verbatim root). `:` has no special
+    /// meaning to `Path` on Unix, so `join` there only ever appends.
+    #[cfg(windows)]
+    #[test]
+    fn postcondition_catches_a_drive_prefix_join_even_without_check_component() {
+        let parent = std::path::Path::new(r"C:\root\app");
+        let named = parent.join("C:evil");
+        assert!(
+            !named.starts_with(parent),
+            "a drive-prefixed name must make `join` discard `parent`, or this guard has nothing to catch"
+        );
+
+        // The ordinary case the postcondition must not disturb: a plain
+        // filename still extends `parent` as expected.
+        let ordinary = parent.join("real.txt");
+        assert!(ordinary.starts_with(parent));
     }
 }
