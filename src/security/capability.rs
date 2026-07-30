@@ -81,12 +81,29 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 ///
 /// Vocabulary, not mechanism — additive by design (see the module header).
 /// `fs.read` and `fs.write` are deliberately absent from the `operator` and
-/// `read-only` presets: adding them there would hand file access to tokens
-/// already issued, which is a privilege change nobody asked for. An existing
-/// `operator` or `read-only` token must name them explicitly, e.g.
-/// `--capabilities fs.read,fs.write`. `full-control`'s [`CapabilitySet::wildcard`]
-/// already covers both, as it does every capability — there is no way to keep
-/// a `full-control` token from gaining file access once `--fs-root` is set.
+/// `read-only` presets, but what that buys differs sharply between the two,
+/// and it is worth being exact rather than claiming a boundary twice:
+///
+/// - `read-only` holds `session.read` and **no `exec`**, so withholding
+///   `fs.read` is a real containment boundary: such a token genuinely cannot
+///   read a file on this machine, and adding `fs.read` to the preset would
+///   have granted an access it did not have.
+/// - `operator` holds `exec`. A token that can run commands can already read
+///   and write anything the process can reach — `Get-Content`, `cp`, a
+///   redirect. Withholding `fs.*` there contains **nothing**; it keeps an
+///   issued token's capability surface from changing under it, which is a
+///   least-surprise property, not a security one. Do not describe it as
+///   confinement.
+///
+/// `full-control`'s [`CapabilitySet::wildcard`] covers both, as it does every
+/// capability — there is no way to keep such a token from the file API once
+/// `--fs-root` is set, and no reason to try, since `exec` already dominates it.
+///
+/// The practical consequence: `--fs-root` is a meaningful jail only for a
+/// token that has `fs.*` **without** `exec` (`--capabilities fs.write` for a
+/// deploy push, say). Against `operator` or `full-control` it is a convenience
+/// boundary — chunked, resumable, checksummed transfer instead of piping bytes
+/// through a command — not a containment one.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",
