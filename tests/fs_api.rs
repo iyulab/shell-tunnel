@@ -2,7 +2,6 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use shell_tunnel::api::fs::MAX_LIST_LIMIT;
 use shell_tunnel::api::handlers::AppState;
 use shell_tunnel::api::router::create_router_with_state;
 use shell_tunnel::FsRoot;
@@ -443,38 +442,38 @@ async fn list_paginates_and_the_cursor_covers_everything_once() {
 
 #[tokio::test]
 async fn list_caps_the_limit() {
-    // A one-file fixture cannot distinguish "clamped to MAX_LIST_LIMIT" from
-    // "limit ignored entirely" or "unpaginated" — all three return the same
-    // single entry. Proving the ceiling is real needs a fixture bigger than
-    // it.
-    let files: Vec<(String, Vec<u8>)> = (0..=MAX_LIST_LIMIT)
-        .map(|i| (format!("app/f{i:05}.txt"), vec![b'x']))
-        .collect();
-    let borrowed: Vec<(&str, &[u8])> = files
-        .iter()
-        .map(|(name, body)| (name.as_str(), body.as_slice()))
-        .collect();
-    let (_dir, state) = state_with_files(&borrowed);
+    // The exact ceiling and floor are unit-tested directly on the clamp
+    // arithmetic (`resolve_limit_clamps_to_the_configured_bounds` in
+    // `src/api/fs.rs`): that arithmetic depends only on the `limit` argument,
+    // not on how large the tree being listed is, so proving it does not
+    // require building a tree above `MAX_LIST_LIMIT` — this test used to
+    // build 10,001 files for exactly that reason, costing most of this
+    // suite's runtime. This is the end-to-end proof that `list` actually
+    // calls that clamp: a handful of files, `limit` above what exists still
+    // leaves a `next_cursor`, and `limit=0` does not mean "empty page".
+    let (_dir, state) = state_with_files(&[
+        ("app/a.txt", b"a"),
+        ("app/b.txt", b"b"),
+        ("app/c.txt", b"c"),
+    ]);
 
     let response = create_router_with_state(state.clone())
         .oneshot(
             Request::builder()
-                .uri("/api/v1/fs/list?path=app&limit=999999")
+                .uri("/api/v1/fs/list?path=app&limit=2")
                 .body(Body::empty())
                 .expect("request"),
         )
         .await
         .expect("response");
 
-    // Clamped, not refused: a caller asking for too much gets the ceiling,
-    // not an error and not the unbounded whole tree.
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     let entries = json["entries"].as_array().expect("entries");
-    assert_eq!(entries.len(), MAX_LIST_LIMIT);
+    assert_eq!(entries.len(), 2);
     assert!(
         !json["next_cursor"].is_null(),
-        "MAX_LIST_LIMIT+1 files exist; a real cap must leave one for the next page"
+        "3 files exist and limit=2; a real page must leave one for the next page"
     );
 
     // The lower bound is enforced too: `limit=0` must not mean "empty page".
@@ -644,7 +643,12 @@ fn fs_capability_table() -> Vec<(axum::http::Method, &'static str, &'static str)
 fn every_fs_route_declares_a_capability() {
     use shell_tunnel::api::router::{required_capability, RequiredCapability};
 
-    for (method, path, expected) in fs_capability_table() {
+    let table = fs_capability_table();
+    // Not just the loop: an empty (or accidentally emptied) table would let
+    // this pass having asserted nothing at all.
+    assert!(!table.is_empty(), "the capability table is empty");
+
+    for (method, path, expected) in table {
         assert_eq!(
             required_capability(&method, path),
             RequiredCapability::Capability(expected),
@@ -665,6 +669,7 @@ fn every_get_fs_route_authorizes_head_identically() {
     use axum::http::Method;
     use shell_tunnel::api::router::required_capability;
 
+    let mut checked = 0;
     for (method, path, _) in fs_capability_table() {
         if method == Method::GET {
             assert_eq!(
@@ -672,8 +677,16 @@ fn every_get_fs_route_authorizes_head_identically() {
                 required_capability(&Method::GET, path),
                 "HEAD {path} does not match GET's capability — HEAD falls through to Authenticated"
             );
+            checked += 1;
         }
     }
+    // A table with no GET rows would let this pass having checked nothing —
+    // the loop's `if` makes that silent rather than an obvious 0-iteration
+    // loop would be.
+    assert!(
+        checked > 0,
+        "no GET rows in the table — the assertion ran on nothing"
+    );
 }
 
 async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
@@ -887,6 +900,45 @@ async fn download_head_reports_content_length_without_reading_the_body() {
             .get("content-length")
             .and_then(|v| v.to_str().ok()),
         Some("11")
+    );
+    assert!(body_bytes(response).await.is_empty());
+}
+
+#[tokio::test]
+async fn download_head_honours_a_range_without_reading_the_body() {
+    // The `include_body` branch was added to both the whole-file and the
+    // ranged arm; only the whole-file one had a test. This pins that a
+    // ranged `HEAD` still 206s (does not collapse to a whole-file 200) and
+    // that its `content-length` matches the *range*, not the file.
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "bytes=6-10")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes 6-10/11")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
     );
     assert!(body_bytes(response).await.is_empty());
 }

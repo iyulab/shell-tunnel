@@ -123,6 +123,19 @@ pub const DEFAULT_LIST_LIMIT: usize = 1_000;
 /// Largest page a caller may ask for. Requests above it are clamped, not refused.
 pub const MAX_LIST_LIMIT: usize = 10_000;
 
+/// Resolve the requested page size against the configured bounds.
+///
+/// Clamped, not refused: a caller asking for zero or for more than the
+/// ceiling gets a valid page size instead of an error or an unbounded walk.
+/// Pure arithmetic on `requested`, independent of how large the tree being
+/// listed is — proving it holds does not require building a tree above
+/// `MAX_LIST_LIMIT`, only calling this with the numbers that matter.
+fn resolve_limit(requested: Option<usize>) -> usize {
+    requested
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT)
+}
+
 /// Where in-flight uploads are staged. Never reported by `list`.
 pub use crate::fs::UPLOAD_DIR;
 
@@ -206,10 +219,7 @@ fn list_blocking(root: &FsRoot, query: &ListQuery) -> Response {
         Err(_) => return fs_error_response(FsError::NotFound),
     }
 
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_LIST_LIMIT)
-        .clamp(1, MAX_LIST_LIMIT);
+    let limit = resolve_limit(query.limit);
     let want_hash = query.hash.as_deref() == Some("sha256");
 
     let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
@@ -604,13 +614,27 @@ fn download_blocking(
             } else {
                 Vec::new()
             };
+            // `bytes.len()`, not the `size` read from `metadata` earlier: a
+            // concurrent writer can truncate or extend the file between that
+            // `metadata` call and this `std::fs::read` (Tasks 5-6 add upload
+            // routes into this same root, so this is not hypothetical). Using
+            // the length of what was actually just read means the header can
+            // never disagree with the body hyper is about to frame it around.
+            // `HEAD` never reads, so it has no body length to take instead —
+            // `size` from metadata is exactly what RFC 9110 §9.3.2 asks a
+            // `HEAD` response to report.
+            let content_length = if include_body {
+                bytes.len() as u64
+            } else {
+                size
+            };
             (
                 StatusCode::OK,
                 [
                     ("content-type", "application/octet-stream".to_string()),
                     ("accept-ranges", "bytes".to_string()),
                     ("etag", etag),
-                    ("content-length", size.to_string()),
+                    ("content-length", content_length.to_string()),
                 ],
                 bytes,
             )
@@ -696,6 +720,18 @@ mod tests {
         assert_eq!(parse_range("bytes=5-2", 11), Ignore); // last-byte-pos < first-byte-pos
         assert_eq!(parse_range("bytes=0-1,4-5", 11), Ignore); // multipart, unsupported
         assert_eq!(parse_range("bytes=-", 11), Ignore); // empty suffix
+    }
+
+    #[test]
+    fn resolve_limit_clamps_to_the_configured_bounds() {
+        assert_eq!(resolve_limit(None), DEFAULT_LIST_LIMIT);
+        // Lower bound: zero must not mean "empty page".
+        assert_eq!(resolve_limit(Some(0)), 1);
+        // Ceiling: a caller asking for far more than the max is clamped, not
+        // refused and not served unbounded.
+        assert_eq!(resolve_limit(Some(999_999)), MAX_LIST_LIMIT);
+        // Pass-through within bounds.
+        assert_eq!(resolve_limit(Some(50)), 50);
     }
 
     #[test]
