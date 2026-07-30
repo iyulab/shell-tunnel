@@ -1081,12 +1081,6 @@ fn create_upload_blocking(
     // `up-{serial:016x}.part` could collide with a future session's own
     // staging file, making that session's `create_new` fail for a reason
     // that has nothing to do with it.
-    // The upload staging directory is reserved: `list` deliberately hides it
-    // (`src/api/fs.rs`'s `walk`), so a file published inside it could never be
-    // reported back through this API, and a destination shaped like
-    // `up-{serial:016x}.part` could collide with a future session's own
-    // staging file, making that session's `create_new` fail for a reason
-    // that has nothing to do with it.
     if dest_rel == crate::fs::UPLOAD_DIR
         || dest_rel.starts_with(&format!("{}/", crate::fs::UPLOAD_DIR))
     {
@@ -1290,8 +1284,19 @@ fn complete_upload_blocking(root: &FsRoot, uploads: &crate::fs::UploadStore, id:
         if let Err(e) = std::fs::create_dir_all(parent) {
             std::fs::remove_file(&finished.part_path).ok();
             uploads.release_destination(&finished.dest_rel);
+            // Consults the same `platform::is_out_of_space` predicate
+            // `upload_error_response` uses for `UploadError::Io`, rather
+            // than a second, undifferentiated 500 — a full disk publishing
+            // a GB-scale, checksum-verified upload is exactly the likely
+            // failure this distinction exists for, not an edge case, and it
+            // would be dishonest to make it 507 for `append`'s writes but
+            // not for the one this function does itself.
+            let status = match platform::is_out_of_space(&e) {
+                true => StatusCode::INSUFFICIENT_STORAGE,
+                false => StatusCode::INTERNAL_SERVER_ERROR,
+            };
             return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 "io-error",
                 &format!("could not create the destination directory: {e}"),
             );
@@ -1307,8 +1312,14 @@ fn complete_upload_blocking(root: &FsRoot, uploads: &crate::fs::UploadStore, id:
     if let Err(e) = std::fs::rename(&finished.part_path, &destination) {
         std::fs::remove_file(&finished.part_path).ok();
         uploads.release_destination(&finished.dest_rel);
+        // Same reasoning as the `create_dir_all` failure above: consult the
+        // predicate rather than always answering 500.
+        let status = match platform::is_out_of_space(&e) {
+            true => StatusCode::INSUFFICIENT_STORAGE,
+            false => StatusCode::INTERNAL_SERVER_ERROR,
+        };
         return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            status,
             "io-error",
             &format!("could not publish the upload: {e}"),
         );

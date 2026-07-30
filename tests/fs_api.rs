@@ -2249,21 +2249,44 @@ async fn the_upload_body_limit_does_not_leak_to_other_routes() {
     // Comfortably above axum-core's own 2 MiB default, comfortably below
     // MAX_CHUNK_SIZE — if this ever stopped 413ing, the raised limit reached
     // a route it must not have.
-    let oversized = vec![0_u8; 3 * 1024 * 1024];
+    let oversized = || vec![0_u8; 3 * 1024 * 1024];
 
-    let response = create_router_with_state(AppState::new())
+    let execute_response = create_router_with_state(AppState::new())
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/execute")
                 .header("content-type", "application/json")
-                .body(Body::from(oversized))
+                .body(Body::from(oversized()))
                 .expect("request"),
         )
         .await
         .expect("response");
+    assert_eq!(execute_response.status(), StatusCode::PAYLOAD_TOO_LARGE);
 
-    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // `/execute` alone only catches the limit being hoisted onto `api_v1` or
+    // higher. It stays 413 even if `route_layer` on `upload_session_routes`
+    // (`src/api/router.rs`) were instead applied to the whole `fs_routes()`
+    // router — `/execute` lives outside `fs_routes()` entirely, so that
+    // mistake would leave this first assertion green while every sibling
+    // fs route quietly gained an 8 MiB limit. `POST /api/v1/fs/uploads` is
+    // inside `fs_routes()`, so it closes exactly that gap: it must still
+    // 413 at the 2 MiB default too.
+    let create_upload_response = create_router_with_state(AppState::new())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(oversized()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        create_upload_response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
 }
 
 /// Review finding: a real directory at the destination was only ever

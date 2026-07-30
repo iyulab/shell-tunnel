@@ -119,27 +119,45 @@ pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::i
 /// from "the server has a bug, file a report" needs this to be reliable —
 /// the two respond completely differently.
 ///
-/// `ENOSPC` (`libc::ENOSPC`, value 28 on Linux/macOS/BSD alike) is the same
-/// constant `src/pty/native.rs` and `src/pty/async_adapter.rs` already
-/// compare against for `EIO`, so this follows an established pattern rather
-/// than introducing a new way of reading `raw_os_error()`.
-/// `ERROR_DISK_FULL` (112) is its Windows counterpart; there is no crate in
-/// this tree's dependency graph that names it (no `windows-sys`, and this
-/// task adds no new dependencies), so it is a documented literal instead of
-/// `libc::ENOSPC`'s named constant.
+/// `ENOSPC` (`libc::ENOSPC`) is the same constant `src/pty/native.rs` and
+/// `src/pty/async_adapter.rs` already compare against for `EIO`, so this
+/// follows an established pattern rather than introducing a new way of
+/// reading `raw_os_error()`. `EDQUOT` (`libc::EDQUOT`) is its quota-analogue
+/// sibling — a per-user or per-directory quota can be exhausted well before
+/// the volume itself is full, and from a client's perspective both answers
+/// are the same instruction ("free something up and retry"). Both are
+/// `libc`'s *named* constants rather than a literal number precisely
+/// because their numeric value is not portable across Unix-likes (`EDQUOT`
+/// is 122 on Linux, 69 on macOS and the BSDs) — `libc` already carries the
+/// platform-correct value for each target, so naming it is also more
+/// correct than hardcoding one.
+///
+/// Windows has two counterparts, not one: `ERROR_DISK_FULL` (112) and
+/// `ERROR_HANDLE_DISK_FULL` (39/`0x27`) — the latter is what a handle-based
+/// write (exactly the path `UploadStore::append`'s `Write` impl takes)
+/// reports for a full volume, per `winerror.h`. Both are documented literals
+/// rather than named constants: there is no crate in this tree's dependency
+/// graph that names them (no `windows-sys`, and this task adds no new
+/// dependencies).
 #[cfg(unix)]
 pub fn is_out_of_space(err: &std::io::Error) -> bool {
-    err.raw_os_error() == Some(libc::ENOSPC)
+    matches!(err.raw_os_error(), Some(code) if code == libc::ENOSPC || code == libc::EDQUOT)
 }
 
 #[cfg(windows)]
 pub fn is_out_of_space(err: &std::io::Error) -> bool {
-    /// `ERROR_DISK_FULL`, from `winerror.h`. `io::Error::raw_os_error()`
-    /// reports the raw Win32 error code, not an `errno`, so this is the
-    /// value that appears there — not to be confused with any POSIX
-    /// `ENOSPC` numbering.
+    /// `ERROR_DISK_FULL`, from `winerror.h`.
     const ERROR_DISK_FULL: i32 = 112;
-    err.raw_os_error() == Some(ERROR_DISK_FULL)
+    /// `ERROR_HANDLE_DISK_FULL` (`0x27`), from `winerror.h` — reported for a
+    /// full volume on a handle-based write, which is the path uploads take.
+    const ERROR_HANDLE_DISK_FULL: i32 = 39;
+    // `io::Error::raw_os_error()` reports the raw Win32 error code, not an
+    // `errno` — neither of these is to be confused with any POSIX `ENOSPC`
+    // or `EDQUOT` numbering.
+    matches!(
+        err.raw_os_error(),
+        Some(code) if code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -201,11 +219,15 @@ mod tests {
     /// would actually report.
     #[cfg(unix)]
     #[test]
-    fn is_out_of_space_matches_enospc_only() {
+    fn is_out_of_space_matches_enospc_and_edquot_only() {
         let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
         assert!(is_out_of_space(&enospc));
 
-        // A different errno — e.g. ENOENT — must not be mistaken for it.
+        // The quota-analogue sibling must match too, not just ENOSPC itself.
+        let edquot = std::io::Error::from_raw_os_error(libc::EDQUOT);
+        assert!(is_out_of_space(&edquot));
+
+        // A different errno — e.g. ENOENT — must not be mistaken for either.
         let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
         assert!(!is_out_of_space(&enoent));
 
@@ -216,13 +238,20 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn is_out_of_space_matches_error_disk_full_only() {
+    fn is_out_of_space_matches_disk_full_codes_only() {
         const ERROR_DISK_FULL: i32 = 112;
+        const ERROR_HANDLE_DISK_FULL: i32 = 39;
+
         let disk_full = std::io::Error::from_raw_os_error(ERROR_DISK_FULL);
         assert!(is_out_of_space(&disk_full));
 
+        // The handle-based-write sibling must match too — this is the code
+        // an actual full-volume `Write` (the path uploads take) reports.
+        let handle_disk_full = std::io::Error::from_raw_os_error(ERROR_HANDLE_DISK_FULL);
+        assert!(is_out_of_space(&handle_disk_full));
+
         // A different Win32 code — e.g. ERROR_FILE_NOT_FOUND (2) — must not
-        // be mistaken for it.
+        // be mistaken for either.
         let not_found = std::io::Error::from_raw_os_error(2);
         assert!(!is_out_of_space(&not_found));
 

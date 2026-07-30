@@ -341,13 +341,6 @@ impl UploadStore {
         // caller-supplied (via `Content-Range`) and could in principle be
         // adversarially close to `u64::MAX`; overflow is treated the same as
         // exceeding the declared size, not as a wrapped-around pass.
-        // Refused before a single byte is written: without this, a session
-        // can stream arbitrarily far past what it declared, and the mismatch
-        // is only ever caught at `complete` — after every byte has already
-        // hit disk. `checked_add` rather than a plain `+`: `offset` is
-        // caller-supplied (via `Content-Range`) and could in principle be
-        // adversarially close to `u64::MAX`; overflow is treated the same as
-        // exceeding the declared size, not as a wrapped-around pass.
         let next_offset = offset.checked_add(bytes.len() as u64);
         if next_offset.map_or(true, |next| next > session.declared_size) {
             return Err(UploadError::SizeExceeded);
