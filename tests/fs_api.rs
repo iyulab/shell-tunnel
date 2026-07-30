@@ -346,38 +346,47 @@ async fn list_hashes_only_when_asked() {
 /// helper of the same name in `src/fs/root.rs`'s test module — duplicated
 /// rather than exported, since it exists only so a test here can skip
 /// cleanly when the runner cannot create one.
-fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> bool {
+///
+/// Returns the creation `io::Result` rather than collapsing it to `bool`:
+/// `require_symlink` puts the error in its panic message when creation fails
+/// on a platform where that should never happen, and `.is_ok()` would have
+/// thrown the errno away before it got there.
+fn try_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link).is_ok()
+        std::os::unix::fs::symlink(target, link)
     }
     #[cfg(windows)]
     {
-        std::os::windows::fs::symlink_file(target, link).is_ok()
+        std::os::windows::fs::symlink_file(target, link)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (target, link);
-        false
+        Err(std::io::Error::other(
+            "symlinks unsupported on this platform",
+        ))
     }
 }
 
 /// Like `try_symlink`, but for a target that is a directory. Windows
 /// distinguishes file-symlinks from directory-symlinks at creation time
 /// (`symlink_file` vs `symlink_dir`); Unix does not.
-fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
+fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link).is_ok()
+        std::os::unix::fs::symlink(target, link)
     }
     #[cfg(windows)]
     {
-        std::os::windows::fs::symlink_dir(target, link).is_ok()
+        std::os::windows::fs::symlink_dir(target, link)
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (target, link);
-        false
+        Err(std::io::Error::other(
+            "symlinks unsupported on this platform",
+        ))
     }
 }
 
@@ -391,24 +400,27 @@ fn try_symlink_dir(target: &std::path::Path, link: &std::path::Path) -> bool {
 /// Unix has no equivalent of Windows's `SeCreateSymbolicLinkPrivilege` gate
 /// for an ordinary user creating a symlink, so a failure there almost
 /// certainly means something is actually broken, not that the privilege is
-/// missing — treated as a hard test failure rather than a silent skip.
-/// Windows commonly denies it to an unprivileged, non-developer-mode
-/// account, so that platform gets a clearly marked skip instead. CI's ubuntu
-/// and macos runners always have the privilege, so on CI these assertions
-/// execute rather than skip; only a privilege-restricted local Windows
-/// session skips.
-fn require_symlink(created: bool, test_name: &str) -> bool {
-    if created {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        eprintln!("SKIPPED {test_name}: symlink privilege unavailable on this runner");
-        false
-    }
-    #[cfg(not(windows))]
-    {
-        panic!("{test_name}: symlink creation failed unexpectedly on a non-Windows platform");
+/// missing — treated as a hard test failure rather than a silent skip, with
+/// the underlying `io::Error` in the panic message so it is diagnosable
+/// rather than a bare "it failed". Windows commonly denies it to an
+/// unprivileged, non-developer-mode account, so that platform gets a
+/// clearly marked skip instead. CI's ubuntu and macos runners always have
+/// the privilege, so on CI these assertions execute rather than skip; only a
+/// privilege-restricted local Windows session skips.
+fn require_symlink(created: std::io::Result<()>, test_name: &str) -> bool {
+    match created {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(_) => {
+            eprintln!("SKIPPED {test_name}: symlink privilege unavailable on this runner");
+            false
+        }
+        #[cfg(not(windows))]
+        Err(e) => {
+            panic!(
+                "{test_name}: symlink creation failed unexpectedly on a non-Windows platform: {e}"
+            );
+        }
     }
 }
 
@@ -428,7 +440,7 @@ async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
 
     let root = state.fs.as_ref().expect("fs root enabled");
     let link = root.path().join("app").join("linked.txt");
-    if !try_symlink(&secret, &link) {
+    if try_symlink(&secret, &link).is_err() {
         return; // symlink privilege unavailable on this runner; skip
     }
 
@@ -1332,6 +1344,53 @@ async fn delete_refuses_a_path_ending_in_dot_dot() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let json = body_json(response).await;
     assert_eq!(json["error"], "path-escapes-root");
+}
+
+/// The `..` guard's sibling for `.`, and it needs a symlink fixture to mean
+/// anything: `path=app/a.txt/.` would 404 on Unix by accident (`ENOTDIR`,
+/// since `a.txt` is a plain file) and 204 on Windows by the same accident
+/// that motivated this test in the first place — neither tells the guard
+/// apart from its absence. A same-root symlink does: `resolve_existing`
+/// follows `link/.` straight to `real.txt` (passing the full-path gate), and
+/// on Windows that result is a verbatim path on which `PathBuf::join(".")`
+/// collapses back onto itself — so without the guard, `parent =
+/// resolve_existing("link")` (the followed target) plus `named =
+/// parent.join(".")` lands on `real.txt` again, the exact defect the
+/// split-then-join approach exists to avoid, reached through `.` instead of
+/// through `resolve_existing`'s own symlink-following.
+#[tokio::test]
+async fn delete_refuses_a_path_ending_in_dot() {
+    let (dir, state) = state_with_files(&[("app/real.txt", b"keep me")]);
+    let target = dir.path().join("app/real.txt");
+    let link = dir.path().join("link");
+    if !require_symlink(
+        try_symlink(&target, &link),
+        "delete_refuses_a_path_ending_in_dot",
+    ) {
+        return;
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=link/.")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        target.exists(),
+        "the symlink's target must survive — `.` does not name it"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the symlink itself must survive — the request was refused, not acted on"
+    );
 }
 
 #[tokio::test]

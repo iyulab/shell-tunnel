@@ -660,12 +660,14 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
 /// operation that wants the guards (dry-run, backup, approval) this layer
 /// does not have; a convenience flag here would hand out that power without
 /// them. Everything else the entry could be — a regular file, a symlink (to
-/// a file or to a directory), a FIFO, a socket, a device node — is removed:
-/// unlike `download`, this handler never reads the entry's contents, so
-/// `download`'s reason for gating on `is_file()` (a FIFO never reaches EOF)
-/// does not apply here. And refusing a non-regular entry would leave it
-/// permanently undeletable through this API, the same trap that decided the
-/// symlink question below in favour of acting on the named entry.
+/// a file or to a directory), a FIFO, a socket, a device node — is removed,
+/// provided the link itself resolves inside the root — see the accepted
+/// limitation on escaping and dangling links below: unlike `download`, this
+/// handler never reads the entry's contents, so `download`'s reason for
+/// gating on `is_file()` (a FIFO never reaches EOF) does not apply here. And
+/// refusing a non-regular entry would leave it permanently undeletable
+/// through this API, the same trap that decided the symlink question below
+/// in favour of acting on the named entry.
 pub async fn delete_file(
     State(state): State<AppState>,
     Query(query): Query<PathQuery>,
@@ -727,6 +729,14 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 /// already pass `check_component` during that walk. It only decides which of
 /// two jail-approved paths to act on — the request's own final component, not
 /// whatever that component's target happens to be.
+///
+/// Accepted limitation: a symlink pointing outside the root, and a dangling
+/// symlink, both stay undeletable through this route. The very first line of
+/// this function already refuses both with `Escapes` — the jail's verdict on
+/// the full path is final, and reaching either kind of link would mean
+/// overriding it. That is the property every other route in this feature
+/// rests on, so it is not relaxed here just to reach a broken link; an
+/// operator has to remove those directly.
 fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     if let Err(error) = root.resolve_existing(&query.path) {
         return fs_error_response(error);
@@ -756,6 +766,25 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     // exists to leave untouched.
     if name == ".." {
         return fs_error_response(FsError::Escapes);
+    }
+
+    // `.` is the other value `FsRoot::components` never runs `check_component`
+    // over, and it fails the same way `..` did above, through a different
+    // mechanism: `PathBuf::join` absorbs a trailing `.` on a verbatim path,
+    // and `resolve_existing`'s result *is* verbatim on Windows (`canonicalize`
+    // returns `\\?\C:\...`). So for `path=link/.` where `link` is a
+    // same-root symlink, `parent = resolve_existing("link")` is the link's
+    // *followed target*, and `parent.join(".")` collapses right back onto
+    // that target — reproduced on this box: `canonicalize(link).join(".") ==
+    // canonicalize(link)`, both the link's target, with no `.` component
+    // surviving to distinguish them. That reintroduces exactly the defect
+    // this handler exists to avoid, through a spelling `..`'s guard does not
+    // cover. `Malformed`, not `Escapes`: naming an entry as `.` is not an
+    // escape, just not a name.
+    if name == "." {
+        return fs_error_response(FsError::Malformed(
+            "delete target must name an entry, not `.`",
+        ));
     }
 
     let parent = match root.resolve_existing(parent_rel) {
