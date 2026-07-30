@@ -775,26 +775,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_required_capability_head_matches_get() {
-        use RequiredCapability::Capability;
-
-        // `axum`'s `get()` serves `HEAD` automatically; its authorization must
-        // be identical to `GET`'s, not the fail-closed `Authenticated` default
-        // an unmapped method/path pair would otherwise fall back to.
-        assert_eq!(
-            required_capability(&Method::HEAD, "/api/v1/fs/file"),
-            Capability("fs.read")
-        );
-        assert_eq!(
-            required_capability(&Method::HEAD, "/api/v1/fs/stat"),
-            Capability("fs.read")
-        );
-        assert_eq!(
-            required_capability(&Method::HEAD, "/api/v1/fs/list"),
-            Capability("fs.read")
-        );
-    }
+    // A direct unit-level check of the `HEAD` normalisation lived here once,
+    // hardcoding three fs paths. It is superseded by
+    // `every_get_fs_route_authorizes_head_identically` in `tests/fs_api.rs`,
+    // which derives the same check from the one authoritative route table
+    // (shared with `every_fs_route_declares_a_capability`) instead of a
+    // second, hand-maintained list that could drift from it.
 
     #[test]
     fn test_secure_router_creation() {

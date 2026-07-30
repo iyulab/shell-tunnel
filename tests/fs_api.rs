@@ -612,15 +612,19 @@ async fn list_hides_the_upload_staging_directory() {
         .all(|p| !p.starts_with(".shell-tunnel-uploads")));
 }
 
-/// Guards the fail-closed trap in `required_capability`: an unmapped route
-/// silently falls back to `Authenticated`, which would open every fs route to
-/// any valid token. The compiler cannot catch it, so this does.
-#[test]
-fn every_fs_route_declares_a_capability() {
+/// The one authoritative `(method, path, capability)` table for every fs
+/// route. Two different guarantees are derived from this single list rather
+/// than each keeping its own copy: that the table maps every route here
+/// exactly (`every_fs_route_declares_a_capability`), and that `HEAD` on every
+/// `GET` row here is authorized identically to that row's `GET`
+/// (`every_get_fs_route_authorizes_head_identically`). A ninth route added
+/// for Task 5/6 gets both checks by being added to this one list — nobody
+/// has to remember a second, hand-maintained list of `GET` routes to keep it
+/// in sync with.
+fn fs_capability_table() -> Vec<(axum::http::Method, &'static str, &'static str)> {
     use axum::http::Method;
-    use shell_tunnel::api::router::{required_capability, RequiredCapability};
 
-    let routes = [
+    vec![
         (Method::GET, "/api/v1/fs/list", "fs.read"),
         (Method::GET, "/api/v1/fs/stat", "fs.read"),
         (Method::GET, "/api/v1/fs/file", "fs.read"),
@@ -630,14 +634,45 @@ fn every_fs_route_declares_a_capability() {
         (Method::PATCH, "/api/v1/fs/uploads/{id}", "fs.write"),
         (Method::POST, "/api/v1/fs/uploads/{id}/complete", "fs.write"),
         (Method::DELETE, "/api/v1/fs/uploads/{id}", "fs.write"),
-    ];
+    ]
+}
 
-    for (method, path, expected) in routes {
+/// Guards the fail-closed trap in `required_capability`: an unmapped route
+/// silently falls back to `Authenticated`, which would open every fs route to
+/// any valid token. The compiler cannot catch it, so this does.
+#[test]
+fn every_fs_route_declares_a_capability() {
+    use shell_tunnel::api::router::{required_capability, RequiredCapability};
+
+    for (method, path, expected) in fs_capability_table() {
         assert_eq!(
             required_capability(&method, path),
             RequiredCapability::Capability(expected),
             "{method} {path} is not mapped; it would fall back to Authenticated"
         );
+    }
+}
+
+/// `axum`'s `get()` serves `HEAD` automatically, but `required_capability` has
+/// no separate `HEAD` entries — it normalises `HEAD` to `GET` once, centrally,
+/// rather than needing a twin arm beside every `GET` row (a forgotten twin
+/// would silently fall through to the fail-closed default `Authenticated`,
+/// admitting any valid token). This derives the check from the same table
+/// `every_fs_route_declares_a_capability` uses, so a `GET` route added later
+/// is covered without anyone adding a second assertion for it.
+#[test]
+fn every_get_fs_route_authorizes_head_identically() {
+    use axum::http::Method;
+    use shell_tunnel::api::router::required_capability;
+
+    for (method, path, _) in fs_capability_table() {
+        if method == Method::GET {
+            assert_eq!(
+                required_capability(&Method::HEAD, path),
+                required_capability(&Method::GET, path),
+                "HEAD {path} does not match GET's capability — HEAD falls through to Authenticated"
+            );
+        }
     }
 }
 
@@ -719,6 +754,141 @@ async fn an_unsatisfiable_range_is_refused() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    // Not just the status: a 416 with no `Content-Range` leaves the client
+    // unable to learn the file's actual size to retry with. `bytes */<size>`
+    // is exactly what RFC 9110 §14.4 asks a 416 to carry.
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|v| v.to_str().ok()),
+        Some("bytes */5")
+    );
+}
+
+#[tokio::test]
+async fn an_unrecognised_range_unit_is_ignored_not_refused() {
+    // RFC 9110 §14.2: an unrecognised range unit must be ignored — served as
+    // the whole file (200) — not refused with 416. The brief this handler was
+    // first built from asserted the opposite for `parse_range` in isolation;
+    // this is the HTTP-level proof the corrected behaviour actually ships.
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .header("range", "items=0-4")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(body_bytes(response).await, b"hello world");
+}
+
+#[tokio::test]
+async fn download_refuses_a_directory_with_not_a_file() {
+    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "not-a-file");
+}
+
+/// Proves `HEAD` skips the content read rather than merely hiding it from the
+/// client: a permission-denied file still lets `stat` succeed (metadata is
+/// readable independent of read permission on the content), but a `GET` on
+/// it fails to `std::fs::read` it. If `HEAD` silently performed that same
+/// read and only axum's body-stripping hid the result, this would 404 too;
+/// 200 is only reachable if the read was never attempted.
+///
+/// `#[cfg(unix)]`: removing read permission from a *file* has no direct
+/// `std::fs` equivalent on Windows (ACLs, not a mode bit) — same constraint
+/// already accepted by `a_symlink_out_of_the_root_is_refused` in
+/// `src/fs/root.rs` and `an_unreadable_nested_subdirectory_does_not_abort_the_whole_walk`
+/// in `src/api/fs.rs`.
+#[cfg(unix)]
+#[tokio::test]
+async fn download_head_does_not_read_a_file_it_lacks_permission_to_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let path = dir.path().join("app/a.bin");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+
+    // A privileged account (root, or a runner that ignores the mode bit) can
+    // still open the file — nothing to verify then.
+    if std::fs::File::open(&path).is_ok() {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).ok();
+        return;
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Restore permissions before any assertion can panic and leak a file the
+    // temp-dir cleanup would otherwise be unable to remove.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+        .expect("restore permissions");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "HEAD must succeed without ever attempting to read the file's contents"
+    );
+}
+
+#[tokio::test]
+async fn download_head_reports_content_length_without_reading_the_body() {
+    let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/api/v1/fs/file?path=app/a.bin")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    // The body is never read for HEAD, so `content-length` cannot come from
+    // an in-memory `Vec`'s length — it must be set explicitly from metadata.
+    assert_eq!(
+        response
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok()),
+        Some("11")
+    );
+    assert!(body_bytes(response).await.is_empty());
 }
 
 #[tokio::test]

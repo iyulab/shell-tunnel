@@ -374,39 +374,93 @@ pub fn etag_for(meta: &std::fs::Metadata) -> String {
     )
 }
 
-/// Parse a single-range `Range` header into an inclusive `(start, end)`.
+/// The outcome of interpreting a `Range` header against a file of `size` bytes.
 ///
-/// Only one range is supported. Multipart ranges would need a multipart body,
-/// which buys nothing for resumable transfer and costs a second encoding to
-/// defend.
-pub fn parse_range(header: &str, size: u64) -> Option<(u64, u64)> {
-    let spec = header.trim().strip_prefix("bytes=")?;
-    if spec.contains(',') {
-        return None;
-    }
-    let (from, to) = spec.split_once('-')?;
-    let (start, end) = match (from.trim(), to.trim()) {
-        ("", "") => return None,
-        // `bytes=-N`: the last N bytes.
-        ("", suffix) => {
-            let n: u64 = suffix.parse().ok()?;
-            if n == 0 || size == 0 {
-                return None;
-            }
-            (size.saturating_sub(n), size - 1)
-        }
-        (first, "") => (first.parse().ok()?, size.checked_sub(1)?),
-        (first, last) => (first.parse().ok()?, last.parse().ok()?),
+/// RFC 9110 §14.2 requires two different failure shapes to produce two
+/// different responses: an unrecognised range unit, or a syntactically
+/// invalid `bytes` spec, must be *ignored* — served as the whole file, 200 —
+/// while only a well-formed `bytes` range that names bytes the file does not
+/// have is "not satisfiable" (416). Collapsing both into one `Option::None`,
+/// as an earlier version of this function did, served 416 for `Range:
+/// items=0-4`, which the RFC forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeOutcome {
+    /// No usable range: fall through to serving the whole file, exactly as
+    /// if `Range` had not been sent at all.
+    Ignore,
+    /// A well-formed `bytes` range outside the file's current length.
+    Unsatisfiable,
+    /// A well-formed, in-bounds range: inclusive `(start, end)`.
+    Satisfiable(u64, u64),
+}
+
+/// Parse a single-range `Range` header against a file of `size` bytes.
+///
+/// Only one range is supported: a multi-range spec is syntactically valid
+/// but this implementation has no multipart body to serve it with, so it is
+/// treated the same as an unrecognised unit — ignored, not refused with 416
+/// for something the client asked for correctly.
+pub fn parse_range(header: &str, size: u64) -> RangeOutcome {
+    use RangeOutcome::{Ignore, Satisfiable, Unsatisfiable};
+
+    let Some(spec) = header.trim().strip_prefix("bytes=") else {
+        return Ignore; // unrecognised unit
     };
-    if start > end || start >= size {
-        return None;
+    if spec.contains(',') {
+        return Ignore; // multipart; unsupported, but not the client's fault
     }
-    Some((start, end.min(size - 1)))
+    let Some((from, to)) = spec.split_once('-') else {
+        return Ignore;
+    };
+
+    let (start, end) = match (from.trim(), to.trim()) {
+        ("", "") => return Ignore,
+        // `bytes=-N`: the last N bytes. `saturating_sub` throughout rather
+        // than an early `size == 0` guard: an empty file and a suffix of `0`
+        // both collapse to `start >= size` below — the same "nothing to
+        // serve" outcome either way, reached without a special case.
+        ("", suffix) => {
+            let Ok(n) = suffix.parse::<u64>() else {
+                return Ignore;
+            };
+            (size.saturating_sub(n), size.saturating_sub(1))
+        }
+        (first, "") => {
+            let Ok(start) = first.parse::<u64>() else {
+                return Ignore;
+            };
+            (start, size.saturating_sub(1))
+        }
+        (first, last) => {
+            let (Ok(start), Ok(end)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+                return Ignore;
+            };
+            // `last-byte-pos < first-byte-pos` is an invalid byte-range-spec
+            // (RFC 9110 §14.1.2) — a syntax problem, not an out-of-bounds one.
+            if end < start {
+                return Ignore;
+            }
+            (start, end)
+        }
+    };
+
+    if start >= size {
+        return Unsatisfiable;
+    }
+    Satisfiable(start, end.min(size - 1))
 }
 
 /// `GET /api/v1/fs/file` — the whole file, or a range of it.
+///
+/// `HEAD` reaches this handler too: `axum`'s `get()` serves it automatically,
+/// running the same handler and discarding the body. Without the `method`
+/// check below, that meant loading the entire file into a `Vec` purely to
+/// throw it away — waste on every call, and an amplification on a large file.
+/// `include_body` skips every read while still computing the same status and
+/// headers a `GET` would.
 pub async fn download(
     State(state): State<AppState>,
+    method: axum::http::Method,
     headers: axum::http::HeaderMap,
     Query(query): Query<PathQuery>,
 ) -> Response {
@@ -425,6 +479,7 @@ pub async fn download(
     };
     let range_header = header_str(axum::http::header::RANGE);
     let if_range_header = header_str(axum::http::header::IF_RANGE);
+    let include_body = method != axum::http::Method::HEAD;
 
     // Resolving the path, `stat`-ing it, and reading the bytes (whole file or
     // a span) are all blocking I/O. Same convention as `execution::executor::execute`
@@ -439,6 +494,7 @@ pub async fn download(
             &query,
             range_header.as_deref(),
             if_range_header.as_deref(),
+            include_body,
         )
     })
     .await
@@ -455,11 +511,17 @@ pub async fn download(
 /// The synchronous body of `download`. Blocking throughout — see `download`,
 /// which runs this via `spawn_blocking` rather than directly on the async
 /// runtime.
+///
+/// `include_body` is `false` for `HEAD`: every status code and header below
+/// is computed exactly as for `GET`, but no file content is read, and
+/// `content-length` is set explicitly from metadata rather than left to be
+/// inferred from an (empty) body.
 fn download_blocking(
     root: &FsRoot,
     query: &PathQuery,
     range_header: Option<&str>,
     if_range_header: Option<&str>,
+    include_body: bool,
 ) -> Response {
     let resolved = match root.resolve_existing(&query.path) {
         Ok(path) => path,
@@ -470,14 +532,17 @@ fn download_blocking(
     // and `is_file()` gates every read below. A FIFO blocks `File::open`
     // indefinitely and a character device never reaches EOF, so without this
     // check a path like `/dev/zero` inside the root would hang the request
-    // forever instead of failing fast.
+    // forever instead of failing fast. The message says "not a regular
+    // file" rather than "a directory": a FIFO or character device hits this
+    // same arm, and a message that named only directories would be wrong for
+    // them.
     let meta = match std::fs::metadata(&resolved) {
         Ok(meta) if meta.is_file() => meta,
         Ok(_) => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "not-a-file",
-                "path is a directory; use /api/v1/fs/list",
+                "path is not a regular file; if it is a directory, use /api/v1/fs/list",
             )
         }
         Err(_) => return fs_error_response(FsError::NotFound),
@@ -494,38 +559,50 @@ fn download_blocking(
         None => true,
     };
 
-    let requested = range_header.filter(|_| range_allowed);
+    let requested = range_header
+        .filter(|_| range_allowed)
+        .map(|raw| parse_range(raw, size));
 
     match requested {
-        Some(raw) => match parse_range(raw, size) {
-            Some((start, end)) => {
-                let length = end - start + 1;
-                let bytes = match read_span(&resolved, start, length) {
+        Some(RangeOutcome::Satisfiable(start, end)) => {
+            let length = end - start + 1;
+            let bytes = if include_body {
+                match read_span(&resolved, start, length) {
                     Ok(bytes) => bytes,
                     Err(_) => return fs_error_response(FsError::NotFound),
-                };
-                (
-                    StatusCode::PARTIAL_CONTENT,
-                    [
-                        ("content-type", "application/octet-stream".to_string()),
-                        ("accept-ranges", "bytes".to_string()),
-                        ("etag", etag),
-                        ("content-range", format!("bytes {start}-{end}/{size}")),
-                    ],
-                    bytes,
-                )
-                    .into_response()
-            }
-            None => (
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                [("content-range", format!("bytes */{size}"))],
+                }
+            } else {
+                Vec::new()
+            };
+            (
+                StatusCode::PARTIAL_CONTENT,
+                [
+                    ("content-type", "application/octet-stream".to_string()),
+                    ("accept-ranges", "bytes".to_string()),
+                    ("etag", etag),
+                    ("content-range", format!("bytes {start}-{end}/{size}")),
+                    ("content-length", length.to_string()),
+                ],
+                bytes,
             )
-                .into_response(),
-        },
-        None => {
-            let bytes = match std::fs::read(&resolved) {
-                Ok(bytes) => bytes,
-                Err(_) => return fs_error_response(FsError::NotFound),
+                .into_response()
+        }
+        Some(RangeOutcome::Unsatisfiable) => (
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            [("content-range", format!("bytes */{size}"))],
+        )
+            .into_response(),
+        // `Ignore` (unrecognised unit, or a syntactically invalid `bytes`
+        // spec — RFC 9110 §14.2) falls through to the whole file exactly as
+        // `None` (no `Range` header at all) does.
+        Some(RangeOutcome::Ignore) | None => {
+            let bytes = if include_body {
+                match std::fs::read(&resolved) {
+                    Ok(bytes) => bytes,
+                    Err(_) => return fs_error_response(FsError::NotFound),
+                }
+            } else {
+                Vec::new()
             };
             (
                 StatusCode::OK,
@@ -533,6 +610,7 @@ fn download_blocking(
                     ("content-type", "application/octet-stream".to_string()),
                     ("accept-ranges", "bytes".to_string()),
                     ("etag", etag),
+                    ("content-length", size.to_string()),
                 ],
                 bytes,
             )
@@ -581,23 +659,85 @@ mod tests {
 
     #[test]
     fn ranges_parse_into_inclusive_bounds() {
-        assert_eq!(parse_range("bytes=0-4", 11), Some((0, 4)));
-        assert_eq!(parse_range("bytes=6-10", 11), Some((6, 10)));
+        use RangeOutcome::Satisfiable;
+
+        assert_eq!(parse_range("bytes=0-4", 11), Satisfiable(0, 4));
+        assert_eq!(parse_range("bytes=6-10", 11), Satisfiable(6, 10));
         // Open-ended: to the last byte.
-        assert_eq!(parse_range("bytes=6-", 11), Some((6, 10)));
+        assert_eq!(parse_range("bytes=6-", 11), Satisfiable(6, 10));
         // Suffix: the last N bytes.
-        assert_eq!(parse_range("bytes=-3", 11), Some((8, 10)));
+        assert_eq!(parse_range("bytes=-3", 11), Satisfiable(8, 10));
         // Clamped to the file, not refused.
-        assert_eq!(parse_range("bytes=0-999", 11), Some((0, 10)));
+        assert_eq!(parse_range("bytes=0-999", 11), Satisfiable(0, 10));
     }
 
     #[test]
-    fn unsatisfiable_or_unsupported_ranges_are_rejected() {
-        assert_eq!(parse_range("bytes=11-20", 11), None);
-        assert_eq!(parse_range("bytes=5-2", 11), None);
-        assert_eq!(parse_range("bytes=0-1,4-5", 11), None);
-        assert_eq!(parse_range("items=0-4", 11), None);
-        assert_eq!(parse_range("bytes=-", 11), None);
+    fn a_well_formed_out_of_bounds_range_is_unsatisfiable() {
+        use RangeOutcome::Unsatisfiable;
+
+        // First-byte-pos at or past the current length: well-formed, but the
+        // file does not have those bytes.
+        assert_eq!(parse_range("bytes=11-20", 11), Unsatisfiable);
+        // A suffix of 0 bytes names nothing the file can supply.
+        assert_eq!(parse_range("bytes=-0", 11), Unsatisfiable);
+        // An empty file satisfies no byte-range-spec at all.
+        assert_eq!(parse_range("bytes=0-4", 0), Unsatisfiable);
+    }
+
+    #[test]
+    fn malformed_or_unrecognised_ranges_are_ignored_not_refused() {
+        use RangeOutcome::Ignore;
+
+        // RFC 9110 §14.2: an unrecognised unit or a syntactically invalid
+        // `bytes` spec must be ignored — served as the whole file (200) —
+        // not refused with 416. Only a well-formed, out-of-bounds `bytes`
+        // range is 416 (see `a_well_formed_out_of_bounds_range_is_unsatisfiable`).
+        assert_eq!(parse_range("items=0-4", 11), Ignore); // unrecognised unit
+        assert_eq!(parse_range("bytes=5-2", 11), Ignore); // last-byte-pos < first-byte-pos
+        assert_eq!(parse_range("bytes=0-1,4-5", 11), Ignore); // multipart, unsupported
+        assert_eq!(parse_range("bytes=-", 11), Ignore); // empty suffix
+    }
+
+    #[test]
+    fn etag_reflects_size_and_discriminates_on_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("a.bin");
+        std::fs::write(&path, b"hello").expect("write");
+        let meta = std::fs::metadata(&path).expect("metadata");
+        let etag = etag_for(&meta);
+
+        // Shape: `"<size>-<mtime>-<identity>"`, three hex fields.
+        let inner = etag.trim_matches('"');
+        let parts: Vec<&str> = inner.split('-').collect();
+        assert_eq!(
+            parts.len(),
+            3,
+            "etag should be three hyphen-separated fields: {etag}"
+        );
+        assert_eq!(
+            u64::from_str_radix(parts[0], 16).expect("size field is hex"),
+            meta.len()
+        );
+
+        // Rewriting with different content of the *same* length changes only
+        // the mtime (and, on Unix, nothing else — same inode). If the etag
+        // did not change too, a caller could not tell a mutated same-size
+        // file from the original — exactly the failure `If-Range` depends on
+        // this function to prevent.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, b"HELLO").expect("rewrite, same size");
+        let meta2 = std::fs::metadata(&path).expect("metadata");
+
+        if mtime_ms(&meta) == mtime_ms(&meta2) {
+            // Coarse filesystem clock; the two writes landed in the same
+            // millisecond. Nothing to compare — skip rather than flake.
+            return;
+        }
+        assert_ne!(
+            etag,
+            etag_for(&meta2),
+            "same-size file with a different mtime must get a different etag"
+        );
     }
 
     /// Regression for the bug where a nested `read_dir` failure propagated
