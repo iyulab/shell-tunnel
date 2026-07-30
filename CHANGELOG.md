@@ -3,6 +3,21 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.12.2 — 2026-07-31
+
+### Fixed
+
+- **The upload staging directory was reachable through the file API when no `--fs-root`
+  was set.** The guard matched `.shell-tunnel-uploads` as a path prefix, which is where
+  it sits inside a jail; without one, staging follows the destination and the name lands
+  mid-path, so the test stopped matching. `stat` and `list` reported the directory,
+  `download` served in-flight `.part` contents belonging to another upload, and `delete`
+  removed another session's staging file. Affects 0.12.0 and 0.12.1. Matched per path
+  segment now, at any depth.
+
+  A directory of your own named `.shell-tunnel-uploads` is refused as well. The name is
+  reserved.
+
 ## 0.12.1 — 2026-07-31
 
 ### Fixed
