@@ -26,7 +26,11 @@ const BIN: &str = env!("CARGO_BIN_EXE_shell-tunnel");
 /// call hang past a two-minute background-command timeout with the server
 /// still bound to its port, which is the reason this wrapper exists rather
 /// than the simpler call.
-fn run_with_timeout(args: &[&str], timeout: Duration) -> (bool, String, String) {
+/// Returns the exit code (`None` if the process was killed by a signal)
+/// alongside the captured output, rather than a bare success bool: the
+/// refusals here are specified to exit 2, and "some non-zero code" would not
+/// distinguish them from a panic or a different refusal entirely.
+fn run_with_timeout(args: &[&str], timeout: Duration) -> (Option<i32>, String, String) {
     let mut child = Command::new(BIN)
         .args(args)
         .stdout(Stdio::piped())
@@ -47,8 +51,8 @@ fn run_with_timeout(args: &[&str], timeout: Duration) -> (bool, String, String) 
 
     match rx.recv_timeout(timeout) {
         Ok((stdout, stderr)) => {
-            let success = child.wait().map(|s| s.success()).unwrap_or(false);
-            (success, stdout, stderr)
+            let code = child.wait().expect("child is waitable").code();
+            (code, stdout, stderr)
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             let _ = child.kill();
@@ -72,7 +76,7 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
     std::fs::create_dir(&root).expect("mkdir root");
     let audit_log = root.join("audit.jsonl");
 
-    let (success, _stdout, stderr) = run_with_timeout(
+    let (code, _stdout, stderr) = run_with_timeout(
         &[
             "--port",
             "39880",
@@ -84,9 +88,23 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
         Duration::from_secs(10),
     );
 
-    assert!(!success, "expected a non-zero exit; stderr: {stderr}");
+    assert_eq!(code, Some(2), "expected exit 2; stderr: {stderr}");
     assert!(stderr.contains("--audit-log"), "{stderr}");
     assert!(stderr.contains("--fs-root"), "{stderr}");
+
+    // Matched on text unique to the containment branch, not merely on both
+    // flag names: `audit_log_is_inside_fs_root`'s `Err` arm also refuses,
+    // also exits 2, and also names both flags ("cannot be checked against").
+    // Asserting only "refused, and both flags appear" would therefore pass
+    // just as happily if this check started failing to *evaluate*
+    // containment on some platform instead of finding it — which is the most
+    // likely way this could diverge on a system other than the one it was
+    // written on, and precisely the case worth being told about. This
+    // pins the refusal to the stated reason.
+    assert!(
+        stderr.contains("resolves inside"),
+        "the refusal must be the containment branch, not the cannot-be-checked fallback: {stderr}"
+    );
 
     // The check runs before the audit sink is created (see `async_main`), so
     // a misconfigured server must never create the file it is about to
