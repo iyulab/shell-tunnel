@@ -1,6 +1,7 @@
 //! Shell-tunnel binary entry point.
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
 use shell_tunnel::config::PublicExposure;
@@ -179,8 +180,83 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // port, so this line used to announce 3000 while the server bound something
     // else entirely.
 
-    // Opened before serving so a path that cannot be written stops startup,
-    // rather than leaving an operator believing there is a trail.
+    // A root that exists but is a plain file canonicalises fine and then fails
+    // every resolve afterward with a confusing 404 — caught here instead, at
+    // startup, where an operator will actually see it.
+    //
+    // Built before the audit sink below (this used to run after it): the
+    // sink's `OpenOptions::create(true)` would otherwise create `--audit-log`
+    // on disk before the containment check that follows had any chance to
+    // refuse it, leaving a stray empty file *inside* the fs jail — creating a
+    // file nobody asked for on a path that is about to fail startup anyway.
+    let fs_root = if let Some(fs_root) = args.fs_root.as_ref() {
+        if !fs_root.is_dir() {
+            eprintln!(
+                "--fs-root {} cannot be used: not a directory",
+                fs_root.display()
+            );
+            eprintln!("The directory must exist and be readable.");
+            std::process::exit(2);
+        }
+        match shell_tunnel::FsRoot::new(fs_root) {
+            Ok(root) => Some(root),
+            Err(e) => {
+                eprintln!("--fs-root {} cannot be used: {e}", fs_root.display());
+                eprintln!("The directory must exist and be readable.");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    // The audit log must not sit inside the fs jail: from that moment an
+    // fs.write token could DELETE or overwrite-by-upload the trail recording
+    // its own actions. `.shell-tunnel-uploads` has a reserved-path refusal
+    // for exactly this shape of problem (`src/api/fs.rs`); the audit log had
+    // nothing, because the audit layer predates the jail and neither knew
+    // about the other's path.
+    //
+    // Checked here, before the audit sink is created below: `--audit-log`
+    // does not exist yet in the common case (first startup), only its parent
+    // directory does — see `audit_log_is_inside_fs_root`'s own doc comment
+    // for why the check works on the parent rather than the whole path.
+    // `fs_root`'s path is already canonicalised by `FsRoot::new` above.
+    if let (Some(audit_log), Some(root)) = (args.audit_log.as_ref(), fs_root.as_ref()) {
+        match audit_log_is_inside_fs_root(audit_log, root.path()) {
+            Ok(true) => {
+                eprintln!(
+                    "--audit-log {} cannot be used: it resolves inside --fs-root {}",
+                    audit_log.display(),
+                    root.path().display()
+                );
+                eprintln!(
+                    "An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root."
+                );
+                std::process::exit(2);
+            }
+            Ok(false) => {}
+            // Not treated as "not inside, proceed": an inability to verify
+            // containment is not evidence of its absence. Refusing here is
+            // the same fail-closed choice `refuse_if_reserved` makes in
+            // `src/api/fs.rs` when it cannot compute a path's canonical
+            // form — an approximate "probably fine" would read as a
+            // guarantee this check does not have grounds to make.
+            Err(e) => {
+                eprintln!(
+                    "--audit-log {} cannot be checked against --fs-root {}: {e}",
+                    audit_log.display(),
+                    root.path().display()
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // Opened only now, after the check above has had its chance to refuse —
+    // so a path that cannot be written still stops startup here rather than
+    // leaving an operator believing there is a trail, and a path inside the
+    // fs jail never gets this far at all.
     let audit = match &args.audit_log {
         Some(path) => {
             match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_max_bytes) {
@@ -200,29 +276,9 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         );
     }
     let state = shell_tunnel::AppState::new().with_audit(audit);
-
-    // A root that exists but is a plain file canonicalises fine and then fails
-    // every resolve afterward with a confusing 404 — caught here instead, at
-    // startup, where an operator will actually see it.
-    let state = if let Some(fs_root) = args.fs_root.as_ref() {
-        if !fs_root.is_dir() {
-            eprintln!(
-                "--fs-root {} cannot be used: not a directory",
-                fs_root.display()
-            );
-            eprintln!("The directory must exist and be readable.");
-            std::process::exit(2);
-        }
-        match shell_tunnel::FsRoot::new(fs_root) {
-            Ok(root) => state.with_fs_root(root),
-            Err(e) => {
-                eprintln!("--fs-root {} cannot be used: {e}", fs_root.display());
-                eprintln!("The directory must exist and be readable.");
-                std::process::exit(2);
-            }
-        }
-    } else {
-        state
+    let state = match fs_root {
+        Some(root) => state.with_fs_root(root),
+        None => state,
     };
 
     // Rejected at startup rather than clamped silently: a chunk size at or
@@ -612,4 +668,122 @@ fn print_banner(tunnel: &TunnelHandle, generated_key: Option<&str>) {
          \x20              -d '{{\"command\":\"echo hi\"}}'\n",
         provider = tunnel.provider(),
     );
+}
+
+/// Whether `audit_log`'s canonical location sits under `fs_root`.
+///
+/// `fs_root` is expected already canonicalised (`FsRoot::new` does this
+/// once, at construction). `audit_log` itself is checked by canonicalising
+/// its *parent* and rejoining the file name lexically, rather than
+/// canonicalising the whole path: this check runs before the audit sink is
+/// created (see the call site), so in the common case — first startup —
+/// `audit_log` does not exist yet at all, only the directory it will be
+/// created in does. Canonicalising the whole path would fail with
+/// `NotFound` on every first run, making this unusable for the exact case
+/// it exists to guard.
+///
+/// A canonicalise failure (the parent directory does not exist, or is not
+/// readable) is reported as `Err`, not folded into `Ok(false)`: an inability
+/// to prove containment is not proof of its absence, and the caller refuses
+/// to start on `Err` rather than treating it as "probably fine" — see the
+/// call site's own comment. In practice this `Err` is not expected to fire
+/// before `AuditSink::file_with_limit`'s own parent-must-exist requirement
+/// would already have refused startup a different way; it is handled
+/// explicitly here anyway rather than assumed unreachable.
+fn audit_log_is_inside_fs_root(audit_log: &Path, fs_root: &Path) -> std::io::Result<bool> {
+    let file_name = audit_log.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "audit log path has no file name",
+        )
+    })?;
+    let parent = match audit_log.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        // A bare filename (`"audit.jsonl"`, no directory component) resolves
+        // relative to the current directory — the same place
+        // `OpenOptions::open` would later resolve it, so this must match.
+        _ => Path::new("."),
+    };
+    Ok(parent.canonicalize()?.join(file_name).starts_with(fs_root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Nothing in the test suite reaches `async_main` (no test binds a real
+    /// server from CLI args), so this is a direct unit test of the pure
+    /// comparison. `tests/main_startup_e2e.rs` covers the other half — that
+    /// `async_main` actually calls this rather than merely computing the
+    /// right boolean nobody consults.
+    ///
+    /// The audit log file itself is deliberately never created here: this
+    /// check runs before the audit sink exists (see the call site in
+    /// `async_main`), so in the case that matters — first startup — only the
+    /// parent directory exists yet. A test that created the file first would
+    /// not catch a regression back to whole-path canonicalisation.
+    #[test]
+    fn audit_log_under_the_fs_root_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let audit_log = root.join("audit.jsonl");
+
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        assert!(
+            audit_log_is_inside_fs_root(&audit_log, &canonical_root)
+                .expect("the parent directory exists"),
+            "an audit log inside the root must be detected as inside it"
+        );
+    }
+
+    #[test]
+    fn audit_log_outside_the_fs_root_is_not_flagged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let audit_log = dir.path().join("audit.jsonl");
+
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        assert!(
+            !audit_log_is_inside_fs_root(&audit_log, &canonical_root)
+                .expect("the parent directory exists"),
+            "a sibling audit log must not be flagged as inside the root"
+        );
+    }
+
+    /// A nested destination is still detected, not just a direct child —
+    /// otherwise `--fs-root /srv/deploy --audit-log /srv/deploy/logs/audit.jsonl`
+    /// would slip through the same way a direct child would have.
+    #[test]
+    fn a_nested_audit_log_under_the_fs_root_is_detected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("logs")).expect("mkdir root/logs");
+        let audit_log = root.join("logs").join("audit.jsonl");
+
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+        assert!(
+            audit_log_is_inside_fs_root(&audit_log, &canonical_root)
+                .expect("the parent directory exists"),
+            "a nested audit log must be detected as inside the root too"
+        );
+    }
+
+    /// The `Err` arm itself: a path whose *parent* cannot be canonicalised
+    /// (nothing exists there) must not be silently treated as "not inside,
+    /// proceed".
+    #[test]
+    fn an_uncheckable_audit_log_path_is_an_error_not_a_silent_pass() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let canonical_root = root.canonicalize().expect("canonicalize root");
+
+        let never_created = dir.path().join("nonexistent").join("audit.jsonl");
+        assert!(
+            audit_log_is_inside_fs_root(&never_created, &canonical_root).is_err(),
+            "a path whose parent cannot be canonicalised must surface as Err, not Ok(false)"
+        );
+    }
 }

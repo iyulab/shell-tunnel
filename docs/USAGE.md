@@ -341,6 +341,11 @@ traffic instead.
 every refusal. Off unless a path is given — creating a file nobody asked for is
 its own kind of surprise.
 
+If `--fs-root` is also given, the audit log may not resolve inside it: startup
+is refused rather than allowed, since an `fs.write` token could otherwise delete
+or overwrite the trail recording its own actions. Point `--audit-log` at a
+directory outside the fs root.
+
 ```bash
 shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
 ```
