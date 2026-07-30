@@ -180,6 +180,34 @@ fn reserved_path_response() -> Response {
 /// degrade into serving or removing the very file this check exists to
 /// refuse — that would be fail-*open*, the wrong direction for a guard whose
 /// only job is refusing.
+///
+/// **Existence-gated, deliberately — and that leaves a residual oracle.**
+/// This guard only runs once a caller's path has already resolved to
+/// something that exists (`resolve_existing`'s own 404 answers a
+/// non-existent path first, before this ever sees it). So a caller probing
+/// `.shell-tunnel-uploads/up-{serial:016x}.part` for a serial that never
+/// existed gets 404, while the same probe against a serial with a session
+/// currently in flight gets 403 `reserved-path`. Session ids are a
+/// predictable per-process counter, so that pair of outcomes lets a holder
+/// of `fs.read`/`fs.write` enumerate *which* session ids are live right now.
+/// Accepted, not overlooked: what leaks is presence alone — never the
+/// staged content (closed by this guard) and never the upload's destination
+/// path (which lives only in the in-memory session and was never
+/// derivable from the staging filename either way) — to a caller who
+/// already holds root-wide read or delete via that same capability. The
+/// asymmetry this guard exists to close (content exposure, cross-session
+/// deletion) is a materially different severity than a presence bit.
+///
+/// The alternative — checking before resolution, directly on the caller's
+/// raw string — was considered and rejected. Matching the unresolved string
+/// is bypassable by spelling (`./`, backslashes, a `.` component), the same
+/// aliasing class `two_sessions_for_aliased_spellings_of_one_destination_are_refused`
+/// exists to cover for the upload destination claim key; making it reliable
+/// would mean canonicalising independently of `resolve_existing`, i.e. a
+/// second canonicalisation on every `stat`/`download` call — a real cost on
+/// what is otherwise the hot read path — to close a leak that only ever
+/// reveals a boolean, against a caller who is not thereby granted anything
+/// they could not already reach.
 fn refuse_if_reserved(root: &FsRoot, resolved: &std::path::Path) -> Option<Response> {
     match root.relative(resolved) {
         Some(rel) if is_reserved_path(&rel) => Some(reserved_path_response()),
