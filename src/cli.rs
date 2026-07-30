@@ -372,8 +372,8 @@ OPTIONS:
                             Rotate the audit trail to <FILE>.1 past this size
                             [default: unbounded]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
-        --fs-root <PATH>       Enable the file API, confined to this directory
-        --fs-chunk-size <N>    Upload chunk size in bytes (default 4194304)
+        --fs-root <PATH>    Enable the file API, confined to this directory
+        --fs-chunk-size <N> Upload chunk size in bytes (default 4194304)
 
 TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
         --tls-self-signed   Serve HTTPS with a self-signed certificate,
