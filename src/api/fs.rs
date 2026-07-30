@@ -139,8 +139,8 @@ fn resolve_limit(requested: Option<usize>) -> usize {
 /// Where in-flight uploads are staged. Never reported by `list`.
 pub use crate::fs::UPLOAD_DIR;
 
-/// Whether a root-relative path names the upload staging directory itself, or
-/// anything inside it.
+/// Whether a path names the upload staging directory itself, or anything
+/// inside it.
 ///
 /// One helper rather than one inline copy per handler that takes a `path`.
 /// Before this existed, `list`'s walk hid the directory from listings and
@@ -150,8 +150,22 @@ pub use crate::fs::UPLOAD_DIR;
 /// routes exposing the same directory the first two were built to protect.
 /// A sixth route taking a `path` calls this too, instead of becoming the
 /// place someone forgets it a third time.
+///
+/// Matched as a **path component at any depth**, not as a prefix. A prefix
+/// test was right while every scope was a jail, where staging sits directly
+/// under the root and so is always the first segment. It silently stopped
+/// matching when staging began following the destination: machine-wide, the
+/// name this receives is an absolute path like
+/// `C:/srv/deploy/.shell-tunnel-uploads/up-….part`, whose first segment is a
+/// drive. Every route that calls this went back to serving and deleting
+/// in-flight staging files — the exact exposure this helper was written to
+/// close, reopened by a change nowhere near it. Verified against a live
+/// server, not caught here, because every test in this suite used a jail.
+///
+/// A caller's own directory that happens to be named `.shell-tunnel-uploads`
+/// is refused too. The name is reserved; refusing is the safe direction.
 fn is_reserved_path(rel: &str) -> bool {
-    rel == UPLOAD_DIR || rel.starts_with(&format!("{UPLOAD_DIR}/"))
+    rel.split('/').any(|segment| segment == UPLOAD_DIR)
 }
 
 /// The refusal for a path that names the upload staging directory, or

@@ -357,6 +357,92 @@ async fn a_second_upload_into_the_same_directory_leaves_the_first_intact() {
     );
 }
 
+/// The staging directory stays hidden and untouchable when no `--fs-root`
+/// narrows the scope.
+///
+/// The guard matched `.shell-tunnel-uploads` as a path *prefix*, which held
+/// while every scope was a jail — staging sits directly under the root, so it
+/// is always the first segment. Machine-wide it is a segment in the middle of
+/// an absolute path, the prefix test stopped matching, and `stat`, `list`,
+/// `download`, and `delete` all went back to exposing in-flight staging files.
+///
+/// Found against a live server: `stat` on the staging directory answered 200
+/// and `list` returned it as an ordinary entry. Every test in this suite used
+/// a jail, so none of them could see it.
+#[tokio::test]
+async fn the_staging_directory_stays_reserved_without_a_jail() {
+    let (dir, state, base) = machine_wide_state();
+    // Opening a session is what creates the staging directory on disk.
+    let _id = create_test_upload(state.clone(), &format!("{base}/x.bin"), b"hello world").await;
+    let staging = format!("{base}/{}", shell_tunnel::fs::UPLOAD_DIR);
+    assert!(
+        dir.path().join(shell_tunnel::fs::UPLOAD_DIR).is_dir(),
+        "the fixture must have produced a staging directory to hide"
+    );
+
+    for uri in [
+        format!("/api/v1/fs/stat?path={staging}"),
+        format!("/api/v1/fs/file?path={staging}/up-0000000000000000.part"),
+    ] {
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{uri} must be refused as a reserved path"
+        );
+    }
+
+    let deleted = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/fs/file?path={staging}/up-0000000000000000.part"
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        deleted.status(),
+        StatusCode::FORBIDDEN,
+        "a staging file must not be deletable through the file API"
+    );
+
+    let listed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/list?path={base}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let entries = body_json(listed).await;
+    let names: Vec<String> = entries["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .map(|e| e["path"].as_str().expect("path").to_string())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|p| p.contains(shell_tunnel::fs::UPLOAD_DIR)),
+        "list must not report the staging directory: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
