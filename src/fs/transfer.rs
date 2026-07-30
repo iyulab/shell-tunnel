@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Seek, SeekFrom, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -188,9 +188,31 @@ impl UploadStore {
         self.chunk_size
     }
 
-    /// Where staging files live for `root`.
-    pub fn staging_dir(root: &crate::fs::FsRoot) -> PathBuf {
-        root.path().join(UPLOAD_DIR)
+    /// Where staging files live for an upload landing at `dest_abs`.
+    ///
+    /// Inside a jail that is one directory at the root, as it has always been.
+    /// Machine-wide there is no single place it could be: `complete` publishes
+    /// by `rename`, which is only atomic within a filesystem, so staging has to
+    /// sit on the same one as the destination. Windows makes this unavoidable
+    /// rather than merely preferable — a staging directory on `C:` cannot be
+    /// renamed onto `D:` at all.
+    ///
+    /// Taking the destination's own parent, rather than the volume root, keeps
+    /// that guarantee on Unix too, where a mount point below `/` is a different
+    /// filesystem and `/` is usually not writable by the account running this.
+    ///
+    /// The cost is that machine-wide staging is no longer one enumerable
+    /// directory, which is what `sweep_orphan_parts` needs — see its doc.
+    pub fn staging_dir(root: &crate::fs::FsRoot, dest_abs: &Path) -> PathBuf {
+        match root.jail_path() {
+            Some(jail) => jail.join(UPLOAD_DIR),
+            None => match dest_abs.parent() {
+                Some(parent) => parent.join(UPLOAD_DIR),
+                // A destination with no parent is a filesystem anchor, which
+                // `resolve_for_create` already refuses as a create target.
+                None => PathBuf::from(UPLOAD_DIR),
+            },
+        }
     }
 
     /// Open a session for `dest_rel`, which need not exist yet.
@@ -209,6 +231,7 @@ impl UploadStore {
     pub fn create(
         &self,
         root: &crate::fs::FsRoot,
+        dest_abs: &Path,
         dest_rel: String,
         size: u64,
         sha256: String,
@@ -226,7 +249,7 @@ impl UploadStore {
             claimed.insert(dest_rel.clone());
         }
 
-        let staging = Self::staging_dir(root);
+        let staging = Self::staging_dir(root, dest_abs);
         if let Err(e) = std::fs::create_dir_all(&staging) {
             self.release(&dest_rel);
             return Err(e.into());
@@ -586,9 +609,33 @@ fn poisoned() -> UploadError {
 /// could not be read at all" (most commonly: no upload has ever run against
 /// this root, so it was never created). Not distinguished, same reasoning as
 /// before this was widened: nothing consumes that distinction.
+///
+/// **Machine-wide scope sweeps nothing here, and that is a real gap rather
+/// than an oversight.** With no `--fs-root`, staging follows each destination
+/// to its own directory (see [`UploadStore::staging_dir`]), so the set of
+/// places a `.part` could be left is every directory anyone has ever uploaded
+/// to — not enumerable without walking every drive, which is not a thing a
+/// startup path should do. What covers it instead is
+/// [`sweep_orphan_parts_in`], called against a single destination's staging
+/// directory when an upload next targets it. The practical difference: inside
+/// a jail an orphan is reclaimed at the next restart; machine-wide it is
+/// reclaimed the next time something uploads to the same directory. Both are
+/// invisible to `list`, which refuses the staging directory by name either
+/// way.
 pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> Vec<(String, u64)> {
-    let staging = UploadStore::staging_dir(root);
-    let Ok(entries) = std::fs::read_dir(&staging) else {
+    let Some(jail) = root.jail_path() else {
+        return Vec::new();
+    };
+    sweep_orphan_parts_in(&jail.join(UPLOAD_DIR))
+}
+
+/// [`sweep_orphan_parts`] against one staging directory, whatever its scope.
+///
+/// Split out so machine-wide uploads have a reclaim path at all: the caller
+/// that knows a destination knows its staging directory, even though no
+/// startup path can enumerate every such directory.
+pub fn sweep_orphan_parts_in(staging: &Path) -> Vec<(String, u64)> {
+    let Ok(entries) = std::fs::read_dir(staging) else {
         return Vec::new();
     };
     let mut removed = Vec::new();
@@ -645,6 +692,38 @@ mod tests {
         (dir, root, store)
     }
 
+    impl UploadStore {
+        /// `create` from a root-relative destination, resolving it the way the
+        /// API layer does.
+        ///
+        /// `create` takes the resolved absolute destination because staging
+        /// has to land on the destination's own filesystem when no `--fs-root`
+        /// narrows the scope (see `staging_dir`). These tests all run against a
+        /// jail, where that resolution is uninteresting — doing it here rather
+        /// than passing some hand-built path keeps them exercising the same
+        /// path the real caller takes.
+        fn create_rel(
+            &self,
+            root: &FsRoot,
+            dest: &str,
+            size: u64,
+            sha256: String,
+        ) -> Result<String, UploadError> {
+            let absolute = root.resolve_for_create(dest).expect("destination resolves");
+            self.create(root, &absolute, dest.to_string(), size, sha256)
+        }
+    }
+
+    /// The staging directory of a jailed root.
+    ///
+    /// `staging_dir` takes a destination because machine-wide scope has to put
+    /// staging on the destination's own filesystem. A jail ignores it, so these
+    /// tests name that explicitly rather than threading a value none of them
+    /// care about through every call.
+    fn staging_of(root: &FsRoot) -> PathBuf {
+        UploadStore::staging_dir(root, Path::new("ignored-when-jailed"))
+    }
+
     /// SHA-256 of b"hello world".
     const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
@@ -652,7 +731,7 @@ mod tests {
     fn a_session_starts_at_offset_zero() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         assert_eq!(store.offset(&id), Some(0));
     }
@@ -661,7 +740,7 @@ mod tests {
     fn chunks_advance_the_offset() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
 
         assert_eq!(store.append(&id, 0, b"hello ").expect("first"), 6);
@@ -672,7 +751,7 @@ mod tests {
     fn a_chunk_at_the_wrong_offset_is_refused_with_the_expected_one() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         store.append(&id, 0, b"hello ").expect("first");
 
@@ -686,10 +765,10 @@ mod tests {
     fn two_sessions_may_not_target_the_same_path() {
         let (_dir, root, store) = store();
         store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("first");
         assert_eq!(
-            store.create(&root, "out.bin".into(), 11, HELLO_DIGEST.into()),
+            store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into()),
             Err(UploadError::Conflict)
         );
     }
@@ -698,7 +777,7 @@ mod tests {
     fn a_matching_checksum_completes() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         store.append(&id, 0, b"hello world").expect("append");
 
@@ -713,7 +792,7 @@ mod tests {
         let (_dir, root, store) = store();
         let wrong = "0".repeat(64);
         let id = store
-            .create(&root, "out.bin".into(), 11, wrong.clone())
+            .create_rel(&root, "out.bin", 11, wrong.clone())
             .expect("create");
         store.append(&id, 0, b"hello world").expect("append");
 
@@ -737,7 +816,7 @@ mod tests {
     fn a_chunk_above_the_ceiling_is_refused() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         let oversized = vec![0_u8; DEFAULT_CHUNK_SIZE + 1];
         assert_eq!(store.append(&id, 0, &oversized), Err(UploadError::TooLarge));
@@ -749,7 +828,7 @@ mod tests {
         // Declares 5 bytes; the digest is irrelevant here since the size
         // check runs at `append` time, well before any checksum comparison.
         let id = store
-            .create(&root, "out.bin".into(), 5, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 5, HELLO_DIGEST.into())
             .expect("create");
         assert_eq!(
             store.append(&id, 0, b"hello world"),
@@ -763,7 +842,7 @@ mod tests {
     fn a_chunk_landing_exactly_on_the_declared_size_is_accepted() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         // Exactly 11 bytes against a declared size of 11 — the boundary
         // `a_chunk_that_would_exceed_the_declared_size_is_refused` does not
@@ -775,7 +854,7 @@ mod tests {
     fn cancelling_removes_the_session_and_frees_the_destination() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         store.append(&id, 0, b"hello ").expect("append");
 
@@ -785,7 +864,7 @@ mod tests {
         assert_eq!(store.offset(&id), None);
         // The destination is claimable again.
         assert!(store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .is_ok());
     }
 
@@ -793,7 +872,7 @@ mod tests {
     fn sweeping_drops_sessions_past_their_ttl() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
 
         assert_eq!(store.sweep(Duration::ZERO).len(), 1);
@@ -814,11 +893,11 @@ mod tests {
     fn create_does_not_sweep_expired_sessions_itself() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "old.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "old.bin", 11, HELLO_DIGEST.into())
             .expect("create");
 
         store
-            .create(&root, "new.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "new.bin", 11, HELLO_DIGEST.into())
             .expect("second create");
 
         assert_eq!(
@@ -850,7 +929,7 @@ mod tests {
         let secret = outer.path().join("secret.txt");
         std::fs::write(&secret, b"outside-secret").expect("write secret");
 
-        let staging = UploadStore::staging_dir(&root);
+        let staging = staging_of(&root);
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         let predicted = staging.join("up-0000000000000000.part");
 
@@ -864,7 +943,7 @@ mod tests {
             return; // symlink privilege unavailable on this runner; skip
         }
 
-        let result = store.create(&root, "app-new.bin".into(), 11, HELLO_DIGEST.into());
+        let result = store.create_rel(&root, "app-new.bin", 11, HELLO_DIGEST.into());
         assert!(
             matches!(result, Err(UploadError::Io { .. })),
             "create_new must refuse a pre-existing symlink at the staging path \
@@ -884,20 +963,20 @@ mod tests {
         let mut ids = Vec::with_capacity(MAX_CONCURRENT_UPLOADS);
         for i in 0..MAX_CONCURRENT_UPLOADS {
             let id = store
-                .create(&root, format!("f{i}.bin"), 1, HELLO_DIGEST.into())
+                .create_rel(&root, &format!("f{i}.bin"), 1, HELLO_DIGEST.into())
                 .unwrap_or_else(|e| panic!("session {i} should fit under the cap: {e:?}"));
             ids.push(id);
         }
 
         assert_eq!(
-            store.create(&root, "one-too-many.bin".into(), 1, HELLO_DIGEST.into()),
+            store.create_rel(&root, "one-too-many.bin", 1, HELLO_DIGEST.into()),
             Err(UploadError::TooManySessions)
         );
 
         // Freeing one slot makes room for exactly one more.
         assert!(store.cancel(&ids[0]).is_some());
         assert!(store
-            .create(&root, "one-too-many.bin".into(), 1, HELLO_DIGEST.into())
+            .create_rel(&root, "one-too-many.bin", 1, HELLO_DIGEST.into())
             .is_ok());
     }
 
@@ -905,7 +984,7 @@ mod tests {
     fn completing_an_upload_keeps_the_destination_claimed_until_explicitly_released() {
         let (_dir, root, store) = store();
         let id = store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         store.append(&id, 0, b"hello world").expect("append");
         let finished = store.take_for_complete(&id).expect("complete");
@@ -915,7 +994,7 @@ mod tests {
         // refused to a second session — otherwise two sessions could both be
         // mid-publication to the same path.
         assert_eq!(
-            store.create(&root, "out.bin".into(), 11, HELLO_DIGEST.into()),
+            store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into()),
             Err(UploadError::Conflict)
         );
 
@@ -923,7 +1002,7 @@ mod tests {
 
         // Now that the caller is done with it, the destination is claimable again.
         assert!(store
-            .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .is_ok());
     }
 
@@ -931,7 +1010,7 @@ mod tests {
     fn sweep_orphan_parts_removes_leftover_part_files_and_nothing_else() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = FsRoot::new(dir.path()).expect("root");
-        let staging = UploadStore::staging_dir(&root);
+        let staging = staging_of(&root);
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         std::fs::write(staging.join("up-0000000000000000.part"), b"leftover")
             .expect("write orphan");
@@ -976,7 +1055,7 @@ mod tests {
             "the closure must have panicked while holding the write guard"
         );
 
-        let outcome = store.create(&root, "out.bin".into(), 11, HELLO_DIGEST.into());
+        let outcome = store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into());
         assert!(
             matches!(outcome, Err(UploadError::Io { .. })),
             "a poisoned sessions lock must surface as an Io error, got {outcome:?}"
@@ -989,12 +1068,12 @@ mod tests {
         store.sessions.clear_poison();
         assert!(
             store
-                .create(&root, "out.bin".into(), 11, HELLO_DIGEST.into())
+                .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
                 .is_ok(),
             "the destination must not still be claimed by the failed attempt"
         );
 
-        let staging = UploadStore::staging_dir(&root);
+        let staging = staging_of(&root);
         let leftover_parts = std::fs::read_dir(&staging)
             .expect("staging dir")
             .flatten()

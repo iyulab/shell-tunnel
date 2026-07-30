@@ -112,19 +112,29 @@ testing-only. See [docs/USAGE.md](docs/USAGE.md) for both paths in full.
 
 ## Moving files
 
-Point the server at a directory and it will serve and accept files inside it — and
-nowhere else:
+The file API reaches what the account running the server reaches — the same places a
+command it runs would. No flag needed:
 
 ```bash
-shell-tunnel --fs-root /srv/deploy --require-auth --capabilities fs.read,fs.write
+shell-tunnel --require-auth --preset operator
 ```
 
 Downloads are ordinary HTTP with `Range`, so an interrupted transfer resumes with the
 same header any HTTP client already speaks. Uploads run as a session: declare the size
 and SHA-256, send chunks, and the file appears at its destination only once the whole
-thing verifies.
+thing verifies. That is the point of these endpoints: a large transfer that resumes and
+verifies, rather than bytes piped through a command.
 
-Without `--fs-root` the file endpoints stay off.
+To confine them to one directory instead, name it:
+
+```bash
+shell-tunnel --fs-root /srv/deploy --require-auth --capabilities fs.write
+```
+
+That confinement is worth something for a token holding `fs.read`/`fs.write` and **not**
+`exec` — a deploy push, say. It is not a boundary against a token that can run commands,
+since such a token can already read and write anything the server can. The startup banner
+states the effective scope either way.
 
 ## A word on exposure
 
@@ -147,7 +157,7 @@ flag, and the fingerprint it prints keeps the connection authenticated, not just
 Implemented: sessions, one-shot and streaming execution, WebSocket, capability-scoped auth,
 rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS with
 self-signed generation and fingerprint pinning, host-header checking, an append-only audit
-trail, and filesystem operations (list, read, write, delete, confined to `--fs-root`). On the
+trail, and filesystem operations (list, read, write, delete, optionally confined by `--fs-root`). On the
 roadmap: native MCP tools.
 
 ## License

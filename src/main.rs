@@ -199,7 +199,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             std::process::exit(2);
         }
         match shell_tunnel::FsRoot::new(fs_root) {
-            Ok(root) => Some(root),
+            Ok(root) => root,
             Err(e) => {
                 eprintln!("--fs-root {} cannot be used: {e}", fs_root.display());
                 eprintln!("The directory must exist and be readable.");
@@ -207,7 +207,15 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             }
         }
     } else {
-        None
+        // No flag means the whole machine, not "off". A token that can reach
+        // the file API at all holds `fs.read`/`fs.write`, and every preset that
+        // carries those also carries `exec`, which can already read and write
+        // anything this process can — so confining the file API to one subtree
+        // by default withheld no access, it only forced callers onto the slow
+        // path for every destination outside it. `--fs-root` still narrows,
+        // for the one case where narrowing bites: a token granted `fs.*`
+        // *without* `exec`.
+        shell_tunnel::FsRoot::machine_wide()
     };
 
     // The audit log must not sit inside the fs jail: from that moment an
@@ -222,13 +230,19 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // directory does — see `audit_log_is_inside_fs_root`'s own doc comment
     // for why the check works on the parent rather than the whole path.
     // `fs_root`'s path is already canonicalised by `FsRoot::new` above.
-    if let (Some(audit_log), Some(root)) = (args.audit_log.as_ref(), fs_root.as_ref()) {
-        match audit_log_is_inside_fs_root(audit_log, root.path()) {
+    //
+    // Only when `--fs-root` narrows the scope. Machine-wide there is nowhere
+    // outside to point the log at, so this refusal has nothing to offer: the
+    // trail is reachable by the file API wherever it sits — as it already is
+    // by `exec`, which every preset carrying `fs.*` also carries. The banner
+    // says so rather than pretending otherwise.
+    if let (Some(audit_log), Some(jail)) = (args.audit_log.as_ref(), fs_root.jail_path()) {
+        match audit_log_is_inside_fs_root(audit_log, jail) {
             Ok(true) => {
                 eprintln!(
                     "--audit-log {} cannot be used: it resolves inside --fs-root {}",
                     audit_log.display(),
-                    root.path().display()
+                    jail.display()
                 );
                 eprintln!(
                     "An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root."
@@ -246,7 +260,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 eprintln!(
                     "--audit-log {} cannot be checked against --fs-root {}: {e}",
                     audit_log.display(),
-                    root.path().display()
+                    jail.display()
                 );
                 std::process::exit(2);
             }
@@ -275,11 +289,18 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             args.audit_log.as_ref().unwrap().display()
         );
     }
-    let state = shell_tunnel::AppState::new().with_audit(audit);
-    let state = match fs_root {
-        Some(root) => state.with_fs_root(root),
-        None => state,
-    };
+    // The banner is the whole mitigation for a file API that no longer needs a
+    // flag to exist: an operator who never passes `--fs-root` still has to be
+    // told, in one unmissable line, what the API can reach. Printed before the
+    // server starts so it is not buried under request logging.
+    println!("File API:    {}", fs_root.describe());
+    if fs_root.jail_path().is_none() && args.audit_log.is_some() {
+        println!("             the audit log is within this scope — as it already is for `exec`");
+    }
+
+    let state = shell_tunnel::AppState::new()
+        .with_audit(audit)
+        .with_fs_root(fs_root);
 
     // Rejected at startup rather than clamped silently: a chunk size at or
     // above the ceiling would make every relayed transfer 413, and the

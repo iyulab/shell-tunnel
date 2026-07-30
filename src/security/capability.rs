@@ -119,11 +119,25 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// name so the caller can surface a clear error.
 pub fn preset(name: &str) -> Option<CapabilitySet> {
     match name {
+        // `fs.read`/`fs.write` sit alongside `exec` here rather than being
+        // withheld from it: this preset already grants command execution, which
+        // reaches every file this process can. Withholding the file API from it
+        // confined nothing and only pushed callers onto the slow path — see
+        // `KNOWN_CAPABILITIES` above.
         "operator" => Some(
-            ["exec", "session.read", "session.manage"]
-                .into_iter()
-                .collect(),
+            [
+                "exec",
+                "session.read",
+                "session.manage",
+                "fs.read",
+                "fs.write",
+            ]
+            .into_iter()
+            .collect(),
         ),
+        // Not given `fs.read`, and this one is a real boundary: `read-only`
+        // has no `exec`, so a token holding it genuinely cannot read a file on
+        // this machine. Adding it here would be a grant, not a convenience.
         "read-only" => Some(["session.read"].into_iter().collect()),
         "full-control" => Some(CapabilitySet::wildcard()),
         _ => None,
@@ -187,12 +201,21 @@ mod tests {
         assert!(operator.satisfies("exec"));
         assert!(operator.satisfies("session.read"));
         assert!(operator.satisfies("session.manage"));
+        // Carried because `exec` above already reaches every file this process
+        // can: withholding them confined nothing. Asserted rather than left
+        // implicit so removing them again has to be a deliberate act.
+        assert!(operator.satisfies("fs.read"));
+        assert!(operator.satisfies("fs.write"));
         assert!(!operator.is_wildcard());
 
         let read_only = preset("read-only").unwrap();
         assert!(read_only.satisfies("session.read"));
         assert!(!read_only.satisfies("session.manage"));
         assert!(!read_only.satisfies("exec"));
+        // The one preset where withholding the file API is a real boundary:
+        // with no `exec`, this token has no other route to a file's contents.
+        assert!(!read_only.satisfies("fs.read"));
+        assert!(!read_only.satisfies("fs.write"));
 
         let full = preset("full-control").unwrap();
         assert!(full.is_wildcard());

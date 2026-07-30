@@ -1315,7 +1315,23 @@ fn create_upload_blocking(
     // freed the moment somebody next asks for a new one.
     sweep_expired_uploads(uploads, audit, crate::fs::SESSION_TTL);
 
-    match uploads.create(root, dest_rel, body.size, body.sha256.to_ascii_lowercase()) {
+    // Machine-wide staging follows the destination rather than sitting in one
+    // enumerable directory, so no startup pass can reclaim what a previous run
+    // left there. Reclaiming it here — at the one moment this process knows a
+    // destination's staging directory — is what keeps that path bounded; see
+    // `sweep_orphan_parts`'s doc for why it cannot be done globally.
+    if root.jail_path().is_none() {
+        let staging = crate::fs::UploadStore::staging_dir(root, &resolved);
+        record_orphans(&crate::fs::sweep_orphan_parts_in(&staging), audit);
+    }
+
+    match uploads.create(
+        root,
+        &resolved,
+        dest_rel,
+        body.size,
+        body.sha256.to_ascii_lowercase(),
+    ) {
         Ok(upload_id) => {
             audit.record(
                 crate::audit::AuditEvent::new("upload.start")
@@ -1735,7 +1751,19 @@ pub fn sweep_expired_uploads(
 /// the destination by matching `upload_id` between the two events.
 pub fn sweep_orphaned_uploads(root: &FsRoot, audit: &crate::audit::AuditSink) -> usize {
     let removed = crate::fs::sweep_orphan_parts(root);
-    for (upload_id, bytes) in &removed {
+    record_orphans(&removed, audit);
+    removed.len()
+}
+
+/// Record one `upload.orphaned` per reclaimed staging file.
+///
+/// Shared by the startup/interval sweep above and the per-destination sweep in
+/// `create_upload_blocking`, which is the only reclaim path machine-wide scope
+/// has. One builder in one place: an earlier round of this work found three
+/// terminal upload paths that recorded nothing, and two callers assembling the
+/// same event by hand is how a fourth would appear.
+fn record_orphans(removed: &[(String, u64)], audit: &crate::audit::AuditSink) {
+    for (upload_id, bytes) in removed {
         // Built without `with_file`: that builder always sets `file`
         // alongside `bytes`, and this event deliberately carries no `file` —
         // there is nothing left here to attach one from. `bytes` is set
@@ -1745,7 +1773,6 @@ pub fn sweep_orphaned_uploads(root: &FsRoot, audit: &crate::audit::AuditSink) ->
         event.bytes = Some(*bytes);
         audit.record(event);
     }
-    removed.len()
 }
 
 #[cfg(test)]

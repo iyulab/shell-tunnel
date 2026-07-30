@@ -522,7 +522,11 @@ async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
     std::fs::write(&secret, b"outside-secret").expect("write outside file");
 
     let root = state.fs.as_ref().expect("fs root enabled");
-    let link = root.path().join("app").join("linked.txt");
+    let link = root
+        .jail_path()
+        .expect("this fixture builds a jailed root")
+        .join("app")
+        .join("linked.txt");
     if try_symlink(&secret, &link).is_err() {
         return; // symlink privilege unavailable on this runner; skip
     }
