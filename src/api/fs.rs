@@ -974,21 +974,35 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
             })),
         )
             .into_response(),
-        // Always 500. An earlier version tried to detect "out of space" by
-        // matching substrings like "space" or "full" in `detail` to answer
-        // with 507 — locale-dependent (the OS renders `io::Error`'s message
-        // in the system locale), and it would also trip on an ordinary error
-        // that happens to name a directory "full". Telling ENOSPC apart
-        // reliably needs the original `std::io::Error`'s `raw_os_error()`,
-        // which `UploadError::Io` does not carry (it stores an
-        // already-formatted `String`); carrying it would mean reshaping this
-        // variant and adding the OS-code-to-condition mapping to
-        // `platform.rs`, the one place this codebase reaches for
-        // OS-specific detail — out of scope for this pass. A uniform 500 is
-        // more honest than a text match that is wrong on some locales and
-        // some ordinary messages.
-        UploadError::Io(detail) => {
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "io-error", &detail)
+        // 507 vs. 500 decided on the numeric OS error code, never on
+        // `detail`'s text: an earlier version matched substrings like
+        // "space" or "full" in the rendered message, which is
+        // locale-dependent (the OS renders `io::Error`'s `Display` in the
+        // system locale) and would also trip on an ordinary error that
+        // happens to name a directory "full". For a transfer API this
+        // distinction is worth making — "the disk is full, retry after
+        // freeing space" and "the server has a bug, file a report" are two
+        // answers a client acts on completely differently, and a
+        // `sha256`-verified GB-scale upload is exactly where a full disk is
+        // a likely failure, not an edge case.
+        //
+        // `platform::is_out_of_space` takes `&io::Error`, which this arm no
+        // longer has — `UploadError::Io` carries only the numeric
+        // `raw_os_error`, not the original error, so the error is
+        // reconstructed from that code purely to hand it to the one
+        // existing predicate rather than duplicating its comparison here.
+        UploadError::Io {
+            detail,
+            raw_os_error,
+        } => {
+            let out_of_space = raw_os_error
+                .map(std::io::Error::from_raw_os_error)
+                .is_some_and(|e| platform::is_out_of_space(&e));
+            let status = match out_of_space {
+                true => StatusCode::INSUFFICIENT_STORAGE,
+                false => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, "io-error", &detail)
         }
     }
 }
@@ -1410,6 +1424,43 @@ mod tests {
         );
         assert_eq!(parse_content_range_start("bytes 0-4"), None);
         assert_eq!(parse_content_range_start("items 0-4/9"), None);
+    }
+
+    /// `platform::is_out_of_space`'s own unit tests (`src/fs/platform.rs`)
+    /// prove the predicate is correct against the raw codes; this proves
+    /// `upload_error_response` actually *wires* it in — that a
+    /// `raw_os_error` meaning "out of space" reaches `507`, an unrelated
+    /// one stays `500`, and no code at all (the `poisoned()` case, which
+    /// never had an underlying `io::Error`) also stays `500`.
+    #[test]
+    fn io_error_maps_to_507_only_when_the_raw_code_means_out_of_space() {
+        use crate::fs::UploadError;
+
+        #[cfg(unix)]
+        let out_of_space_code = libc::ENOSPC;
+        #[cfg(windows)]
+        let out_of_space_code = 112; // ERROR_DISK_FULL
+
+        let out_of_space = upload_error_response(UploadError::Io {
+            detail: "no space left on device".to_string(),
+            raw_os_error: Some(out_of_space_code),
+        });
+        assert_eq!(out_of_space.status(), StatusCode::INSUFFICIENT_STORAGE);
+
+        // A real but unrelated OS error must not be mistaken for it.
+        let unrelated = upload_error_response(UploadError::Io {
+            detail: "permission denied".to_string(),
+            raw_os_error: Some(13),
+        });
+        assert_eq!(unrelated.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // No OS code at all (e.g. `poisoned()`'s synthetic error) must not
+        // default to the space-exhausted branch either.
+        let no_code = upload_error_response(UploadError::Io {
+            detail: "internal lock poisoned".to_string(),
+            raw_os_error: None,
+        });
+        assert_eq!(no_code.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

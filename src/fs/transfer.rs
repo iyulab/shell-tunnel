@@ -64,7 +64,28 @@ pub enum UploadError {
     /// The assembled bytes do not hash to what was declared.
     Checksum { expected: String, actual: String },
     /// The filesystem refused.
-    Io(String),
+    Io {
+        /// Already-rendered detail (`ToString` of the underlying
+        /// `io::Error`). A `String`, not the `io::Error` itself: `UploadError`
+        /// derives `Clone`/`PartialEq`/`Eq`, neither of which `io::Error`
+        /// implements.
+        detail: String,
+        /// The underlying `io::Error`'s `raw_os_error()`, carried alongside
+        /// `detail` so a caller can tell ENOSPC apart from an unrelated
+        /// failure without a locale-dependent match on the rendered message
+        /// — see `platform::is_out_of_space`, which `upload_error_response`
+        /// (`src/api/fs.rs`) uses this to answer.
+        raw_os_error: Option<i32>,
+    },
+}
+
+impl From<std::io::Error> for UploadError {
+    fn from(e: std::io::Error) -> Self {
+        UploadError::Io {
+            raw_os_error: e.raw_os_error(),
+            detail: e.to_string(),
+        }
+    }
 }
 
 /// A session whose bytes are all in and whose digest has been computed.
@@ -193,7 +214,7 @@ impl UploadStore {
         let staging = Self::staging_dir(root);
         if let Err(e) = std::fs::create_dir_all(&staging) {
             self.release(&dest_rel);
-            return Err(UploadError::Io(e.to_string()));
+            return Err(e.into());
         }
 
         let serial = self
@@ -226,7 +247,7 @@ impl UploadStore {
             Ok(file) => file,
             Err(e) => {
                 self.release(&dest_rel);
-                return Err(UploadError::Io(e.to_string()));
+                return Err(e.into());
             }
         };
 
@@ -335,11 +356,8 @@ impl UploadStore {
         session
             .file
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| UploadError::Io(e.to_string()))?;
-        session
-            .file
-            .write_all(bytes)
-            .map_err(|e| UploadError::Io(e.to_string()))?;
+            .map_err(UploadError::from)?;
+        session.file.write_all(bytes).map_err(UploadError::from)?;
 
         session.hasher.update(bytes);
         session.offset += bytes.len() as u64;
@@ -502,7 +520,10 @@ impl std::fmt::Debug for UploadStore {
 }
 
 fn poisoned() -> UploadError {
-    UploadError::Io("internal lock poisoned".to_string())
+    UploadError::Io {
+        detail: "internal lock poisoned".to_string(),
+        raw_os_error: None,
+    }
 }
 
 /// Remove staging files left behind by a previous run.
@@ -730,7 +751,7 @@ mod tests {
 
         let result = store.create(&root, "app-new.bin".into(), 11, HELLO_DIGEST.into());
         assert!(
-            matches!(result, Err(UploadError::Io(_))),
+            matches!(result, Err(UploadError::Io { .. })),
             "create_new must refuse a pre-existing symlink at the staging path \
              rather than follow it, got {result:?}"
         );
@@ -833,7 +854,7 @@ mod tests {
 
         let outcome = store.create(&root, "out.bin".into(), 11, HELLO_DIGEST.into());
         assert!(
-            matches!(outcome, Err(UploadError::Io(_))),
+            matches!(outcome, Err(UploadError::Io { .. })),
             "a poisoned sessions lock must surface as an Io error, got {outcome:?}"
         );
 

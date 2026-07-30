@@ -108,6 +108,45 @@ pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::i
     std::fs::remove_file(path)
 }
 
+/// Whether `err` reports that the filesystem has run out of space.
+///
+/// Checked against the numeric OS error code, never the rendered message: an
+/// earlier version of the upload API answered this by matching substrings
+/// like `"space"` or `"full"` in `io::Error`'s `Display` output, which
+/// renders in the system locale (wrong on a non-English system) and would
+/// also fire on an ordinary error that happens to name a directory "full".
+/// A caller distinguishing "the disk is full, retry after freeing space"
+/// from "the server has a bug, file a report" needs this to be reliable —
+/// the two respond completely differently.
+///
+/// `ENOSPC` (`libc::ENOSPC`, value 28 on Linux/macOS/BSD alike) is the same
+/// constant `src/pty/native.rs` and `src/pty/async_adapter.rs` already
+/// compare against for `EIO`, so this follows an established pattern rather
+/// than introducing a new way of reading `raw_os_error()`.
+/// `ERROR_DISK_FULL` (112) is its Windows counterpart; there is no crate in
+/// this tree's dependency graph that names it (no `windows-sys`, and this
+/// task adds no new dependencies), so it is a documented literal instead of
+/// `libc::ENOSPC`'s named constant.
+#[cfg(unix)]
+pub fn is_out_of_space(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::ENOSPC)
+}
+
+#[cfg(windows)]
+pub fn is_out_of_space(err: &std::io::Error) -> bool {
+    /// `ERROR_DISK_FULL`, from `winerror.h`. `io::Error::raw_os_error()`
+    /// reports the raw Win32 error code, not an `errno`, so this is the
+    /// value that appears there — not to be confused with any POSIX
+    /// `ENOSPC` numbering.
+    const ERROR_DISK_FULL: i32 = 112;
+    err.raw_os_error() == Some(ERROR_DISK_FULL)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn is_out_of_space(_err: &std::io::Error) -> bool {
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +193,40 @@ mod tests {
     #[test]
     fn empty_components_are_refused() {
         assert!(check_component("").is_err());
+    }
+
+    /// Cannot deterministically fill a disk to force a real `ENOSPC` in a
+    /// test, so this is the honest substitute: pin `is_out_of_space` against
+    /// the raw OS codes directly, the same numeric values `raw_os_error()`
+    /// would actually report.
+    #[cfg(unix)]
+    #[test]
+    fn is_out_of_space_matches_enospc_only() {
+        let enospc = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert!(is_out_of_space(&enospc));
+
+        // A different errno — e.g. ENOENT — must not be mistaken for it.
+        let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert!(!is_out_of_space(&enoent));
+
+        // Not an OS error at all.
+        let other = std::io::Error::other("not an os error");
+        assert!(!is_out_of_space(&other));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn is_out_of_space_matches_error_disk_full_only() {
+        const ERROR_DISK_FULL: i32 = 112;
+        let disk_full = std::io::Error::from_raw_os_error(ERROR_DISK_FULL);
+        assert!(is_out_of_space(&disk_full));
+
+        // A different Win32 code — e.g. ERROR_FILE_NOT_FOUND (2) — must not
+        // be mistaken for it.
+        let not_found = std::io::Error::from_raw_os_error(2);
+        assert!(!is_out_of_space(&not_found));
+
+        let other = std::io::Error::other("not an os error");
+        assert!(!is_out_of_space(&other));
     }
 }
