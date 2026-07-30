@@ -4,7 +4,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{connect_info::IntoMakeServiceWithConnectInfo, MatchedPath, Request, State},
+    extract::{
+        connect_info::IntoMakeServiceWithConnectInfo, DefaultBodyLimit, MatchedPath, Request, State,
+    },
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
     response::Response,
@@ -646,6 +648,30 @@ async fn shutdown_signal() {
 /// Built in one place so the two constructors cannot drift apart — a route
 /// present in only one of them is reachable in only one deployment shape.
 fn fs_routes() -> Router<AppState> {
+    // The chunk-upload route carries request bodies up to `MAX_CHUNK_SIZE` (8
+    // MiB) — well above axum-core's own default body limit (2 MiB, axum-core
+    // 0.5.6's `DEFAULT_LIMIT`), which this app otherwise never overrides. A
+    // client sending a chunk at the server's own advertised `chunk_size` (4
+    // MiB default) would have it rejected before `append_chunk` ever ran.
+    //
+    // Raised only for this one path, via a merged sub-router, rather than
+    // `.layer()` on the whole `fs_routes` router: the latter would also raise
+    // the limit for `/list`, `/stat`, and `/file`, none of which need an 8
+    // MiB body, and a limit set any higher up would reach `/api/v1/execute`
+    // too. Set at the hard ceiling (`MAX_CHUNK_SIZE`) rather than the
+    // *configured* `chunk_size`, so a chunk larger than configured but still
+    // under the ceiling reaches `append_chunk`'s own `TooLarge` check and
+    // gets a 413 with a machine-readable body — if axum's limit cut it off
+    // first, the caller would get a bodyless 413 with no way to tell why.
+    let upload_session_routes = Router::new()
+        .route(
+            "/uploads/{id}",
+            get(super::fs::upload_status)
+                .patch(super::fs::append_chunk)
+                .delete(super::fs::cancel_upload),
+        )
+        .route_layer(DefaultBodyLimit::max(crate::fs::MAX_CHUNK_SIZE));
+
     Router::new()
         .route("/list", get(super::fs::list))
         .route("/stat", get(super::fs::stat))
@@ -653,6 +679,9 @@ fn fs_routes() -> Router<AppState> {
             "/file",
             get(super::fs::download).delete(super::fs::delete_file),
         )
+        .route("/uploads", post(super::fs::create_upload))
+        .merge(upload_session_routes)
+        .route("/uploads/{id}/complete", post(super::fs::complete_upload))
 }
 
 #[cfg(test)]

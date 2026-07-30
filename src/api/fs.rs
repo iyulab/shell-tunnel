@@ -889,6 +889,369 @@ pub async fn stat(State(state): State<AppState>, Query(query): Query<PathQuery>)
     Json(entry_for(&root, &resolved, &meta, None)).into_response()
 }
 
+/// Body of `POST /api/v1/fs/uploads`.
+#[derive(Debug, Deserialize)]
+pub struct CreateUpload {
+    /// Destination, root-relative.
+    pub path: String,
+    /// Total size the caller intends to send.
+    pub size: u64,
+    /// SHA-256 of the whole file, lowercase hex.
+    pub sha256: String,
+}
+
+/// Reply describing a session's current state.
+#[derive(Debug, Serialize)]
+pub struct UploadState {
+    pub upload_id: String,
+    /// Next byte the server expects.
+    pub offset: u64,
+    /// Largest chunk the caller may send.
+    ///
+    /// Advertised rather than assumed: the ceiling depends on the path the
+    /// request travelled, and a client that guesses will guess wrong on one of
+    /// them.
+    pub chunk_size: usize,
+}
+
+/// Map an upload refusal onto HTTP.
+fn upload_error_response(error: crate::fs::UploadError) -> Response {
+    use crate::fs::UploadError;
+    match error {
+        UploadError::NotFound => error_response(
+            StatusCode::NOT_FOUND,
+            "no-such-upload",
+            "unknown, completed, or expired upload session",
+        ),
+        UploadError::OffsetMismatch { expected } => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "offset-mismatch",
+                "message": "chunk does not continue from the session offset",
+                "offset": expected,
+            })),
+        )
+            .into_response(),
+        UploadError::Conflict => error_response(
+            StatusCode::CONFLICT,
+            "destination-busy",
+            "another upload session is already targeting this path",
+        ),
+        UploadError::TooLarge => error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "chunk-too-large",
+            "chunk exceeds the advertised chunk_size",
+        ),
+        // Distinct from `Conflict` (409, same path contested): this is a
+        // capacity refusal, not a path collision, so it gets its own code and
+        // status — a client should back off and retry rather than pick a
+        // different destination.
+        UploadError::TooManySessions => error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too-many-uploads",
+            "too many upload sessions are open; finish or cancel one and retry",
+        ),
+        UploadError::Checksum { expected, actual } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "checksum-mismatch",
+                "message": "the assembled bytes do not match the declared digest",
+                "expected": expected,
+                "actual": actual,
+            })),
+        )
+            .into_response(),
+        UploadError::Io(detail) => {
+            let out_of_space = detail.contains("space") || detail.contains("full");
+            let status = match out_of_space {
+                true => StatusCode::INSUFFICIENT_STORAGE,
+                false => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            error_response(status, "io-error", &detail)
+        }
+    }
+}
+
+/// `POST /api/v1/fs/uploads` — open a session.
+///
+/// Resolving the destination, creating the staging directory, and opening the
+/// staging file (`UploadStore::create`) are all blocking I/O — same
+/// convention as `list`/`list_blocking` and `download`/`download_blocking`
+/// above (`src/execution/executor.rs:209-215`): run it on `spawn_blocking` so
+/// a slow filesystem can never starve the tokio worker pool that also runs
+/// `/health` and the accept loop.
+pub async fn create_upload(
+    State(state): State<AppState>,
+    Json(body): Json<CreateUpload>,
+) -> Response {
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
+    };
+    let uploads = state.uploads.clone();
+
+    match tokio::task::spawn_blocking(move || create_upload_blocking(&root, &uploads, body)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "create-upload-failed",
+            "creating the upload session failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `create_upload`. Blocking throughout — see
+/// `create_upload`, which runs this via `spawn_blocking` rather than directly
+/// on the async runtime.
+fn create_upload_blocking(
+    root: &FsRoot,
+    uploads: &crate::fs::UploadStore,
+    body: CreateUpload,
+) -> Response {
+    // Validate the destination before claiming anything, so a bad path cannot
+    // leave a staging file or a claim behind.
+    if let Err(error) = root.resolve_for_create(&body.path) {
+        return fs_error_response(error);
+    }
+    if body.sha256.len() != 64 || !body.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "bad-digest",
+            "sha256 must be 64 hexadecimal characters",
+        );
+    }
+
+    match uploads.create(root, body.path, body.size, body.sha256.to_ascii_lowercase()) {
+        Ok(upload_id) => (
+            StatusCode::CREATED,
+            Json(UploadState {
+                upload_id,
+                offset: 0,
+                chunk_size: uploads.chunk_size(),
+            }),
+        )
+            .into_response(),
+        Err(error) => upload_error_response(error),
+    }
+}
+
+/// `GET /api/v1/fs/uploads/{id}` — where to resume from.
+///
+/// Reads only in-memory session state (`UploadStore::offset`), so unlike the
+/// other four upload routes this never touches disk and stays directly on the
+/// async runtime rather than going through `spawn_blocking`.
+pub async fn upload_status(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if state.fs.is_none() {
+        return fs_not_enabled();
+    }
+    match state.uploads.offset(&id) {
+        Some(offset) => Json(UploadState {
+            upload_id: id,
+            offset,
+            chunk_size: state.uploads.chunk_size(),
+        })
+        .into_response(),
+        None => upload_error_response(crate::fs::UploadError::NotFound),
+    }
+}
+
+/// `PATCH /api/v1/fs/uploads/{id}` — append one chunk.
+///
+/// The offset comes from `Content-Range` rather than the body, so a chunk that
+/// arrives twice is refused by position instead of being appended again.
+///
+/// Writing the chunk to the staging file (`UploadStore::append`) is blocking
+/// disk I/O — `spawn_blocking`, same convention as the other routes here. The
+/// route this handler serves also carries `DefaultBodyLimit::max(MAX_CHUNK_SIZE)`
+/// (`src/api/router.rs`), raising axum-core's own 2 MiB default so a chunk at
+/// the advertised `chunk_size` (4 MiB) reaches this handler at all, rather than
+/// being cut off by axum before `append`'s own `TooLarge` check ever runs.
+pub async fn append_chunk(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if state.fs.is_none() {
+        return fs_not_enabled();
+    }
+
+    let offset = match headers
+        .get("content-range")
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_start)
+    {
+        Some(offset) => offset,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "bad-content-range",
+                "a Content-Range header of the form 'bytes <start>-<end>/<total>' is required",
+            )
+        }
+    };
+
+    let uploads = state.uploads.clone();
+    match tokio::task::spawn_blocking(move || append_chunk_blocking(&uploads, &id, offset, &body))
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "append-failed",
+            "writing the chunk failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `append_chunk`. Blocking throughout — see
+/// `append_chunk`, which runs this via `spawn_blocking` rather than directly
+/// on the async runtime.
+fn append_chunk_blocking(
+    uploads: &crate::fs::UploadStore,
+    id: &str,
+    offset: u64,
+    body: &[u8],
+) -> Response {
+    match uploads.append(id, offset, body) {
+        Ok(next) => Json(UploadState {
+            upload_id: id.to_string(),
+            offset: next,
+            chunk_size: uploads.chunk_size(),
+        })
+        .into_response(),
+        Err(error) => upload_error_response(error),
+    }
+}
+
+/// The start offset named by a `Content-Range` request header.
+pub fn parse_content_range_start(header: &str) -> Option<u64> {
+    let spec = header.trim().strip_prefix("bytes ")?;
+    let (range, _total) = spec.split_once('/')?;
+    let (start, _end) = range.split_once('-')?;
+    start.trim().parse().ok()
+}
+
+/// `POST /api/v1/fs/uploads/{id}/complete` — verify and publish.
+///
+/// Verifying the checksum, resolving the destination, creating its parent
+/// directory, and the rename itself are all blocking I/O — `spawn_blocking`,
+/// same convention as the other routes here.
+pub async fn complete_upload(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let Some(root) = state.fs.clone() else {
+        return fs_not_enabled();
+    };
+    let uploads = state.uploads.clone();
+
+    match tokio::task::spawn_blocking(move || complete_upload_blocking(&root, &uploads, &id)).await
+    {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "complete-upload-failed",
+            "publishing the upload failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `complete_upload`. Blocking throughout — see
+/// `complete_upload`, which runs this via `spawn_blocking` rather than
+/// directly on the async runtime.
+///
+/// `UploadStore::take_for_complete` deliberately keeps `finished.dest_rel`'s
+/// claim alive on success (see its doc comment), so every exit path below
+/// calls `release_destination` exactly once — whether the rename lands or
+/// not — instead of relying on `take_for_complete` to have released it
+/// already.
+fn complete_upload_blocking(root: &FsRoot, uploads: &crate::fs::UploadStore, id: &str) -> Response {
+    let finished = match uploads.take_for_complete(id) {
+        Ok(finished) => finished,
+        Err(error) => return upload_error_response(error),
+    };
+
+    let destination = match root.resolve_for_create(&finished.dest_rel) {
+        Ok(path) => path,
+        Err(error) => {
+            std::fs::remove_file(&finished.part_path).ok();
+            uploads.release_destination(&finished.dest_rel);
+            return fs_error_response(error);
+        }
+    };
+
+    if let Some(parent) = destination.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            std::fs::remove_file(&finished.part_path).ok();
+            uploads.release_destination(&finished.dest_rel);
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "io-error",
+                &format!("could not create the destination directory: {e}"),
+            );
+        }
+    }
+
+    // Rename is the publication step: until it runs the destination holds the
+    // old file or nothing, never a half-written one. `rename` never follows a
+    // symlink on either operand, so even if `destination`'s final component
+    // became a symlink between the `resolve_for_create` above and this call,
+    // the rename simply replaces that directory entry rather than writing
+    // through it — no additional guard is needed for that case.
+    if let Err(e) = std::fs::rename(&finished.part_path, &destination) {
+        std::fs::remove_file(&finished.part_path).ok();
+        uploads.release_destination(&finished.dest_rel);
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "io-error",
+            &format!("could not publish the upload: {e}"),
+        );
+    }
+    uploads.release_destination(&finished.dest_rel);
+
+    Json(serde_json::json!({
+        "path": finished.dest_rel,
+        "size": finished.bytes,
+        "sha256": finished.digest,
+    }))
+    .into_response()
+}
+
+/// `DELETE /api/v1/fs/uploads/{id}` — abandon a session.
+///
+/// Removing the staging file (`UploadStore::cancel`) is blocking I/O —
+/// `spawn_blocking`, same convention as the other routes here.
+pub async fn cancel_upload(
+    State(state): State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    if state.fs.is_none() {
+        return fs_not_enabled();
+    }
+    let uploads = state.uploads.clone();
+    match tokio::task::spawn_blocking(move || cancel_upload_blocking(&uploads, &id)).await {
+        Ok(response) => response,
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cancel-failed",
+            "cancelling the upload failed unexpectedly",
+        ),
+    }
+}
+
+/// The synchronous body of `cancel_upload`. Blocking throughout — see
+/// `cancel_upload`, which runs this via `spawn_blocking` rather than directly
+/// on the async runtime.
+fn cancel_upload_blocking(uploads: &crate::fs::UploadStore, id: &str) -> Response {
+    match uploads.cancel(id) {
+        true => StatusCode::NO_CONTENT.into_response(),
+        false => upload_error_response(crate::fs::UploadError::NotFound),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +1307,20 @@ mod tests {
         assert_eq!(resolve_limit(Some(999_999)), MAX_LIST_LIMIT);
         // Pass-through within bounds.
         assert_eq!(resolve_limit(Some(50)), 50);
+    }
+
+    #[test]
+    fn content_range_yields_its_start_offset() {
+        assert_eq!(
+            parse_content_range_start("bytes 0-4194303/209715200"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_content_range_start("bytes 4194304-8388607/209715200"),
+            Some(4194304)
+        );
+        assert_eq!(parse_content_range_start("bytes 0-4"), None);
+        assert_eq!(parse_content_range_start("items 0-4/9"), None);
     }
 
     #[test]

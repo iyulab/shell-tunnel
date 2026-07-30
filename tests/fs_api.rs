@@ -194,6 +194,86 @@ fn authed_delete(uri: &str, token: &str) -> Request<Body> {
         .expect("request")
 }
 
+/// A bearer-authenticated POST request with a JSON body.
+fn authed_post_json(uri: &str, token: &str, json: serde_json::Value) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(json.to_string()))
+        .expect("request")
+}
+
+/// A bearer-authenticated POST request with an empty body.
+fn authed_post_empty(uri: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .expect("request")
+}
+
+/// A bearer-authenticated PATCH request carrying one chunk.
+fn authed_patch(
+    uri: &str,
+    token: &str,
+    content_range: &str,
+    bytes: impl Into<Body>,
+) -> Request<Body> {
+    Request::builder()
+        .method("PATCH")
+        .uri(uri)
+        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+        .header("content-range", content_range)
+        .body(bytes.into())
+        .expect("request")
+}
+
+/// SHA-256 of b"hello world".
+const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+/// Create an upload session for `path` sized and hashed to match `payload`,
+/// through the *plain* (unsecured) router — session state lives in
+/// `AppState.uploads`, shared with whatever router later wraps the same
+/// `state`, so fixture setup does not need to go through the router under
+/// test.
+async fn create_test_upload(state: AppState, path: &str, payload: &[u8]) -> String {
+    let digest = {
+        let mut hasher = shell_tunnel::fs::sha256::Hasher::new();
+        hasher.update(payload);
+        hasher.finish()
+    };
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": path,
+                        "size": payload.len() as u64,
+                        "sha256": digest,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        response.status(),
+        StatusCode::CREATED,
+        "fixture upload creation must succeed"
+    );
+    body_json(response).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string()
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
@@ -1571,4 +1651,543 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
         std::fs::symlink_metadata(&link).is_err(),
         "the directory symlink itself is what was named, and must be gone"
     );
+}
+
+#[tokio::test]
+async fn an_upload_round_trips_and_publishes_atomically() {
+    let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/new.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let json = body_json(created).await;
+    let id = json["upload_id"].as_str().expect("upload_id").to_string();
+    assert_eq!(json["offset"], 0);
+    assert_eq!(json["chunk_size"], 4194304);
+
+    // Not published yet.
+    assert!(!dir.path().join("app/new.bin").exists());
+
+    let patched = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(patched.status(), StatusCode::OK);
+    assert_eq!(body_json(patched).await["offset"], 11);
+
+    // Still not published: only `complete` renames.
+    assert!(!dir.path().join("app/new.bin").exists());
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::OK);
+
+    assert_eq!(
+        std::fs::read(dir.path().join("app/new.bin")).expect("read"),
+        b"hello world"
+    );
+}
+
+#[tokio::test]
+async fn a_resumed_upload_continues_from_the_reported_offset() {
+    let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/resumed.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-5/11")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // The client "reconnects" and asks where it left off.
+    let status = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let offset = body_json(status).await["offset"].as_u64().expect("offset");
+    assert_eq!(offset, 6);
+
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", format!("bytes {offset}-10/11"))
+                .body(Body::from(&b"world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(dir.path().join("app/resumed.bin")).expect("read"),
+        b"hello world"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_checksum_refuses_and_leaves_no_file() {
+    let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let wrong = "0".repeat(64);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/corrupt.bin",
+                        "size": 11,
+                        "sha256": wrong,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(completed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(!dir.path().join("app/corrupt.bin").exists());
+}
+
+#[tokio::test]
+async fn a_second_session_for_the_same_destination_is_refused() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let body = || {
+        Body::from(
+            serde_json::json!({
+                "path": "app/contested.bin",
+                "size": 11,
+                "sha256": HELLO_DIGEST,
+            })
+            .to_string(),
+        )
+    };
+
+    let first = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(body())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn an_upload_may_not_target_a_path_outside_the_root() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "../escape.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+/// The one small-payload test above cannot catch the axum-core body-limit gap
+/// (`DEFAULT_LIMIT` = 2 MiB, `src/api/router.rs`'s `upload_session_routes`):
+/// an 11-byte chunk sails under any limit, configured or not. This sends a
+/// chunk of the *actual* advertised `chunk_size` (4 MiB) through the real
+/// router and proves it reaches `append_chunk` rather than being cut off by
+/// axum first.
+#[tokio::test]
+async fn a_chunk_at_the_advertised_chunk_size_round_trips_through_the_router() {
+    let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let chunk_size = shell_tunnel::fs::DEFAULT_CHUNK_SIZE;
+    let payload = vec![0x5A_u8; chunk_size];
+    let digest = {
+        let mut hasher = shell_tunnel::fs::sha256::Hasher::new();
+        hasher.update(&payload);
+        hasher.finish()
+    };
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/big.bin",
+                        "size": chunk_size as u64,
+                        "sha256": digest,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    let patched = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header(
+                    "content-range",
+                    format!("bytes 0-{}/{chunk_size}", chunk_size - 1),
+                )
+                .body(Body::from(payload))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        patched.status(),
+        StatusCode::OK,
+        "a chunk of the advertised chunk_size must not be rejected before append_chunk runs"
+    );
+    assert_eq!(body_json(patched).await["offset"], chunk_size as u64);
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::metadata(dir.path().join("app/big.bin"))
+            .expect("published file")
+            .len(),
+        chunk_size as u64
+    );
+}
+
+#[tokio::test]
+async fn create_upload_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_post_json(
+            "/api/v1/fs/uploads",
+            "reader",
+            serde_json::json!({"path": "app/new.bin", "size": 11, "sha256": HELLO_DIGEST}),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn create_upload_allows_a_token_holding_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_post_json(
+            "/api/v1/fs/uploads",
+            "writer",
+            serde_json::json!({"path": "app/new.bin", "size": 11, "sha256": HELLO_DIGEST}),
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn upload_status_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_get(&format!("/api/v1/fs/uploads/{id}"), "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn upload_status_allows_a_token_holding_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_get(&format!("/api/v1/fs/uploads/{id}"), "writer"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn append_chunk_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_patch(
+            &format!("/api/v1/fs/uploads/{id}"),
+            "reader",
+            "bytes 0-10/11",
+            &b"hello world"[..],
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn append_chunk_allows_a_token_holding_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_patch(
+            &format!("/api/v1/fs/uploads/{id}"),
+            "writer",
+            "bytes 0-10/11",
+            &b"hello world"[..],
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn complete_upload_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+    let response = app
+        .oneshot(authed_post_empty(
+            &format!("/api/v1/fs/uploads/{id}/complete"),
+            "reader",
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn complete_upload_allows_a_token_holding_fs_write() {
+    let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+    let response = app
+        .oneshot(authed_post_empty(
+            &format!("/api/v1/fs/uploads/{id}/complete"),
+            "writer",
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        std::fs::read(dir.path().join("app/new.bin")).expect("read"),
+        b"hello world"
+    );
+}
+
+#[tokio::test]
+async fn cancel_upload_forbids_a_token_lacking_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "reader", &["session.read"]);
+
+    let response = app
+        .oneshot(authed_delete(&format!("/api/v1/fs/uploads/{id}"), "reader"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn cancel_upload_allows_a_token_holding_fs_write() {
+    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
+    let app = secure_app_with_token(state, "writer", &["fs.write"]);
+
+    let response = app
+        .oneshot(authed_delete(&format!("/api/v1/fs/uploads/{id}"), "writer"))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }

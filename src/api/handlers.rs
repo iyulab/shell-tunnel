@@ -28,6 +28,8 @@ pub struct AppState {
     /// `None` means the API is off. Off by default: a gateway that starts
     /// serving files because it was started is not what an operator asked for.
     pub fs: Option<Arc<crate::fs::FsRoot>>,
+    /// In-flight uploads. Always present; useless until `fs` is set.
+    pub uploads: Arc<crate::fs::UploadStore>,
 }
 
 impl AppState {
@@ -39,6 +41,7 @@ impl AppState {
             executor,
             audit: Arc::new(crate::audit::AuditSink::Disabled),
             fs: None,
+            uploads: Arc::new(crate::fs::UploadStore::new(crate::fs::DEFAULT_CHUNK_SIZE)),
         }
     }
 
@@ -51,6 +54,12 @@ impl AppState {
     /// Enable the filesystem API, confined to `root`.
     pub fn with_fs_root(mut self, root: crate::fs::FsRoot) -> Self {
         self.fs = Some(Arc::new(root));
+        self
+    }
+
+    /// Advertise a different chunk size to upload clients.
+    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
+        self.uploads = Arc::new(crate::fs::UploadStore::new(chunk_size));
         self
     }
 }

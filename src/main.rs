@@ -225,6 +225,29 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         state
     };
 
+    // Rejected at startup rather than clamped silently: a chunk size at or
+    // above the ceiling would make every relayed transfer 413, and the
+    // symptom would look like a server bug rather than a misconfiguration.
+    let state = match args.fs_chunk_size {
+        Some(size) if size == 0 || size >= shell_tunnel::fs::MAX_CHUNK_SIZE => {
+            eprintln!("--fs-chunk-size {size} is out of range.");
+            eprintln!("It must be between 1 and 8388607 bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
+            std::process::exit(2);
+        }
+        Some(size) => state.with_chunk_size(size),
+        None => state,
+    };
+
+    // Sessions never survive a restart, so any `.part` staging file still
+    // present is unreachable — nothing can resume it and nothing will
+    // complete it. Swept once, here, before the server starts accepting.
+    if let Some(root) = state.fs.as_ref() {
+        let removed = shell_tunnel::fs::sweep_orphan_parts(root);
+        if removed > 0 {
+            info!("removed {removed} orphaned upload staging file(s)");
+        }
+    }
+
     #[cfg(feature = "relay-client")]
     if let Some(relay_url) = args.relay_url.clone() {
         return run_with_relay(server_config, &args, relay_url, exposure, state).await;
