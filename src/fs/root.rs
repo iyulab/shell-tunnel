@@ -525,8 +525,28 @@ mod machine_wide_tests {
     /// to detect two uploads racing for one destination — so one file must
     /// name itself the same way regardless of the separator the caller used.
     #[test]
-    fn one_file_gets_one_name_whichever_separator_was_sent() {
+    fn one_file_gets_one_name() {
         let (_dir, canonical, named) = a_real_file();
+        let scope = FsRoot::machine_wide();
+
+        assert_eq!(scope.resolve_existing(&named), Ok(canonical.clone()));
+        assert_eq!(scope.relative(&canonical), Some(named));
+    }
+
+    /// On Windows `C:\x` and `C:/x` name one file, so both spellings have to
+    /// resolve to one path — the upload claim key is this string, and two names
+    /// for one destination is the aliasing that lets two sessions race onto it.
+    ///
+    /// Deliberately not asserted on Unix, where it would be false: `\` is an
+    /// ordinary filename character there, not a separator, so `\tmp\x` is a
+    /// relative path naming a file called `\tmp\x` — refused rather than
+    /// silently treated as absolute. Asserting separator-independence on both
+    /// platforms is what made this test fail on Unix; the property is real, it
+    /// just belongs to Windows.
+    #[cfg(windows)]
+    #[test]
+    fn both_windows_separators_name_the_same_file() {
+        let (_dir, _canonical, named) = a_real_file();
         let scope = FsRoot::machine_wide();
 
         let via_forward = scope.resolve_existing(&named).expect("forward slashes");
@@ -534,7 +554,22 @@ mod machine_wide_tests {
             .resolve_existing(&named.replace('/', "\\"))
             .expect("backslashes");
         assert_eq!(via_forward, via_back);
-        assert_eq!(scope.relative(&canonical), Some(named));
+    }
+
+    /// A backslash-led path is not absolute on Unix, and must not be taken for
+    /// one: silently reading it as a rooted path would resolve a request that
+    /// named a file this scope was never asked about.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_led_path_is_not_absolute_on_unix() {
+        let scope = FsRoot::machine_wide();
+
+        assert_eq!(
+            scope.resolve_existing("\\tmp\\payload.txt"),
+            Err(FsError::Malformed(
+                "path must be absolute when no --fs-root is set"
+            ))
+        );
     }
 
     #[test]
