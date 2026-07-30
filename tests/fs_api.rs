@@ -2353,3 +2353,309 @@ async fn create_upload_refuses_a_destination_inside_the_staging_directory() {
     let json = body_json(response).await;
     assert_eq!(json["error"], "reserved-path");
 }
+
+/// Audit events written by a state whose sink is a file in `dir`.
+fn audited_state(dir: &tempfile::TempDir) -> (AppState, std::path::PathBuf) {
+    let log = dir.path().join("audit.jsonl");
+    let sink = shell_tunnel::audit::AuditSink::file(&log).expect("sink");
+    let root = FsRoot::new(dir.path()).expect("root");
+    (
+        AppState::new()
+            .with_fs_root(root)
+            .with_audit(std::sync::Arc::new(sink)),
+        log,
+    )
+}
+
+fn audit_lines(log: &std::path::Path) -> Vec<serde_json::Value> {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("audit json"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        // Spelled with a "./" prefix deliberately: the audit
+                        // trail must record the canonical destination, not
+                        // whatever the caller happened to type, or `start`
+                        // and `complete` for the same session could carry two
+                        // different spellings and never correlate.
+                        "path": "./audited.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    // Two chunks: the audit trail must not grow with them.
+    for (range, chunk) in [
+        ("bytes 0-5/11", &b"hello "[..]),
+        ("bytes 6-10/11", &b"world"[..]),
+    ] {
+        create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri(format!("/api/v1/fs/uploads/{id}"))
+                    .header("content-range", range)
+                    .body(Body::from(chunk))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+    }
+
+    create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let events = audit_lines(&log);
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"upload.start"), "got {kinds:?}");
+    assert!(kinds.contains(&"upload.complete"), "got {kinds:?}");
+    // Chunks are not recorded: a GB transfer would otherwise bury the trail.
+    // Nothing in this codebase emits "upload.chunk" today, so this cannot go
+    // red by itself — it is a regression guard against a future per-chunk
+    // record being added back, not proof one was ever removed.
+    assert!(!kinds.contains(&"upload.chunk"), "got {kinds:?}");
+
+    let start = events
+        .iter()
+        .find(|e| e["kind"] == "upload.start")
+        .expect("start event");
+    let complete = events
+        .iter()
+        .find(|e| e["kind"] == "upload.complete")
+        .expect("complete event");
+    // Same canonical spelling on both ends, despite the "./" the request used.
+    assert_eq!(start["file"], "audited.bin");
+    assert_eq!(complete["file"], "audited.bin");
+    assert_eq!(complete["bytes"], 11);
+    assert_eq!(complete["digest_ok"], true);
+}
+
+#[tokio::test]
+async fn an_abandoned_session_is_audited_when_it_is_swept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "abandoned.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-5/11")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Sweep with a zero TTL: everything in flight is stale.
+    shell_tunnel::api::fs::sweep_expired_uploads(&state, std::time::Duration::ZERO);
+
+    let events = audit_lines(&log);
+    let expired = events
+        .iter()
+        .find(|e| e["kind"] == "upload.expired")
+        .expect("an abandoned session must leave a terminal event");
+    assert_eq!(expired["file"], "abandoned.bin");
+    assert_eq!(expired["bytes"], 6);
+}
+
+/// The task brief for this feature names three events explicitly: "Record
+/// start, complete, and cancel — never chunks." An explicit `DELETE
+/// /api/v1/fs/uploads/{id}` is as terminal as a sweep-driven expiry, and
+/// without this the trail would show a session starting and then nothing —
+/// indistinguishable from one still in progress.
+#[tokio::test]
+async fn a_cancelled_upload_is_audited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "cancelled.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    let cancelled = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(cancelled.status(), StatusCode::NO_CONTENT);
+
+    let events = audit_lines(&log);
+    let kinds: Vec<&str> = events.iter().filter_map(|e| e["kind"].as_str()).collect();
+    assert!(kinds.contains(&"upload.start"), "got {kinds:?}");
+    assert!(
+        kinds.contains(&"upload.cancel"),
+        "an explicit cancel must leave a terminal event: got {kinds:?}"
+    );
+}
+
+/// A checksum mismatch at `complete` is also terminal for the session —
+/// `UploadStore::take_for_complete` removes it from the session map before
+/// returning the error (`src/fs/transfer.rs`) — so it must leave its own
+/// event rather than falling through to look, in the trail, like a session
+/// still open.
+#[tokio::test]
+async fn a_checksum_mismatch_is_audited_as_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+    let wrong = "0".repeat(64);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "corrupt.bin",
+                        "size": 11,
+                        "sha256": wrong,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let id = body_json(created).await["upload_id"]
+        .as_str()
+        .expect("upload_id")
+        .to_string();
+
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let events = audit_lines(&log);
+    let rejected = events
+        .iter()
+        .find(|e| e["kind"] == "upload.rejected")
+        .expect("a rejected checksum must leave a terminal event");
+    assert_eq!(rejected["digest_ok"], false);
+}
+
+#[tokio::test]
+async fn a_deleted_file_is_audited() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("old.dll"), b"stale").expect("write");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=old.dll")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let events = audit_lines(&log);
+    let deleted = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete")
+        .expect("a deletion must leave an audit event");
+    assert_eq!(deleted["file"], "old.dll");
+}

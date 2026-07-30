@@ -73,6 +73,15 @@ pub struct AuditEvent {
     /// Why a request was refused (`missing-token`, `invalid-token`, …).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Path a file operation touched, relative to the configured root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<String>,
+    /// Bytes transferred. Present on terminal transfer events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+    /// Whether the declared digest matched what arrived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_ok: Option<bool>,
 }
 
 impl AuditEvent {
@@ -91,6 +100,9 @@ impl AuditEvent {
             duration_ms: None,
             status: None,
             reason: None,
+            file: None,
+            bytes: None,
+            digest_ok: None,
         }
     }
 
@@ -141,6 +153,23 @@ impl AuditEvent {
     pub fn with_denial(mut self, status: u16, reason: impl Into<String>) -> Self {
         self.status = Some(status);
         self.reason = Some(reason.into());
+        self
+    }
+
+    /// Attach the file a transfer touched, and how many bytes moved.
+    ///
+    /// Recorded on terminal events only. A chunk-level trail would turn one
+    /// gigabyte-scale transfer into hundreds of lines and bury everything else
+    /// in the log.
+    pub fn with_file(mut self, path: impl Into<String>, bytes: Option<u64>) -> Self {
+        self.file = Some(path.into());
+        self.bytes = bytes;
+        self
+    }
+
+    /// Record whether the declared digest matched.
+    pub fn with_digest(mut self, verified: bool) -> Self {
+        self.digest_ok = Some(verified);
         self
     }
 }

@@ -684,13 +684,17 @@ pub async fn delete_file(
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
     };
+    let audit = state.audit.clone();
 
     // Resolving the path and removing the file are both blocking I/O. Same
     // convention as `list`/`list_blocking` and `download`/`download_blocking`
     // above (`src/execution/executor.rs:209-215`): run it on `spawn_blocking`
     // so a slow filesystem can never starve the tokio worker pool that also
-    // runs `/health` and the accept loop.
-    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &query)).await {
+    // runs `/health` and the accept loop. `audit.record` is blocking too
+    // (`AuditSink::record` opens/writes/flushes a file), so it is recorded
+    // from `delete_file_blocking` rather than back here — same reason the
+    // upload handlers thread it into their own `_blocking` bodies.
+    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &audit, &query)).await {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -743,7 +747,11 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 /// "accepted limitation": a symlink pointing outside the root, or a
 /// dangling one, is refused with `Escapes` right there, before any of the
 /// named-entry logic that follows ever runs.
-fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
+fn delete_file_blocking(
+    root: &FsRoot,
+    audit: &crate::audit::AuditSink,
+    query: &PathQuery,
+) -> Response {
     if let Err(error) = root.resolve_existing(&query.path) {
         return fs_error_response(error);
     }
@@ -857,7 +865,23 @@ fn delete_file_blocking(root: &FsRoot, query: &PathQuery) -> Response {
     }
 
     match platform::remove_entry(&named, &meta) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => {
+            // `query.path` as the caller spelled it, not a canonical form —
+            // unlike `upload.start`/`upload.complete`, which need to agree on
+            // one spelling to correlate two events for the *same* session,
+            // this is the only event this deletion will ever produce, so
+            // there is nothing to correlate it with. Recording the raw
+            // request path here also matches what this handler actually acts
+            // on: `delete_file_blocking`'s own doc comment above explains why
+            // it deliberately targets the named entry (`query.path`'s own
+            // final component) rather than whatever a symlink resolves to.
+            audit.record(
+                crate::audit::AuditEvent::new("fs.delete")
+                    .with_route("DELETE /api/v1/fs/file")
+                    .with_file(query.path.clone(), None),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "delete-failed",
@@ -1023,8 +1047,11 @@ pub async fn create_upload(
         return fs_not_enabled();
     };
     let uploads = state.uploads.clone();
+    let audit = state.audit.clone();
 
-    match tokio::task::spawn_blocking(move || create_upload_blocking(&root, &uploads, body)).await {
+    match tokio::task::spawn_blocking(move || create_upload_blocking(&root, &uploads, &audit, body))
+        .await
+    {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1036,10 +1063,15 @@ pub async fn create_upload(
 
 /// The synchronous body of `create_upload`. Blocking throughout — see
 /// `create_upload`, which runs this via `spawn_blocking` rather than directly
-/// on the async runtime.
+/// on the async runtime. `audit` is threaded in as a parameter rather than
+/// recorded back on the async side, because `AuditSink::record` itself does
+/// blocking file I/O (open/write/flush) — recording it here keeps that I/O on
+/// the same blocking-pool thread as everything else this function does,
+/// instead of adding a second blocking call directly on the tokio runtime.
 fn create_upload_blocking(
     root: &FsRoot,
     uploads: &crate::fs::UploadStore,
+    audit: &crate::audit::AuditSink,
     body: CreateUpload,
 ) -> Response {
     // Validate the destination before claiming anything, so a bad path cannot
@@ -1117,16 +1149,30 @@ fn create_upload_blocking(
         );
     }
 
+    // Cloned before the move below: `dest_rel` is canonical (see the comment
+    // on its own `let` above), and the audit event must record that same
+    // canonical form rather than `body.path` as spelled by the caller — a
+    // session's `start` and `complete` events need to agree on `file` so the
+    // two can be correlated even when the request used a different spelling
+    // (`./x.bin` vs. `x.bin`) than `complete`'s response does.
+    let dest_for_audit = dest_rel.clone();
     match uploads.create(root, dest_rel, body.size, body.sha256.to_ascii_lowercase()) {
-        Ok(upload_id) => (
-            StatusCode::CREATED,
-            Json(UploadState {
-                upload_id,
-                offset: 0,
-                chunk_size: uploads.chunk_size(),
-            }),
-        )
-            .into_response(),
+        Ok(upload_id) => {
+            audit.record(
+                crate::audit::AuditEvent::new("upload.start")
+                    .with_route("POST /api/v1/fs/uploads")
+                    .with_file(dest_for_audit, Some(body.size)),
+            );
+            (
+                StatusCode::CREATED,
+                Json(UploadState {
+                    upload_id,
+                    offset: 0,
+                    chunk_size: uploads.chunk_size(),
+                }),
+            )
+                .into_response()
+        }
         Err(error) => upload_error_response(error),
     }
 }
@@ -1244,8 +1290,12 @@ pub async fn complete_upload(
         return fs_not_enabled();
     };
     let uploads = state.uploads.clone();
+    let audit = state.audit.clone();
 
-    match tokio::task::spawn_blocking(move || complete_upload_blocking(&root, &uploads, &id)).await
+    match tokio::task::spawn_blocking(move || {
+        complete_upload_blocking(&root, &uploads, &audit, &id)
+    })
+    .await
     {
         Ok(response) => response,
         Err(_) => error_response(
@@ -1258,17 +1308,41 @@ pub async fn complete_upload(
 
 /// The synchronous body of `complete_upload`. Blocking throughout — see
 /// `complete_upload`, which runs this via `spawn_blocking` rather than
-/// directly on the async runtime.
+/// directly on the async runtime. `audit` is threaded in for the same reason
+/// `create_upload_blocking` takes it: `AuditSink::record` is itself blocking
+/// I/O, and this function already runs on the blocking pool.
 ///
 /// `UploadStore::take_for_complete` deliberately keeps `finished.dest_rel`'s
 /// claim alive on success (see its doc comment), so every exit path below
 /// calls `release_destination` exactly once — whether the rename lands or
 /// not — instead of relying on `take_for_complete` to have released it
 /// already.
-fn complete_upload_blocking(root: &FsRoot, uploads: &crate::fs::UploadStore, id: &str) -> Response {
+fn complete_upload_blocking(
+    root: &FsRoot,
+    uploads: &crate::fs::UploadStore,
+    audit: &crate::audit::AuditSink,
+    id: &str,
+) -> Response {
     let finished = match uploads.take_for_complete(id) {
         Ok(finished) => finished,
-        Err(error) => return upload_error_response(error),
+        // `take_for_complete` already removed the session from the map before
+        // returning this error (`src/fs/transfer.rs`'s checksum-mismatch
+        // branch), so this is terminal for the session, not a state a later
+        // sweep could also see and double-record. It carries no `file`:
+        // `UploadError::Checksum` holds only the two digests, and by the time
+        // this arm runs the session's `dest_rel` has already been consumed
+        // and dropped inside `take_for_complete` — there is nothing left here
+        // to attach it from without changing that error type.
+        Err(error) => {
+            if let crate::fs::UploadError::Checksum { .. } = &error {
+                audit.record(
+                    crate::audit::AuditEvent::new("upload.rejected")
+                        .with_route("POST /api/v1/fs/uploads/{id}/complete")
+                        .with_digest(false),
+                );
+            }
+            return upload_error_response(error);
+        }
     };
 
     let destination = match root.resolve_for_create(&finished.dest_rel) {
@@ -1326,6 +1400,13 @@ fn complete_upload_blocking(root: &FsRoot, uploads: &crate::fs::UploadStore, id:
     }
     uploads.release_destination(&finished.dest_rel);
 
+    audit.record(
+        crate::audit::AuditEvent::new("upload.complete")
+            .with_route("POST /api/v1/fs/uploads/{id}/complete")
+            .with_file(finished.dest_rel.clone(), Some(finished.bytes))
+            .with_digest(true),
+    );
+
     Json(serde_json::json!({
         "path": finished.dest_rel,
         "size": finished.bytes,
@@ -1346,7 +1427,8 @@ pub async fn cancel_upload(
         return fs_not_enabled();
     }
     let uploads = state.uploads.clone();
-    match tokio::task::spawn_blocking(move || cancel_upload_blocking(&uploads, &id)).await {
+    let audit = state.audit.clone();
+    match tokio::task::spawn_blocking(move || cancel_upload_blocking(&uploads, &audit, &id)).await {
         Ok(response) => response,
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1359,11 +1441,54 @@ pub async fn cancel_upload(
 /// The synchronous body of `cancel_upload`. Blocking throughout — see
 /// `cancel_upload`, which runs this via `spawn_blocking` rather than directly
 /// on the async runtime.
-fn cancel_upload_blocking(uploads: &crate::fs::UploadStore, id: &str) -> Response {
+///
+/// An explicit cancel is as terminal as a sweep-driven expiry, and without a
+/// recorded event here the trail would show a session starting and then
+/// nothing — indistinguishable from one still in progress. Unlike `sweep`,
+/// which returns `(id, destination, bytes_received)` for exactly this reason,
+/// `UploadStore::cancel` reports only whether a session existed — so this
+/// event carries no `file`/`bytes`. Widening `cancel`'s return type to match
+/// `sweep`'s is a plausible follow-up; left alone here since it touches
+/// `UploadStore`, which this task was not asked to change.
+fn cancel_upload_blocking(
+    uploads: &crate::fs::UploadStore,
+    audit: &crate::audit::AuditSink,
+    id: &str,
+) -> Response {
     match uploads.cancel(id) {
-        true => StatusCode::NO_CONTENT.into_response(),
+        true => {
+            audit.record(
+                crate::audit::AuditEvent::new("upload.cancel")
+                    .with_route("DELETE /api/v1/fs/uploads/{id}"),
+            );
+            StatusCode::NO_CONTENT.into_response()
+        }
         false => upload_error_response(crate::fs::UploadError::NotFound),
     }
+}
+
+/// Drop upload sessions idle past `ttl`, recording a terminal event for each.
+///
+/// A session that starts and never ends leaves a trail showing only a
+/// beginning. Sweeping silently would make every abandoned transfer look, in
+/// the log, exactly like one still in progress.
+///
+/// Plain and synchronous rather than `async` or `spawn_blocking`-wrapped
+/// itself: `UploadStore::sweep` removes staging files and `audit.record`
+/// writes to a file, both blocking I/O, but which runtime this runs on is the
+/// caller's decision to make — a periodic task on the async runtime needs to
+/// wrap this in `spawn_blocking` (see `main.rs`); a test calling it directly
+/// from a `#[tokio::test]` body does not need that ceremony to observe what
+/// it records.
+pub fn sweep_expired_uploads(state: &AppState, ttl: std::time::Duration) -> usize {
+    let expired = state.uploads.sweep(ttl);
+    for (_id, destination, bytes) in &expired {
+        state.audit.record(
+            crate::audit::AuditEvent::new("upload.expired")
+                .with_file(destination.clone(), Some(*bytes)),
+        );
+    }
+    expired.len()
 }
 
 #[cfg(test)]

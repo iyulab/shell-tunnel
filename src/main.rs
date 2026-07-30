@@ -248,6 +248,43 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         }
     }
 
+    // A server that goes quiet after `SESSION_TTL` elapses would otherwise
+    // hold every expired session's file descriptor and staging file
+    // indefinitely — `UploadStore::create`'s own opportunistic sweep only
+    // runs when a *new* upload is requested, which never happens on an idle
+    // server. This is the actual mechanism; the opportunistic call stays too,
+    // bounding staging growth between ticks.
+    if state.fs.is_some() {
+        let sweeper = state.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                ticker.tick().await;
+                // Both `UploadStore::sweep` (removes staging files) and
+                // `AuditSink::record` (opens/writes/flushes the audit log)
+                // are blocking I/O, so — unlike the brief this task started
+                // from, which called this straight from the spawned async
+                // task — the call itself is wrapped in `spawn_blocking` here.
+                // Same convention as every filesystem route in
+                // `src/api/fs.rs` (`src/execution/executor.rs:209-215`): a
+                // slow disk must never stall the worker pool that also runs
+                // `/health` and the accept loop.
+                let sweeper = sweeper.clone();
+                let dropped = tokio::task::spawn_blocking(move || {
+                    shell_tunnel::api::fs::sweep_expired_uploads(
+                        &sweeper,
+                        shell_tunnel::fs::SESSION_TTL,
+                    )
+                })
+                .await
+                .unwrap_or(0);
+                if dropped > 0 {
+                    info!("swept {dropped} expired upload session(s)");
+                }
+            }
+        });
+    }
+
     #[cfg(feature = "relay-client")]
     if let Some(relay_url) = args.relay_url.clone() {
         return run_with_relay(server_config, &args, relay_url, exposure, state).await;
