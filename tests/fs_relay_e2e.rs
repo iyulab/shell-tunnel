@@ -167,6 +167,105 @@ async fn wait_until_attached(base: &str) {
     panic!("device never became reachable through the relay");
 }
 
+/// Like `http_request`, but reads past any interim `1xx` block to the final
+/// response, the way a client that sent `Expect: 100-continue` must.
+///
+/// `http_request` takes the first status line it sees, which is the whole
+/// reason the defect this covers survived: with `Expect` in play the first
+/// status line *is* `100 Continue`, so a test parsing naively would either
+/// assert on the interim status or read a `500` and not know which layer
+/// produced it.
+async fn http_request_final_status(
+    url: &str,
+    method: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> u16 {
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let mut head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\ncontent-length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).await.unwrap();
+    // Sent without waiting for the interim response. A client is allowed to do
+    // this, and it keeps the test from hanging if the server never sends one —
+    // the point here is which *final* status comes back, not the handshake's
+    // timing.
+    stream.write_all(body).await.unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("relay should answer")
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&raw);
+    text.split("\r\n\r\n")
+        .filter_map(|block| block.split_whitespace().nth(1))
+        .filter_map(|code| code.parse::<u16>().ok())
+        .find(|code| !(100..200).contains(code))
+        .unwrap_or(0)
+}
+
+/// A body-carrying request with `Expect: 100-continue` must reach the device
+/// and come back with the device's own status.
+///
+/// It came back `500` while the device answered `200`. The relay replayed the
+/// `Expect` header onto the device's local HTTP call, that server answered with
+/// an interim `100 Continue`, the device reported the interim response as *the*
+/// response, and the relay tried to return `100` as a final status — which
+/// hyper cannot write, so it substituted an empty `500`.
+///
+/// The request always succeeded. Only the status the caller saw was wrong,
+/// which is the worst shape available here: a non-idempotent `execute`
+/// reported as failed after it had already run, and an upload chunk written
+/// but reported lost. `curl` adds the header automatically above roughly a
+/// kilobyte, so this hit every real upload while the suite — which never sent
+/// it — stayed green.
+#[tokio::test]
+async fn a_request_with_expect_100_continue_is_answered_by_the_device() {
+    let relay_addr = start_relay().await;
+    let (_dir, local_addr) = start_device_server().await;
+    let device_name = "expect-device";
+    spawn_device(relay_addr, local_addr, device_name);
+    let base = format!("http://{relay_addr}/d/{device_name}");
+    wait_until_attached(&base).await;
+
+    let create_body = serde_json::json!({
+        "path": "expect.bin",
+        "size": 11,
+        "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    })
+    .to_string();
+
+    let status = http_request_final_status(
+        &format!("{base}/api/v1/fs/uploads"),
+        "POST",
+        &[
+            ("content-type", "application/json"),
+            ("expect", "100-continue"),
+        ],
+        create_body.as_bytes(),
+    )
+    .await;
+
+    assert_eq!(
+        status, 201,
+        "the device answers 201; a 500 here means the relay returned its own \
+         status instead of the device's"
+    );
+}
+
 #[tokio::test]
 async fn an_upload_completes_over_the_relay() {
     let relay_addr = start_relay().await;
