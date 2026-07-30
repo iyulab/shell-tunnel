@@ -241,8 +241,11 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // Sessions never survive a restart, so any `.part` staging file still
     // present is unreachable — nothing can resume it and nothing will
     // complete it. Swept once, here, before the server starts accepting.
+    // `sweep_orphaned_uploads` (not the lower-level `fs::sweep_orphan_parts`)
+    // so each orphan leaves an `upload.orphaned` audit event rather than
+    // vanishing with only a count logged.
     if let Some(root) = state.fs.as_ref() {
-        let removed = shell_tunnel::fs::sweep_orphan_parts(root);
+        let removed = shell_tunnel::api::fs::sweep_orphaned_uploads(root, &state.audit);
         if removed > 0 {
             info!("removed {removed} orphaned upload staging file(s)");
         }
@@ -250,12 +253,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
 
     // A server that goes quiet after `SESSION_TTL` elapses would otherwise
     // hold every expired session's file descriptor and staging file
-    // indefinitely — `UploadStore::create`'s own opportunistic sweep only
-    // runs when a *new* upload is requested, which never happens on an idle
-    // server. This is the actual mechanism; the opportunistic call stays too,
-    // bounding staging growth between ticks.
+    // indefinitely — `create_upload_blocking`'s own opportunistic sweep
+    // (`src/api/fs.rs`) only runs when a *new* upload is requested, which
+    // never happens on an idle server. This is the actual mechanism; the
+    // opportunistic call stays too, bounding staging growth between ticks.
     if state.fs.is_some() {
-        let sweeper = state.clone();
+        let uploads = state.uploads.clone();
+        let audit = state.audit.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(300));
             loop {
@@ -269,10 +273,12 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 // `src/api/fs.rs` (`src/execution/executor.rs:209-215`): a
                 // slow disk must never stall the worker pool that also runs
                 // `/health` and the accept loop.
-                let sweeper = sweeper.clone();
+                let uploads = uploads.clone();
+                let audit = audit.clone();
                 let dropped = tokio::task::spawn_blocking(move || {
                     shell_tunnel::api::fs::sweep_expired_uploads(
-                        &sweeper,
+                        &uploads,
+                        &audit,
                         shell_tunnel::fs::SESSION_TTL,
                     )
                 })

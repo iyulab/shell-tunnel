@@ -994,7 +994,9 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
             "too-many-uploads",
             "too many upload sessions are open; finish or cancel one and retry",
         ),
-        UploadError::Checksum { expected, actual } => (
+        UploadError::Checksum {
+            expected, actual, ..
+        } => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({
                 "error": "checksum-mismatch",
@@ -1167,13 +1169,23 @@ fn create_upload_blocking(
     // two can be correlated even when the request used a different spelling
     // (`./x.bin` vs. `x.bin`) than `complete`'s response does.
     let dest_for_audit = dest_rel.clone();
+
+    // Opportunistic reclamation used to live inside `UploadStore::create`
+    // itself, unaudited (see that method's own doc comment for why it moved).
+    // Sweeping here, immediately before `create`, preserves the ordering the
+    // old internal call existed for: stale capacity is reclaimed before the
+    // cap check inside `create` runs, so a session old enough to matter is
+    // freed the moment somebody next asks for a new one.
+    sweep_expired_uploads(uploads, audit, crate::fs::SESSION_TTL);
+
     match uploads.create(root, dest_rel, body.size, body.sha256.to_ascii_lowercase()) {
         Ok(upload_id) => {
             audit.record(
                 crate::audit::AuditEvent::new("upload.start")
                     .with_identity(identity)
                     .with_route("POST /api/v1/fs/uploads")
-                    .with_file(dest_for_audit, Some(body.size)),
+                    .with_file(dest_for_audit, Some(body.size))
+                    .with_upload_id(upload_id.clone()),
             );
             (
                 StatusCode::CREATED,
@@ -1343,17 +1355,14 @@ fn complete_upload_blocking(
         // `take_for_complete` already removed the session from the map before
         // returning this error (`src/fs/transfer.rs`'s checksum-mismatch
         // branch), so this is terminal for the session, not a state a later
-        // sweep could also see and double-record. It carries no `file`:
-        // `UploadError::Checksum` holds only the two digests, and by the time
-        // this arm runs the session's `dest_rel` has already been consumed
-        // and dropped inside `take_for_complete` — there is nothing left here
-        // to attach it from without changing that error type.
+        // sweep could also see and double-record.
         Err(error) => {
-            if let crate::fs::UploadError::Checksum { .. } = &error {
+            if let crate::fs::UploadError::Checksum { ref dest_rel, .. } = error {
                 audit.record(
                     crate::audit::AuditEvent::new("upload.rejected")
                         .with_identity(identity)
                         .with_route("POST /api/v1/fs/uploads/{id}/complete")
+                        .with_file(dest_rel.clone(), None)
                         .with_digest(false),
                 );
             }
@@ -1361,12 +1370,26 @@ fn complete_upload_blocking(
         }
     };
 
+    // From here on, `take_for_complete` has already removed the session and
+    // the destination's claim survives only until `release_destination` is
+    // called below — so every exit path, success or failure, is terminal for
+    // this upload and must leave its own event. `upload.failed` (distinct
+    // from `upload.rejected` above): these are IO failures on the server's
+    // own publication step, not a contract violation by the caller.
     let destination = match root.resolve_for_create(&finished.dest_rel) {
         Ok(path) => path,
         Err(error) => {
             std::fs::remove_file(&finished.part_path).ok();
             uploads.release_destination(&finished.dest_rel);
-            return fs_error_response(error);
+            let response = fs_error_response(error);
+            audit.record(
+                crate::audit::AuditEvent::new("upload.failed")
+                    .with_identity(identity)
+                    .with_route("POST /api/v1/fs/uploads/{id}/complete")
+                    .with_file(finished.dest_rel.clone(), Some(finished.bytes))
+                    .with_denial(response.status().as_u16(), "destination-resolve-failed"),
+            );
+            return response;
         }
     };
 
@@ -1385,6 +1408,13 @@ fn complete_upload_blocking(
                 true => StatusCode::INSUFFICIENT_STORAGE,
                 false => StatusCode::INTERNAL_SERVER_ERROR,
             };
+            audit.record(
+                crate::audit::AuditEvent::new("upload.failed")
+                    .with_identity(identity)
+                    .with_route("POST /api/v1/fs/uploads/{id}/complete")
+                    .with_file(finished.dest_rel.clone(), Some(finished.bytes))
+                    .with_denial(status.as_u16(), "directory-creation-failed"),
+            );
             return error_response(
                 status,
                 "io-error",
@@ -1408,6 +1438,13 @@ fn complete_upload_blocking(
             true => StatusCode::INSUFFICIENT_STORAGE,
             false => StatusCode::INTERNAL_SERVER_ERROR,
         };
+        audit.record(
+            crate::audit::AuditEvent::new("upload.failed")
+                .with_identity(identity)
+                .with_route("POST /api/v1/fs/uploads/{id}/complete")
+                .with_file(finished.dest_rel.clone(), Some(finished.bytes))
+                .with_denial(status.as_u16(), "rename-failed"),
+        );
         return error_response(
             status,
             "io-error",
@@ -1500,27 +1537,71 @@ fn cancel_upload_blocking(
 /// beginning. Sweeping silently would make every abandoned transfer look, in
 /// the log, exactly like one still in progress.
 ///
+/// Takes `uploads`/`audit` directly rather than `&AppState`: this is the only
+/// state either caller needs, and one of those callers is
+/// `create_upload_blocking`, which already holds both as separate parameters
+/// (see that function's own signature) rather than an `AppState`. Matching
+/// shapes means the opportunistic sweep that used to live inside
+/// `UploadStore::create` can call this exactly the way the periodic sweeper
+/// in `main.rs` does, instead of needing a second, `AppState`-shaped variant.
+///
 /// Plain and synchronous rather than `async` or `spawn_blocking`-wrapped
 /// itself: `UploadStore::sweep` removes staging files and `audit.record`
 /// writes to a file, both blocking I/O, but which runtime this runs on is the
 /// caller's decision to make — a periodic task on the async runtime needs to
-/// wrap this in `spawn_blocking` (see `main.rs`); a test calling it directly
-/// from a `#[tokio::test]` body does not need that ceremony to observe what
-/// it records.
+/// wrap this in `spawn_blocking` (see `main.rs`); `create_upload_blocking`
+/// calls it directly because it is already running on the blocking pool
+/// itself; a test calling it directly from a `#[tokio::test]` body does not
+/// need that ceremony to observe what it records.
 ///
 /// The recorded event carries no `route` (there is no request driving this —
-/// it runs off a timer) and no `identity` (the session was opened by some
-/// caller, long since disconnected; nothing here still knows who that was).
-/// Every other event this task adds carries both.
-pub fn sweep_expired_uploads(state: &AppState, ttl: std::time::Duration) -> usize {
-    let expired = state.uploads.sweep(ttl);
+/// it runs off a timer, or opportunistically off an unrelated request) and no
+/// `identity` (the session was opened by some caller, long since
+/// disconnected; nothing here still knows who that was). Every other event
+/// this task adds carries both.
+pub fn sweep_expired_uploads(
+    uploads: &crate::fs::UploadStore,
+    audit: &crate::audit::AuditSink,
+    ttl: std::time::Duration,
+) -> usize {
+    let expired = uploads.sweep(ttl);
     for (_id, destination, bytes) in &expired {
-        state.audit.record(
+        audit.record(
             crate::audit::AuditEvent::new("upload.expired")
                 .with_file(destination.clone(), Some(*bytes)),
         );
     }
     expired.len()
+}
+
+/// Remove `.part` staging files left behind by a previous run, recording a
+/// terminal event for each.
+///
+/// Thin wrapper over `crate::fs::sweep_orphan_parts`: that function stays
+/// audit-agnostic (it lives in `crate::fs`, which has no `AuditSink`), and
+/// this is where the recording happens instead — same split as
+/// `sweep_expired_uploads` over `UploadStore::sweep`.
+///
+/// The recorded `upload.orphaned` event carries `upload_id` but not `file`:
+/// the destination lived only in the in-memory session a restart already
+/// discarded before this ever runs, so there is nothing left to attach as
+/// `file`. It also carries neither `route` nor `identity`, for the same
+/// reason `upload.expired` does not — nothing here was driven by a request.
+/// A reader correlates an orphan back to the `upload.start` that does have
+/// the destination by matching `upload_id` between the two events.
+pub fn sweep_orphaned_uploads(root: &FsRoot, audit: &crate::audit::AuditSink) -> usize {
+    let removed = crate::fs::sweep_orphan_parts(root);
+    for (upload_id, bytes) in &removed {
+        // Built without `with_file`: that builder always sets `file`
+        // alongside `bytes`, and this event deliberately carries no `file` —
+        // there is nothing left here to attach one from. `bytes` is set
+        // directly on the field instead (both `pub` within the crate).
+        let mut event =
+            crate::audit::AuditEvent::new("upload.orphaned").with_upload_id(upload_id.clone());
+        event.bytes = Some(*bytes);
+        audit.record(event);
+    }
+    removed.len()
 }
 
 #[cfg(test)]

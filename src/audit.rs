@@ -82,6 +82,13 @@ pub struct AuditEvent {
     /// Whether the declared digest matched what arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest_ok: Option<bool>,
+    /// The upload session's id.
+    ///
+    /// Recorded on `upload.start` and on any event that cannot carry `file`
+    /// (see `with_upload_id`'s doc comment) so the two can still be joined
+    /// into one session's story.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upload_id: Option<String>,
 }
 
 impl AuditEvent {
@@ -103,6 +110,7 @@ impl AuditEvent {
             file: None,
             bytes: None,
             digest_ok: None,
+            upload_id: None,
         }
     }
 
@@ -170,6 +178,22 @@ impl AuditEvent {
     /// Record whether the declared digest matched.
     pub fn with_digest(mut self, verified: bool) -> Self {
         self.digest_ok = Some(verified);
+        self
+    }
+
+    /// Attach the upload session's id.
+    ///
+    /// Every terminal upload event but one can name its subject through
+    /// `file` (the destination). The exception is `upload.orphaned`: a
+    /// `.part` staging file found at startup carries only the id encoded in
+    /// its own filename — the destination it was headed for lived in the
+    /// in-memory session that a restart already discarded, so there is
+    /// nothing left to attach as `file`. `upload_id` is how a reader
+    /// recovers that link anyway: it is also recorded on `upload.start`
+    /// (which does have `file`), so grepping the trail for one upload's id
+    /// still surfaces both ends of its story.
+    pub fn with_upload_id(mut self, id: impl Into<String>) -> Self {
+        self.upload_id = Some(id.into());
         self
     }
 }

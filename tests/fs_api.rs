@@ -2460,6 +2460,12 @@ async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
     assert_eq!(complete["file"], "audited.bin");
     assert_eq!(complete["bytes"], 11);
     assert_eq!(complete["digest_ok"], true);
+    // `upload.start` carries the session's own id: the one thing that also
+    // survives on a bare orphaned staging file (see
+    // `an_orphaned_staging_file_is_audited_and_correlates_to_its_start_by_upload_id`
+    // below), which cannot carry `file` at all and correlates back to this
+    // event by `upload_id` alone.
+    assert_eq!(start["upload_id"], id);
 }
 
 #[tokio::test]
@@ -2503,7 +2509,11 @@ async fn an_abandoned_session_is_audited_when_it_is_swept() {
         .expect("response");
 
     // Sweep with a zero TTL: everything in flight is stale.
-    shell_tunnel::api::fs::sweep_expired_uploads(&state, std::time::Duration::ZERO);
+    shell_tunnel::api::fs::sweep_expired_uploads(
+        &state.uploads,
+        &state.audit,
+        std::time::Duration::ZERO,
+    );
 
     let events = audit_lines(&log);
     let expired = events
@@ -2648,6 +2658,9 @@ async fn a_checksum_mismatch_is_audited_as_rejected() {
         .find(|e| e["kind"] == "upload.rejected")
         .expect("a rejected checksum must leave a terminal event");
     assert_eq!(rejected["digest_ok"], false);
+    // `UploadError::Checksum` carries `dest_rel` precisely so this event can
+    // name its subject, like every other terminal upload event.
+    assert_eq!(rejected["file"], "corrupt.bin");
 }
 
 #[tokio::test]
@@ -2702,4 +2715,235 @@ async fn a_deleted_files_audit_event_carries_the_callers_identity() {
         .find(|e| e["kind"] == "fs.delete")
         .expect("a deletion must leave an audit event");
     assert_eq!(deleted["identity"]["label"], "test");
+}
+
+/// `complete_upload_blocking` has three exit paths after `take_for_complete`
+/// succeeds: `resolve_for_create`, `create_dir_all`, and `rename` can each
+/// fail. Before this test, none of the three recorded anything — an
+/// `upload.start` sat in the log followed by permanent silence, since
+/// `take_for_complete` had already removed the session from the map. This
+/// covers the `create_dir_all` branch: a plain file already sits where the
+/// destination's parent directory needs to be, so `create_dir_all` fails
+/// deterministically, no ENOSPC simulation required.
+#[tokio::test]
+async fn a_directory_creation_failure_at_complete_is_audited_as_failed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // "blocker" already exists as a regular file, so it can never also serve
+    // as an ancestor directory of the destination below.
+    std::fs::write(dir.path().join("blocker"), b"x").expect("write blocker");
+    let (state, log) = audited_state(&dir);
+
+    let id = create_test_upload(state.clone(), "blocker/inner.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "upload.failed")
+        .expect("a publication failure must leave a terminal event, not silence");
+    assert_eq!(failed["file"], "blocker/inner.bin");
+    assert_eq!(failed["bytes"], 11);
+    assert_eq!(failed["reason"], "directory-creation-failed");
+    assert_eq!(failed["status"], 500);
+}
+
+/// Same failure family as the test above, different branch: `rename` itself
+/// fails. Reproduced by racing a directory into existence at the destination
+/// after the session was created (`resolve_for_create` and `create_dir_all`
+/// both pass — the destination's *parent* is fine — but renaming a file onto
+/// an existing directory is refused on every platform this project targets).
+#[tokio::test]
+async fn a_rename_failure_at_complete_is_audited_as_failed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let id = create_test_upload(state.clone(), "raced.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Simulates an external actor creating a directory at the destination
+    // while the upload was in flight — nothing this API exposes can do this,
+    // but nothing stops another process on the same filesystem either.
+    std::fs::create_dir_all(dir.path().join("raced.bin")).expect("race a directory into place");
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "upload.failed")
+        .expect("a publication failure must leave a terminal event, not silence");
+    assert_eq!(failed["file"], "raced.bin");
+    assert_eq!(failed["bytes"], 11);
+    assert_eq!(failed["reason"], "rename-failed");
+    assert_eq!(failed["status"], 500);
+}
+
+/// The third and hardest-to-reach branch: `resolve_for_create` itself fails
+/// at `complete` time, after having already succeeded once at `create` time.
+/// Reproduced the same way the jail's own tests do (`src/fs/root.rs`): an
+/// intermediate path component that did not exist at `create` time is
+/// replaced with a symlink escaping the root before `complete` runs. Skips
+/// itself when the platform refuses to create the symlink (unprivileged
+/// Windows), matching the existing convention in
+/// `src/fs/transfer.rs`'s own symlink test.
+#[tokio::test]
+async fn a_resolve_failure_at_complete_is_audited_as_failed() {
+    let outer = tempfile::tempdir().expect("outer tempdir");
+    let root_dir = outer.path().join("root");
+    std::fs::create_dir_all(&root_dir).expect("mkdir root");
+    let outside = outer.path().join("outside");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+
+    // Built by hand rather than through `audited_state`: that helper roots
+    // the `FsRoot` at the whole `TempDir`, but this test needs `outside` to
+    // sit *beside* the root, not inside it, so the root has to be a
+    // subdirectory of `outer` instead.
+    let log = outer.path().join("audit.jsonl");
+    let sink = shell_tunnel::audit::AuditSink::file(&log).expect("sink");
+    let root = FsRoot::new(&root_dir).expect("root");
+    let state = AppState::new()
+        .with_fs_root(root)
+        .with_audit(std::sync::Arc::new(sink));
+
+    let id = create_test_upload(state.clone(), "escaped/inner.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-10/11")
+                .body(Body::from(&b"hello world"[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // "escaped" did not exist at `create` time, so `resolve_for_create` left
+    // it in the unresolved tail rather than refusing it. Replacing it with a
+    // symlink out of the root now reproduces exactly the same failure a race
+    // between `create` and `complete` would.
+    let link = root_dir.join("escaped");
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_dir(&outside, &link).is_ok();
+    #[cfg(not(any(unix, windows)))]
+    let linked = false;
+    if !linked {
+        return; // symlink privilege unavailable on this runner; skip
+    }
+
+    let completed = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(completed.status(), StatusCode::FORBIDDEN);
+
+    let events = audit_lines(&log);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "upload.failed")
+        .expect("a publication failure must leave a terminal event, not silence");
+    assert_eq!(failed["file"], "escaped/inner.bin");
+    assert_eq!(failed["bytes"], 11);
+    assert_eq!(failed["reason"], "destination-resolve-failed");
+    assert_eq!(failed["status"], 403);
+}
+
+/// `main.rs` runs `sweep_orphaned_uploads` once at startup, after a restart
+/// has already discarded every in-memory session — so the only thing left of
+/// an interrupted upload is its `.part` file. That function never consults
+/// `UploadStore` at all (it is a raw directory scan, same as the
+/// `crate::fs::sweep_orphan_parts` it wraps), so calling it directly here,
+/// without simulating a real restart, exercises exactly the same code path
+/// a restart would.
+#[tokio::test]
+async fn an_orphaned_staging_file_is_audited_and_correlates_to_its_start_by_upload_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let id = create_test_upload(state.clone(), "orphan.bin", b"hello world").await;
+    create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", "bytes 0-5/11")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let root = state.fs.clone().expect("fs root");
+    let removed = shell_tunnel::api::fs::sweep_orphaned_uploads(&root, &state.audit);
+    assert_eq!(removed, 1);
+
+    let events = audit_lines(&log);
+    let start = events
+        .iter()
+        .find(|e| e["kind"] == "upload.start")
+        .expect("start event");
+    let orphaned = events
+        .iter()
+        .find(|e| e["kind"] == "upload.orphaned")
+        .expect("an orphaned staging file must leave a terminal event, not silence");
+
+    assert_eq!(orphaned["bytes"], 6);
+    // The destination is not recoverable from a bare staging file — the only
+    // link back to it is the id, shared with `upload.start`.
+    assert_eq!(orphaned["upload_id"], start["upload_id"]);
+    assert_eq!(orphaned["upload_id"], id);
+    assert!(
+        !orphaned.as_object().expect("object").contains_key("file"),
+        "the destination is not recoverable here; `file` must be absent, not merely null"
+    );
 }

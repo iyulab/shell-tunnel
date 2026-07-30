@@ -62,7 +62,19 @@ pub enum UploadError {
     /// Too many sessions are already open (see `MAX_CONCURRENT_UPLOADS`).
     TooManySessions,
     /// The assembled bytes do not hash to what was declared.
-    Checksum { expected: String, actual: String },
+    Checksum {
+        expected: String,
+        actual: String,
+        /// The destination the rejected session was headed for. Widened for
+        /// this field for the same reason `UploadStore::cancel`'s return
+        /// type was: an audit event for a terminal upload outcome should be
+        /// able to name its subject. `dest_rel` is not consumed before this
+        /// variant is built — `take_for_complete` only borrows it (for
+        /// `self.release(&dest_rel)`) beforehand — so there was never a
+        /// reason it could not be carried here; the field was simply never
+        /// added.
+        dest_rel: String,
+    },
     /// The filesystem refused.
     Io {
         /// Already-rendered detail (`ToString` of the underlying
@@ -182,6 +194,18 @@ impl UploadStore {
     }
 
     /// Open a session for `dest_rel`, which need not exist yet.
+    ///
+    /// Does *not* sweep expired sessions itself, even opportunistically — an
+    /// earlier version did, right here, before anything else ran. That
+    /// silently discarded whatever session the sweep reclaimed: `UploadStore`
+    /// has no `AuditSink` to record with, so a sweep run from inside this
+    /// method structurally cannot leave a trail. The caller
+    /// (`create_upload_blocking`, `src/api/fs.rs`) now sweeps via the
+    /// audit-aware `sweep_expired_uploads` immediately before calling this,
+    /// preserving the ordering the old internal call existed for: reclaim
+    /// stale capacity before the cap check below runs, so a session old
+    /// enough to matter is freed the moment somebody next asks for a new one
+    /// — the same guarantee, just recorded now instead of silent.
     pub fn create(
         &self,
         root: &crate::fs::FsRoot,
@@ -189,15 +213,6 @@ impl UploadStore {
         size: u64,
         sha256: String,
     ) -> Result<String, UploadError> {
-        // Opportunistic reclamation: a cap with nothing ever reclaiming past
-        // it would eventually leave every one of its slots permanently
-        // stuck on an abandoned session. Run the sweep at the point new
-        // capacity is being requested rather than on a background timer —
-        // simpler, and self-limiting: a session old enough to matter is
-        // reclaimed the moment somebody next asks for a new one, which is
-        // exactly when reclaiming it matters.
-        self.sweep(SESSION_TTL);
-
         // Claim the destination first: a second session for the same path is a
         // silent-overwrite race, and last-writer-wins loses data quietly.
         {
@@ -319,6 +334,17 @@ impl UploadStore {
     /// made here: it restructures the state machine's storage at the tail
     /// of an already-large task, and the contention it would remove is
     /// bounded and documented, not a correctness gap.
+    ///
+    /// One failure mode this contention analysis does not cover: if a writer
+    /// ever panicked while holding `sessions`' *write* guard (`create`'s
+    /// insert, `take_for_complete`'s or `sweep`'s remove), `std::sync::RwLock`
+    /// poisons permanently — every later `.read()` and `.write()` on it,
+    /// including this method's and `sweep`'s own, then fails identically and
+    /// forever, not "eventually swept once the panic clears." No write-lock
+    /// section in this file does disk I/O or anything else that panics today
+    /// (each is a plain insert/remove), so this is unreachable rather than a
+    /// live gap — worth stating outright rather than leaving "the lock could
+    /// get poisoned" to imply a transient condition sweeping would clear.
     pub fn append(&self, id: &str, offset: u64, bytes: &[u8]) -> Result<u64, UploadError> {
         if bytes.len() > self.chunk_size {
             return Err(UploadError::TooLarge);
@@ -396,6 +422,7 @@ impl UploadStore {
             return Err(UploadError::Checksum {
                 expected: declared_sha256,
                 actual: digest,
+                dest_rel,
             });
         }
 
@@ -532,25 +559,57 @@ fn poisoned() -> UploadError {
 /// Sessions do not survive a restart, so any `.part` still present is
 /// unreachable — nothing can resume it and nothing will complete it.
 ///
-/// Returns `0` both when there was nothing to sweep and when the staging
-/// directory could not be read at all (most commonly: no upload has ever
-/// run against this root, so it was never created). Not distinguished:
-/// `main.rs`'s only use of the return value is to log a positive count, and
-/// "nothing there" vs. "unreadable" both mean nothing to log. Telling them
-/// apart would need a richer return type for a distinction the one caller
-/// does not consume.
-pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> usize {
+/// Returns `(upload_id, bytes)` for each file removed, so a caller can record
+/// a terminal audit event per orphan — same reason `UploadStore::sweep` and
+/// `cancel` return what they do, rather than dropping what they find. Two
+/// things are recoverable here and one is not: `upload_id` is the filename
+/// stem (`up-{serial:016x}`, never caller input, so parsing it back out is
+/// safe), and `bytes` is the file's size, which always equals what
+/// `append` had written — but the *destination* lived only in the in-memory
+/// `Session` a restart already discarded before this function ever runs, so
+/// there is nothing here to recover it from. See `AuditEvent::with_upload_id`
+/// for how a caller correlates this back to the `upload.start` that does
+/// have it.
+///
+/// An empty `Vec` covers both "nothing to sweep" and "the staging directory
+/// could not be read at all" (most commonly: no upload has ever run against
+/// this root, so it was never created). Not distinguished, same reasoning as
+/// before this was widened: nothing consumes that distinction.
+pub fn sweep_orphan_parts(root: &crate::fs::FsRoot) -> Vec<(String, u64)> {
     let staging = UploadStore::staging_dir(root);
     let Ok(entries) = std::fs::read_dir(&staging) else {
-        return 0;
+        return Vec::new();
     };
-    let mut removed = 0;
+    let mut removed = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("part")
-            && std::fs::remove_file(&path).is_ok()
-        {
-            removed += 1;
+        if path.extension().and_then(|e| e.to_str()) != Some("part") {
+            continue;
+        }
+        // Read before removing: there is no size to report once the file is
+        // gone. `std::fs::metadata(&path)` — a fresh stat — rather than the
+        // cheaper `entry.metadata()`: on Windows, `DirEntry::metadata()`
+        // returns the `WIN32_FIND_DATA` captured by the `read_dir`
+        // enumeration itself, which can under-report the size of a file
+        // still open elsewhere for writing (verified: a session whose
+        // staging file was just appended to and never closed reported `0`
+        // bytes here, on this platform, until this was changed to a fresh
+        // stat). Not reachable in production — the whole reason a `.part`
+        // file is orphaned is that the process that held it open is gone —
+        // but a test exercising this without a real restart can still hit
+        // it, and the fresh call costs one extra syscall per file, on a path
+        // that runs once at startup.
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let Some(id) = path.file_stem().and_then(|s| s.to_str()) else {
+            // Not a name this process ever generated (`up-{serial:016x}.part`
+            // is always valid UTF-8) — nothing to correlate an event to, so
+            // the file is removed but not reported.
+            std::fs::remove_file(&path).ok();
+            continue;
+        };
+        let id = id.to_string();
+        if std::fs::remove_file(&path).is_ok() {
+            removed.push((id, bytes));
         }
     }
     removed
@@ -641,9 +700,14 @@ mod tests {
         store.append(&id, 0, b"hello world").expect("append");
 
         match store.take_for_complete(&id) {
-            Err(UploadError::Checksum { expected, actual }) => {
+            Err(UploadError::Checksum {
+                expected,
+                actual,
+                dest_rel,
+            }) => {
                 assert_eq!(expected, wrong);
                 assert_eq!(actual, HELLO_DIGEST);
+                assert_eq!(dest_rel, "out.bin");
             }
             other => panic!("expected a checksum refusal, got {other:?}"),
         }
@@ -716,6 +780,34 @@ mod tests {
 
         assert_eq!(store.sweep(Duration::ZERO).len(), 1);
         assert_eq!(store.offset(&id), None);
+    }
+
+    /// `create` used to sweep opportunistically (with the real, fixed
+    /// `SESSION_TTL`) before doing anything else. That call is gone — moved
+    /// to the caller, which sweeps through the audit-aware
+    /// `sweep_expired_uploads` instead (`src/api/fs.rs`) — because
+    /// `UploadStore` has no `AuditSink` to record with, so a sweep run from
+    /// inside this method could never leave a trail. This is the regression
+    /// guard for that move: even a session that a zero-TTL sweep would call
+    /// stale must survive an unrelated `create` call untouched, proving
+    /// `create` itself no longer reclaims anything — only an explicit
+    /// `sweep`/`sweep_expired_uploads` call does.
+    #[test]
+    fn create_does_not_sweep_expired_sessions_itself() {
+        let (_dir, root, store) = store();
+        let id = store
+            .create(&root, "old.bin".into(), 11, HELLO_DIGEST.into())
+            .expect("create");
+
+        store
+            .create(&root, "new.bin".into(), 11, HELLO_DIGEST.into())
+            .expect("second create");
+
+        assert_eq!(
+            store.offset(&id),
+            Some(0),
+            "create must not silently reclaim a stale session; only an explicit sweep call may"
+        );
     }
 
     /// The strongest test in this module: `create` opens the staging file
@@ -831,7 +923,16 @@ mod tests {
         // everything in the directory".
         std::fs::write(staging.join("keep.txt"), b"not a part file").expect("write keep");
 
-        assert_eq!(sweep_orphan_parts(&root), 2);
+        let mut removed = sweep_orphan_parts(&root);
+        removed.sort();
+        assert_eq!(
+            removed,
+            vec![
+                ("up-0000000000000000".to_string(), 8),
+                ("up-0000000000000001".to_string(), 9),
+            ],
+            "each orphan must be reported by its id (the filename stem) and the bytes it held, so a caller can audit it"
+        );
         assert!(!staging.join("up-0000000000000000.part").exists());
         assert!(!staging.join("up-0000000000000001.part").exists());
         assert!(
