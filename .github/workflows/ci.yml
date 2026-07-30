@@ -59,8 +59,13 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # `--all-targets` and `relay-client` for the same reason the test job
+      # carries the feature: without the former, test and example code is never
+      # linted at all; without the latter, the two relay end-to-end files are
+      # not even compiled here. A lint that skips the code most likely to be
+      # written in a hurry is not the lint anyone thinks it is.
       - name: Clippy
-        run: cargo clippy --all -- -D warnings
+        run: cargo clippy --all-targets --features relay-client -- -D warnings
 
   msrv:
     name: MSRV
