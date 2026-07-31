@@ -18,6 +18,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   tunnel or a relay did, and `-H 0.0.0.0` merely produced a warning when
   combined with one. A LAN is other people's machines.
 
+- **The startup banner names the one combination that is a hazard.** A token
+  holding `fs.read`/`fs.write` without `exec` — what `--preset file-read` and
+  `--preset file-write` grant — has no route to a file except the file API, so
+  `--fs-root` is the only thing that confines it. Run without one, the banner
+  now says so on its own line instead of leaving the operator to draw the
+  conclusion from three separately true lines. The test is the resolved
+  capability set, not the preset name, so `--capabilities fs.read` reaches it
+  too; a token holding `exec` never does, since there the file API grants
+  nothing `exec` did not already reach.
+
 ### Breaking
 
 - **`--preset read-only` is removed.** It granted only `session.read`, so it

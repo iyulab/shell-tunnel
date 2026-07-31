@@ -110,9 +110,8 @@ See [§5](#5-self-hosted-relay).
 
 Two things the table below doesn't cover:
 
-- a warning, not a refusal, is printed if rate limiting is disabled — every
-  other default in the table below is enforced, but turning off rate limiting
-  is a legitimate, deliberate choice, so it stays a warning
+- a warning, not a refusal, is printed if rate limiting is disabled — turning it
+  off is a legitimate, deliberate choice, so it stays a warning
 - only a *generated* key is echoed — a key you supplied is never written to stdout
 
 ### What reachability changes
@@ -127,8 +126,12 @@ posture — the bind address and the public path decide it.
 | Audit trail | off | **on**, at `shell-tunnel-audit.jsonl` in the working directory unless `--audit-log` says otherwise |
 | `--no-auth` | honoured | **refused** |
 
-Naming a scope explicitly (`--preset`, `--capabilities`) always wins over the
-default. `--preset full-control` keeps the wildcard on a reachable server.
+These rows are not all the same kind of rule. Authentication and the `--no-auth`
+refusal are *enforced*: nothing you pass turns them off on a reachable server.
+The audit trail is enforced only in that one exists — `--audit-log` moves it.
+The issued token's scope is a *default*: naming a scope explicitly (`--preset`,
+`--capabilities`) always wins over it, and `--preset full-control` keeps the
+wildcard on a reachable server.
 
 A non-loopback bind counts on its own: a LAN is other people's machines. Host
 checking (`--allow-host`) answers a different question — which names this server
@@ -713,8 +716,13 @@ still sees the real address.
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 
-Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
+Environment: `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
+
+`SHELL_TUNNEL_HOST` is read but has no effect: the bind address is taken from
+`-H` on every start, so whatever the environment (or a config file) says is
+overwritten by the command line, default included. Give the bind address with
+`-H`. The port has no such problem — `-p` overrides only when you pass it.
 
 ---
 
@@ -722,7 +730,7 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8080, "graceful_shutdown": true },
+  "server": { "port": 8080, "graceful_shutdown": true },
   "security": {
     "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 },
@@ -735,6 +743,11 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 
 `transport.mode` is `none`, `cloudflared`, or `command` (with `command` naming
 the client to run). CLI flags override the file, as with every setting.
+
+`server.host` is deliberately absent from the example: the bind address is taken
+from `-H` on every start, so a value here is overwritten by the CLI default and
+never takes effect. Pass `-H` instead. `server.port` is honoured — the CLI
+overrides it only when `-p` is given.
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json
@@ -754,6 +767,7 @@ startup rather than serving local-only.
 | `Tunnel closed: the public URL is no longer reachable` | tunnel client died; server exited with it | restart (a new URL is allocated) |
 | `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
+| `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |

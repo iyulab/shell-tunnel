@@ -82,6 +82,15 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 /// Vocabulary, not mechanism — additive by design (see the module header).
 /// See [`preset`] for why the presets below draw their boundary at `exec`
 /// rather than at `fs.*`.
+///
+/// The practical consequence — and what `src/fs/root.rs` points here for: a
+/// `--fs-root` jail confines something only for a token holding `fs.*`
+/// **without** `exec`, which is exactly what `file-read` and `file-write`
+/// grant. Against `operator` or `full-control` it is a convenience boundary —
+/// chunked, resumable, checksummed transfer instead of piping bytes through a
+/// command — and not a containment one, because `exec` already reaches every
+/// file this process can. Both halves matter: the second is why the file API
+/// needs no flag to exist, the first is why `--fs-root` still has a job.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",

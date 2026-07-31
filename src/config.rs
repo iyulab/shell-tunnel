@@ -110,7 +110,7 @@ pub struct AuthSection {
     pub api_keys: Vec<String>,
     /// Capability strings scoping the keys (empty = full-control).
     pub capabilities: Vec<String>,
-    /// Role preset scoping the keys (operator/file-read/file-write/full-control).
+    /// Role preset scoping the keys (operator/file-write/file-read/full-control).
     pub preset: Option<String>,
 }
 
@@ -534,7 +534,11 @@ impl std::fmt::Display for ConfigError {
             Self::InvalidPreset(name) if name == "read-only" => {
                 write!(
                     f,
-                    "the 'read-only' preset was removed: it granted only session.read, so it could not read a file despite its name. Use --preset file-read to read files, or --capabilities session.read for the old behaviour"
+                    // Names the config key as well as the flags: this error is
+                    // reached just as readily from `security.auth.preset` in a
+                    // config file, where an operator told to change a flag they
+                    // never passed has nowhere to look.
+                    "the 'read-only' preset was removed: it granted only session.read, so it could not read a file despite its name. Use file-read to read files, or capabilities session.read for the old behaviour — as --preset/--capabilities, or as security.auth.preset/security.auth.capabilities in a config file"
                 )
             }
             Self::InvalidPreset(name) => write!(
@@ -821,6 +825,12 @@ mod tests {
         assert!(
             message.contains("session.read"),
             "must offer the exact escape: {message}"
+        );
+        // `security.auth.preset` reaches this error too, and an operator who
+        // set it there never passed a flag to correct.
+        assert!(
+            message.contains("security.auth.preset"),
+            "must name the config key, not only the flags: {message}"
         );
     }
 
