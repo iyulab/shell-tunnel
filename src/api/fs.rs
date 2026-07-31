@@ -933,7 +933,12 @@ fn delete_file_blocking(
     // `root`-based one just ruled out — it does not rule out `..` either
     // (`join("..")` on Unix does not collapse, so `named` is literally
     // `parent/..` and does start with `parent`), so this guard stays
-    // load-bearing for `..` regardless.
+    // load-bearing for `..` regardless. Asymmetric on Windows, though: there
+    // `parent` is a verbatim `canonicalize()` result, and `join("..")` on
+    // *that* does collapse — `named` lands directly on the grandparent and
+    // no longer starts with `parent` — so this guard carries the weight on
+    // Unix, while on Windows the `starts_with(&parent)` postcondition below
+    // (built for the drive-letter-injection case) ends up refusing `..` too.
     if name == ".." {
         return fs_error_response(FsError::Escapes);
     }

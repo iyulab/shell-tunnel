@@ -20,10 +20,12 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   the counts and a `failures` list; a `dry_run` that could not enumerate everything
   answers `500 preview-incomplete` instead, since nothing was removed there and the counts
   are a lower bound rather than exact.
-- The audit trail records a directory removal as `fs.delete`, `fs.delete.dry_run`, or
-  `fs.delete.partial`, matching the convention the upload events already use — the split
-  is what makes a partial failure greppable on its own rather than folded into a generic
-  success kind.
+- The audit trail records a directory removal as `fs.delete`, `fs.delete.dry_run`,
+  `fs.delete.preview_incomplete`, or `fs.delete.partial`, matching the convention the
+  upload events already use — the split is what makes a partial failure greppable on its
+  own rather than folded into a generic success kind. `fs.delete.preview_incomplete` is a
+  `dry_run` that hit an enumeration failure: the disk is untouched, same as
+  `fs.delete.dry_run`, but the entry count is only a lower bound rather than exact.
 
   These guard against a caller's mistake, not against a caller. A token holding
   `fs.write` can already remove anything the server can reach.
