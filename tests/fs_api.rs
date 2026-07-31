@@ -443,6 +443,127 @@ async fn the_staging_directory_stays_reserved_without_a_jail() {
     );
 }
 
+/// Pagination still covers a directory exactly once when entry names are
+/// absolute paths.
+///
+/// The cursor encodes the last path returned, and `list` resumes after it.
+/// That string used to be short and root-relative; machine-wide it is an
+/// absolute path carrying a drive prefix, `:`, and separators — the same
+/// consumer-of-`relative()` shape that broke `is_reserved_path`. Nothing
+/// covered it, so this walks a directory two entries at a time and checks the
+/// union, which catches a cursor that skips entries, repeats a page, or never
+/// terminates.
+#[tokio::test]
+async fn paginating_a_machine_wide_directory_returns_every_entry_once() {
+    let (dir, state, base) = machine_wide_state();
+    let expected: Vec<String> = (0..7)
+        .map(|i| {
+            let name = format!("f{i}.txt");
+            std::fs::write(dir.path().join(&name), b"x").expect("write");
+            format!("{base}/{name}")
+        })
+        .collect();
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let uri = match &cursor {
+            Some(c) => format!("/api/v1/fs/list?path={base}&limit=2&cursor={c}"),
+            None => format!("/api/v1/fs/list?path={base}&limit=2"),
+        };
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(&uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let page = body_json(response).await;
+        for entry in page["entries"].as_array().expect("entries") {
+            seen.push(entry["path"].as_str().expect("path").to_string());
+        }
+        match page["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    let mut deduped = seen.clone();
+    deduped.sort();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        seen.len(),
+        "pagination repeated an entry: {seen:?}"
+    );
+    let mut want = expected;
+    want.sort();
+    assert_eq!(deduped, want, "pagination did not cover the directory once");
+}
+
+/// Two spellings of one absolute destination must not open two sessions.
+///
+/// The claim key is `relative()`'s output for the resolved destination, which
+/// is why aliasing is caught at all. The existing coverage
+/// (`two_sessions_for_aliased_spellings_of_one_destination_are_refused`) uses
+/// jailed spellings; the machine-wide alias set is a different one, and it
+/// runs through the same key.
+#[tokio::test]
+async fn two_sessions_for_aliased_absolute_spellings_are_refused() {
+    let (_dir, state, base) = machine_wide_state();
+    let digest = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    let open = |path: String| {
+        let state = state.clone();
+        async move {
+            create_router_with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/fs/uploads")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"path": path, "size": 11, "sha256": digest})
+                                .to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+        }
+    };
+
+    assert_eq!(open(format!("{base}/dup.bin")).await, StatusCode::CREATED);
+
+    // `.` is stripped while resolving, so this names the file already claimed.
+    assert_eq!(
+        open(format!("{base}/./dup.bin")).await,
+        StatusCode::CONFLICT,
+        "a `.` component must not open a second session for one destination"
+    );
+
+    // Windows accepts either separator for one file, and canonicalises the
+    // drive letter's case — both spellings have to land on the same key.
+    #[cfg(windows)]
+    {
+        assert_eq!(
+            open(base.replace('/', "\\") + "\\dup.bin").await,
+            StatusCode::CONFLICT,
+            "backslashes name the same file on this platform"
+        );
+        let lowercased = format!("{}{}", base[..1].to_lowercase(), &base[1..]);
+        assert_eq!(
+            open(format!("{lowercased}/dup.bin")).await,
+            StatusCode::CONFLICT,
+            "a lower-case drive letter names the same file"
+        );
+    }
+}
+
 #[tokio::test]
 async fn stat_forbids_a_token_lacking_fs_read() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
