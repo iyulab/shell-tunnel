@@ -215,6 +215,31 @@ impl UploadStore {
         }
     }
 
+    /// 살아있는 세션 중 스테이징 파일이 `dir` 아래에 있는 것이 하나라도 있는가.
+    ///
+    /// 트리 삭제가 진행 중인 업로드를 지우지 않기 위한 조회다. 근거는 **세션
+    /// 목록이지 디스크가 아니다**: 이전 실행이 남긴 고아 `.part`는 아무도
+    /// 소유하지 않으므로 "살아있음"이 아니고, 그것까지 살아있다고 답하면
+    /// 스윕이 아직 닿지 않은 트리가 무기한 삭제 불가가 된다.
+    ///
+    /// `sessions` 락만 잡는다. `claimed`을 함께 잡으면 이 타입의 락 불변식이
+    /// 깨진다 — 그 이유는 `UploadStore`의 doc comment에 있다.
+    pub fn has_live_part_under(&self, dir: &Path) -> bool {
+        let Ok(sessions) = self.sessions.read() else {
+            // 락이 오염됐다면 "없다"고 답할 근거가 없다. 삭제를 막는 쪽이
+            // 안전하다 — 이 조회의 유일한 소비자가 그렇게 쓴다.
+            return true;
+        };
+        // 캐노니칼화 시도, 실패하면 원본 사용 (존재하지 않는 경로인 경우)
+        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        sessions.values().any(|session| {
+            session
+                .lock()
+                .map(|s| s.part_path.starts_with(&canonical_dir))
+                .unwrap_or(true)
+        })
+    }
+
     /// Open a session for `dest_rel`, which need not exist yet.
     ///
     /// Does *not* sweep expired sessions itself, even opportunistically — an
@@ -768,6 +793,59 @@ mod tests {
 
     /// SHA-256 of b"hello world".
     const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    /// 트리 삭제가 진행 중인 업로드를 지우지 않으려면, 어떤 디렉터리 아래에
+    /// 살아있는 세션의 스테이징 파일이 있는지 물을 수 있어야 한다. 고아
+    /// `.part`는 "살아있음"이 아니다 — 그것까지 살아있다고 답하면 스윕이 늦은
+    /// 트리가 무기한 삭제 불가가 된다.
+    #[test]
+    fn a_live_session_is_visible_under_its_staging_directory() {
+        let (dir, root, store) = store();
+        let staging = staging_of(&root);
+
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "세션이 없으면 아무것도 살아있지 않다"
+        );
+
+        let id = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("create");
+
+        assert!(
+            store.has_live_part_under(dir.path()),
+            "루트 아래에서 보인다"
+        );
+        assert!(
+            store.has_live_part_under(&staging),
+            "스테이징 자신 아래에서도 보인다"
+        );
+        assert!(
+            !store.has_live_part_under(&dir.path().join("elsewhere")),
+            "관계없는 디렉터리 아래에서는 보이지 않는다"
+        );
+
+        store.cancel(&id);
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "취소된 세션은 살아있지 않다"
+        );
+    }
+
+    /// 세션이 없는 채 남은 `.part`(이전 실행의 고아)는 살아있지 않다.
+    #[test]
+    fn an_orphan_part_file_is_not_a_live_session() {
+        let (dir, root, _store) = store();
+        let staging = staging_of(&root);
+        std::fs::create_dir_all(&staging).expect("mkdir staging");
+        std::fs::write(staging.join("up-0000000000000000.part"), b"x").expect("write orphan");
+
+        let fresh = UploadStore::new(DEFAULT_CHUNK_SIZE);
+        assert!(
+            !fresh.has_live_part_under(dir.path()),
+            "디스크의 파일이 아니라 세션 목록이 근거다"
+        );
+    }
 
     #[test]
     fn a_session_starts_at_offset_zero() {
