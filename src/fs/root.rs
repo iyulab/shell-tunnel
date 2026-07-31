@@ -19,6 +19,18 @@ pub enum FsError {
     NotFound,
 }
 
+/// Drop Windows' verbatim prefix (`\\?\`) from an already-rendered path.
+///
+/// `canonicalize` returns verbatim paths, and every path this module hands
+/// outward came through it. The prefix is correct and is never what a caller
+/// sent, so leaving it in means one file has two names — one on the wire and
+/// one in the banner. One helper because there are two consumers already and a
+/// third would otherwise open-code it again: `relative` and `describe` each
+/// stripped it separately before this existed.
+fn strip_verbatim(rendered: &str) -> &str {
+    rendered.strip_prefix(r"\\?\").unwrap_or(rendered)
+}
+
 /// What the API is allowed to reach.
 ///
 /// Two shapes, one resolver. Every path still reaches the disk through the same
@@ -112,8 +124,7 @@ impl FsRoot {
     /// banner whose whole job is telling someone at a glance what the file API
     /// can reach.
     fn displayable(path: &Path) -> String {
-        let text = path.display().to_string();
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+        strip_verbatim(&path.display().to_string()).to_string()
     }
 
     /// Whether `resolved` sits inside the scope.
@@ -397,8 +408,7 @@ impl FsRoot {
                 // echoing back `//?/C:/x` would name the same file a second
                 // way. Stripped so one file has exactly one name on the wire.
                 let text = abs.to_string_lossy();
-                let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
-                return Some(text.replace('\\', "/"));
+                return Some(strip_verbatim(&text).replace('\\', "/"));
             }
         };
         let rest = abs.strip_prefix(root).ok()?;
