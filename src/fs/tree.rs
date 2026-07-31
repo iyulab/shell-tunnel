@@ -221,10 +221,11 @@ mod tests {
         assert!(outcome.truncated);
     }
 
-    /// 테스트에서 심볼릭 링크를 만든다. Windows 일부 계정/CI 러너에 없는 권한
-    /// (`SeCreateSymbolicLinkPrivilege`)을 관용한다. `tests/fs_api.rs`와
-    /// `src/fs/root.rs`의 test 모듈에 있는 같은 이름의 헬퍼를 그대로 본뜬 것
-    /// — 테스트 모듈 경계를 넘는 공유보다 이 리포의 기존 방식(중복)에 맞춘다.
+    /// 테스트에서 심볼릭 링크를 만든다. 실패는 `io::Result`로 그대로 넘길
+    /// 뿐 여기서 관용하지 않는다 — 어떻게 다룰지는 `require_symlink`가
+    /// 정한다. `tests/fs_api.rs`와 `src/fs/root.rs`의 test 모듈에 있는 같은
+    /// 이름의 헬퍼를 그대로 본뜬 것 — 테스트 모듈 경계를 넘는 공유보다 이
+    /// 리포의 기존 방식(중복)에 맞춘다.
     fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -315,28 +316,29 @@ mod tests {
         assert_eq!(out.failures, vec!["<unreadable entry>".to_string()]);
     }
 
-    /// 링크 생성 결과를 "계속" 또는 "중단"으로 바꾸되, **어느 쪽이든 보이게**
-    /// 한다. 표시 없는 early return은 "테스트가 돌아서 통과한 것"과 구별되지
-    /// 않는다 — 조용히 공허하게 통과하는 바로 그 모양이다.
+    /// 링크를 만들지 못했으면 **플랫폼 구분 없이** 실패한다. 스킵 경로는
+    /// 없다.
     ///
-    /// Unix에는 평범한 사용자의 심링크 생성을 막는 Windows의
-    /// `SeCreateSymbolicLinkPrivilege` 같은 관문이 없으므로, 거기서의 실패는
-    /// 권한 부재가 아니라 실제로 뭔가 깨졌다는 뜻에 가깝다 — 조용한 skip이
-    /// 아니라 하드 실패로 다루고, 진단 가능하도록 `io::Error`를 패닉 메시지에
-    /// 함께 싣는다. Windows는 비권한·비개발자모드 계정에 흔히 거부하므로 그
-    /// 플랫폼만 명시적으로 표시된 skip을 받는다.
-    fn require_symlink(created: std::io::Result<()>, test_name: &str) -> bool {
-        match created {
-            Ok(()) => true,
-            #[cfg(windows)]
-            Err(e) => {
-                eprintln!("SKIPPED {test_name}: symlink creation failed: {e}");
-                false
-            }
-            #[cfg(not(windows))]
-            Err(e) => {
-                panic!("{test_name}: symlink creation failed unexpectedly on a non-Windows platform: {e}");
-            }
+    /// 조용한 스킵은 `#[ignore]`보다 못하다. libtest는 통과한 테스트를 요약에
+    /// `ok`로 적으므로 스킵을 `eprintln!`으로 표시해도 그 줄이 통과와 구별되지
+    /// 않고, 게다가 통과한 테스트의 출력은 캡처해 버려 표시 자체가 보이지
+    /// 않는다. 이 리포의 CI는 `cargo test --all --features relay-client
+    /// --verbose`로 도는데 `--verbose`는 cargo의 빌드 로그 플래그일 뿐
+    /// libtest 캡처와 무관하다(`--show-output`이라야 나온다). 즉 스킵한
+    /// 러너와 실제로 검증한 러너가 CI 로그에서 똑같아 보인다. `#[ignore]`는
+    /// 적어도 요약에 카운트를 남긴다.
+    ///
+    /// 심링크를 만들 수 없는 환경이라면 해법은 그 권한을 부여하는 것이지
+    /// 테스트를 침묵시키는 것이 아니다(Windows: 개발자 모드 또는
+    /// `SeCreateSymbolicLinkPrivilege`). 심링크를 지원하지 않는 플랫폼
+    /// (`try_symlink`의 `#[cfg(not(any(unix, windows)))]` 갈래)도 마찬가지로
+    /// 조용히 넘어가지 않고 실패한다 — CI 매트릭스는 ubuntu/windows/macos뿐이라
+    /// 닿지 않지만, 닿는다면 그 사실을 알아야 한다.
+    ///
+    /// 원인을 추측하지 않도록 `io::Error`를 패닉 메시지에 싣는다.
+    fn require_symlink(created: std::io::Result<()>, test_name: &str) {
+        if let Err(e) = created {
+            panic!("{test_name}: 심링크 생성 실패: {e} — 권한 문제라면 권한을 부여할 것(Windows: 개발자 모드 또는 SeCreateSymbolicLinkPrivilege). 테스트를 침묵시키는 것은 해법이 아니다.");
         }
     }
 
@@ -347,14 +349,10 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside");
         let target_file = outside.path().join("keep.txt");
         std::fs::write(&target_file, b"keep").expect("write");
-        // 심링크 생성 권한이 없는 러너에서는 여기서 멈춘다 — skip은 표준
-        // 에러로 표시되므로 통과와 구별된다.
-        if !require_symlink(
+        require_symlink(
             try_symlink(&target_file, &dir.path().join("app/link")),
             "a_symlink_is_removed_without_touching_its_target",
-        ) {
-            return;
-        }
+        );
 
         let target = root.resolve_existing("app").expect("resolve");
         let outcome = remove_tree(&root, &target, false, 100);
@@ -379,14 +377,10 @@ mod tests {
         std::fs::create_dir(&keep_dir).expect("mkdir keep_dir");
         let precious = keep_dir.join("precious.txt");
         std::fs::write(&precious, b"precious").expect("write");
-        // 심링크 생성 권한이 없는 러너에서는 여기서 멈춘다 — skip은 표준
-        // 에러로 표시되므로 통과와 구별된다.
-        if !require_symlink(
+        require_symlink(
             try_symlink_dir(&keep_dir, &dir.path().join("app/dlink")),
             "a_directory_symlink_is_removed_without_descending_into_its_target",
-        ) {
-            return;
-        }
+        );
 
         let target = root.resolve_existing("app").expect("resolve");
 
