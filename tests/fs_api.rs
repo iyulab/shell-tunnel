@@ -1669,8 +1669,10 @@ async fn delete_refuses_a_directory() {
         .await
         .expect("response");
 
-    // Recursive directory removal is deliberately out of scope: it belongs
-    // with the destructive-operation guards, not with transfer.
+    // Removing a directory now requires `recursive=true` explicitly —
+    // `deleting_a_directory_without_recursive_is_refused` below checks the
+    // response body's error code; this one is kept for the plain
+    // no-query-params case.
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(dir.path().join("app/a.txt").exists());
 }
@@ -1945,6 +1947,214 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
         std::fs::symlink_metadata(&link).is_err(),
         "the directory symlink itself is what was named, and must be gone"
     );
+}
+
+/// Removing a directory needs `recursive` spelled out.
+///
+/// The threat model is an agent's mistake. This one line is the cheapest
+/// guard against it — a call meaning to delete one file cannot take a tree
+/// with it. 400, not 403: it's under-specified intent, not unauthorised.
+#[tokio::test]
+async fn deleting_a_directory_without_recursive_is_refused() {
+    let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "recursive-required");
+    assert!(
+        body["message"]
+            .as_str()
+            .expect("message")
+            .contains("recursive"),
+        "the message should name the flag: {body}"
+    );
+}
+
+/// A preview does not change the disk — checked against disk, not response.
+#[tokio::test]
+async fn a_dry_run_reports_the_tree_and_leaves_it_alone() {
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy"), ("app/deep/b.txt", b"xy")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 4);
+    assert_eq!(body["bytes"], 4);
+    assert_eq!(body["dry_run"], true);
+    assert!(dir.path().join("app/a.txt").exists(), "the preview deleted");
+    assert!(dir.path().join("app/deep/b.txt").exists());
+}
+
+#[tokio::test]
+async fn a_recursive_delete_removes_the_tree() {
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy"), ("app/deep/b.txt", b"xy")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 4);
+    assert_eq!(body["dry_run"], false);
+    assert!(!dir.path().join("app").exists());
+}
+
+/// A tree holding an upload in flight is refused whole — nothing removed.
+///
+/// The same shape as 0.12.0's data loss: an invariant depended on the
+/// staging location living somewhere else.
+#[tokio::test]
+async fn a_tree_holding_a_live_upload_is_refused_without_removing_anything() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
+    let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={base}/sub&recursive=true"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"], "staging-in-tree");
+    assert!(
+        dir.path().join("sub/keep.txt").exists(),
+        "a refusal must remove nothing"
+    );
+}
+
+/// Tree deletion works without `--fs-root` too.
+///
+/// `remove_tree` is a new consumer of `root.relative()`, and that string's
+/// shape depends on scope — two defects in this repo have come from exactly
+/// that spot.
+#[tokio::test]
+async fn a_recursive_delete_works_without_a_jail() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub/deep")).expect("mkdir");
+    std::fs::write(dir.path().join("sub/a.txt"), b"xy").expect("write");
+    std::fs::write(dir.path().join("sub/deep/b.txt"), b"xy").expect("write");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={base}/sub&recursive=true"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 4);
+    // Names must come back as absolute paths, not jail-relative ones.
+    let first = body["entries"][0].as_str().expect("entry");
+    assert!(
+        first.starts_with(&base),
+        "entries must be absolute paths: {first}"
+    );
+    assert!(!dir.path().join("sub").exists());
+}
+
+/// A partial removal must not be reported as success.
+///
+/// Induced by stripping write permission on the parent directory so its
+/// children cannot be removed. Windows would need an open-handle induction,
+/// which has been flaky elsewhere in this suite, so it is excluded here.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partial_removal_is_not_reported_as_success() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) = state_with_files(&[("app/locked/a.txt", b"xy"), ("app/free.txt", b"xy")]);
+    let locked = dir.path().join("app/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod locked");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Restore before asserting: a failed assertion here must not leave the
+    // temp-dir cleanup unable to remove the locked directory.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a 200 on a partial removal reads as success to a caller that does not read the body"
+    );
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "partial-delete");
+    assert!(
+        !body["failures"].as_array().expect("failures").is_empty(),
+        "it must say what is left: {body}"
+    );
+}
+
+/// Single-file deletion's existing behaviour is unchanged.
+#[tokio::test]
+async fn deleting_a_single_file_still_answers_204() {
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/a.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(!dir.path().join("app/a.txt").exists());
 }
 
 #[tokio::test]

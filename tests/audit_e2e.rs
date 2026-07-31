@@ -113,10 +113,10 @@ async fn an_execution_is_recorded_with_who_and_what() {
     // null": every fs-only field is an `Option`, and `serde_json` maps both
     // shapes to `None` on the way in. That makes this file, despite its
     // name, a strong *behaviour* test and a near-worthless *shape* test —
-    // dropping `skip_serializing_if` from `file`/`bytes`/`digest_ok`/
-    // `upload_id` would make every event in this file grow
-    // `"file":null,"bytes":null,"digest_ok":null,"upload_id":null` and all
-    // six tests here would still pass. Parsing the raw line as a bare
+    // dropping `skip_serializing_if` from `file`/`bytes`/`entries`/
+    // `digest_ok`/`upload_id` would make every event in this file grow
+    // `"file":null,"bytes":null,"entries":null,"digest_ok":null,"upload_id":null`
+    // and all six tests here would still pass. Parsing the raw line as a bare
     // `Value` instead — the same `contains_key` pattern `tests/fs_api.rs`
     // already uses to prove `upload.orphaned` omits `file` — is the only way
     // to prove these keys are genuinely missing from an execute event, not
@@ -124,7 +124,7 @@ async fn an_execution_is_recorded_with_who_and_what() {
     let raw_line = std::fs::read_to_string(&trail).unwrap();
     let raw: serde_json::Value = serde_json::from_str(raw_line.lines().next().unwrap()).unwrap();
     let object = raw.as_object().expect("object");
-    for key in ["file", "bytes", "digest_ok", "upload_id"] {
+    for key in ["file", "bytes", "entries", "digest_ok", "upload_id"] {
         assert!(
             !object.contains_key(key),
             "an execute event must not carry the fs-only `{key}` key at all"
