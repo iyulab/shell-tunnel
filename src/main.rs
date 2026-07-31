@@ -112,10 +112,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             std::process::exit(1);
         }
     };
-    // Attaching to a relay publishes this machine just as a tunnel does, so it
-    // goes through the same hardening rather than a parallel set of rules.
-    let public = provider.is_some() || args.relay_url.is_some();
-    let exposure = if public {
+    // The posture decides the security defaults. Attaching to a relay publishes
+    // this machine just as a tunnel does, so it goes through the same hardening
+    // rather than a parallel set of rules — and so does a non-loopback bind: a
+    // LAN is other people's machines too, and host checking (the DNS rebinding
+    // defence) is a different axis that does not fill this gap.
+    let posture = config.posture(provider.is_some(), args.relay_url.is_some());
+    let exposure = if posture == Posture::Exposed {
         match config.harden_for_public_exposure(&args) {
             Ok(exposure) => exposure,
             Err(e) => {
@@ -161,7 +164,11 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
 
     // Convert to server config
-    let allowed_hosts = config.allowed_hosts(&args, public);
+    // Unchanged in outcome by the posture switch above: `allowed_hosts` already
+    // declines to check the `Host` header on a non-loopback bind of its own
+    // accord, so the one quadrant where the posture is broader than the old
+    // `provider.is_some() || relay` test was returning `None` here anyway.
+    let allowed_hosts = config.allowed_hosts(&args, posture == Posture::Exposed);
     let server_config = match config.to_server_config() {
         Ok(mut c) => {
             if let Some(hosts) = allowed_hosts {
@@ -218,6 +225,12 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         shell_tunnel::FsRoot::machine_wide()
     };
 
+    // Derived once, here. The containment check below and the sink creation
+    // after it both read this value — the default path lives in the working
+    // directory too, so it can land inside `--fs-root`, and it has to face the
+    // same check when it does.
+    let audit_log = effective_audit_log(args.audit_log.as_deref(), posture);
+
     // The audit log must not sit inside the fs jail: from that moment an
     // fs.write token could DELETE or overwrite-by-upload the trail recording
     // its own actions. `.shell-tunnel-uploads` has a reserved-path refusal
@@ -236,17 +249,27 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // trail is reachable by the file API wherever it sits — as it already is
     // by `exec`, which every preset carrying `fs.*` also carries. The banner
     // says so rather than pretending otherwise.
-    if let (Some(audit_log), Some(jail)) = (args.audit_log.as_ref(), fs_root.jail_path()) {
-        match audit_log_is_inside_fs_root(audit_log, jail) {
+    if let (Some(path), Some(jail)) = (audit_log.as_ref(), fs_root.jail_path()) {
+        match audit_log_is_inside_fs_root(path, jail) {
+            // Two refusals, because there are two different mistakes to
+            // correct. Telling someone their chosen path is wrong when they
+            // never chose one sends them looking for a flag they did not pass.
             Ok(true) => {
-                eprintln!(
-                    "--audit-log {} cannot be used: it resolves inside --fs-root {}",
-                    audit_log.display(),
-                    jail.display()
-                );
-                eprintln!(
-                    "An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root."
-                );
+                if args.audit_log.is_some() {
+                    eprintln!(
+                        "--audit-log {} cannot be used: it resolves inside --fs-root {}",
+                        path.display(),
+                        jail.display()
+                    );
+                    eprintln!("An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root.");
+                } else {
+                    eprintln!(
+                        "A publicly reachable server writes an audit trail, and its default location ({}) resolves inside --fs-root {}",
+                        DEFAULT_AUDIT_LOG,
+                        jail.display()
+                    );
+                    eprintln!("An fs.write token could delete or overwrite the trail recording its own actions. Pass --audit-log with a path outside the fs root.");
+                }
                 std::process::exit(2);
             }
             Ok(false) => {}
@@ -259,7 +282,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             Err(e) => {
                 eprintln!(
                     "--audit-log {} cannot be checked against --fs-root {}: {e}",
-                    audit_log.display(),
+                    path.display(),
                     jail.display()
                 );
                 std::process::exit(2);
@@ -271,7 +294,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // so a path that cannot be written still stops startup here rather than
     // leaving an operator believing there is a trail, and a path inside the
     // fs jail never gets this far at all.
-    let audit = match &args.audit_log {
+    let audit = match &audit_log {
         Some(path) => {
             match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_max_bytes) {
                 Ok(sink) => std::sync::Arc::new(sink),
@@ -284,17 +307,17 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         None => std::sync::Arc::new(shell_tunnel::audit::AuditSink::Disabled),
     };
     if audit.is_enabled() {
-        info!(
-            "audit trail: {}",
-            args.audit_log.as_ref().unwrap().display()
-        );
+        info!("audit trail: {}", audit_log.as_ref().unwrap().display());
     }
     // The banner is the whole mitigation for a file API that no longer needs a
     // flag to exist: an operator who never passes `--fs-root` still has to be
     // told, in one unmissable line, what the API can reach. Printed before the
     // server starts so it is not buried under request logging.
+    for line in posture_banner(posture, audit_log.as_deref()) {
+        println!("{line}");
+    }
     println!("File API:    {}", fs_root.describe());
-    if fs_root.jail_path().is_none() && args.audit_log.is_some() {
+    if fs_root.jail_path().is_none() && audit_log.is_some() {
         println!("             the audit log is within this scope — as it already is for `exec`");
     }
 
@@ -374,6 +397,18 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
 
     let Some(provider) = provider else {
+        // A non-loopback bind reaches here with neither tunnel nor relay to
+        // print for it, and it is now hardened like both — so the generated
+        // key has to be reported here as well. It is the operator's only copy;
+        // without this the server starts authenticated against a secret nobody
+        // can read. Locally `PublicExposure::default()` is empty and this stays
+        // silent, so the zero-friction local path is untouched.
+        for warning in &exposure.warnings {
+            warn!("{}", warning);
+        }
+        if let Some(key) = &exposure.generated_key {
+            println!("API key:     {key}   (generated)");
+        }
         return shell_tunnel::api::serve_with_state(server_config, state).await;
     };
 

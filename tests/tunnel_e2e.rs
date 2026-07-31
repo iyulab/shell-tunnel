@@ -74,7 +74,16 @@ fn wait_for_line(
 
 #[test]
 fn tunnel_publishes_a_banner_with_a_generated_key() {
+    // Every tunnelled run is an exposed one, and an exposed run writes an audit
+    // trail whose default path is relative to the working directory. Inheriting
+    // the crate root would drop that file into the repository, and — because
+    // cargo runs the tests in a file concurrently — have all of them appending
+    // to the same one. The tempdir is declared before the `Killed` guard so it
+    // is dropped last: on Windows a directory cannot be removed while the
+    // process still holds a file open inside it.
+    let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
+        .current_dir(dir.path())
         .args([
             "--port",
             "39871",
@@ -97,7 +106,10 @@ fn tunnel_publishes_a_banner_with_a_generated_key() {
 
 #[test]
 fn tunnel_generates_and_reports_an_api_key() {
+    // Working directory as above: an exposed run writes its audit trail here.
+    let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
+        .current_dir(dir.path())
         .args([
             "--port",
             "39872",
@@ -148,7 +160,11 @@ fn a_tunnel_command_that_never_publishes_fails_the_startup() {
     #[cfg(unix)]
     let silent = "sleep 5";
 
+    // The tunnel fails long after the audit sink is opened, so this run creates
+    // the trail too — same working-directory reasoning as the tests above.
+    let dir = tempfile::tempdir().expect("tempdir");
     let output = Command::new(BIN)
+        .current_dir(dir.path())
         .args([
             "--port",
             "39874",

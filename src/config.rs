@@ -534,7 +534,7 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::RemoteWithoutAuth => write!(
                 f,
-                "--no-auth cannot be combined with a public tunnel: that would expose an unauthenticated shell to the internet. Drop --no-auth (a key is generated for you), or drop the tunnel"
+                "--no-auth cannot be combined with a publicly reachable server: that would expose an unauthenticated shell. It is refused for a tunnel, a relay, and a non-loopback bind alike. Drop --no-auth (a key is generated for you), or bind loopback and drop the public path"
             ),
         }
     }

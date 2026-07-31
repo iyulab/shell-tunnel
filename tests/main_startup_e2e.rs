@@ -31,8 +31,18 @@ const BIN: &str = env!("CARGO_BIN_EXE_shell-tunnel");
 /// refusals here are specified to exit 2, and "some non-zero code" would not
 /// distinguish them from a panic or a different refusal entirely.
 fn run_with_timeout(args: &[&str], timeout: Duration) -> (Option<i32>, String, String) {
-    let mut child = Command::new(BIN)
-        .args(args)
+    let mut command = Command::new(BIN);
+    command.args(args);
+    run_command_with_timeout(command, timeout)
+}
+
+/// As `run_with_timeout`, for a command that needs more than arguments set on
+/// it — a working directory, in the one case that has one.
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> (Option<i32>, String, String) {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -113,5 +123,54 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
     assert!(
         !audit_log.exists(),
         "a refused startup must not have created the audit log file"
+    );
+}
+
+/// A bare non-loopback bind is exposed on its own, and an exposed run derives
+/// an audit log it was never asked for — so the derived path faces the same
+/// containment check as a chosen one, and refuses startup when it lands inside
+/// the jail.
+///
+/// This is the only test that proves the derivation is *wired*. `src/main.rs`'s
+/// `effective_audit_log` and `posture_banner` are unit-tested as pure
+/// functions, but re-pointing `async_main` back at the raw `--audit-log` value
+/// would leave every one of those unit tests green — the same gap this file
+/// exists to close for `audit_log_is_inside_fs_root`. It pins three facts at
+/// once: the posture is computed from the bind address alone (no tunnel, no
+/// relay, no `--audit-log` here), the derived path is what the containment
+/// check sees, and its refusal is reachable.
+#[test]
+fn an_exposed_bind_deriving_an_audit_log_inside_the_fs_root_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("mkdir root");
+
+    // The working directory is the root itself, which is what puts the derived
+    // default path (a bare file name) inside the jail.
+    let mut child = Command::new(BIN);
+    child.current_dir(&root).args([
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "39881",
+        "--fs-root",
+        root.to_str().expect("utf-8 path"),
+    ]);
+    let (code, _stdout, stderr) = run_command_with_timeout(child, Duration::from_secs(10));
+
+    assert_eq!(code, Some(2), "expected exit 2; stderr: {stderr}");
+    // Matched on text unique to the derived branch: the chosen-path refusal
+    // above also exits 2 and also names `--fs-root`, so asserting less would
+    // pass just as happily if the derived path were reported as one the user
+    // had picked — the mistake that branch exists to avoid.
+    assert!(
+        stderr.contains("A publicly reachable server writes an audit trail"),
+        "the refusal must be the derived-path branch, not the chosen-path one: {stderr}"
+    );
+
+    // Nothing was created inside the jail on the way to refusing.
+    assert!(
+        !root.join("shell-tunnel-audit.jsonl").exists(),
+        "a refused startup must not have created the audit log it refused"
     );
 }
