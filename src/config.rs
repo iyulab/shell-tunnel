@@ -333,11 +333,12 @@ impl Config {
     /// authentication is switched on, and a key is generated when none was
     /// supplied (the caller reports it — an unusable server would be worse).
     /// `--no-auth` is refused outright instead of being silently overridden.
+    /// An unscoped token is likewise defaulted rather than warned about: it is
+    /// scoped to the `operator` preset unless the consumer already chose a
+    /// scope.
     ///
-    /// The remaining risks are real but legitimate choices, so they are warned
-    /// about rather than blocked: a full-control token on a public URL, rate
-    /// limiting turned off, and binding a non-loopback address in addition to
-    /// the tunnel.
+    /// The remaining risk is a real but legitimate choice, so it is warned
+    /// about rather than blocked: rate limiting turned off.
     pub fn harden_for_public_exposure(
         &mut self,
         args: &Args,
@@ -356,23 +357,27 @@ impl Config {
             None
         };
 
-        let mut warnings = Vec::new();
+        // A default, not a warning. Warning about it is an admission that the
+        // default is wrong for the situation, and here the default can follow
+        // the situation instead.
+        //
+        // The actual reach is the same as `full-control` — `operator` already
+        // has `exec`, and `exec` reaches every file this process can reach.
+        // Only one thing changes: it does not automatically pick up
+        // capabilities added later. That is the wildcard's real danger.
+        //
+        // An explicit scope is left untouched. If the consumer chose it, that
+        // is the answer.
         if self.security.auth.preset.is_none() && self.security.auth.capabilities.is_empty() {
-            warnings.push(
-                "the issued token has full control over this machine and is reachable from the internet; scope it with --preset operator or --capabilities"
-                    .to_string(),
-            );
+            self.security.auth.preset = Some("operator".to_string());
         }
+
+        let mut warnings = Vec::new();
+        // The one warning left. This is a defense the consumer explicitly
+        // turned off, so a default cannot decide it on their behalf, and a
+        // warning is right.
         if !self.security.rate_limit.enabled {
             warnings.push("rate limiting is disabled on a publicly reachable server".to_string());
-        }
-        if let Ok(ip) = self.server.host.parse::<IpAddr>() {
-            if !ip.is_loopback() {
-                warnings.push(format!(
-                    "binding {} exposes the server directly in addition to the tunnel; 127.0.0.1 is enough when a tunnel provides reachability",
-                    ip
-                ));
-            }
         }
 
         Ok(PublicExposure {
@@ -879,11 +884,11 @@ mod tests {
     }
 
     #[test]
-    fn test_public_exposure_warns_about_an_unscoped_token() {
+    fn test_public_exposure_no_longer_warns_about_an_unscoped_token_because_it_scopes_it() {
         let mut config = Config::default();
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
         assert!(
-            exposure.warnings.iter().any(|w| w.contains("full control")),
+            !exposure.warnings.iter().any(|w| w.contains("full control")),
             "{:?}",
             exposure.warnings
         );
@@ -902,10 +907,9 @@ mod tests {
     }
 
     #[test]
-    fn test_public_exposure_warns_about_disabled_rate_limit_and_public_bind() {
+    fn test_public_exposure_warns_about_disabled_rate_limit() {
         let mut config = Config::default();
         config.security.rate_limit.enabled = false;
-        config.server.host = "0.0.0.0".to_string();
 
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
 
@@ -913,7 +917,6 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("rate limiting")));
-        assert!(exposure.warnings.iter().any(|w| w.contains("0.0.0.0")));
     }
 
     #[test]
@@ -922,6 +925,91 @@ mod tests {
         config.security.auth.preset = Some("operator".to_string());
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
         assert!(exposure.warnings.is_empty(), "{:?}", exposure.warnings);
+    }
+
+    #[test]
+    fn exposure_scopes_the_issued_token_instead_of_warning_about_it() {
+        let mut config = Config::default();
+        assert!(config.security.auth.preset.is_none());
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        // The default handles the situation, so there is nothing left to warn about.
+        assert_eq!(config.security.auth.preset.as_deref(), Some("operator"));
+        assert!(
+            !exposure.warnings.iter().any(|w| w.contains("full control")),
+            "the warning must be gone, not merely reworded: {:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn the_exposed_token_is_not_a_wildcard() {
+        // The actual reach is unchanged. What changes is one thing: it does not
+        // automatically pick up capabilities added later. That is the wildcard's
+        // real danger.
+        let mut config = Config::default();
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        let set = resolve_capabilities(
+            config.security.auth.preset.as_deref(),
+            &config.security.auth.capabilities,
+        )
+        .unwrap()
+        .expect("an exposed token must have an explicit set");
+        assert!(!set.is_wildcard());
+        assert!(set.satisfies("exec"));
+        assert!(set.satisfies("fs.write"));
+    }
+
+    #[test]
+    fn an_explicit_scope_is_left_alone() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("file-read".to_string());
+
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert_eq!(config.security.auth.preset.as_deref(), Some("file-read"));
+    }
+
+    #[test]
+    fn explicit_capabilities_are_left_alone_too() {
+        let mut config = Config::default();
+        config.security.auth.capabilities = vec!["exec".to_string()];
+
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(config.security.auth.preset.is_none());
+        assert_eq!(config.security.auth.capabilities, vec!["exec".to_string()]);
+    }
+
+    #[test]
+    fn a_non_loopback_bind_no_longer_warns_because_it_now_decides_the_posture() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(
+            !exposure.warnings.iter().any(|w| w.contains("binding")),
+            "posture covers this now: {:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn a_disabled_rate_limit_still_warns() {
+        // This is a risk the consumer explicitly chose, so a warning is right —
+        // it is not the kind of thing a default can decide on their behalf.
+        let mut config = Config::default();
+        config.security.rate_limit.enabled = false;
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(exposure
+            .warnings
+            .iter()
+            .any(|w| w.contains("rate limiting")));
     }
 
     #[test]
