@@ -9,12 +9,14 @@ pub mod platform;
 pub mod root;
 pub mod sha256;
 pub mod transfer;
+pub mod tree;
 
 pub use root::{FsError, FsRoot};
 pub use transfer::{
     sweep_orphan_parts, sweep_orphan_parts_in, FinishedUpload, UploadError, UploadStore,
     DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, SESSION_TTL,
 };
+pub use tree::{remove_tree, TreeOutcome};
 
 /// Directory under the root where in-flight uploads are staged.
 ///
