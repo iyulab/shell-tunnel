@@ -202,6 +202,31 @@ mod tests {
         }
     }
 
+    /// 링크 생성 결과를 "계속" 또는 "중단"으로 바꾸되, **어느 쪽이든 보이게**
+    /// 한다. 표시 없는 early return은 "테스트가 돌아서 통과한 것"과 구별되지
+    /// 않는다 — 조용히 공허하게 통과하는 바로 그 모양이다.
+    ///
+    /// Unix에는 평범한 사용자의 심링크 생성을 막는 Windows의
+    /// `SeCreateSymbolicLinkPrivilege` 같은 관문이 없으므로, 거기서의 실패는
+    /// 권한 부재가 아니라 실제로 뭔가 깨졌다는 뜻에 가깝다 — 조용한 skip이
+    /// 아니라 하드 실패로 다루고, 진단 가능하도록 `io::Error`를 패닉 메시지에
+    /// 함께 싣는다. Windows는 비권한·비개발자모드 계정에 흔히 거부하므로 그
+    /// 플랫폼만 명시적으로 표시된 skip을 받는다.
+    fn require_symlink(created: std::io::Result<()>, test_name: &str) -> bool {
+        match created {
+            Ok(()) => true,
+            #[cfg(windows)]
+            Err(e) => {
+                eprintln!("SKIPPED {test_name}: symlink creation failed: {e}");
+                false
+            }
+            #[cfg(not(windows))]
+            Err(e) => {
+                panic!("{test_name}: symlink creation failed unexpectedly on a non-Windows platform: {e}");
+            }
+        }
+    }
+
     /// 링크를 따라가면 트리 밖을 지운다.
     #[test]
     fn a_symlink_is_removed_without_touching_its_target() {
@@ -209,8 +234,13 @@ mod tests {
         let outside = tempfile::tempdir().expect("outside");
         let target_file = outside.path().join("keep.txt");
         std::fs::write(&target_file, b"keep").expect("write");
-        if try_symlink(&target_file, &dir.path().join("app/link")).is_err() {
-            return; // symlink privilege unavailable on this runner; skip
+        // 심링크 생성 권한이 없는 러너에서는 여기서 멈춘다 — skip은 표준
+        // 에러로 표시되므로 통과와 구별된다.
+        if !require_symlink(
+            try_symlink(&target_file, &dir.path().join("app/link")),
+            "a_symlink_is_removed_without_touching_its_target",
+        ) {
+            return;
         }
 
         let target = root.resolve_existing("app").expect("resolve");
@@ -236,8 +266,13 @@ mod tests {
         std::fs::create_dir(&keep_dir).expect("mkdir keep_dir");
         let precious = keep_dir.join("precious.txt");
         std::fs::write(&precious, b"precious").expect("write");
-        if try_symlink_dir(&keep_dir, &dir.path().join("app/dlink")).is_err() {
-            return; // symlink privilege unavailable on this runner; skip
+        // 심링크 생성 권한이 없는 러너에서는 여기서 멈춘다 — skip은 표준
+        // 에러로 표시되므로 통과와 구별된다.
+        if !require_symlink(
+            try_symlink_dir(&keep_dir, &dir.path().join("app/dlink")),
+            "a_directory_symlink_is_removed_without_descending_into_its_target",
+        ) {
+            return;
         }
 
         let target = root.resolve_existing("app").expect("resolve");
