@@ -159,15 +159,59 @@ mod tests {
         assert!(outcome.truncated);
     }
 
+    /// 테스트에서 심볼릭 링크를 만든다. Windows 일부 계정/CI 러너에 없는 권한
+    /// (`SeCreateSymbolicLinkPrivilege`)을 관용한다. `tests/fs_api.rs`와
+    /// `src/fs/root.rs`의 test 모듈에 있는 같은 이름의 헬퍼를 그대로 본뜬 것
+    /// — 테스트 모듈 경계를 넘는 공유보다 이 리포의 기존 방식(중복)에 맞춘다.
+    fn try_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::other(
+                "symlinks unsupported on this platform",
+            ))
+        }
+    }
+
+    /// `try_symlink`와 같되 대상이 디렉터리일 때. Windows는 파일 심링크와
+    /// 디렉터리 심링크를 생성 시점에 구분한다(`symlink_file` vs
+    /// `symlink_dir`); Unix는 구분하지 않는다.
+    fn try_symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::other(
+                "symlinks unsupported on this platform",
+            ))
+        }
+    }
+
     /// 링크를 따라가면 트리 밖을 지운다.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_is_removed_without_touching_its_target() {
         let (dir, root) = tree(&["app/a.txt"]);
         let outside = tempfile::tempdir().expect("outside");
         let target_file = outside.path().join("keep.txt");
         std::fs::write(&target_file, b"keep").expect("write");
-        std::os::unix::fs::symlink(&target_file, dir.path().join("app/link")).expect("symlink");
+        if try_symlink(&target_file, &dir.path().join("app/link")).is_err() {
+            return; // symlink privilege unavailable on this runner; skip
+        }
 
         let target = root.resolve_existing("app").expect("resolve");
         let outcome = remove_tree(&root, &target, false, 100);
@@ -182,8 +226,8 @@ mod tests {
     /// `metadata`로 바꿔 링크를 따라가게 만들어도 `is_dir()`은 여전히
     /// false이고 결과는 똑같이 통과한다. 위험은 **디렉터리** 심링크다 — 따라
     /// 들어가면 `is_dir()`이 참이 되어 `read_dir`이 대상 디렉터리 안으로
-    /// 내려가 그 내용물을 지운다.
-    #[cfg(unix)]
+    /// 내려가 그 내용물을 지운다. Windows도 예외가 아니다: 디렉터리 reparse
+    /// point도 `metadata`로 보면 디렉터리로 보이므로 같은 메커니즘이 재현된다.
     #[test]
     fn a_directory_symlink_is_removed_without_descending_into_its_target() {
         let (dir, root) = tree(&["app/a.txt"]);
@@ -192,7 +236,9 @@ mod tests {
         std::fs::create_dir(&keep_dir).expect("mkdir keep_dir");
         let precious = keep_dir.join("precious.txt");
         std::fs::write(&precious, b"precious").expect("write");
-        std::os::unix::fs::symlink(&keep_dir, dir.path().join("app/dlink")).expect("symlink");
+        if try_symlink_dir(&keep_dir, &dir.path().join("app/dlink")).is_err() {
+            return; // symlink privilege unavailable on this runner; skip
+        }
 
         let target = root.resolve_existing("app").expect("resolve");
 
