@@ -28,7 +28,7 @@ pub struct Args {
     pub require_auth: bool,
     /// Capability strings scoping the issued token(s) (empty = full-control).
     pub capabilities: Vec<String>,
-    /// Role preset scoping the issued token(s) (operator/read-only/full-control).
+    /// Role preset scoping the issued token(s) (operator/file-write/file-read/full-control).
     pub preset: Option<String>,
     /// Disable rate limiting.
     pub no_rate_limit: bool,
@@ -349,7 +349,7 @@ OPTIONS:
         --capabilities <C>  Scope issued token(s): comma-separated capabilities
                             (e.g. exec,session.read). Default: full-control
         --preset <NAME>     Scope issued token(s) by role preset
-                            (operator | read-only | full-control)
+                            (operator | file-write | file-read | full-control)
         --no-rate-limit     Disable rate limiting
         --tunnel            Expose publicly via a Cloudflare quick tunnel
                             (requires `cloudflared`; implies authentication)
@@ -436,8 +436,8 @@ EXAMPLES:
     # Behind a proxy that forwards 443 here, name the port devices dial
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com:443
 
-    # Issue a fine-grained, read-only token
-    shell-tunnel -k readonly-key --preset read-only
+    # Issue a token that can only read files, confined to one directory
+    shell-tunnel -k readonly-key --preset file-read --fs-root /srv/deploy
 
     # Issue a token scoped to specific capabilities
     shell-tunnel -k ci-key --capabilities exec,session.read

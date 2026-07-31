@@ -143,10 +143,11 @@ states the effective scope either way.
 ## A word on exposure
 
 Publishing a shell means anyone holding the token can run commands as the user running
-shell-tunnel. So a public path (`--tunnel` or `--relay`) turns authentication on, generates a
-key if you gave none, and refuses `--no-auth`. Scope the token with `--preset operator` rather
-than leaving it full-control, keep rate limiting on, and treat the URL and token as
-credentials. TLS is not optional over the internet — `--tls-self-signed` on the relay is one
+shell-tunnel. So a public path (`--tunnel` or `--relay`), or simply binding to a
+non-loopback address, turns authentication on, generates a key if you gave none, and
+refuses `--no-auth`. Scope the token with `--preset operator` rather than leaving it
+full-control, keep rate limiting on, and treat the URL and token as credentials.
+TLS is not optional over the internet — `--tls-self-signed` on the relay is one
 flag, and the fingerprint it prints keeps the connection authenticated, not just encrypted.
 
 ## Documentation

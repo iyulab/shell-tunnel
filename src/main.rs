@@ -215,14 +215,14 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             }
         }
     } else {
-        // No flag means the whole machine, not "off". A token that can reach
-        // the file API at all holds `fs.read`/`fs.write`, and every preset that
-        // carries those also carries `exec`, which can already read and write
-        // anything this process can — so confining the file API to one subtree
-        // by default withheld no access, it only forced callers onto the slow
-        // path for every destination outside it. `--fs-root` still narrows,
-        // for the one case where narrowing bites: a token granted `fs.*`
-        // *without* `exec`.
+        // No flag means the whole machine, not "off". A token holding `exec`
+        // already reads and writes anything this process can, so confining
+        // the file API by default withholds nothing from `operator` or
+        // `full-control` — it only forces callers onto the slow path for
+        // every destination outside the jail. `file-read` and `file-write`
+        // hold `fs.*` without `exec`, so that reasoning does not cover them:
+        // for those two presets `--fs-root` is the only confinement there
+        // is, and it has to be asked for explicitly (see docs/USAGE.md).
         shell_tunnel::FsRoot::machine_wide()
     };
 
