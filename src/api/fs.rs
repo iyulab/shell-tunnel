@@ -911,11 +911,13 @@ fn delete_file_blocking(
     // with a lexical `PathBuf::join`, which never resolves `..`, so joining
     // `..` onto an in-root `parent` produces a path whose *actual* location —
     // once something reads it — is one level above `parent`, without ever
-    // having gone through the jail. Today the directory refusal further down
-    // happens to catch this anyway, since `X/..` always names a directory;
-    // that is an accident of recursive removal not being supported yet, not
-    // a reason, so it is checked here explicitly instead: `..` is refused as
-    // a delete target outright, before it is ever joined.
+    // having gone through the jail. `X/..` always names a directory, but that
+    // no longer refuses it by itself: `path=app/..&recursive=true` reaches the
+    // directory branch below with `recursive` set, so without this guard it
+    // would walk and remove a real directory one level above `parent` —
+    // outside the root — through `remove_tree`. This check is what stops
+    // that, checked here explicitly before `..` is ever joined, load-bearing
+    // on its own regardless of `recursive`.
     //
     // A containment check on the joined path instead of this would not work:
     // `Path::starts_with` is a pure component-prefix comparison that does not
@@ -1043,9 +1045,16 @@ fn delete_file_blocking(
         // said, instead of a new field: this repo already distinguishes
         // outcomes this way for uploads (`upload.complete`/`upload.failed`/…),
         // and a distinct kind is what lets an operator grep the trail for
-        // partial failures specifically.
-        let kind = if query.dry_run {
+        // partial failures specifically. Four kinds, not three: `dry_run`
+        // alone collapses "a clean preview" and "a preview that could not
+        // enumerate everything" into one kind whose `entries` looks exact
+        // either way — the same signal mismatch the HTTP body's `error`
+        // already splits into `preview-incomplete` below, applied to the
+        // trail too.
+        let kind = if query.dry_run && outcome.failures.is_empty() {
             "fs.delete.dry_run"
+        } else if query.dry_run {
+            "fs.delete.preview_incomplete"
         } else if outcome.failures.is_empty() {
             "fs.delete"
         } else {
@@ -1087,6 +1096,9 @@ fn delete_file_blocking(
             return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
         }
         body["error"] = serde_json::json!("partial-delete");
+        body["message"] = serde_json::json!(
+            "some entries survived; removed/bytes counts what was visited and attempted, not what actually disappeared -- see failures for what did not go"
+        );
         return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
     }
 

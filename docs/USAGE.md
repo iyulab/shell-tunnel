@@ -433,8 +433,9 @@ capability token is the access control — withhold `exec` to deny execution.
 | `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot) |
 | `denied` | a request was refused | `status`, `reason` |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
-| `fs.delete.dry_run` | a preview — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
-| `fs.delete.partial` | a directory removal where some entries survived | `file`, `bytes`, `entries` (a count — a lower bound here) |
+| `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
+| `fs.delete.preview_incomplete` | a preview that hit an enumeration failure — nothing changed on disk | `file`, `bytes`, `entries` (a count — a lower bound here: an entry that could not be enumerated was never counted) |
+| `fs.delete.partial` | a directory removal where some entries survived | `file`, `bytes`, `entries` (a count — not a lower bound: an entry whose removal itself failed is still counted, so this is what was attempted, not what actually disappeared) |
 | `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
 | `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
 | `upload.rejected` | the digest did not match at `complete` | `file`, `digest_ok: false`, `upload_id` |
@@ -443,11 +444,16 @@ capability token is the access control — withhold `exec` to deny execution.
 | `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
 
-The three `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
+The four `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
 on one shared kind — the same convention the `upload.*` kinds already use. It is what
 makes the trail greppable for the one case worth finding on its own: matching `kind`
 exactly against `fs.delete` (`jq 'select(.kind == "fs.delete")'`, say) silently misses
-every `fs.delete.partial`, which is precisely the removal that did not fully succeed.
+every `fs.delete.partial`, which is precisely the removal that did not fully succeed. The
+split between `fs.delete.dry_run` and `fs.delete.preview_incomplete` exists for the same
+reason: a preview that could not enumerate everything reports the same HTTP `error` and
+status as a real partial removal, and needs its own kind so it isn't mistaken for one —
+nothing was removed either way, but a plain `fs.delete.dry_run` promises an exact count
+that an incomplete one cannot back up.
 
 ---
 

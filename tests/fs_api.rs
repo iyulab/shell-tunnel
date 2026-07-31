@@ -1699,11 +1699,14 @@ async fn delete_refuses_a_path_outside_the_root() {
 /// A request whose final component is `..` passes the full-path resolution
 /// (`resolve_existing("app/..")` walks straight back to a real directory —
 /// the root itself here — not out of the root), so nothing upstream refuses
-/// it. Without an explicit check, the only thing standing between this and
-/// deleting the root is that `X/..` always names a directory — an accident
-/// that disappears the day recursive directory removal ships. See the
-/// comment in `delete_file_blocking` for why a containment check on the
-/// joined path cannot substitute for refusing `..` outright.
+/// it. Without an explicit check, `X/..` always naming a directory used to be
+/// enough on its own: every directory was refused regardless. Recursive
+/// removal changed that — `path=app/..&recursive=true` now reaches the
+/// directory branch instead of stopping there, so without this guard it
+/// would walk and remove whatever real directory sits one level above
+/// `parent`, outside the root, through `remove_tree`. See the comment in
+/// `delete_file_blocking` for why a containment check on the joined path
+/// cannot substitute for refusing `..` outright.
 #[tokio::test]
 async fn delete_refuses_a_path_ending_in_dot_dot() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
@@ -1723,6 +1726,35 @@ async fn delete_refuses_a_path_ending_in_dot_dot() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let json = body_json(response).await;
     assert_eq!(json["error"], "path-escapes-root");
+}
+
+/// The same request as above, but spelling `recursive=true` too -- this is
+/// the exact case the updated comment above describes: the one where the
+/// old "every directory is refused" safety net no longer applies, so the
+/// explicit `..` guard is what carries all the weight.
+#[tokio::test]
+async fn delete_refuses_a_path_ending_in_dot_dot_even_with_recursive() {
+    let (dir, state) = state_with_files(&[("app/a.txt", b"a")]);
+    let app = create_router_with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/..&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = body_json(response).await;
+    assert_eq!(json["error"], "path-escapes-root");
+    // Nothing above the root was touched -- the fixture directory itself
+    // (which sits one level above `app`, exactly the location the guard
+    // protects) must still be intact.
+    assert!(dir.path().join("app/a.txt").exists());
 }
 
 /// The `..` guard's sibling for `.`, and it needs a symlink fixture to mean
@@ -1770,6 +1802,40 @@ async fn delete_refuses_a_path_ending_in_dot() {
         std::fs::symlink_metadata(&link).is_ok(),
         "the symlink itself must survive — the request was refused, not acted on"
     );
+}
+
+/// The same request as above, but spelling `recursive=true` too. The `.`
+/// guard fires before the directory branch is ever reached, so `recursive`
+/// changes nothing here -- unlike the `..` case, this one was never
+/// load-bearing only by accident, but it is worth pinning down now that a
+/// directory-shaped request can mean something on this route.
+#[tokio::test]
+async fn delete_refuses_a_path_ending_in_dot_even_with_recursive() {
+    let (dir, state) = state_with_files(&[("app/real.txt", b"keep me")]);
+    let target = dir.path().join("app/real.txt");
+    let link = dir.path().join("link");
+    if !require_symlink(
+        try_symlink(&target, &link),
+        "delete_refuses_a_path_ending_in_dot_even_with_recursive",
+    ) {
+        return;
+    }
+
+    let app = create_router_with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=link/.&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(target.exists());
+    assert!(std::fs::symlink_metadata(&link).is_ok());
 }
 
 /// A third accident in the same shape as the `..` and `.` guards: `named =
@@ -2038,12 +2104,22 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
         .expect("chmod locked");
 
-    // A privileged runner (root, or one that ignores the mode bit) can still
-    // read a "locked" directory -- nothing to verify then.
-    if std::fs::read_dir(&locked).is_ok() {
+    // A quiet early return here would pass having proven nothing on a
+    // runner that ignores the mode bit (root), the same failure mode this
+    // plan already rejected for `require_symlink` in `src/fs/tree.rs`: if the
+    // premise a test depends on does not hold, a loud failure on whatever
+    // runner hits that is worth more than a silent, untraceable pass
+    // everywhere else. Restore the permission before asserting either way,
+    // so a failure here does not also break the temp-dir cleanup.
+    let locked_is_unreadable = std::fs::read_dir(&locked).is_err();
+    if !locked_is_unreadable {
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
-        return;
     }
+    assert!(
+        locked_is_unreadable,
+        "chmod 0o000 did not block read_dir on this runner (root?); this test needs a \
+         different induction here, the same way the Windows sibling below uses one"
+    );
 
     let response = create_router_with_state(state)
         .oneshot(
@@ -2068,6 +2144,13 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
         "an incomplete preview must not be reported the same way as a real partial delete: {body}"
     );
     assert!(!body["failures"].as_array().expect("failures").is_empty());
+    // `docs/openapi.json`'s `PartialDeleteResult` requires `message` for both
+    // `preview-incomplete` and `partial-delete` -- a schema-checking client
+    // rejects a response missing it.
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message must be present and non-empty: {body}"
+    );
     // dry_run really did not touch anything, including the entries it could
     // enumerate.
     assert!(dir.path().join("app/visible.txt").exists());
@@ -2118,6 +2201,13 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
         "an incomplete preview must not be reported the same way as a real partial delete: {body}"
     );
     assert!(!body["failures"].as_array().expect("failures").is_empty());
+    // `docs/openapi.json`'s `PartialDeleteResult` requires `message` for both
+    // `preview-incomplete` and `partial-delete` -- a schema-checking client
+    // rejects a response missing it.
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message must be present and non-empty: {body}"
+    );
     assert!(dir.path().join("app/visible.txt").exists());
     assert!(dir.path().join("app/locked/secret.txt").exists());
 }
@@ -2172,6 +2262,35 @@ async fn a_tree_holding_a_live_upload_is_refused_without_removing_anything() {
         dir.path().join("sub/keep.txt").exists(),
         "a refusal must remove nothing"
     );
+}
+
+/// The design's other half (§4.1): a staging directory holding only an
+/// *orphaned* `.part` -- one with no live session, left behind by a previous
+/// run -- is not a reason to refuse. `has_live_part_under` answers from the
+/// session list, not the disk, precisely so a tree the sweep has not reached
+/// yet is not stuck undeletable forever. Removed here means gone: the staging
+/// directory and its orphan go with the rest of the tree.
+#[tokio::test]
+async fn a_tree_holding_only_an_orphaned_staging_file_is_removed_whole() {
+    let (dir, state, base) = machine_wide_state();
+    let staging = dir.path().join("sub").join(shell_tunnel::fs::UPLOAD_DIR);
+    std::fs::create_dir_all(&staging).expect("mkdir staging");
+    std::fs::write(staging.join("up-0000000000000000.part"), b"x").expect("write orphan");
+    std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={base}/sub&recursive=true"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!dir.path().join("sub").exists());
 }
 
 /// Tree deletion works without `--fs-root` too.
@@ -2253,14 +2372,18 @@ async fn a_partial_removal_is_not_reported_as_success() {
     assert_eq!(body["error"], "partial-delete");
     // `locked`'s own `read_dir` still succeeds (its own mode still allows
     // read+execute) -- only the two file removals and the two `remove_dir`
-    // calls that depend on them fail -- so every one of app/locked/a.txt is
-    // still counted, matching the same four-entry tree in
-    // `a_recursive_delete_removes_the_tree` above.
+    // calls that depend on them fail -- so all four entries (app, locked,
+    // a.txt, free.txt) are still counted, matching the same four-entry tree
+    // in `a_recursive_delete_removes_the_tree` above.
     assert_eq!(body["removed"], 4);
     assert_eq!(body["bytes"], 4);
     assert!(
         !body["failures"].as_array().expect("failures").is_empty(),
         "it must say what is left: {body}"
+    );
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message must be present and non-empty: {body}"
     );
 }
 
@@ -2319,6 +2442,10 @@ async fn a_partial_removal_is_not_reported_as_success() {
     assert!(
         !body["failures"].as_array().expect("failures").is_empty(),
         "it must say what is left: {body}"
+    );
+    assert!(
+        body["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "message must be present and non-empty: {body}"
     );
 }
 
@@ -3570,6 +3697,238 @@ async fn a_deleted_files_audit_event_carries_the_callers_identity() {
         .find(|e| e["kind"] == "fs.delete")
         .expect("a deletion must leave an audit event");
     assert_eq!(deleted["identity"]["label"], "test");
+}
+
+/// The four `fs.delete*` kinds exist so an operator can grep the trail for
+/// exactly one outcome without reading every event's body. Nothing pinned
+/// that contract down before this: a mutation collapsing all four kinds to
+/// `"fs.delete"` and dropping `event.entries` entirely passed the whole
+/// suite, including every test above -- none of them read `kind` off a tree
+/// removal or asserted `entries` at all. These four assert both.
+#[tokio::test]
+async fn a_clean_dry_run_over_a_tree_is_audited_as_fs_delete_dry_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/deep")).expect("mkdir");
+    std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
+    std::fs::write(dir.path().join("app/deep/b.txt"), b"xy").expect("write");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.dry_run")
+        .expect("a clean tree preview must be audited as fs.delete.dry_run, not fs.delete");
+    // "app", "app/a.txt", "app/deep", "app/deep/b.txt".
+    assert_eq!(event["entries"], 4);
+}
+
+#[tokio::test]
+async fn a_clean_recursive_delete_is_audited_as_fs_delete_with_its_entry_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/deep")).expect("mkdir");
+    std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
+    std::fs::write(dir.path().join("app/deep/b.txt"), b"xy").expect("write");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete")
+        .expect("a clean tree removal must be audited as fs.delete");
+    assert_eq!(event["entries"], 4);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_partial_recursive_delete_is_audited_as_fs_delete_partial() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/locked")).expect("mkdir locked");
+    std::fs::write(dir.path().join("app/locked/a.txt"), b"xy").expect("write");
+    std::fs::write(dir.path().join("app/free.txt"), b"xy").expect("write");
+    let locked = dir.path().join("app/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
+        .expect("chmod locked");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.partial")
+        .expect("a partial tree removal must be audited as fs.delete.partial");
+    // "app", "app/locked", "app/locked/a.txt", "app/free.txt" -- all four
+    // are still counted even though three of the four removals fail (same
+    // reasoning as `a_partial_removal_is_not_reported_as_success` above).
+    assert_eq!(event["entries"], 4);
+}
+
+/// Windows counterpart, same induction as
+/// `a_partial_removal_is_not_reported_as_success`'s Windows sibling: an
+/// exclusive-share handle blocks one file's removal deterministically.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_partial_recursive_delete_is_audited_as_fs_delete_partial() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/locked")).expect("mkdir locked");
+    std::fs::write(dir.path().join("app/locked/a.txt"), b"xy").expect("write");
+    std::fs::write(dir.path().join("app/free.txt"), b"xy").expect("write");
+    let locked_file = dir.path().join("app/locked/a.txt");
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked_file)
+        .expect("open exclusively");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    drop(handle);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.partial")
+        .expect("a partial tree removal must be audited as fs.delete.partial");
+    assert_eq!(event["entries"], 4);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_that_cannot_enumerate_everything_is_audited_as_preview_incomplete() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/locked")).expect("mkdir locked");
+    std::fs::write(dir.path().join("app/locked/secret.txt"), b"x").expect("write");
+    std::fs::write(dir.path().join("app/visible.txt"), b"yz").expect("write");
+    let locked = dir.path().join("app/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod locked");
+    let locked_is_unreadable = std::fs::read_dir(&locked).is_err();
+    if !locked_is_unreadable {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+    }
+    assert!(
+        locked_is_unreadable,
+        "chmod 0o000 did not block read_dir on this runner (root?)"
+    );
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.preview_incomplete")
+        .expect("an incomplete preview must be audited under its own kind, not fs.delete.dry_run");
+    // "app", "app/visible.txt" -- "app/locked" itself and everything under
+    // it could not be enumerated, so entries is a lower bound, not the real
+    // count.
+    assert_eq!(event["entries"], 2);
+}
+
+/// Windows counterpart, same induction as the enumeration-failure test above:
+/// an exclusive-share handle on the subdirectory blocks `read_dir` itself.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_dry_run_that_cannot_enumerate_everything_is_audited_as_preview_incomplete() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/locked")).expect("mkdir locked");
+    std::fs::write(dir.path().join("app/locked/secret.txt"), b"x").expect("write");
+    std::fs::write(dir.path().join("app/visible.txt"), b"yz").expect("write");
+    let locked = dir.path().join("app/locked");
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(&locked)
+        .expect("open directory exclusively");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    drop(handle);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let event = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.preview_incomplete")
+        .expect("an incomplete preview must be audited under its own kind, not fs.delete.dry_run");
+    assert_eq!(event["entries"], 2);
 }
 
 /// `complete_upload_blocking` has three exit paths after `take_for_complete`

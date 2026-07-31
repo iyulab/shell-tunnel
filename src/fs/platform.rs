@@ -116,8 +116,12 @@ pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::i
 /// unlinking a file symlink — nothing under it is touched either way.
 /// `RemoveDirectoryW` (`std::fs::remove_dir`) is what actually unlinks a
 /// directory reparse point without recursing into it; it only recurses into
-/// a *real* directory's contents, which is why the `not-a-file` refusal in
-/// `api::fs::delete_file` runs before this is ever reached.
+/// a *real* directory's contents, which both of this function's callers keep
+/// away from it: `api::fs::delete_file` refuses a real directory outright
+/// unless `recursive=true` names it, and from there `fs::tree::remove_tree`
+/// calls this only for a non-directory entry (`meta.is_dir()`, from `lstat`,
+/// routes a real directory to `remove_dir` itself instead — a directory
+/// *symlink* still reaches here, same as everywhere else in this function).
 #[cfg(windows)]
 pub fn remove_entry(path: &std::path::Path, meta: &std::fs::Metadata) -> std::io::Result<()> {
     if meta.is_symlink() {
