@@ -1074,6 +1074,18 @@ fn delete_file_blocking(
         // repeatedly.
         let mut body = body;
         body["failures"] = serde_json::json!(outcome.failures);
+        if query.dry_run {
+            // A preview that could not enumerate everything did not
+            // partially delete anything -- it deleted nothing at all,
+            // dry-run or not. `partial-delete` would say a removal
+            // half-happened when none did; `TreeOutcome`'s own doc is what
+            // "a lower bound" means here, so the message says exactly that.
+            body["error"] = serde_json::json!("preview-incomplete");
+            body["message"] = serde_json::json!(
+                "some entries could not be enumerated, so removed/bytes is a lower bound; nothing was removed"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+        }
         body["error"] = serde_json::json!("partial-delete");
         return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
     }

@@ -1956,7 +1956,7 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
 /// with it. 400, not 403: it's under-specified intent, not unauthorised.
 #[tokio::test]
 async fn deleting_a_directory_without_recursive_is_refused() {
-    let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
+    let (dir, state) = state_with_files(&[("app/config.json", b"hello")]);
 
     let response = create_router_with_state(state)
         .oneshot(
@@ -1978,6 +1978,12 @@ async fn deleting_a_directory_without_recursive_is_refused() {
             .expect("message")
             .contains("recursive"),
         "the message should name the flag: {body}"
+    );
+    // A refusal must not act on the disk at all -- the status code alone
+    // does not prove the tree survived.
+    assert!(
+        dir.path().join("app/config.json").exists(),
+        "a refused delete must remove nothing"
     );
 }
 
@@ -2004,6 +2010,116 @@ async fn a_dry_run_reports_the_tree_and_leaves_it_alone() {
     assert_eq!(body["dry_run"], true);
     assert!(dir.path().join("app/a.txt").exists(), "the preview deleted");
     assert!(dir.path().join("app/deep/b.txt").exists());
+}
+
+/// A preview that cannot enumerate everything is not a partial *delete* --
+/// nothing was removed at all, dry-run or not.
+///
+/// Regression for reusing `partial-delete` unconditionally: an unreadable
+/// subdirectory makes `remove_tree` return a non-empty `failures` even under
+/// `dry_run`, and the same 500 that means "some entries survived removal"
+/// would then also fire when nothing was ever attempted. An operator
+/// grepping `partial-delete` for real failed removals would wrongly match a
+/// preview, and the response would say "removed"/"bytes" (a lower bound
+/// here, per `TreeOutcome`'s own doc) as if they were exact.
+///
+/// Unix induces the enumeration failure by stripping read permission from
+/// the subdirectory; the Windows sibling below opens it exclusively instead,
+/// for the same reason `a_partial_removal_is_not_reported_as_success` needs
+/// two different inductions above.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_not_partial() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (dir, state) =
+        state_with_files(&[("app/locked/secret.txt", b"x"), ("app/visible.txt", b"yz")]);
+    let locked = dir.path().join("app/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000))
+        .expect("chmod locked");
+
+    // A privileged runner (root, or one that ignores the mode bit) can still
+    // read a "locked" directory -- nothing to verify then.
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).ok();
+        return;
+    }
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Restore before asserting: a failed assertion here must not leave the
+    // temp-dir cleanup unable to remove the locked directory.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
+        .expect("restore permissions");
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"], "preview-incomplete",
+        "an incomplete preview must not be reported the same way as a real partial delete: {body}"
+    );
+    assert!(!body["failures"].as_array().expect("failures").is_empty());
+    // dry_run really did not touch anything, including the entries it could
+    // enumerate.
+    assert!(dir.path().join("app/visible.txt").exists());
+    assert!(dir.path().join("app/locked/secret.txt").exists());
+}
+
+/// Windows counterpart of the test above: opening the subdirectory
+/// exclusively blocks `read_dir` deterministically, playing the same role
+/// stripping read permission plays on Unix. `FILE_FLAG_BACKUP_SEMANTICS` is
+/// required to open a directory at all through `CreateFileW`; `share_mode(0)`
+/// (no `FILE_SHARE_READ`/`WRITE`/`DELETE`) is what actually blocks the walk's
+/// later `read_dir` call, the same flag
+/// `a_partial_removal_is_not_reported_as_success` uses to block a delete.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_not_partial() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (dir, state) =
+        state_with_files(&[("app/locked/secret.txt", b"x"), ("app/visible.txt", b"yz")]);
+    let locked = dir.path().join("app/locked");
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+        .open(&locked)
+        .expect("open directory exclusively");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Close the handle before asserting: a failed assertion here must not
+    // leave the temp-dir cleanup unable to remove the still-open directory.
+    drop(handle);
+
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"], "preview-incomplete",
+        "an incomplete preview must not be reported the same way as a real partial delete: {body}"
+    );
+    assert!(!body["failures"].as_array().expect("failures").is_empty());
+    assert!(dir.path().join("app/visible.txt").exists());
+    assert!(dir.path().join("app/locked/secret.txt").exists());
 }
 
 #[tokio::test]
@@ -2095,9 +2211,13 @@ async fn a_recursive_delete_works_without_a_jail() {
 
 /// A partial removal must not be reported as success.
 ///
-/// Induced by stripping write permission on the parent directory so its
-/// children cannot be removed. Windows would need an open-handle induction,
-/// which has been flaky elsewhere in this suite, so it is excluded here.
+/// Unix and Windows need different inductions for the same shape: stripping
+/// write permission on a *directory* blocks removing its children here (a
+/// file's own mode bits don't gate `unlink`, its parent's do). The Windows
+/// sibling below cannot reuse this — Windows has no mode-bit equivalent, and
+/// (verified) marking the file read-only doesn't work either, since
+/// `std::fs::remove_file` clears that attribute and retries — so it induces
+/// the same partial failure with an exclusive-share open handle instead.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_partial_removal_is_not_reported_as_success() {
@@ -2131,6 +2251,71 @@ async fn a_partial_removal_is_not_reported_as_success() {
     );
     let body = body_json(response).await;
     assert_eq!(body["error"], "partial-delete");
+    // `locked`'s own `read_dir` still succeeds (its own mode still allows
+    // read+execute) -- only the two file removals and the two `remove_dir`
+    // calls that depend on them fail -- so every one of app/locked/a.txt is
+    // still counted, matching the same four-entry tree in
+    // `a_recursive_delete_removes_the_tree` above.
+    assert_eq!(body["removed"], 4);
+    assert_eq!(body["bytes"], 4);
+    assert!(
+        !body["failures"].as_array().expect("failures").is_empty(),
+        "it must say what is left: {body}"
+    );
+}
+
+/// Windows counterpart of the test above.
+///
+/// The read-only attribute does **not** work for this induction on current
+/// Rust: `std::fs::remove_file` on Windows clears `FILE_ATTRIBUTE_READONLY`
+/// and retries before giving up, so a read-only file is removed anyway
+/// (verified with a standalone repro against this toolchain — read-only set,
+/// `remove_file` still returns `Ok`, the file is gone). What blocks
+/// `DeleteFileW` deterministically instead is an exclusive-share open handle:
+/// opening with `share_mode(0)` (no `FILE_SHARE_READ`/`WRITE`/`DELETE`) turns
+/// the later delete into `ERROR_SHARING_VIOLATION`, with no timing window to
+/// race — the handle is held for the entire request, not raced against it.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_partial_removal_is_not_reported_as_success() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let (dir, state) = state_with_files(&[("app/locked/a.txt", b"xy"), ("app/free.txt", b"xy")]);
+    let locked_file = dir.path().join("app/locked/a.txt");
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked_file)
+        .expect("open exclusively");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    // Close the handle before asserting: a failed assertion here must not
+    // leave the temp-dir cleanup unable to remove the still-open file.
+    drop(handle);
+
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a 200 on a partial removal reads as success to a caller that does not read the body"
+    );
+    let body = body_json(response).await;
+    assert_eq!(body["error"], "partial-delete");
+    // Enumeration never fails here (the open handle only blocks the later
+    // `DeleteFileW`, not `read_dir`/lstat), so every one of the four entries
+    // is still counted despite three of the four removals failing: `a.txt`
+    // (sharing violation), `locked` and `app` (both non-empty afterward).
+    assert_eq!(body["removed"], 4);
+    assert_eq!(body["bytes"], 4);
     assert!(
         !body["failures"].as_array().expect("failures").is_empty(),
         "it must say what is left: {body}"
@@ -2155,6 +2340,38 @@ async fn deleting_a_single_file_still_answers_204() {
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert!(!dir.path().join("app/a.txt").exists());
+}
+
+/// A preview of a single file reports it and leaves it alone.
+///
+/// Checked against the disk, not just the response: a handler that ignores
+/// `dry_run` on this branch and deletes the file anyway would still answer
+/// 200 with `removed: 1` -- the file's continued existence is what actually
+/// proves the preview did not act.
+#[tokio::test]
+async fn a_dry_run_on_a_single_file_reports_it_and_leaves_it_alone() {
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/a.txt&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 1);
+    assert_eq!(body["bytes"], 2);
+    assert_eq!(body["dry_run"], true);
+    assert!(
+        dir.path().join("app/a.txt").exists(),
+        "the preview must not remove the file"
+    );
 }
 
 #[tokio::test]
