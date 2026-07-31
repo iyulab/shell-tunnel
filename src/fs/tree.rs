@@ -9,9 +9,16 @@ use crate::fs::{platform, FsRoot};
 
 /// 한 번의 트리 연산 결과.
 ///
-/// `removed`/`bytes`는 항상 정확하다. `entries`는 `limit`까지만 담고 넘치면
-/// `truncated`가 선다 — 릴레이 본문 상한이 8 MiB이고, 이 응답의 목적은
-/// "얼마나 큰 일인가"를 알리는 것이지 목록을 완전히 나르는 것이 아니다.
+/// `removed`/`bytes`는 **`failures`가 비어 있을 때만** 정확하다. 비어 있지
+/// 않으면 두 방향으로 어긋난다: 열거나 stat에 실패한 항목은 이름도 크기도
+/// 몰라 아예 세지 못했으므로 `removed`/`bytes`는 하한이고, 제거에 실패한
+/// 항목은 세어진 뒤에 실패했으므로 `removed`는 "지워진 개수"가 아니라
+/// "세어서 시도한 개수"다. 어느 쪽이든 `failures`가 비어 있는지부터 봐야
+/// 한다.
+///
+/// `entries`는 `limit`까지만 담고 넘치면 `truncated`가 선다 — 릴레이 본문
+/// 상한이 8 MiB이고, 이 응답의 목적은 "얼마나 큰 일인가"를 알리는 것이지
+/// 목록을 완전히 나르는 것이 아니다.
 #[derive(Debug, Default)]
 pub struct TreeOutcome {
     pub removed: u64,
@@ -48,8 +55,12 @@ fn visit(root: &FsRoot, path: &Path, dry_run: bool, limit: usize, out: &mut Tree
         // 디렉터리일 때만 내려간다.
         match std::fs::read_dir(path) {
             Ok(entries) => {
-                for entry in entries.flatten() {
-                    visit(root, &entry.path(), dry_run, limit, out);
+                // `entries`를 그대로 넘긴다. `.flatten()`을 끼우면 `Err`이
+                // 여기서 사라져 `visit_entry`의 `Err` 갈래가 영영 안 불린다
+                // — 그래도 테스트는 전부 통과하므로(확인함) 이 한 줄은
+                // 리뷰로만 지켜진다.
+                for entry in entries {
+                    visit_entry(root, path, entry, dry_run, limit, out);
                 }
             }
             Err(_) => {
@@ -92,6 +103,57 @@ fn visit(root: &FsRoot, path: &Path, dry_run: bool, limit: usize, out: &mut Tree
         if result.is_err() {
             out.failures.push(name_of(root, path));
         }
+    }
+}
+
+/// 열거가 내놓은 항목 하나를 처리한다.
+///
+/// `read_dir`의 이터레이터는 `io::Result<DirEntry>`를 낸다. 이 갈래가 별도
+/// 함수인 것은 `Err`을 버리지 않는다는 결정을 테스트가 직접 붙잡을 수 있게
+/// 하기 위해서다 — 이터레이터가 `Err`을 내도록 플랫폼 독립적으로 유도할
+/// 방법이 없다.
+///
+/// 예전에는 `.flatten()`으로 받아 `Err`을 말없이 버렸다. 그러면 그 항목이
+/// `removed`에도 `failures`에도 남지 않는다. 실제 삭제에서는 나중에 부모의
+/// `remove_dir`이 "비어 있지 않음"으로 실패해 결국 드러나지만, `dry_run`에는
+/// 그 안전망이 없어 미리보기가 `failures`를 비운 채 개수를 틀리게 답했다.
+fn visit_entry(
+    root: &FsRoot,
+    parent: &Path,
+    entry: std::io::Result<std::fs::DirEntry>,
+    dry_run: bool,
+    limit: usize,
+    out: &mut TreeOutcome,
+) {
+    match entry {
+        Ok(entry) => visit(root, &entry.path(), dry_run, limit, out),
+        // `entries`에도 `removed`에도 넣지 않는다 — 이름도 크기도 모르는 것을
+        // 셀 수는 없다. 위 `symlink_metadata` 실패 경로와 같은 처리다.
+        Err(_) => out.failures.push(unreadable_entry_name(root, parent)),
+    }
+}
+
+/// 열거에 실패해 경로조차 모르는 항목의 이름. 아는 것은 어느 디렉터리 안에
+/// 있었는가뿐이므로 부모 이름에 매단다.
+///
+/// 부모 **자신**의 실패는 `name_of`가 낸 이름 그대로 들어가므로 두 사유가
+/// 같은 문자열로 섞이지 않는다. `<`/`>`는 Windows 파일명에 쓸 수 없고
+/// Unix에서도 드물어 진짜 경로로 오해되지 않는다.
+///
+/// 한 디렉터리에서 N개가 실패하면 같은 문자열이 N번 들어간다. 그 개수가
+/// 정보이므로 의도된 것이다 — 나중에 중복 제거로 "고치지" 말 것.
+fn unreadable_entry_name(root: &FsRoot, parent: &Path) -> String {
+    let parent_name = name_of(root, parent);
+    if parent_name.is_empty() {
+        // 부모가 jail 루트 자신이면 `relative`는 빈 문자열을 준다. 그대로
+        // 이으면 `/<unreadable entry>`가 되어 절대경로처럼 보인다.
+        //
+        // jailed scope에서만 생기는 일이다. machine-wide에서는 `relative`가
+        // 절대경로를 그대로 주고, scope 밖이면 `name_of`가 원시 표기로
+        // 떨어지므로 어느 쪽이든 비지 않는다 — 이 갈래에 오지 않는다.
+        "<unreadable entry>".to_string()
+    } else {
+        format!("{parent_name}/<unreadable entry>")
     }
 }
 
@@ -200,6 +262,57 @@ mod tests {
                 "symlinks unsupported on this platform",
             ))
         }
+    }
+
+    /// 열거 중 실패한 엔트리는 조용히 사라지지 않는다.
+    ///
+    /// `read_dir` 이터레이터가 `Err`을 내도록 플랫폼 독립적으로 유도할 방법이
+    /// 없어(`readdir`/`FindNextFileW`의 중간 실패는 임의로 만들 수 없다),
+    /// 이터레이터가 실제로 내놓는 것과 **같은 타입**을 `visit_entry`에 직접
+    /// 건넨다. 결정 로직은 진짜 프로덕션 코드다. 다만 `Err`을 여기까지 실어
+    /// 나르는 `visit` 쪽 배선 한 줄은 이 테스트가 덮지 못한다 — 보고서에
+    /// 그대로 적었다.
+    #[test]
+    fn an_entry_that_fails_to_enumerate_lands_in_failures() {
+        let (_dir, root) = tree(&["app/a.txt"]);
+        let parent = root.resolve_existing("app").expect("resolve");
+        let mut out = TreeOutcome::default();
+
+        visit_entry(
+            &root,
+            &parent,
+            Err(std::io::Error::other("enumeration failed")),
+            true,
+            100,
+            &mut out,
+        );
+
+        assert_eq!(out.failures, vec!["app/<unreadable entry>".to_string()]);
+        // 세지 않는 것이 맞다: 이름도 크기도 모르는 것을 세면 미리보기가
+        // 반대 방향으로 거짓말한다. 호출자는 `failures`를 보고 판단한다.
+        assert_eq!(out.removed, 0);
+        assert_eq!(out.bytes, 0);
+        assert!(out.entries.is_empty());
+    }
+
+    /// 부모가 jail 루트 자신이면 `relative`가 빈 문자열을 주므로, 그대로 이으면
+    /// `/<unreadable entry>`가 되어 절대경로처럼 읽힌다.
+    #[test]
+    fn an_unreadable_entry_at_the_root_is_not_named_with_a_leading_slash() {
+        let (_dir, root) = tree(&["app/a.txt"]);
+        let jail = root.jail_path().expect("이 픽스처는 jailed root를 만든다");
+        let mut out = TreeOutcome::default();
+
+        visit_entry(
+            &root,
+            jail,
+            Err(std::io::Error::other("enumeration failed")),
+            true,
+            100,
+            &mut out,
+        );
+
+        assert_eq!(out.failures, vec!["<unreadable entry>".to_string()]);
     }
 
     /// 링크 생성 결과를 "계속" 또는 "중단"으로 바꾸되, **어느 쪽이든 보이게**
