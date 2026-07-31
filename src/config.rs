@@ -442,6 +442,20 @@ impl Config {
         Ok(server_config)
     }
 
+    /// The capability set an issued token will actually carry.
+    ///
+    /// `None` means nothing narrowed it — the full-control default, which is
+    /// the wildcard. Resolved from the same two fields `to_server_config` uses
+    /// and through the same function, so a caller that wants to *describe* the
+    /// scope cannot drift from the one that enforces it. Call it after
+    /// `harden_for_public_exposure`, or the answer predates the promotion.
+    pub fn resolved_capabilities(&self) -> Result<Option<CapabilitySet>, ConfigError> {
+        resolve_capabilities(
+            self.security.auth.preset.as_deref(),
+            &self.security.auth.capabilities,
+        )
+    }
+
     /// Get the log level filter string.
     pub fn log_filter(&self) -> &str {
         &self.logging.level

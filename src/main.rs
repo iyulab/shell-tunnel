@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use shell_tunnel::config::{Posture, PublicExposure};
 use shell_tunnel::relay::{serve_relay, RelayConfig};
+use shell_tunnel::security::CapabilitySet;
 use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
@@ -313,7 +314,17 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // flag to exist: an operator who never passes `--fs-root` still has to be
     // told, in one unmissable line, what the API can reach. Printed before the
     // server starts so it is not buried under request logging.
-    for line in posture_banner(posture, audit_log.as_deref()) {
+    // Read after `harden_for_public_exposure` (far above), so the promoted
+    // `operator` is what gets described rather than the pre-promotion state.
+    // An `Err` is unreachable here: `to_server_config` resolved these same two
+    // fields earlier and exited on an unknown preset. Should that ever change,
+    // falling back to `None` reports the wildcard — the direction that
+    // overstates the grant rather than understating it.
+    let scope = token_scope(
+        config.security.auth.preset.as_deref(),
+        config.resolved_capabilities().ok().flatten().as_ref(),
+    );
+    for line in posture_banner(posture, &scope, audit_log.as_deref()) {
         println!("{line}");
     }
     println!("File API:    {}", fs_root.describe());
@@ -745,20 +756,75 @@ fn effective_audit_log(explicit: Option<&Path>, posture: Posture) -> Option<Path
     }
 }
 
+/// What a token issued by this server actually holds.
+///
+/// The banner used to assume the answer was always `operator`, which is only
+/// true when nothing was chosen and the default promoted it. Naming the three
+/// cases makes the wildcard impossible to describe as a scope by accident.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenScope {
+    /// Every capability, including any added in later versions.
+    Wildcard,
+    /// A named preset, holding exactly what that name grants.
+    Preset(String),
+    /// An explicit set of capability strings, in a stable order.
+    Explicit(Vec<String>),
+}
+
+/// Describe the scope in force from the *resolved* facts.
+///
+/// `capabilities` is the set that actually reaches the server, so it — not the
+/// preset name — decides whether anything is scoped at all. `None` means
+/// nothing narrowed it: the full-control default, which is the wildcard.
+///
+/// The preset name is used only when it still describes the whole set. A preset
+/// with capabilities unioned on top grants more than its name promises, and
+/// naming it there would understate the token.
+fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> TokenScope {
+    let Some(set) = capabilities else {
+        return TokenScope::Wildcard;
+    };
+    if set.is_wildcard() {
+        return TokenScope::Wildcard;
+    }
+    match preset {
+        Some(name) if shell_tunnel::security::preset(name).as_ref() == Some(set) => {
+            TokenScope::Preset(name.to_string())
+        }
+        _ => {
+            // Sorted because the set is a `HashSet`: unsorted, the same
+            // configuration would print a different banner on every run.
+            let mut listed: Vec<String> = set.iter().cloned().collect();
+            listed.sort();
+            TokenScope::Explicit(listed)
+        }
+    }
+}
+
 /// The banner lines announcing the posture. Local is an empty list — with
 /// nothing narrowed there is nothing to report.
 ///
 /// The strings come out of a function so that tests can hold them in place.
 /// User-facing text in this repository has broken four times, every one of
 /// them somewhere no test was looking.
-fn posture_banner(posture: Posture, audit_log: Option<&Path>) -> Vec<String> {
+fn posture_banner(posture: Posture, scope: &TokenScope, audit_log: Option<&Path>) -> Vec<String> {
     if posture == Posture::Local {
         return Vec::new();
     }
-    let mut lines = vec![
-        "Reachable:   from other machines — tokens are scoped to `operator`, not wildcard"
-            .to_string(),
-    ];
+    // The wildcard line deliberately avoids the word "scoped": the wildcard is
+    // the absence of scoping, and this line is the only place a consumer
+    // confirms which of the two they have.
+    let reach = match scope {
+        TokenScope::Wildcard => "Reachable:   from other machines — tokens hold the wildcard `*`: every capability, including any added in later versions".to_string(),
+        TokenScope::Preset(name) => {
+            format!("Reachable:   from other machines — tokens are scoped to `{name}`, not wildcard")
+        }
+        TokenScope::Explicit(listed) => format!(
+            "Reachable:   from other machines — tokens are scoped to {}, not wildcard",
+            listed.join(", ")
+        ),
+    };
+    let mut lines = vec![reach];
     if let Some(path) = audit_log {
         lines.push(format!("Audit trail: {}", path.display()));
     }
@@ -892,10 +958,18 @@ mod tests {
         );
     }
 
+    /// Resolve a preset name the way `Config` does, for the tests below.
+    fn resolved(name: &str) -> CapabilitySet {
+        shell_tunnel::security::preset(name).expect("preset exists")
+    }
+
     #[test]
     fn the_exposed_banner_names_the_scope_and_the_trail() {
+        // The default-promoted case: no preset and no capabilities were given,
+        // so `harden_for_public_exposure` set `operator`.
         let path = PathBuf::from("shell-tunnel-audit.jsonl");
-        let lines = posture_banner(Posture::Exposed, Some(&path));
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let lines = posture_banner(Posture::Exposed, &scope, Some(&path));
         let text = lines.join("\n");
         assert!(text.contains("Reachable:"), "{text}");
         assert!(
@@ -910,11 +984,88 @@ mod tests {
         assert!(lines.len() >= 2, "{lines:?}");
     }
 
+    /// The defect this signature exists to fix: `--preset full-control` resolves
+    /// to the wildcard, and the banner used to call it "scoped to `operator`"
+    /// regardless — false on the one surface a consumer uses to confirm what a
+    /// token can do.
+    #[test]
+    fn a_wildcard_scope_is_never_described_as_scoped() {
+        let scope = token_scope(Some("full-control"), Some(&resolved("full-control")));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(
+            !text.contains("operator"),
+            "a wildcard token must not be reported as `operator`: {text}"
+        );
+        assert!(
+            !text.contains("scoped"),
+            "the wildcard is the absence of scoping — saying `scoped` here is the lie being fixed: {text}"
+        );
+        assert!(
+            text.contains("wildcard"),
+            "it must say plainly that the token holds the wildcard: {text}"
+        );
+    }
+
+    /// A `None` resolution is the legacy full-control default, which is also the
+    /// wildcard — it must not be mistaken for "nothing granted".
+    #[test]
+    fn an_unresolved_scope_is_the_wildcard() {
+        assert_eq!(token_scope(None, None), TokenScope::Wildcard);
+    }
+
+    #[test]
+    fn an_explicit_preset_is_named_rather_than_the_promoted_one() {
+        let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(text.contains("file-read"), "{text}");
+        assert!(
+            !text.contains("operator"),
+            "the preset in force is file-read, not the default: {text}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_capability_list_is_spelled_out() {
+        let caps: CapabilitySet = ["exec", "fs.read"].into_iter().collect();
+        let scope = token_scope(None, Some(&caps));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(text.contains("exec"), "{text}");
+        assert!(text.contains("fs.read"), "{text}");
+    }
+
+    /// A preset with extra capabilities unioned on top holds more than the
+    /// preset's name promises, so the name alone would understate the grant.
+    #[test]
+    fn a_preset_with_extras_is_listed_rather_than_named() {
+        let mut caps = resolved("file-read");
+        caps.insert("exec");
+        let scope = token_scope(Some("file-read"), Some(&caps));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(
+            !text.contains("file-read"),
+            "naming the preset would hide the `exec` unioned on top of it: {text}"
+        );
+        assert!(text.contains("exec"), "{text}");
+    }
+
+    /// Capability order must not depend on `HashSet` iteration order, or the
+    /// banner would differ between runs of the same configuration.
+    #[test]
+    fn an_explicit_capability_list_is_ordered() {
+        let caps: CapabilitySet = ["session.read", "exec", "fs.read"].into_iter().collect();
+        match token_scope(None, Some(&caps)) {
+            TokenScope::Explicit(listed) => {
+                assert_eq!(listed, vec!["exec", "fs.read", "session.read"]);
+            }
+            other => panic!("expected an explicit list, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_local_banner_says_nothing() {
         // Local is zero friction. Nothing was narrowed, so there is nothing
         // to report.
-        assert!(posture_banner(Posture::Local, None).is_empty());
+        assert!(posture_banner(Posture::Local, &TokenScope::Wildcard, None).is_empty());
     }
 
     /// The `Err` arm itself: a path whose *parent* cannot be canonicalised
