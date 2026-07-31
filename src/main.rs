@@ -1,10 +1,10 @@
 //! Shell-tunnel binary entry point.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use shell_tunnel::config::PublicExposure;
+use shell_tunnel::config::{Posture, PublicExposure};
 use shell_tunnel::relay::{serve_relay, RelayConfig};
 use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
@@ -691,6 +691,45 @@ fn print_banner(tunnel: &TunnelHandle, generated_key: Option<&str>) {
     );
 }
 
+/// The file name an audit trail lands on by default once the server is exposed.
+///
+/// Created in the working directory and reused across restarts — the same
+/// structure as the self-signed certificate (`shell-tunnel-cert.pem`).
+const DEFAULT_AUDIT_LOG: &str = "shell-tunnel-audit.jsonl";
+
+/// The audit log path actually used.
+///
+/// An explicitly named path wins. Absent one, an exposed server gets the
+/// default path; a local one gets nothing — locally we still create no file
+/// nobody asked for.
+fn effective_audit_log(explicit: Option<&Path>, posture: Posture) -> Option<PathBuf> {
+    match (explicit, posture) {
+        (Some(path), _) => Some(path.to_path_buf()),
+        (None, Posture::Exposed) => Some(PathBuf::from(DEFAULT_AUDIT_LOG)),
+        (None, Posture::Local) => None,
+    }
+}
+
+/// The banner lines announcing the posture. Local is an empty list — with
+/// nothing narrowed there is nothing to report.
+///
+/// The strings come out of a function so that tests can hold them in place.
+/// User-facing text in this repository has broken four times, every one of
+/// them somewhere no test was looking.
+fn posture_banner(posture: Posture, audit_log: Option<&Path>) -> Vec<String> {
+    if posture == Posture::Local {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "Reachable:   from other machines — tokens are scoped to `operator`, not wildcard"
+            .to_string(),
+    ];
+    if let Some(path) = audit_log {
+        lines.push(format!("Audit trail: {}", path.display()));
+    }
+    lines
+}
+
 /// Whether `audit_log`'s canonical location sits under `fs_root`.
 ///
 /// `fs_root` is expected already canonicalised (`FsRoot::new` does this
@@ -789,6 +828,58 @@ mod tests {
                 .expect("the parent directory exists"),
             "a nested audit log must be detected as inside the root too"
         );
+    }
+
+    #[test]
+    fn an_exposed_run_gets_an_audit_trail_it_did_not_ask_for() {
+        // Same shape as the self-signed certificate: being exposed is the
+        // circumstance that justifies an exception to the "create no file
+        // nobody asked for" rule.
+        let derived = effective_audit_log(None, Posture::Exposed);
+        assert_eq!(derived, Some(PathBuf::from(DEFAULT_AUDIT_LOG)));
+    }
+
+    #[test]
+    fn a_local_run_still_creates_nothing() {
+        assert_eq!(effective_audit_log(None, Posture::Local), None);
+    }
+
+    #[test]
+    fn an_explicit_audit_path_wins_in_either_posture() {
+        let chosen = PathBuf::from("/var/log/st.jsonl");
+        assert_eq!(
+            effective_audit_log(Some(&chosen), Posture::Exposed),
+            Some(chosen.clone())
+        );
+        assert_eq!(
+            effective_audit_log(Some(&chosen), Posture::Local),
+            Some(chosen)
+        );
+    }
+
+    #[test]
+    fn the_exposed_banner_names_the_scope_and_the_trail() {
+        let path = PathBuf::from("shell-tunnel-audit.jsonl");
+        let lines = posture_banner(Posture::Exposed, Some(&path));
+        let text = lines.join("\n");
+        assert!(text.contains("Reachable:"), "{text}");
+        assert!(
+            text.contains("operator"),
+            "must name the scope in force: {text}"
+        );
+        assert!(
+            text.contains("shell-tunnel-audit.jsonl"),
+            "must name the trail: {text}"
+        );
+        // Two facts never fold onto one line — a banner is skimmed, not read.
+        assert!(lines.len() >= 2, "{lines:?}");
+    }
+
+    #[test]
+    fn the_local_banner_says_nothing() {
+        // Local is zero friction. Nothing was narrowed, so there is nothing
+        // to report.
+        assert!(posture_banner(Posture::Local, None).is_empty());
     }
 
     /// The `Err` arm itself: a path whose *parent* cannot be canonicalised
