@@ -247,9 +247,12 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     //
     // Only when `--fs-root` narrows the scope. Machine-wide there is nowhere
     // outside to point the log at, so this refusal has nothing to offer: the
-    // trail is reachable by the file API wherever it sits — as it already is
-    // by `exec`, which every preset carrying `fs.*` also carries. The banner
-    // says so rather than pretending otherwise.
+    // trail is reachable by the file API wherever it sits. (This used to add
+    // "as it already is by `exec`, which every preset carrying `fs.*` also
+    // carries" — no longer true of `file-read`/`file-write`, which hold `fs.*`
+    // without `exec`. The conclusion is unaffected: machine-wide means nothing
+    // is outside, whatever the token holds.) The banner says so rather than
+    // pretending otherwise.
     if let (Some(path), Some(jail)) = (audit_log.as_ref(), fs_root.jail_path()) {
         match audit_log_is_inside_fs_root(path, jail) {
             // Two refusals, because there are two different mistakes to
@@ -329,7 +332,14 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
     println!("File API:    {}", fs_root.describe());
     if fs_root.jail_path().is_none() && audit_log.is_some() {
-        println!("             the audit log is within this scope — as it already is for `exec`");
+        // The `exec` clause this line used to carry ("as it already is for
+        // `exec`") assumed every token reaching the file API also holds `exec`.
+        // `file-read` and `file-write` hold `fs.*` without it, so the clause was
+        // false for exactly the scopes drawn around that boundary — and this
+        // line now prints on every exposed run, not only when `--audit-log` was
+        // passed. What remains is the part that is true for any scope: nothing
+        // is outside a machine-wide file API, so the trail is inside it.
+        println!("             the audit log is within this scope — a token holding `fs.write` can overwrite it");
     }
 
     let state = shell_tunnel::AppState::new()
@@ -819,10 +829,16 @@ fn posture_banner(posture: Posture, scope: &TokenScope, audit_log: Option<&Path>
         TokenScope::Preset(name) => {
             format!("Reachable:   from other machines — tokens are scoped to `{name}`, not wildcard")
         }
-        TokenScope::Explicit(listed) => format!(
-            "Reachable:   from other machines — tokens are scoped to {}, not wildcard",
-            listed.join(", ")
-        ),
+        // Each capability is backticked, as the `Preset` arm backticks its
+        // name: unquoted, "scoped to exec, fs.read, not wildcard" reads as if
+        // `not wildcard` were a third item in the list.
+        TokenScope::Explicit(listed) => {
+            let quoted: Vec<String> = listed.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Reachable:   from other machines — tokens are scoped to {}, not wildcard",
+                quoted.join(", ")
+            )
+        }
     };
     let mut lines = vec![reach];
     if let Some(path) = audit_log {
