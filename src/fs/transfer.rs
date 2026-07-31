@@ -231,6 +231,15 @@ impl UploadStore {
     ///
     /// `sessions` 락만 잡는다. `claimed`을 함께 잡으면 이 타입의 락 불변식이
     /// 깨진다 — 그 이유는 `UploadStore`의 doc comment에 있다.
+    /// 살아있는 세션 중 스테이징 파일이 `dir` 아래에 있는 것이 하나라도 있는가.
+    ///
+    /// 트리 삭제가 진행 중인 업로드를 지우지 않기 위한 조회다. 근거는 **세션
+    /// 목록이지 디스크가 아니다**: 이전 실행이 남긴 고아 `.part`는 아무도
+    /// 소유하지 않으므로 "살아있음"이 아니고, 그것까지 살아있다고 답하면
+    /// 스윕이 아직 닿지 않은 트리가 무기한 삭제 불가가 된다.
+    ///
+    /// `sessions` 락만 잡는다. `claimed`을 함께 잡으면 이 타입의 락 불변식이
+    /// 깨진다 — 그 이유는 `UploadStore`의 doc comment에 있다.
     pub fn has_live_part_under(&self, dir: &Path) -> bool {
         let Ok(sessions) = self.sessions.read() else {
             // 락이 오염됐다면 "없다"고 답할 근거가 없다. 삭제를 막는 쪽이
@@ -848,41 +857,41 @@ mod tests {
     }
 
     /// 세션이 없는 채 남은 `.part`(이전 실행의 고아)는 살아있지 않다.
-    /// 이 테스트는 다른 파일의 살아있는 세션이 있을 때, 그 세션 목록에 없는
-    /// 고아 `.part` 파일을 명확히 구분함으로써 "디스크가 아니라 세션 목록이
-    /// 근거"임을 증명한다.
+    /// 이 테스트는 고아 `.part` 파일이 디스크에 존재해도, 세션 목록에
+    /// 없으면 "살아있음"이 아님을 증명한다. 구현이 디스크를 조회한다면
+    /// 이 테스트는 실패할 것이다.
     #[test]
     fn an_orphan_part_file_is_not_a_live_session() {
         let (dir, root, store) = store();
         let staging = staging_of(&root);
         std::fs::create_dir_all(&staging).expect("mkdir staging");
 
-        // 다른 파일에 살아있는 세션을 생성 (세션 목록이 비어있지 않음)
+        // 살아있는 세션을 생성
         let live_id = store
             .create_rel(&root, "upload1.bin", 5, "0".repeat(64))
             .expect("create live session");
 
-        // 서브디렉터리에 고아 `.part` 파일 생성
-        let subdir = dir.path().join("subdir");
-        std::fs::create_dir_all(&subdir).expect("mkdir subdir");
-        let subdir_staging = UploadStore::staging_dir(&root, &subdir);
-        std::fs::create_dir_all(&subdir_staging).expect("mkdir subdir staging");
-        std::fs::write(subdir_staging.join("up-0000000000000001.part"), b"x")
-            .expect("write orphan");
-
-        // subdir 아래에는 살아있는 세션이 없으므로 false를 반환해야 한다.
-        assert!(
-            !store.has_live_part_under(&subdir),
-            "디스크의 파일이 아니라 세션 목록이 근거다"
-        );
-
-        // 루트는 여전히 살아있는 세션을 가지고 있다 (세션 목록이 작동함을 증명)
+        // 세션이 있으므로 true를 반환
         assert!(
             store.has_live_part_under(dir.path()),
-            "루트 아래의 살아있는 세션은 보여야 한다"
+            "살아있는 세션이 있으므로 true를 반환한다"
         );
 
+        // 세션을 취소하고, 고아 `.part` 파일을 그 자리에 남김
         store.cancel(&live_id);
+        let orphan_path = staging.join("up-0000000000000000.part");
+        std::fs::write(&orphan_path, b"orphan content").expect("write orphan");
+        assert!(
+            orphan_path.exists(),
+            "고아 파일이 디스크에 실제로 존재해야 함"
+        );
+
+        // 고아 파일이 있어도 세션 목록에 없으므로 false를 반환해야 한다.
+        // 구현이 디스크를 조회한다면 이 assertion이 실패할 것이다.
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "고아 파일이 있어도 세션 목록이 기준이므로 false를 반환한다"
+        );
     }
 
     /// 존재하지 않는 경로(캐노니칼화 불가)에 대한 조회는 안전하게 "있다"고 답한다.
