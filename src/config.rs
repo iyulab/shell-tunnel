@@ -110,7 +110,7 @@ pub struct AuthSection {
     pub api_keys: Vec<String>,
     /// Capability strings scoping the keys (empty = full-control).
     pub capabilities: Vec<String>,
-    /// Role preset scoping the keys (operator/read-only/full-control).
+    /// Role preset scoping the keys (operator/file-read/file-write/full-control).
     pub preset: Option<String>,
 }
 
@@ -207,7 +207,7 @@ impl Config {
 
         // Token scoping (fine-grained capabilities / preset). Specifying a scope
         // implies auth-on — otherwise the scope would be silently ignored and the
-        // server would start open, the opposite of what `--preset read-only` asks
+        // server would start open, the opposite of what `--preset file-read` asks
         // for. Applied before `no_auth` so an explicit `--no-auth` still wins.
         if !args.capabilities.is_empty() {
             self.security.auth.capabilities = args.capabilities.clone();
@@ -512,9 +512,15 @@ impl std::fmt::Display for ConfigError {
             Self::Io(e) => write!(f, "failed to read config file: {}", e),
             Self::Json(e) => write!(f, "failed to parse config file: {}", e),
             Self::InvalidHost(host) => write!(f, "invalid host address: {}", host),
+            Self::InvalidPreset(name) if name == "read-only" => {
+                write!(
+                    f,
+                    "the 'read-only' preset was removed: it granted only session.read, so it could not read a file despite its name. Use --preset file-read to read files, or --capabilities session.read for the old behaviour"
+                )
+            }
             Self::InvalidPreset(name) => write!(
                 f,
-                "unknown role preset: '{}' (expected operator, read-only, or full-control)",
+                "unknown role preset: '{}' (expected operator, file-write, file-read, or full-control)",
                 name
             ),
             Self::MissingTunnelCommand => write!(
@@ -680,7 +686,7 @@ mod tests {
         // still turns auth on, so the server does not start open with the scope ignored.
         let mut by_preset = Config::default();
         by_preset.apply_args(&Args {
-            preset: Some("read-only".to_string()),
+            preset: Some("file-read".to_string()),
             ..Args::default()
         });
         assert!(by_preset.security.auth.enabled);
@@ -698,7 +704,7 @@ mod tests {
         // Explicit --no-auth wins even when a scope is given.
         let mut config = Config::default();
         config.apply_args(&Args {
-            preset: Some("read-only".to_string()),
+            preset: Some("file-read".to_string()),
             no_auth: true,
             ..Args::default()
         });
@@ -714,7 +720,7 @@ mod tests {
                 "auth": {
                     "enabled": true,
                     "api_keys": ["scoped"],
-                    "preset": "read-only",
+                    "preset": "file-read",
                     "capabilities": ["exec"]
                 }
             }
@@ -723,7 +729,7 @@ mod tests {
         file.write_all(json.as_bytes()).unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.security.auth.preset, Some("read-only".to_string()));
+        assert_eq!(config.security.auth.preset, Some("file-read".to_string()));
         assert_eq!(config.security.auth.capabilities, vec!["exec"]);
 
         let server_config = config.to_server_config().unwrap();
@@ -731,7 +737,7 @@ mod tests {
             .security
             .capabilities
             .expect("capabilities scoped from file");
-        assert!(caps.satisfies("session.read")); // from read-only preset
+        assert!(caps.satisfies("fs.read")); // from file-read preset
         assert!(caps.satisfies("exec")); // unioned explicit capability
         assert!(!caps.satisfies("session.manage"));
     }
@@ -744,11 +750,11 @@ mod tests {
 
     #[test]
     fn test_resolve_capabilities_preset_plus_extra() {
-        // read-only preset unioned with an explicit `exec`.
-        let set = resolve_capabilities(Some("read-only"), &["exec".to_string()])
+        // file-read preset unioned with an explicit `exec`.
+        let set = resolve_capabilities(Some("file-read"), &["exec".to_string()])
             .unwrap()
             .unwrap();
-        assert!(set.satisfies("session.read"));
+        assert!(set.satisfies("fs.read"));
         assert!(set.satisfies("exec"));
         assert!(!set.satisfies("session.manage"));
     }
@@ -764,14 +770,14 @@ mod tests {
         let mut config = Config::default();
         config.security.auth.enabled = true;
         config.security.auth.api_keys = vec!["scoped".to_string()];
-        config.security.auth.preset = Some("read-only".to_string());
+        config.security.auth.preset = Some("file-read".to_string());
 
         let server_config = config.to_server_config().unwrap();
         let caps = server_config
             .security
             .capabilities
             .expect("capabilities scoped");
-        assert!(caps.satisfies("session.read"));
+        assert!(caps.satisfies("fs.read"));
         assert!(!caps.satisfies("exec"));
     }
 
@@ -783,6 +789,33 @@ mod tests {
             config.to_server_config(),
             Err(ConfigError::InvalidPreset(_))
         ));
+    }
+
+    #[test]
+    fn the_read_only_refusal_names_its_replacement() {
+        let err = ConfigError::InvalidPreset("read-only".to_string());
+        let message = err.to_string();
+        assert!(
+            message.contains("file-read"),
+            "must point at the replacement: {message}"
+        );
+        assert!(
+            message.contains("session.read"),
+            "must offer the exact escape: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_preset_lists_the_valid_ones() {
+        let err = ConfigError::InvalidPreset("nonsense".to_string());
+        let message = err.to_string();
+        for name in ["operator", "file-write", "file-read", "full-control"] {
+            assert!(message.contains(name), "must list {name}: {message}");
+        }
+        assert!(
+            !message.contains("read-only"),
+            "must not advertise a removed preset: {message}"
+        );
     }
 
     #[test]

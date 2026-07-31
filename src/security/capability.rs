@@ -80,30 +80,8 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 /// Capability strings the router currently maps routes onto.
 ///
 /// Vocabulary, not mechanism — additive by design (see the module header).
-/// `fs.read` and `fs.write` are deliberately absent from the `operator` and
-/// `read-only` presets, but what that buys differs sharply between the two,
-/// and it is worth being exact rather than claiming a boundary twice:
-///
-/// - `read-only` holds `session.read` and **no `exec`**, so withholding
-///   `fs.read` is a real containment boundary: such a token genuinely cannot
-///   read a file on this machine, and adding `fs.read` to the preset would
-///   have granted an access it did not have.
-/// - `operator` holds `exec`. A token that can run commands can already read
-///   and write anything the process can reach — `Get-Content`, `cp`, a
-///   redirect. Withholding `fs.*` there contains **nothing**; it keeps an
-///   issued token's capability surface from changing under it, which is a
-///   least-surprise property, not a security one. Do not describe it as
-///   confinement.
-///
-/// `full-control`'s [`CapabilitySet::wildcard`] covers both, as it does every
-/// capability — there is no way to keep such a token from the file API once
-/// `--fs-root` is set, and no reason to try, since `exec` already dominates it.
-///
-/// The practical consequence: `--fs-root` is a meaningful jail only for a
-/// token that has `fs.*` **without** `exec` (`--capabilities fs.write` for a
-/// deploy push, say). Against `operator` or `full-control` it is a convenience
-/// boundary — chunked, resumable, checksummed transfer instead of piping bytes
-/// through a command — not a containment one.
+/// See [`preset`] for why the presets below draw their boundary at `exec`
+/// rather than at `fs.*`.
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",
@@ -117,13 +95,17 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
 /// Presets are a **non-contract** convenience mapping — they may change freely
 /// and are not part of the frozen wire contract. Returns `None` for an unknown
 /// name so the caller can surface a clear error.
+///
+/// **The gradient's cut line is `exec`.** A token holding `exec` reaches every
+/// file this process can, so withholding the file API from it confines nothing
+/// and only forces callers onto the slow path. The presets below therefore
+/// split into "carries exec, and so carries everything" and "carries no exec,
+/// and so the file capabilities are a real boundary".
 pub fn preset(name: &str) -> Option<CapabilitySet> {
     match name {
         // `fs.read`/`fs.write` sit alongside `exec` here rather than being
         // withheld from it: this preset already grants command execution, which
-        // reaches every file this process can. Withholding the file API from it
-        // confined nothing and only pushed callers onto the slow path — see
-        // `KNOWN_CAPABILITIES` above.
+        // reaches every file this process can. See `KNOWN_CAPABILITIES` above.
         "operator" => Some(
             [
                 "exec",
@@ -135,10 +117,11 @@ pub fn preset(name: &str) -> Option<CapabilitySet> {
             .into_iter()
             .collect(),
         ),
-        // Not given `fs.read`, and this one is a real boundary: `read-only`
-        // has no `exec`, so a token holding it genuinely cannot read a file on
-        // this machine. Adding it here would be a grant, not a convenience.
-        "read-only" => Some(["session.read"].into_iter().collect()),
+        // No `exec`, so the file capabilities are the whole grant and a
+        // `--fs-root` jail actually confines something. `session.*` is
+        // deliberately absent: without `exec` there is no session to read.
+        "file-write" => Some(["fs.read", "fs.write"].into_iter().collect()),
+        "file-read" => Some(["fs.read"].into_iter().collect()),
         "full-control" => Some(CapabilitySet::wildcard()),
         _ => None,
     }
@@ -196,6 +179,34 @@ mod tests {
     }
 
     #[test]
+    fn file_presets_carry_no_exec() {
+        let read = preset("file-read").expect("file-read must exist");
+        assert!(read.satisfies("fs.read"));
+        assert!(!read.satisfies("fs.write"));
+        assert!(!read.satisfies("exec"));
+        // Not slipping in anything the name doesn't promise: without `exec`
+        // there is no session to create, so session lookup would be useless.
+        assert!(!read.satisfies("session.read"));
+        assert_eq!(read.len(), 1);
+
+        let write = preset("file-write").expect("file-write must exist");
+        assert!(write.satisfies("fs.read"));
+        assert!(write.satisfies("fs.write"));
+        assert!(!write.satisfies("exec"));
+        assert!(!write.satisfies("session.read"));
+        assert_eq!(write.len(), 2);
+    }
+
+    #[test]
+    fn read_only_is_gone_rather_than_silently_redefined() {
+        // This preset's name and behaviour used to disagree ("read-only" that
+        // couldn't read a file). Keeping the name as an alias while changing
+        // its meaning would be a silent capability escalation for existing
+        // tokens picking up `fs.read` — removal is the honest direction.
+        assert!(preset("read-only").is_none());
+    }
+
+    #[test]
     fn test_presets() {
         let operator = preset("operator").unwrap();
         assert!(operator.satisfies("exec"));
@@ -207,15 +218,6 @@ mod tests {
         assert!(operator.satisfies("fs.read"));
         assert!(operator.satisfies("fs.write"));
         assert!(!operator.is_wildcard());
-
-        let read_only = preset("read-only").unwrap();
-        assert!(read_only.satisfies("session.read"));
-        assert!(!read_only.satisfies("session.manage"));
-        assert!(!read_only.satisfies("exec"));
-        // The one preset where withholding the file API is a real boundary:
-        // with no `exec`, this token has no other route to a file's contents.
-        assert!(!read_only.satisfies("fs.read"));
-        assert!(!read_only.satisfies("fs.write"));
 
         let full = preset("full-control").unwrap();
         assert!(full.is_wildcard());
