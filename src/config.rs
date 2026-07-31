@@ -305,23 +305,23 @@ impl Config {
         }
     }
 
-    /// 이 설정이 어디까지 노출되는지 판정한다.
+    /// Determine how far this configuration is exposed.
     ///
-    /// `tunnel_configured` 는 CLI(`--tunnel`/`--tunnel-command`)와 설정 파일
-    /// (`transport.mode`)이 합쳐진 뒤의 사실 하나다 — 두 입력 경로를 이 함수가
-    /// 알 필요는 없다. `relay_attached` 는 `--relay` 가 주어졌는지.
+    /// `tunnel_configured` is a single fact after the CLI (`--tunnel`/`--tunnel-command`)
+    /// and config file (`transport.mode`) are merged — this function does not need to know
+    /// which input path it came from. `relay_attached` indicates whether `--relay` was given.
     ///
-    /// 바인드 주소 판정은 `!ip.is_loopback()` 하나뿐이다. 이 조건은 이 파일이
-    /// 이미 경고를 위해 쓰던 바로 그것이며, 새 규칙을 만들지 않는다.
+    /// Bind address is judged by `!ip.is_loopback()` alone. This condition is the same one
+    /// this file already uses for warnings — no new rules are introduced.
     pub fn posture(&self, tunnel_configured: bool, relay_attached: bool) -> Posture {
         if tunnel_configured || relay_attached {
             return Posture::Exposed;
         }
         match self.server.host.parse::<IpAddr>() {
             Ok(ip) if ip.is_loopback() => Posture::Local,
-            // 파싱 실패는 `to_server_config` 가 `InvalidHost` 로 이미 거부하므로
-            // 여기 도달하지 않는다. 그래도 노출로 답한다: 판정할 수 없다는 것은
-            // 안전하다는 증거가 아니다.
+            // Parse failures are already rejected by `to_server_config` with `InvalidHost`,
+            // so this branch is not reached in practice. Even so, we answer Exposed: inability
+            // to judge is not evidence of safety.
             _ => Posture::Exposed,
         }
     }
@@ -467,16 +467,16 @@ fn resolve_capabilities(
     Ok(Some(set))
 }
 
-/// 이 프로세스가 어디까지 노출되는가.
+/// How far this process is exposed.
 ///
-/// **인자에서 파생되며 소비자가 직접 고르지 않는다** — 자세를 고르는 옵션은
-/// 없고, 있어서도 안 된다. 이미 고른 것(터널·릴레이·바인드 주소)이 자세를
-/// 정하고, 자세가 보안 기본값을 정한다.
+/// **Derived from arguments and not selectable by the user** — there is no option to choose
+/// a posture, and there should not be one. What has already been chosen (tunnel, relay, bind
+/// address) determines the posture, and the posture determines the security defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Posture {
-    /// 이 머신에서만 닿는다. 기본값을 좁힐 이유가 없다.
+    /// Reachable only from this machine. No reason to narrow the defaults.
     Local,
-    /// 다른 머신에서 닿는다 — 터널·릴레이·비루프백 바인드 중 하나 이상.
+    /// Reachable from other machines — one or more of: tunnel, relay, or non-loopback bind.
     Exposed,
 }
 
@@ -1013,7 +1013,7 @@ mod tests {
 
     #[test]
     fn a_non_loopback_bind_is_exposed_on_its_own() {
-        // 터널도 릴레이도 없다. LAN 에 열린 것만으로 노출이다 — 남의 머신에서 닿는다.
+        // No tunnel and no relay. Open to the LAN alone is exposure — reachable from another machine.
         let mut config = Config::default();
         config.server.host = "0.0.0.0".to_string();
         assert_eq!(config.posture(false, false), Posture::Exposed);
@@ -1034,9 +1034,9 @@ mod tests {
 
     #[test]
     fn an_unparseable_host_is_exposed_rather_than_local() {
-        // `to_server_config` 가 어차피 InvalidHost 로 기동을 거부하므로 이 분기는
-        // 실제로 도달하지 않는다. 그래도 fail-closed 방향을 고정한다 — 판정 불가를
-        // "안전함"으로 읽는 순간 그것은 보증이 아니라 추측이 된다.
+        // `to_server_config` already rejects this with `InvalidHost` at startup, so this
+        // branch is not actually reachable. Even so, we fix the fail-closed direction — the
+        // moment we read "unable to judge" as "safe", it becomes speculation, not proof.
         let mut config = Config::default();
         config.server.host = "not-an-ip".to_string();
         assert_eq!(config.posture(false, false), Posture::Exposed);
