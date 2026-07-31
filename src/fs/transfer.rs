@@ -113,6 +113,13 @@ pub struct FinishedUpload {
 /// One in-flight upload.
 struct Session {
     dest_rel: String,
+    /// Absolute canonicalized path to the staging file. Always built from a
+    /// canonical prefix (the staging directory derived from an absolute
+    /// destination). `has_live_part_under` compares this against caller-supplied
+    /// input using `starts_with`, which requires both paths to be canonical.
+    /// Building `part_path` from a non-canonicalized destination path would
+    /// break that comparison silently, causing the query to return `false` even
+    /// when a session is actually under the queried directory.
     part_path: PathBuf,
     declared_size: u64,
     declared_sha256: String,
@@ -230,8 +237,13 @@ impl UploadStore {
             // 안전하다 — 이 조회의 유일한 소비자가 그렇게 쓴다.
             return true;
         };
-        // 캐노니칼화 시도, 실패하면 원본 사용 (존재하지 않는 경로인 경우)
-        let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        // 캐노니칼화 실패(경로가 존재하지 않음 등)는 안전하게 "있다"고 답한다.
+        // `part_path`는 항상 정규화된 절대경로이고, 정규화되지 않은 경로와는
+        // 비교할 수 없다. 확인할 수 없는 경우 삭제를 막는 쪽이 안전하다
+        // — 이것은 위의 락 오염 처리와 동일한 입장이다.
+        let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+            return true;
+        };
         sessions.values().any(|session| {
             session
                 .lock()
@@ -820,8 +832,11 @@ mod tests {
             store.has_live_part_under(&staging),
             "스테이징 자신 아래에서도 보인다"
         );
+        // 캐노니칼화할 수 있도록 존재하는 디렉터리 생성
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir elsewhere");
         assert!(
-            !store.has_live_part_under(&dir.path().join("elsewhere")),
+            !store.has_live_part_under(&elsewhere),
             "관계없는 디렉터리 아래에서는 보이지 않는다"
         );
 
@@ -833,18 +848,64 @@ mod tests {
     }
 
     /// 세션이 없는 채 남은 `.part`(이전 실행의 고아)는 살아있지 않다.
+    /// 이 테스트는 다른 파일의 살아있는 세션이 있을 때, 그 세션 목록에 없는
+    /// 고아 `.part` 파일을 명확히 구분함으로써 "디스크가 아니라 세션 목록이
+    /// 근거"임을 증명한다.
     #[test]
     fn an_orphan_part_file_is_not_a_live_session() {
-        let (dir, root, _store) = store();
+        let (dir, root, store) = store();
         let staging = staging_of(&root);
         std::fs::create_dir_all(&staging).expect("mkdir staging");
-        std::fs::write(staging.join("up-0000000000000000.part"), b"x").expect("write orphan");
 
-        let fresh = UploadStore::new(DEFAULT_CHUNK_SIZE);
+        // 다른 파일에 살아있는 세션을 생성 (세션 목록이 비어있지 않음)
+        let live_id = store
+            .create_rel(&root, "upload1.bin", 5, "0".repeat(64))
+            .expect("create live session");
+
+        // 서브디렉터리에 고아 `.part` 파일 생성
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir_all(&subdir).expect("mkdir subdir");
+        let subdir_staging = UploadStore::staging_dir(&root, &subdir);
+        std::fs::create_dir_all(&subdir_staging).expect("mkdir subdir staging");
+        std::fs::write(subdir_staging.join("up-0000000000000001.part"), b"x")
+            .expect("write orphan");
+
+        // subdir 아래에는 살아있는 세션이 없으므로 false를 반환해야 한다.
         assert!(
-            !fresh.has_live_part_under(dir.path()),
+            !store.has_live_part_under(&subdir),
             "디스크의 파일이 아니라 세션 목록이 근거다"
         );
+
+        // 루트는 여전히 살아있는 세션을 가지고 있다 (세션 목록이 작동함을 증명)
+        assert!(
+            store.has_live_part_under(dir.path()),
+            "루트 아래의 살아있는 세션은 보여야 한다"
+        );
+
+        store.cancel(&live_id);
+    }
+
+    /// 존재하지 않는 경로(캐노니칼화 불가)에 대한 조회는 안전하게 "있다"고 답한다.
+    /// `part_path`는 항상 정규화된 절대경로이므로, 정규화되지 않은 경로와는
+    /// 비교할 수 없다. 알 수 없는 경우 삭제를 거부하는 쪽이 안전하다.
+    #[test]
+    fn a_nonexistent_path_cannot_be_canonicalized_so_answers_true() {
+        let (dir, root, store) = store();
+        let id = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("create");
+
+        // 존재하지 않는 경로: canonicalize가 실패한다
+        let nonexistent = dir.path().join("does-not-exist");
+        assert!(!nonexistent.exists(), "path must not exist for this test");
+
+        // 캐노니칼화할 수 없으므로 안전하게 "있다"고 답해야 한다
+        assert!(
+            store.has_live_part_under(&nonexistent),
+            "캐노니칼화 불가능한 경로는 안전하게 true를 반환한다"
+        );
+
+        store.cancel(&id);
     }
 
     #[test]
