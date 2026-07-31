@@ -337,9 +337,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         // `file-read` and `file-write` hold `fs.*` without it, so the clause was
         // false for exactly the scopes drawn around that boundary — and this
         // line now prints on every exposed run, not only when `--audit-log` was
-        // passed. What remains is the part that is true for any scope: nothing
-        // is outside a machine-wide file API, so the trail is inside it.
-        println!("             the audit log is within this scope — a token holding `fs.write` can overwrite it");
+        // passed. What remains names no capability at all: the subject is the
+        // file API's reach, which is what this line actually knows. Naming one
+        // — even conditionally, as "a token holding `fs.write` could overwrite
+        // it" — puts the same token-shaped assumption back in a different
+        // grammatical costume, and under `--preset file-read` no token this
+        // server issues holds `fs.write` to begin with.
+        println!("             the audit log is within this scope — nothing is outside a machine-wide file API");
     }
 
     let state = shell_tunnel::AppState::new()
