@@ -176,4 +176,44 @@ mod tests {
         assert!(!dir.path().join("app").exists());
         assert!(target_file.exists(), "링크의 대상은 남아 있어야 한다");
     }
+
+    /// 위 파일-심링크 테스트는 이 성질을 전혀 검증하지 않는다: 링크가 파일을
+    /// 가리키면 `unlink`은 링크 자체만 끊으므로, `symlink_metadata`를
+    /// `metadata`로 바꿔 링크를 따라가게 만들어도 `is_dir()`은 여전히
+    /// false이고 결과는 똑같이 통과한다. 위험은 **디렉터리** 심링크다 — 따라
+    /// 들어가면 `is_dir()`이 참이 되어 `read_dir`이 대상 디렉터리 안으로
+    /// 내려가 그 내용물을 지운다.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_symlink_is_removed_without_descending_into_its_target() {
+        let (dir, root) = tree(&["app/a.txt"]);
+        let outside = tempfile::tempdir().expect("outside");
+        let keep_dir = outside.path().join("keep_dir");
+        std::fs::create_dir(&keep_dir).expect("mkdir keep_dir");
+        let precious = keep_dir.join("precious.txt");
+        std::fs::write(&precious, b"precious").expect("write");
+        std::os::unix::fs::symlink(&keep_dir, dir.path().join("app/dlink")).expect("symlink");
+
+        let target = root.resolve_existing("app").expect("resolve");
+
+        // 미리보기도 링크를 하나의 항목으로만 센다 — 대상 안으로 내려가면
+        // 개수가 부풀어 호출자가 "얼마나 큰 일인가"를 오판하게 된다.
+        let preview = remove_tree(&root, &target, true, 100);
+        assert_eq!(
+            preview.removed, 3,
+            "app + a.txt + dlink, keep_dir 내용물은 세지 않는다"
+        );
+        assert!(preview.failures.is_empty(), "{:?}", preview.failures);
+        assert!(precious.exists(), "미리보기는 아무것도 지우지 않는다");
+
+        let outcome = remove_tree(&root, &target, false, 100);
+        assert_eq!(outcome.removed, 3);
+        assert!(outcome.failures.is_empty(), "{:?}", outcome.failures);
+        assert!(!dir.path().join("app").exists(), "트리가 사라져야 한다");
+        assert!(keep_dir.exists(), "링크의 대상 디렉터리는 남아 있어야 한다");
+        assert!(
+            precious.exists(),
+            "대상 디렉터리 안의 파일도 남아 있어야 한다"
+        );
+    }
 }
