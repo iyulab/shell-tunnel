@@ -229,8 +229,38 @@ relay's 120s request timeout).
 
 `GET /api/v1/fs/file?path=...` serves the whole file, or a `Range` of it — ordinary HTTP,
 so any client that already speaks `Range`/`If-Range` gets resumable downloads for free.
-`DELETE` removes one entry (not a real directory — recursive removal needs guards this
-layer does not have yet).
+
+`DELETE` removes the named entry. A file, symlink, or other non-directory node needs no
+flags — `204`, no body, the same answer this route has always given. A real directory
+needs `recursive=true`; without it the request is refused with `400 recursive-required`
+naming the flag, so a call meaning to remove one file cannot take a whole tree with it by
+mistake. Add `dry_run=true` to see what a removal would take instead of doing it — the
+same walk the removal itself uses, without touching anything:
+
+```bash
+curl -X DELETE "$BASE/api/v1/fs/file?path=app/build&recursive=true&dry_run=true"
+# {"removed":3,"bytes":142311,"entries":["app/build/index.html","app/build/app.js","app/build"],
+#  "truncated":false,"dry_run":true}
+```
+
+Children are counted before their parent, so a directory follows its own contents in
+`entries` rather than leading them — and falls off the list entirely once `limit` cuts it
+short. `removed`/`bytes` still cover the whole tree regardless of where the list stops.
+
+Drop `dry_run` (or set it to `false`, the default) and the same request performs the
+removal, answering the same body shape. `removed`/`bytes` are exact there — but only when
+nothing failed. A tree holding an upload in flight is refused whole, `409
+staging-in-tree`, rather than partly removed. A removal where some entries survived
+answers `500 partial-delete` with those same fields plus `failures`, the paths that did
+not go; a `dry_run` that could not enumerate everything answers `500 preview-incomplete`
+instead — nothing was removed there, so its counts are a lower bound rather than exact.
+The two share a body shape but not a meaning: treating them alike reports a deletion that
+never happened.
+
+This guards against a caller's mistake, not against a caller. A token holding `fs.write`
+can already remove anything the server can reach, so `recursive` and `dry_run` exist to
+keep an automated caller from taking more than it meant to — they are not a permission
+boundary.
 
 **The full upload round trip**, run against a local server with `--fs-root` set and no
 auth (the same commands work with an `Authorization: Bearer <key>` header once auth is
@@ -299,7 +329,7 @@ Each token carries a set of capabilities; each route declares the one it needs:
 | `session.read` | list and inspect sessions |
 | `session.manage` | create and delete sessions |
 | `fs.read` | `list`, `stat`, read/download a file |
-| `fs.write` | delete a file, and the whole upload-session lifecycle (including reading a session's own resume point) |
+| `fs.write` | delete a file or a directory tree, and the whole upload-session lifecycle (including reading a session's own resume point) |
 | `*` | everything |
 
 Missing or unknown token → **401**. Valid token without the capability → **403**
@@ -395,6 +425,29 @@ puts that secret in the log; that is the trade an audit trail makes.
 Command *content* is not filtered. A `CommandValidator` primitive ships in the
 crate but no handler calls it: a token holding `exec` can run any command. The
 capability token is the access control — withhold `exec` to deny execution.
+
+**Event kinds.** `kind` is one of:
+
+| `kind` | Recorded when | Notable fields |
+|---|---|---|
+| `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot) |
+| `denied` | a request was refused | `status`, `reason` |
+| `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
+| `fs.delete.dry_run` | a preview — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
+| `fs.delete.partial` | a directory removal where some entries survived | `file`, `bytes`, `entries` (a count — a lower bound here) |
+| `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
+| `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
+| `upload.rejected` | the digest did not match at `complete` | `file`, `digest_ok: false`, `upload_id` |
+| `upload.failed` | `complete` failed for a reason other than the digest | `file`, `bytes`, `status`, `reason`, `upload_id` |
+| `upload.cancel` | a session was cancelled before completing | `file`, `bytes`, `upload_id` |
+| `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
+| `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
+
+The three `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
+on one shared kind — the same convention the `upload.*` kinds already use. It is what
+makes the trail greppable for the one case worth finding on its own: matching `kind`
+exactly against `fs.delete` (`jq 'select(.kind == "fs.delete")'`, say) silently misses
+every `fs.delete.partial`, which is precisely the removal that did not fully succeed.
 
 ---
 
@@ -673,6 +726,9 @@ startup rather than serving local-only.
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
+| **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
+| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry |
+| **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |
 
 A relay connection that drops is retried with exponential backoff (1s→60s); the
 device keeps its URL, so callers need no change. A *tunnel* that dies takes the

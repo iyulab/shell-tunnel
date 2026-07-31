@@ -3,6 +3,31 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.13.0 — 2026-07-31
+
+### Added
+
+- **Recursive delete, opt-in.** `DELETE /api/v1/fs/file?path=<dir>&recursive=true` removes
+  a directory and everything under it. Without the flag a directory is refused with `400
+  recursive-required`, so a call meaning to remove one file cannot take a tree with it by
+  mistake. A file, symlink, or other non-directory node still needs no flags at all —
+  `204`, no body, exactly as before this release.
+- **`dry_run=true`** reports what a removal would take — `removed`, `bytes`, and up to
+  `limit` `entries` (`truncated` marks a longer list) — through the same walk the removal
+  itself uses, without touching the disk.
+- A tree holding an upload in flight is refused whole (`409 staging-in-tree`) rather than
+  partly removed. A removal that only partly succeeds answers `500 partial-delete` with
+  the counts and a `failures` list; a `dry_run` that could not enumerate everything
+  answers `500 preview-incomplete` instead, since nothing was removed there and the counts
+  are a lower bound rather than exact.
+- The audit trail records a directory removal as `fs.delete`, `fs.delete.dry_run`, or
+  `fs.delete.partial`, matching the convention the upload events already use — the split
+  is what makes a partial failure greppable on its own rather than folded into a generic
+  success kind.
+
+  These guard against a caller's mistake, not against a caller. A token holding
+  `fs.write` can already remove anything the server can reach.
+
 ## 0.12.3 — 2026-07-31
 
 ### Fixed

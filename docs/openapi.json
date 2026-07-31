@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.11.0",
+    "version": "0.13.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -670,7 +670,7 @@
           "Filesystem"
         ],
         "summary": "Delete one entry",
-        "description": "Removes the named entry — a file, a symlink, or any other non-directory node. A *real* directory is refused: recursive removal needs the destructive-operation guards (dry-run, backup, approval) this layer does not yet have.\n\nRequired capability: `fs.write`.",
+        "description": "Removes the named entry — a file, a symlink, or any other non-directory node — with no flags needed: `204`, no body, the same answer this route has always given. A *real* directory additionally needs `recursive=true`; without it the request is refused rather than acting on part of a tree the caller may not have meant to take whole. Add `dry_run=true` to preview a removal (real or recursive) instead of performing it — the same walk the removal itself uses, reporting counts without touching anything.\n\nThese flags guard against a caller's mistake, not against a caller: a token holding `fs.write` can already remove anything the server can reach, so this is not a permission boundary.\n\nRequired capability: `fs.write`.",
         "operationId": "fsDelete",
         "parameters": [
           {
@@ -682,14 +682,53 @@
               "type": "string"
             },
             "example": "app/stale.log"
+          },
+          {
+            "name": "recursive",
+            "in": "query",
+            "description": "Required to remove a real directory; without it, a directory target is refused with `400 recursive-required`. Has no effect on a file, symlink, or other non-directory node — those are always removed regardless of this flag.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "dry_run",
+            "in": "query",
+            "description": "Report what a removal would take instead of performing it. Same response body as a real removal, and nothing is removed either way.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Largest number of `entries` to report for a directory removal. Clamped to [1, 10000] rather than refused; default 1000. Only caps the listing — `removed` and `bytes` still cover the whole tree (`truncated` marks a longer list than this).",
+            "schema": {
+              "type": "integer",
+              "default": 1000,
+              "minimum": 1,
+              "maximum": 10000
+            }
           }
         ],
         "responses": {
+          "200": {
+            "description": "A directory removal or preview (`recursive=true`, with or without `dry_run=true`), or a preview of a single-entry removal (`dry_run=true` alone, `recursive` irrelevant). `removed`/`bytes` are exact only in this response — see the 500 responses for when they are a lower bound instead.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeleteResult"
+                }
+              }
+            }
+          },
           "204": {
-            "description": "Removed."
+            "description": "Removed. Only for an actual removal of a file, symlink, or other non-directory node — `dry_run` unset or `false`, the default and the backward-compatible case: a single-file delete with no flags at all behaves exactly as before this endpoint gained `recursive`/`dry_run`. A directory always answers 200 or an error instead, never this."
           },
           "400": {
-            "description": "`bad-path`, or `not-a-file` (path is a real directory; recursive removal is not supported).",
+            "description": "`bad-path`, or `recursive-required` (path is a real directory; pass `recursive=true` to remove it and everything under it).",
             "content": {
               "application/json": {
                 "schema": {
@@ -718,11 +757,31 @@
               }
             }
           },
+          "409": {
+            "description": "`staging-in-tree` — an upload is in flight somewhere under this directory. Refused whole rather than removed around it; cancel the upload or wait for it to finish, then retry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"
           },
           "500": {
-            "description": "`delete-failed` (the OS refused the removal) or `delete-panicked` (unexpected failure)."
+            "description": "For a plain removal: `delete-failed` (the OS refused it) or `delete-panicked` (unexpected failure). For a directory removal: `partial-delete` (some entries were removed, some were not) or, only under `dry_run=true`, `preview-incomplete` (some entries could not even be enumerated, so nothing was removed and the counts are a lower bound rather than exact). The last two share one body — the same fields as the 200 response plus `failures`, the paths that did not go — and are not interchangeable: reporting one as the other means reporting a deletion that never happened.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/ErrorResponse" },
+                    { "$ref": "#/components/schemas/PartialDeleteResult" }
+                  ]
+                }
+              }
+            }
           }
         }
       }
@@ -1441,6 +1500,101 @@
           "next_cursor": {
             "type": "string",
             "description": "Opaque token to pass back as `cursor` for the next page. Absent on the last page."
+          }
+        }
+      },
+      "DeleteResult": {
+        "type": "object",
+        "description": "Body for the 200 responses from `DELETE /api/v1/fs/file`: a directory removal or preview (`recursive=true`, with or without `dry_run=true`), or a preview of a single non-directory entry (`dry_run=true` alone). `removed`/`bytes` are exact here; see `PartialDeleteResult` for when they are not.",
+        "required": [
+          "removed",
+          "bytes",
+          "entries",
+          "truncated",
+          "dry_run"
+        ],
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Entries counted (a preview) or removed (a real removal). For a directory this includes the directory itself; for a single non-directory entry this is always 1."
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total size of the files among those entries. Directories themselves contribute nothing."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Root-relative paths of the entries counted, capped at the request's `limit` — see `truncated`."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "`entries` stopped at `limit`. `removed` and `bytes` still cover the whole tree regardless."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Echoes the request: `true` means nothing on disk was touched."
+          }
+        }
+      },
+      "PartialDeleteResult": {
+        "type": "object",
+        "description": "Body for the `partial-delete` and `preview-incomplete` 500 responses from `DELETE /api/v1/fs/file?recursive=true` — the same fields as `DeleteResult` plus `error` and `failures`. Unlike `DeleteResult`, `removed`/`bytes` here are not an exact count of what actually happened; see `error` for which condition produced this body and how the two differ.",
+        "required": [
+          "removed",
+          "bytes",
+          "entries",
+          "truncated",
+          "dry_run",
+          "failures",
+          "error",
+          "message"
+        ],
+        "properties": {
+          "removed": {
+            "type": "integer",
+            "format": "int64",
+            "description": "For `preview-incomplete`, a lower bound: an entry that could not be enumerated was never counted at all. For `partial-delete`, an entry whose removal itself then failed is still counted here — this is the number visited and attempted, not the number of entries actually gone. Either way, `failures` names what did not go."
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Same caveat as `removed`, restricted to the files among those entries."
+          },
+          "entries": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Root-relative paths of the entries counted, capped at the request's `limit`."
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "dry_run": {
+            "type": "boolean"
+          },
+          "failures": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Root-relative paths that could not be removed (`partial-delete`) or could not even be enumerated (`preview-incomplete`)."
+          },
+          "error": {
+            "type": "string",
+            "enum": [
+              "partial-delete",
+              "preview-incomplete"
+            ],
+            "description": "`partial-delete`: a real removal where some entries survived. `preview-incomplete`: a `dry_run` that could not enumerate everything, so nothing was removed and the counts above are a lower bound rather than exact."
+          },
+          "message": {
+            "type": "string"
           }
         }
       },
