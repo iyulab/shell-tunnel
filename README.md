@@ -125,6 +125,10 @@ and SHA-256, send chunks, and the file appears at its destination only once the 
 thing verifies. That is the point of these endpoints: a large transfer that resumes and
 verifies, rather than bytes piped through a command.
 
+Directory removal is opt-in (`recursive=true`) and can be previewed (`dry_run=true`) —
+a guard against a caller's mistake, not against a caller, since a token that can already
+remove one file this way can remove anything the server can reach.
+
 To confine them to one directory instead, name it:
 
 ```bash

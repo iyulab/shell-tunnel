@@ -25,8 +25,13 @@ pub struct AppState {
     pub audit: Arc<crate::audit::AuditSink>,
     /// The directory the filesystem API may touch.
     ///
-    /// `None` means the API is off. Off by default: a gateway that starts
-    /// serving files because it was started is not what an operator asked for.
+    /// `None` means the API is off. Since 0.12.0 the shipped binary no longer
+    /// defaults to this: it always installs `FsRoot::machine_wide()` unless
+    /// `--fs-root` narrows it, on the reasoning that a token holding `fs.*`
+    /// already needs `exec` to matter, and `exec` can already reach anything
+    /// this process can (`src/main.rs`). `None` now only occurs when a
+    /// library consumer builds an `AppState` directly instead of going
+    /// through the binary's startup path.
     pub fs: Option<Arc<crate::fs::FsRoot>>,
     /// In-flight uploads. Always present; useless until `fs` is set.
     pub uploads: Arc<crate::fs::UploadStore>,

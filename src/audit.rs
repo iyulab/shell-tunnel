@@ -79,6 +79,10 @@ pub struct AuditEvent {
     /// Bytes transferred. Present on terminal transfer events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
+    /// Entries a tree operation counted or removed. Present on `fs.delete`
+    /// events that acted on a directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<u64>,
     /// Whether the declared digest matched what arrived.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest_ok: Option<bool>,
@@ -109,6 +113,7 @@ impl AuditEvent {
             reason: None,
             file: None,
             bytes: None,
+            entries: None,
             digest_ok: None,
             upload_id: None,
         }

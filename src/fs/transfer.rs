@@ -113,6 +113,13 @@ pub struct FinishedUpload {
 /// One in-flight upload.
 struct Session {
     dest_rel: String,
+    /// Absolute canonicalized path to the staging file. Always built from a
+    /// canonical prefix (the staging directory derived from an absolute
+    /// destination). `has_live_part_under` compares this against caller-supplied
+    /// input using `starts_with`, which requires both paths to be canonical.
+    /// Building `part_path` from a non-canonicalized destination path would
+    /// break that comparison silently, causing the query to return `false` even
+    /// when a session is actually under the queried directory.
     part_path: PathBuf,
     declared_size: u64,
     declared_sha256: String,
@@ -213,6 +220,36 @@ impl UploadStore {
                 None => PathBuf::from(UPLOAD_DIR),
             },
         }
+    }
+
+    /// 살아있는 세션 중 스테이징 파일이 `dir` 아래에 있는 것이 하나라도 있는가.
+    ///
+    /// 트리 삭제가 진행 중인 업로드를 지우지 않기 위한 조회다. 근거는 **세션
+    /// 목록이지 디스크가 아니다**: 이전 실행이 남긴 고아 `.part`는 아무도
+    /// 소유하지 않으므로 "살아있음"이 아니고, 그것까지 살아있다고 답하면
+    /// 스윕이 아직 닿지 않은 트리가 무기한 삭제 불가가 된다.
+    ///
+    /// `sessions` 락만 잡는다. `claimed`을 함께 잡으면 이 타입의 락 불변식이
+    /// 깨진다 — 그 이유는 `UploadStore`의 doc comment에 있다.
+    pub fn has_live_part_under(&self, dir: &Path) -> bool {
+        let Ok(sessions) = self.sessions.read() else {
+            // 락이 오염됐다면 "없다"고 답할 근거가 없다. 삭제를 막는 쪽이
+            // 안전하다 — 이 조회의 유일한 소비자가 그렇게 쓴다.
+            return true;
+        };
+        // 캐노니칼화 실패(경로가 존재하지 않음 등)는 안전하게 "있다"고 답한다.
+        // `part_path`는 항상 정규화된 절대경로이고, 정규화되지 않은 경로와는
+        // 비교할 수 없다. 확인할 수 없는 경우 삭제를 막는 쪽이 안전하다
+        // — 이것은 위의 락 오염 처리와 동일한 입장이다.
+        let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+            return true;
+        };
+        sessions.values().any(|session| {
+            session
+                .lock()
+                .map(|s| s.part_path.starts_with(&canonical_dir))
+                .unwrap_or(true)
+        })
     }
 
     /// Open a session for `dest_rel`, which need not exist yet.
@@ -768,6 +805,108 @@ mod tests {
 
     /// SHA-256 of b"hello world".
     const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+
+    /// 트리 삭제가 진행 중인 업로드를 지우지 않으려면, 어떤 디렉터리 아래에
+    /// 살아있는 세션의 스테이징 파일이 있는지 물을 수 있어야 한다. 고아
+    /// `.part`는 "살아있음"이 아니다 — 그것까지 살아있다고 답하면 스윕이 늦은
+    /// 트리가 무기한 삭제 불가가 된다.
+    #[test]
+    fn a_live_session_is_visible_under_its_staging_directory() {
+        let (dir, root, store) = store();
+        let staging = staging_of(&root);
+
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "세션이 없으면 아무것도 살아있지 않다"
+        );
+
+        let id = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("create");
+
+        assert!(
+            store.has_live_part_under(dir.path()),
+            "루트 아래에서 보인다"
+        );
+        assert!(
+            store.has_live_part_under(&staging),
+            "스테이징 자신 아래에서도 보인다"
+        );
+        // 캐노니칼화할 수 있도록 존재하는 디렉터리 생성
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).expect("mkdir elsewhere");
+        assert!(
+            !store.has_live_part_under(&elsewhere),
+            "관계없는 디렉터리 아래에서는 보이지 않는다"
+        );
+
+        store.cancel(&id);
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "취소된 세션은 살아있지 않다"
+        );
+    }
+
+    /// 세션이 없는 채 남은 `.part`(이전 실행의 고아)는 살아있지 않다.
+    /// 이 테스트는 고아 `.part` 파일이 디스크에 존재해도, 세션 목록에
+    /// 없으면 "살아있음"이 아님을 증명한다. 구현이 디스크를 조회한다면
+    /// 이 테스트는 실패할 것이다.
+    #[test]
+    fn an_orphan_part_file_is_not_a_live_session() {
+        let (dir, root, store) = store();
+        let staging = staging_of(&root);
+        std::fs::create_dir_all(&staging).expect("mkdir staging");
+
+        // 살아있는 세션을 생성
+        let live_id = store
+            .create_rel(&root, "upload1.bin", 5, "0".repeat(64))
+            .expect("create live session");
+
+        // 세션이 있으므로 true를 반환
+        assert!(
+            store.has_live_part_under(dir.path()),
+            "살아있는 세션이 있으므로 true를 반환한다"
+        );
+
+        // 세션을 취소하고, 고아 `.part` 파일을 그 자리에 남김
+        store.cancel(&live_id);
+        let orphan_path = staging.join("up-0000000000000000.part");
+        std::fs::write(&orphan_path, b"orphan content").expect("write orphan");
+        assert!(
+            orphan_path.exists(),
+            "고아 파일이 디스크에 실제로 존재해야 함"
+        );
+
+        // 고아 파일이 있어도 세션 목록에 없으므로 false를 반환해야 한다.
+        // 구현이 디스크를 조회한다면 이 assertion이 실패할 것이다.
+        assert!(
+            !store.has_live_part_under(dir.path()),
+            "고아 파일이 있어도 세션 목록이 기준이므로 false를 반환한다"
+        );
+    }
+
+    /// 존재하지 않는 경로(캐노니칼화 불가)에 대한 조회는 안전하게 "있다"고 답한다.
+    /// `part_path`는 항상 정규화된 절대경로이므로, 정규화되지 않은 경로와는
+    /// 비교할 수 없다. 알 수 없는 경우 삭제를 거부하는 쪽이 안전하다.
+    #[test]
+    fn a_nonexistent_path_cannot_be_canonicalized_so_answers_true() {
+        let (dir, root, store) = store();
+        let id = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("create");
+
+        // 존재하지 않는 경로: canonicalize가 실패한다
+        let nonexistent = dir.path().join("does-not-exist");
+        assert!(!nonexistent.exists(), "path must not exist for this test");
+
+        // 캐노니칼화할 수 없으므로 안전하게 "있다"고 답해야 한다
+        assert!(
+            store.has_live_part_under(&nonexistent),
+            "캐노니칼화 불가능한 경로는 안전하게 true를 반환한다"
+        );
+
+        store.cancel(&id);
+    }
 
     #[test]
     fn a_session_starts_at_offset_zero() {

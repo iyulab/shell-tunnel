@@ -40,6 +40,24 @@ pub struct PathQuery {
     pub path: String,
 }
 
+/// Query for `DELETE /api/v1/fs/file`.
+///
+/// Not folded into `PathQuery`: `stat` and `download` share that type, and a
+/// `recursive`/`dry_run` that parses on those two routes but does nothing
+/// would read to a caller as if it did.
+#[derive(Debug, Deserialize)]
+pub struct DeleteQuery {
+    pub path: String,
+    /// Must be set to remove a directory. Omitting it is a 400.
+    #[serde(default)]
+    pub recursive: bool,
+    /// When true, nothing is removed; the response reports what would be.
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Render a refusal as JSON with a machine-readable code.
 ///
 /// The code matters more than the prose: a consumer decides whether to retry,
@@ -774,10 +792,12 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
 
 /// `DELETE /api/v1/fs/file` — remove one named entry.
 ///
-/// Only a *real* directory is refused. Recursive removal is a destructive
-/// operation that wants the guards (dry-run, backup, approval) this layer
-/// does not have; a convenience flag here would hand out that power without
-/// them.
+/// A *real* directory is refused unless `recursive=true` is given: the threat
+/// model is an agent's mistake, not an attacker, so the guard is a single
+/// required flag rather than a confirmation flow. With it, the whole tree is
+/// walked and removed through `remove_tree` — the same traversal `dry_run`
+/// uses to preview it — and a tree holding an upload in flight is refused
+/// whole rather than partly removed.
 ///
 /// Everything else the entry could be — a regular file, a symlink (to a file
 /// or to a directory), a FIFO, a socket, a device node — is removed. Unlike
@@ -798,12 +818,13 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
 pub async fn delete_file(
     State(state): State<AppState>,
     identity: Option<axum::Extension<crate::audit::Identity>>,
-    Query(query): Query<PathQuery>,
+    Query(query): Query<DeleteQuery>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
     };
     let audit = state.audit.clone();
+    let uploads = state.uploads.clone();
     let identity = identity.map(|axum::Extension(id)| id);
 
     // Resolving the path and removing the file are both blocking I/O. Same
@@ -814,8 +835,10 @@ pub async fn delete_file(
     // (`AuditSink::record` opens/writes/flushes a file), so it is recorded
     // from `delete_file_blocking` rather than back here — same reason the
     // upload handlers thread it into their own `_blocking` bodies.
-    match tokio::task::spawn_blocking(move || delete_file_blocking(&root, &audit, identity, &query))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        delete_file_blocking(&root, &audit, &uploads, identity, &query)
+    })
+    .await
     {
         Ok(response) => response,
         Err(_) => error_response(
@@ -872,8 +895,9 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 fn delete_file_blocking(
     root: &FsRoot,
     audit: &crate::audit::AuditSink,
+    uploads: &crate::fs::UploadStore,
     identity: Option<crate::audit::Identity>,
-    query: &PathQuery,
+    query: &DeleteQuery,
 ) -> Response {
     if let Err(error) = root.resolve_existing(&query.path) {
         return fs_error_response(error);
@@ -887,11 +911,13 @@ fn delete_file_blocking(
     // with a lexical `PathBuf::join`, which never resolves `..`, so joining
     // `..` onto an in-root `parent` produces a path whose *actual* location —
     // once something reads it — is one level above `parent`, without ever
-    // having gone through the jail. Today the directory refusal further down
-    // happens to catch this anyway, since `X/..` always names a directory;
-    // that is an accident of recursive removal not being supported yet, not
-    // a reason, so it is checked here explicitly instead: `..` is refused as
-    // a delete target outright, before it is ever joined.
+    // having gone through the jail. `X/..` always names a directory, but that
+    // no longer refuses it by itself: `path=app/..&recursive=true` reaches the
+    // directory branch below with `recursive` set, so without this guard it
+    // would walk and remove a real directory one level above `parent` —
+    // outside the root — through `remove_tree`. This check is what stops
+    // that, checked here explicitly before `..` is ever joined, load-bearing
+    // on its own regardless of `recursive`.
     //
     // A containment check on the joined path instead of this would not work:
     // `Path::starts_with` is a pure component-prefix comparison that does not
@@ -907,7 +933,12 @@ fn delete_file_blocking(
     // `root`-based one just ruled out — it does not rule out `..` either
     // (`join("..")` on Unix does not collapse, so `named` is literally
     // `parent/..` and does start with `parent`), so this guard stays
-    // load-bearing for `..` regardless.
+    // load-bearing for `..` regardless. Asymmetric on Windows, though: there
+    // `parent` is a verbatim `canonicalize()` result, and `join("..")` on
+    // *that* does collapse — `named` lands directly on the grandparent and
+    // no longer starts with `parent` — so this guard carries the weight on
+    // Unix, while on Windows the `starts_with(&parent)` postcondition below
+    // (built for the drive-letter-injection case) ends up refusing `..` too.
     if name == ".." {
         return fs_error_response(FsError::Escapes);
     }
@@ -988,13 +1019,112 @@ fn delete_file_blocking(
     // Refused only when `named` is a *real* directory. A symlink is never
     // refused here regardless of what it points to — removing a link is
     // removing one directory entry, not a recursive walk, so it carries none
-    // of the risk the directory refusal above exists to guard against.
+    // of the risk the directory refusal below exists to guard against.
     if meta.is_dir() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "not-a-file",
-            "path is a directory; recursive removal is not supported",
+        if !query.recursive {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "recursive-required",
+                "path is a directory; pass recursive=true to remove it and everything under it",
+            );
+        }
+
+        // A tree holding an upload in flight is refused whole rather than
+        // skipping just the staging file: skipping it still leaves the
+        // parent non-empty, so the removal fails anyway, and removing it
+        // along with everything else destroys the upload — the same shape as
+        // 0.12.0's data loss, an invariant that depended on the staging
+        // location living somewhere else.
+        if uploads.has_live_part_under(&named) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "staging-in-tree",
+                "an upload is in flight under this path; cancel it or wait for it to finish",
+            );
+        }
+
+        let limit = resolve_limit(query.limit);
+        let outcome = crate::fs::remove_tree(root, &named, query.dry_run, limit);
+
+        // The event `kind` carries what a generic outcome label would have
+        // said, instead of a new field: this repo already distinguishes
+        // outcomes this way for uploads (`upload.complete`/`upload.failed`/…),
+        // and a distinct kind is what lets an operator grep the trail for
+        // partial failures specifically. Four kinds, not three: `dry_run`
+        // alone collapses "a clean preview" and "a preview that could not
+        // enumerate everything" into one kind whose `entries` looks exact
+        // either way — the same signal mismatch the HTTP body's `error`
+        // already splits into `preview-incomplete` below, applied to the
+        // trail too.
+        let kind = if query.dry_run && outcome.failures.is_empty() {
+            "fs.delete.dry_run"
+        } else if query.dry_run {
+            "fs.delete.preview_incomplete"
+        } else if outcome.failures.is_empty() {
+            "fs.delete"
+        } else {
+            "fs.delete.partial"
+        };
+        let mut event = crate::audit::AuditEvent::new(kind)
+            .with_identity(identity)
+            .with_route("DELETE /api/v1/fs/file")
+            .with_file(query.path.clone(), Some(outcome.bytes));
+        event.entries = Some(outcome.removed);
+        audit.record(event);
+
+        let body = serde_json::json!({
+            "removed": outcome.removed,
+            "bytes": outcome.bytes,
+            "entries": outcome.entries,
+            "truncated": outcome.truncated,
+            "dry_run": query.dry_run,
+        });
+
+        if outcome.failures.is_empty() {
+            return (StatusCode::OK, axum::Json(body)).into_response();
+        }
+        // Not signalled through the body alone on a 200: a caller that does
+        // not read the body reads success. This repo has hit that shape
+        // repeatedly.
+        let mut body = body;
+        body["failures"] = serde_json::json!(outcome.failures);
+        if query.dry_run {
+            // A preview that could not enumerate everything did not
+            // partially delete anything -- it deleted nothing at all,
+            // dry-run or not. `partial-delete` would say a removal
+            // half-happened when none did; `TreeOutcome`'s own doc is what
+            // "a lower bound" means here, so the message says exactly that.
+            body["error"] = serde_json::json!("preview-incomplete");
+            body["message"] = serde_json::json!(
+                "some entries could not be enumerated, so removed/bytes is a lower bound; nothing was removed"
+            );
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+        }
+        body["error"] = serde_json::json!("partial-delete");
+        body["message"] = serde_json::json!(
+            "some entries survived; removed/bytes counts what was visited and attempted, not what actually disappeared -- see failures for what did not go"
         );
+        return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(body)).into_response();
+    }
+
+    if query.dry_run {
+        audit.record(
+            crate::audit::AuditEvent::new("fs.delete.dry_run")
+                .with_identity(identity)
+                .with_route("DELETE /api/v1/fs/file")
+                .with_file(query.path.clone(), Some(meta.len())),
+        );
+        return (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({
+                "removed": 1,
+                "bytes": meta.len(),
+                "entries": [root.relative(&named).unwrap_or_default()],
+                "truncated": false,
+                "dry_run": true,
+            })),
+        )
+            .into_response();
     }
 
     match platform::remove_entry(&named, &meta) {
