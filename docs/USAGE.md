@@ -413,9 +413,10 @@ traffic instead.
 `--audit-log <file>` appends one JSON object per line for every execution, for
 every request the authentication layer refuses, and for the file operations
 listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry, and refusals decided inside a handler are not
-all there: a delete refused with `400 recursive-required` or `409
-staging-in-tree` writes nothing.
+absent from it leaves no entry. One gap is worth naming rather than leaving to
+be discovered: a request whose *path* does not resolve — missing, malformed, or
+escaping `--fs-root` — is turned away by machinery shared with `list`, `stat`,
+and `download`, and writes nothing on any of those routes.
 
 Off on a loopback bind with no tunnel or relay — creating a file
 nobody asked for is its own kind of surprise there. A server reachable from
@@ -480,6 +481,8 @@ capability token is the access control — withhold `exec` to deny execution.
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
 | `fs.delete.preview_incomplete` | a preview that hit an enumeration failure — nothing changed on disk | `file`, `bytes`, `entries` (a count — a lower bound here: an entry that could not be enumerated was never counted) |
 | `fs.delete.partial` | a directory removal where some entries survived | `file`, `bytes`, `entries` (a count — not a lower bound: an entry whose removal itself failed is still counted, so this is what was attempted, not what actually disappeared) |
+| `fs.delete.refused` | a removal the server turned away before touching the disk | `file`, `status`, `reason` (`recursive-required`, `staging-in-tree`, or `reserved-path` — the same code the HTTP body carries) |
+| `fs.delete.failed` | a removal that was attempted and the filesystem refused | `file`, `status`, `reason` (the underlying error) |
 | `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
 | `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
 | `upload.rejected` | the digest did not match at `complete` | `file`, `digest_ok: false`, `upload_id` |
@@ -488,7 +491,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
 
-The four `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
+The `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
 on one shared kind — the same convention the `upload.*` kinds already use. It is what
 makes the trail greppable for the one case worth finding on its own: matching `kind`
 exactly against `fs.delete` (`jq 'select(.kind == "fs.delete")'`, say) silently misses
@@ -498,6 +501,14 @@ reason: a preview that could not enumerate everything reports the same HTTP `err
 status as a real partial removal, and needs its own kind so it isn't mistaken for one —
 nothing was removed either way, but a plain `fs.delete.dry_run` promises an exact count
 that an incomplete one cannot back up.
+
+`fs.delete.refused` and `fs.delete.failed` stop there rather than splitting further: the
+kinds above are separate because the *accuracy of their counts* differs, and neither of
+these carries counts at all — `reason` distinguishes them, and a kind per reason would
+widen the grep surface without telling an operator anything the field does not. The two
+are separate from each other because they answer different questions: a refusal means the
+server said no and the disk was never touched, while a failure means the removal was
+attempted and the filesystem turned it down.
 
 ---
 

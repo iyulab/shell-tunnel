@@ -252,6 +252,45 @@ fn refuse_if_reserved(root: &FsRoot, resolved: &std::path::Path) -> Option<Respo
     }
 }
 
+/// Record a delete that never removed what it was asked to.
+///
+/// One kind for every refusal (`fs.delete.refused`) and one for every attempt
+/// the filesystem itself turned down (`fs.delete.failed`), with `reason`
+/// carrying the same code the HTTP body does — a trail entry and the error a
+/// caller saw can be matched without a translation table. `status` and
+/// `reason` together are the shape the authentication layer's `denied` events
+/// already use.
+///
+/// Not split per reason, unlike the four `fs.delete*` kinds on the success
+/// side: those are separate because the *accuracy of their counts* differs and
+/// an operator greps for exactly that. Neither of these carries counts, so a
+/// kind per reason would widen the grep surface without distinguishing
+/// anything.
+///
+/// **Scope, deliberately narrow.** Only the outcomes `delete_file_blocking`
+/// decides itself are recorded here. A path that does not resolve — missing,
+/// malformed, or escaping the root — is refused by machinery shared with
+/// `list`, `stat`, and `download`, and recording it from this one caller would
+/// suggest the trail sees every such attempt when it would see a quarter of
+/// them. That is the reassuring-sounding half-truth this repo keeps having to
+/// delete from its own documentation.
+fn audit_delete_denial(
+    audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
+    kind: &str,
+    path: &str,
+    status: StatusCode,
+    reason: &str,
+) {
+    audit.record(
+        crate::audit::AuditEvent::new(kind)
+            .with_identity(identity)
+            .with_route("DELETE /api/v1/fs/file")
+            .with_denial(status.as_u16(), reason)
+            .with_file(path.to_string(), None),
+    );
+}
+
 /// Query parameters for `list`.
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
@@ -1005,6 +1044,25 @@ fn delete_file_blocking(
     // upload later fails `complete` with an opaque 500 instead of the
     // caller ever seeing a clean refusal.
     if let Some(response) = refuse_if_reserved(root, &named) {
+        // Two outcomes, and they are not the same event: `403` is a caller
+        // reaching for another caller's staging file — the one refusal here
+        // with detection value rather than merely diagnostic value — while
+        // `500` is this server failing to place a path it had already
+        // resolved. The status is what tells them apart, so the kind and the
+        // reason are read off it rather than assumed from the call site.
+        let (kind, reason) = if response.status() == StatusCode::FORBIDDEN {
+            ("fs.delete.refused", "reserved-path")
+        } else {
+            ("fs.delete.failed", "path-resolution-failed")
+        };
+        audit_delete_denial(
+            audit,
+            identity,
+            kind,
+            &query.path,
+            response.status(),
+            reason,
+        );
         return response;
     }
 
@@ -1022,6 +1080,14 @@ fn delete_file_blocking(
     // of the risk the directory refusal below exists to guard against.
     if meta.is_dir() {
         if !query.recursive {
+            audit_delete_denial(
+                audit,
+                identity,
+                "fs.delete.refused",
+                &query.path,
+                StatusCode::BAD_REQUEST,
+                "recursive-required",
+            );
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "recursive-required",
@@ -1036,6 +1102,18 @@ fn delete_file_blocking(
         // 0.12.0's data loss, an invariant that depended on the staging
         // location living somewhere else.
         if uploads.has_live_part_under(&named) {
+            // The refusal most worth having in the trail: "why did that
+            // cleanup not happen" is exactly the question a trail answers
+            // after the fact, and without this the only evidence a tree was
+            // held back by an upload in flight is the 409 the caller saw.
+            audit_delete_denial(
+                audit,
+                identity,
+                "fs.delete.refused",
+                &query.path,
+                StatusCode::CONFLICT,
+                "staging-in-tree",
+            );
             return error_response(
                 StatusCode::CONFLICT,
                 "staging-in-tree",
@@ -1146,11 +1224,26 @@ fn delete_file_blocking(
             );
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "delete-failed",
-            &format!("could not remove the file: {e}"),
-        ),
+        Err(e) => {
+            // Not a refusal — nothing said no, the filesystem did — so it
+            // carries its own kind, the way `upload.failed` sits beside
+            // `upload.rejected`. Without it the single-entry path is the only
+            // terminal delete outcome with no entry at all: a tree that half
+            // fails already writes `fs.delete.partial`.
+            audit_delete_denial(
+                audit,
+                identity,
+                "fs.delete.failed",
+                &query.path,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "delete-failed",
+                &format!("could not remove the file: {e}"),
+            )
+        }
     }
 }
 

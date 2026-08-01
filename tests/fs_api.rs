@@ -4164,3 +4164,250 @@ async fn an_orphaned_staging_file_is_audited_and_correlates_to_its_start_by_uplo
         "the destination is not recoverable here; `file` must be absent, not merely null"
     );
 }
+
+/// The delete route's own guards had no trail at all: a caller could be
+/// refused and the audit log would show the request had never happened.
+/// Every other refusal in the file API leaves one -- the authentication layer
+/// writes `denied`, the upload path writes `upload.rejected`/`upload.failed`
+/// -- and asking "why did that cleanup not go through" after the fact is what
+/// the trail is for. These pin the three refusals this handler decides
+/// itself; they are the reason `--audit-log`'s description can name what it
+/// records instead of hedging.
+///
+/// One kind carrying `reason`, not one kind per refusal: the four
+/// `fs.delete*` success kinds are split because the *accuracy of their
+/// counts* differs, and an operator greps for that. A refusal has no counts,
+/// so splitting it would widen the grep surface without distinguishing
+/// anything.
+#[tokio::test]
+async fn a_directory_delete_without_recursive_is_audited_as_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app")).expect("mkdir");
+    std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
+    let (state, log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let events = audit_lines(&log);
+    let refused = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.refused")
+        .expect("a refused delete must leave an audit event");
+    // The same code the HTTP body carries, so a trail entry and a client's
+    // error can be matched without a translation table.
+    assert_eq!(refused["reason"], "recursive-required");
+    assert_eq!(refused["status"], 400);
+    assert_eq!(refused["file"], "app");
+    assert!(
+        dir.path().join("app/a.txt").exists(),
+        "a refusal must remove nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_tree_holding_a_live_upload_is_audited_as_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let base = dir
+        .path()
+        .canonicalize()
+        .expect("canonicalize")
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/");
+    let log = dir.path().join("audit.jsonl");
+    let sink = shell_tunnel::audit::AuditSink::file(&log).expect("sink");
+    // Machine-wide, because that is the scope in which staging follows the
+    // destination and so lands *inside* the tree being removed. Under a
+    // `--fs-root` the staging directory hangs off the root instead, and this
+    // refusal never fires for a subdirectory.
+    let state = AppState::new()
+        .with_fs_root(FsRoot::machine_wide())
+        .with_audit(std::sync::Arc::new(sink));
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
+    let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={base}/sub&recursive=true"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+
+    let events = audit_lines(&log);
+    let refused = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.refused")
+        .expect("a tree refused for an upload in flight must leave an audit event");
+    assert_eq!(refused["reason"], "staging-in-tree");
+    assert_eq!(refused["status"], 409);
+    assert!(
+        dir.path().join("sub/keep.txt").exists(),
+        "a refusal must remove nothing"
+    );
+}
+
+/// Included deliberately, though it is not a guard a caller trips by
+/// accident: an attempt to delete another caller's in-progress staging file
+/// is the one refusal here with detection value rather than merely
+/// diagnostic value.
+#[tokio::test]
+async fn deleting_a_reserved_path_is_audited_as_refused() {
+    let (_dir, state, staging_path, log) = audited_state_with_a_staged_upload().await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={staging_path}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let events = audit_lines(&log);
+    let refused = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.refused")
+        .expect("a reserved-path delete must leave an audit event");
+    assert_eq!(refused["reason"], "reserved-path");
+    assert_eq!(refused["status"], 403);
+}
+
+/// The other half of the same hole. A removal that was *attempted* and
+/// errored is not a refusal -- nothing said no, the filesystem did -- so it
+/// carries its own kind, exactly as `upload.failed` sits beside
+/// `upload.rejected`. Without it, the single-entry path stays silent on
+/// failure while the tree path already writes `fs.delete.partial`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_delete_the_filesystem_refuses_is_audited_as_failed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("locked")).expect("mkdir");
+    std::fs::write(dir.path().join("locked/a.txt"), b"xy").expect("write");
+    let locked = dir.path().join("locked");
+    let (state, log) = audited_state(&dir);
+    // Removing an entry needs write permission on its *parent*, so a
+    // read-and-execute directory blocks it deterministically while leaving
+    // the resolution and lstat above it working.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=locked/a.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("restore");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.failed")
+        .expect("a removal that errored must leave an audit event");
+    assert_eq!(failed["status"], 500);
+    assert_eq!(failed["file"], "locked/a.txt");
+    assert!(
+        failed["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "the trail must say why, not merely that it failed"
+    );
+}
+
+/// `a_delete_the_filesystem_refuses_is_audited_as_failed`'s Windows sibling:
+/// an exclusive-share handle blocks one file's removal deterministically,
+/// the same mechanism the partial-tree test above uses.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_delete_the_filesystem_refuses_is_audited_as_failed() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("locked")).expect("mkdir");
+    let target = dir.path().join("locked/a.txt");
+    std::fs::write(&target, b"xy").expect("write");
+    let (state, log) = audited_state(&dir);
+    let handle = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&target)
+        .expect("open exclusively");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=locked/a.txt")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    drop(handle);
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let events = audit_lines(&log);
+    let failed = events
+        .iter()
+        .find(|e| e["kind"] == "fs.delete.failed")
+        .expect("a removal that errored must leave an audit event");
+    assert_eq!(failed["status"], 500);
+    assert_eq!(failed["file"], "locked/a.txt");
+    assert!(
+        failed["reason"].as_str().is_some_and(|r| !r.is_empty()),
+        "the trail must say why, not merely that it failed"
+    );
+}
+
+/// `state_with_a_staged_upload`'s audited twin. Kept separate rather than
+/// widening that helper's tuple: every existing caller of it asserts on an
+/// HTTP response and has no use for a sink.
+async fn audited_state_with_a_staged_upload(
+) -> (tempfile::TempDir, AppState, String, std::path::PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let upload_id = create_test_upload(state.clone(), "app/upload.bin", b"hello!").await;
+    // One chunk, so the staging file actually exists on disk: `delete`
+    // resolves the path before it consults the reservation, and a path that
+    // is not there is a 404 long before it is a refusal.
+    let patch = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{upload_id}"))
+                .header("content-range", "bytes 0-5/6")
+                .body(Body::from(&b"hello "[..]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(patch.status(), StatusCode::OK);
+
+    let staging_path = format!(".shell-tunnel-uploads/{upload_id}.part");
+    (dir, state, staging_path, log)
+}
