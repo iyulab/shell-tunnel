@@ -640,6 +640,43 @@ mod tests {
         assert!(!config.security.rate_limit.enabled);
     }
 
+    /// Neither `server.host` nor `server.port` survives `apply_args`: both are
+    /// assigned unconditionally from `Args`, whose defaults are `127.0.0.1` and
+    /// `3000`, so a value from a config file or the environment is overwritten
+    /// even when the user passed no flag at all. `port_explicit` does not guard
+    /// this — it is read in one place, to pick an ephemeral port behind a relay.
+    ///
+    /// This pins what the code does today, not what it ought to do. It exists
+    /// because the documentation twice described a precedence that was never
+    /// implemented, and because the only test to touch a configured port passed
+    /// `-p` explicitly, which is exactly what hid the behaviour. Whichever way
+    /// the eventual fix goes, this test has to be updated deliberately.
+    #[test]
+    fn the_cli_default_overwrites_a_configured_host_and_port() {
+        let mut config = Config::default();
+        // As a config file or `SHELL_TUNNEL_HOST`/`SHELL_TUNNEL_PORT` would
+        // leave it: `Config::load` runs `apply_env` before `apply_args`, so
+        // both arrive here indistinguishable from one another.
+        config.server.host = "0.0.0.0".to_string();
+        config.server.port = 8080;
+
+        let nothing_passed = Args::default();
+        assert!(
+            !nothing_passed.port_explicit,
+            "the premise: no flag was given"
+        );
+        config.apply_args(&nothing_passed);
+
+        assert_eq!(
+            config.server.host, "127.0.0.1",
+            "a configured bind address does not survive the CLI default"
+        );
+        assert_eq!(
+            config.server.port, 3000,
+            "and neither does a configured port"
+        );
+    }
+
     #[test]
     fn test_apply_no_auth() {
         let mut config = Config::default();

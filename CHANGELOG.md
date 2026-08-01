@@ -26,7 +26,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   conclusion from three separately true lines. The test is the resolved
   capability set, not the preset name, so `--capabilities fs.read` reaches it
   too; a token holding `exec` never does, since there the file API grants
-  nothing `exec` did not already reach.
+  nothing `exec` did not already reach. It also requires authentication to be
+  on: with `--no-auth` no token exists and every route is open, so there is no
+  scope to describe.
 
 ### Breaking
 

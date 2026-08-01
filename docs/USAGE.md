@@ -716,13 +716,15 @@ still sees the real address.
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 
-Environment: `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
-`SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
+Environment: `SHELL_TUNNEL_API_KEY`, `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
 
-`SHELL_TUNNEL_HOST` is read but has no effect: the bind address is taken from
-`-H` on every start, so whatever the environment (or a config file) says is
-overwritten by the command line, default included. Give the bind address with
-`-H`. The port has no such problem — `-p` overrides only when you pass it.
+`SHELL_TUNNEL_HOST` and `SHELL_TUNNEL_PORT` are read but have no effect. The
+bind address and the port are both taken from `-H` and `-p` on every start, and
+the command line supplies its own defaults (`127.0.0.1`, `3000`) when you pass
+nothing — so whatever the environment or a config file says is overwritten
+either way. **Give the bind address and the port on the command line.** They are
+listed here rather than deleted so that anyone who already set them knows why
+nothing changed.
 
 ---
 
@@ -730,7 +732,7 @@ overwritten by the command line, default included. Give the bind address with
 
 ```json
 {
-  "server": { "port": 8080, "graceful_shutdown": true },
+  "server": { "graceful_shutdown": true },
   "security": {
     "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 },
@@ -742,12 +744,14 @@ overwritten by the command line, default included. Give the bind address with
 ```
 
 `transport.mode` is `none`, `cloudflared`, or `command` (with `command` naming
-the client to run). CLI flags override the file, as with every setting.
+the client to run). A CLI flag you pass overrides the file, as with every
+setting — with the one exception below.
 
-`server.host` is deliberately absent from the example: the bind address is taken
-from `-H` on every start, so a value here is overwritten by the CLI default and
-never takes effect. Pass `-H` instead. `server.port` is honoured — the CLI
-overrides it only when `-p` is given.
+`server.host` and `server.port` are deliberately absent from the example,
+because they are the exception: both are taken from `-H` and `-p` on every
+start, and the CLI supplies its own defaults, so a value here is overwritten
+even when you pass no flag at all. Pass `-H` and `-p` instead. Every other key
+in the block is overridden only by a flag you actually give.
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json

@@ -364,7 +364,9 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // `exec` the file API *is* the whole grant, and `--fs-root` is the only
     // thing that would have narrowed it. A preset name that sounds narrow
     // ("file-read") is precisely how this is reached by accident.
-    if fs_root.jail_path().is_none() && file_scope_is_the_whole_grant(resolved.as_ref()) {
+    if fs_root.jail_path().is_none()
+        && file_scope_is_the_whole_grant(config.security.auth.enabled, resolved.as_ref())
+    {
         println!("             this token holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given");
     }
     if fs_root.jail_path().is_none() && audit_log.is_some() {
@@ -850,10 +852,10 @@ fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> To
 
 /// Whether the file API is the whole of what a token this server issues holds.
 ///
-/// True exactly when the token reaches `fs.read` or `fs.write` and does **not**
-/// hold `exec`. That is the one shape for which `--fs-root` confines anything:
-/// with `exec` the file API grants no reach the token did not already have, so
-/// its absence is not a hazard worth a line.
+/// True exactly when authentication is on and the token reaches `fs.read` or
+/// `fs.write` without holding `exec`. That is the one shape for which
+/// `--fs-root` confines anything: with `exec` the file API grants no reach the
+/// token did not already have, so its absence is not a hazard worth a line.
 ///
 /// Decided from the *resolved* capability set rather than the preset name, so
 /// it cannot drift from what the router enforces — and so it covers
@@ -861,8 +863,19 @@ fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> To
 /// full-control default, which is the wildcard: `satisfies` answers `true` for
 /// `exec` there, so the wildcard falls out of the same test rather than needing
 /// its own arm.
-fn file_scope_is_the_whole_grant(capabilities: Option<&CapabilitySet>) -> bool {
-    let Some(set) = capabilities else {
+///
+/// `auth_enabled` is not a refinement of that test but a precondition for it
+/// meaning anything. With authentication off, `capability_auth_middleware`
+/// (`src/api/router.rs`) returns before a token is ever looked for, so every
+/// route is open — `exec` included — no matter what `--preset` or
+/// `security.auth.preset` says. Describing such a server as holding a scope
+/// without `exec` would be false in the reassuring direction, on the one
+/// surface meant to be trusted. Reachable with `--no-auth --preset file-read`
+/// and with `auth.enabled: false` alongside a preset in a config file; an
+/// exposed server cannot reach it, since the posture turns authentication on
+/// and refuses `--no-auth`.
+fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&CapabilitySet>) -> bool {
+    let Some(set) = capabilities.filter(|_| auth_enabled) else {
         return false;
     };
     !set.satisfies("exec") && (set.satisfies("fs.read") || set.satisfies("fs.write"))
@@ -1139,8 +1152,34 @@ mod tests {
     /// extra banner line names.
     #[test]
     fn the_file_presets_have_nothing_but_the_file_api() {
-        assert!(file_scope_is_the_whole_grant(Some(&resolved("file-read"))));
-        assert!(file_scope_is_the_whole_grant(Some(&resolved("file-write"))));
+        assert!(file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("file-read"))
+        ));
+        assert!(file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("file-write"))
+        ));
+    }
+
+    /// With authentication off there is no token: `capability_auth_middleware`
+    /// returns before it looks for one, so `exec` answers every caller whatever
+    /// the preset says. Claiming a scope without `exec` there would be a
+    /// reassuring falsehood on the surface this banner exists to be trusted on.
+    /// Reachable as `--no-auth --preset file-read`, and from a config file
+    /// pairing `auth.enabled: false` with `security.auth.preset`.
+    #[test]
+    fn an_unauthenticated_server_has_no_token_to_describe() {
+        assert!(!file_scope_is_the_whole_grant(
+            false,
+            Some(&resolved("file-read"))
+        ));
+        assert!(!file_scope_is_the_whole_grant(
+            false,
+            Some(&resolved("file-write"))
+        ));
+        let named: CapabilitySet = ["fs.read"].into_iter().collect();
+        assert!(!file_scope_is_the_whole_grant(false, Some(&named)));
     }
 
     /// The line must not fire for a token holding `exec`: there a machine-wide
@@ -1148,10 +1187,14 @@ mod tests {
     /// confinement warning would train operators to ignore it.
     #[test]
     fn a_token_holding_exec_is_not_confined_by_the_file_root() {
-        assert!(!file_scope_is_the_whole_grant(Some(&resolved("operator"))));
-        assert!(!file_scope_is_the_whole_grant(Some(&resolved(
-            "full-control"
-        ))));
+        assert!(!file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("operator"))
+        ));
+        assert!(!file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("full-control"))
+        ));
         // The wildcard has no arm of its own — `satisfies("exec")` answers for
         // it. Asserted so that stays true if the predicate is rewritten.
         assert!(resolved("full-control").is_wildcard());
@@ -1162,7 +1205,7 @@ mod tests {
     /// the most permissive possible token.
     #[test]
     fn an_unresolved_scope_is_not_treated_as_file_only() {
-        assert!(!file_scope_is_the_whole_grant(None));
+        assert!(!file_scope_is_the_whole_grant(true, None));
     }
 
     /// Named capabilities reach the same state as `--preset file-read` and were
@@ -1171,14 +1214,14 @@ mod tests {
     #[test]
     fn an_explicit_file_capability_list_counts_too() {
         let read: CapabilitySet = ["fs.read"].into_iter().collect();
-        assert!(file_scope_is_the_whole_grant(Some(&read)));
+        assert!(file_scope_is_the_whole_grant(true, Some(&read)));
 
         let with_exec: CapabilitySet = ["fs.read", "exec"].into_iter().collect();
-        assert!(!file_scope_is_the_whole_grant(Some(&with_exec)));
+        assert!(!file_scope_is_the_whole_grant(true, Some(&with_exec)));
 
         // Neither half of the file API: nothing to confine, so nothing to say.
         let sessions: CapabilitySet = ["session.read"].into_iter().collect();
-        assert!(!file_scope_is_the_whole_grant(Some(&sessions)));
+        assert!(!file_scope_is_the_whole_grant(true, Some(&sessions)));
     }
 
     #[test]
