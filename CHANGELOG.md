@@ -29,6 +29,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **`--allow-host` no longer fails silently on a published server.** Host
+  checking is off wherever the server is deliberately reachable under a name it
+  may not know — a tunnel assigns one, a relay routes by path — and the flag was
+  not merely ignored there but never read, with no warning and no refusal. An
+  operator who passed it believed the server answered to one name while it
+  answered to every name. The startup banner now says the flag was not applied.
+
+  Turning the check off is unchanged and is not the defect: host checking
+  answers DNS rebinding, which does not apply once the server is published, and
+  enforcing it would refuse legitimate traffic. It is also not access control —
+  a caller holding the token reaches the server under whatever name the tunnel
+  or relay publishes. Narrow what a token can do instead.
+
 - **An upload no longer leaves its staging directory behind.**
   `.shell-tunnel-uploads` was created for a transfer and never removed: `.part`
   files were swept but the directory holding them stayed, and since `list`

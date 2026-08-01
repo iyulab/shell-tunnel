@@ -343,7 +343,12 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // to avoid: they must describe one token, not two independent guesses at it.
     let resolved = config.resolved_capabilities().ok().flatten();
     let scope = token_scope(config.security.auth.preset.as_deref(), resolved.as_ref());
-    for line in posture_banner(posture, &scope, audit_log.as_deref()) {
+    for line in posture_banner(
+        posture,
+        &scope,
+        audit_log.as_deref(),
+        !args.allow_hosts.is_empty(),
+    ) {
         println!("{line}");
     }
     // The generated key belongs with the reachability it unlocks, not after the
@@ -887,7 +892,12 @@ fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&Capab
 /// The strings come out of a function so that tests can hold them in place.
 /// User-facing text in this repository has broken four times, every one of
 /// them somewhere no test was looking.
-fn posture_banner(posture: Posture, scope: &TokenScope, audit_log: Option<&Path>) -> Vec<String> {
+fn posture_banner(
+    posture: Posture,
+    scope: &TokenScope,
+    audit_log: Option<&Path>,
+    allow_host_given: bool,
+) -> Vec<String> {
     if posture == Posture::Local {
         return Vec::new();
     }
@@ -911,6 +921,21 @@ fn posture_banner(posture: Posture, scope: &TokenScope, audit_log: Option<&Path>
         }
     };
     let mut lines = vec![reach];
+    // `--allow-host` is read only on a loopback bind with no public path, and
+    // that is exactly the posture this function returns early for — so on
+    // every line below it the flag did nothing at all. Turning the check off
+    // here is right: a published server is reached under a name it may not
+    // know (the tunnel provider assigns one, a relay routes by path), and host
+    // checking answers DNS rebinding rather than being access control, so
+    // there is no rebinding to stop and a check would refuse legitimate
+    // traffic. What was wrong is that a flag asking for a defence was
+    // discarded in silence. The banner already exists to say what is actually
+    // in force; this is one more thing that is not.
+    if allow_host_given {
+        lines.push(
+            "             --allow-host was not applied — a published server answers to any Host, since it is reached under names it cannot know".to_string(),
+        );
+    }
     if let Some(path) = audit_log {
         lines.push(format!("Audit trail: {}", path.display()));
     }
@@ -1055,7 +1080,7 @@ mod tests {
         // so `harden_for_public_exposure` set `operator`.
         let path = PathBuf::from("shell-tunnel-audit.jsonl");
         let scope = token_scope(Some("operator"), Some(&resolved("operator")));
-        let lines = posture_banner(Posture::Exposed, &scope, Some(&path));
+        let lines = posture_banner(Posture::Exposed, &scope, Some(&path), false);
         let text = lines.join("\n");
         assert!(text.contains("Reachable:"), "{text}");
         assert!(
@@ -1077,7 +1102,7 @@ mod tests {
     #[test]
     fn a_wildcard_scope_is_never_described_as_scoped() {
         let scope = token_scope(Some("full-control"), Some(&resolved("full-control")));
-        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
         assert!(
             !text.contains("operator"),
             "a wildcard token must not be reported as `operator`: {text}"
@@ -1102,7 +1127,7 @@ mod tests {
     #[test]
     fn an_explicit_preset_is_named_rather_than_the_promoted_one() {
         let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
-        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
         assert!(text.contains("file-read"), "{text}");
         assert!(
             !text.contains("operator"),
@@ -1114,7 +1139,7 @@ mod tests {
     fn an_explicit_capability_list_is_spelled_out() {
         let caps: CapabilitySet = ["exec", "fs.read"].into_iter().collect();
         let scope = token_scope(None, Some(&caps));
-        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
         assert!(text.contains("exec"), "{text}");
         assert!(text.contains("fs.read"), "{text}");
     }
@@ -1126,7 +1151,7 @@ mod tests {
         let mut caps = resolved("file-read");
         caps.insert("exec");
         let scope = token_scope(Some("file-read"), Some(&caps));
-        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
         assert!(
             !text.contains("file-read"),
             "naming the preset would hide the `exec` unioned on top of it: {text}"
@@ -1224,11 +1249,46 @@ mod tests {
         assert!(!file_scope_is_the_whole_grant(true, Some(&sessions)));
     }
 
+    /// A flag that asks for a defence and is then discarded has to say so.
+    /// `--allow-host` is read only on a loopback bind with no public path;
+    /// published, `Config::allowed_hosts` returns before it looks at the flag,
+    /// and until this line nothing warned, refused, or logged. The operator
+    /// believed the server answered to one name while it answered to every
+    /// name — a silence in the reassuring direction.
+    #[test]
+    fn the_exposed_banner_says_allow_host_did_nothing() {
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let text = posture_banner(Posture::Exposed, &scope, None, true).join(
+            "
+",
+        );
+        assert!(
+            text.contains("--allow-host"),
+            "the flag has to be named, not merely alluded to: {text}"
+        );
+        assert!(
+            text.contains("not applied"),
+            "and it has to say the flag did nothing: {text}"
+        );
+    }
+
+    /// The other half: no line when the flag was not given. A banner that
+    /// mentions every flag nobody passed is one nobody reads.
+    #[test]
+    fn the_exposed_banner_is_silent_about_an_allow_host_nobody_gave() {
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join(
+            "
+",
+        );
+        assert!(!text.contains("--allow-host"), "{text}");
+    }
+
     #[test]
     fn the_local_banner_says_nothing() {
         // Local is zero friction. Nothing was narrowed, so there is nothing
         // to report.
-        assert!(posture_banner(Posture::Local, &TokenScope::Wildcard, None).is_empty());
+        assert!(posture_banner(Posture::Local, &TokenScope::Wildcard, None, true).is_empty());
     }
 
     /// The `Err` arm itself: a path whose *parent* cannot be canonicalised
