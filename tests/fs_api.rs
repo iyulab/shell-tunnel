@@ -1679,10 +1679,14 @@ async fn delete_refuses_a_directory() {
 
 #[tokio::test]
 async fn delete_refuses_a_path_outside_the_root() {
-    let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    // The root is a *subdirectory* here, so `..` names somewhere real that
+    // this test owns. With the root at the temp directory itself, `..` points
+    // into the shared system temp directory: there is nothing to place there
+    // safely, so the refusal could only ever be checked by its status code.
+    let (dir, state) = state_with_a_neighbour("outside.txt", b"do not touch");
+    let neighbour = dir.path().join("outside.txt");
 
-    let response = app
+    let response = create_router_with_state(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -1694,6 +1698,36 @@ async fn delete_refuses_a_path_outside_the_root() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // The half this test used to leave unchecked. A handler that removed the
+    // file and *then* answered `403` passed it, and "refuses" in the name
+    // promised otherwise — the reassuring direction.
+    assert!(
+        neighbour.is_file(),
+        "a refusal must leave the file outside the root alone"
+    );
+    assert_eq!(
+        std::fs::read(&neighbour).expect("read neighbour"),
+        b"do not touch",
+        "and must not have rewritten it either"
+    );
+}
+
+/// A root with a sibling file beside it, both inside one temp directory.
+///
+/// Returned so a test can assert on what `..` reaches: escapes are refused by
+/// path resolution, and proving that means having something real one level up
+/// that the test can look at afterwards.
+fn state_with_a_neighbour(
+    name: &str,
+    body: &[u8],
+) -> (tempfile::TempDir, shell_tunnel::api::AppState) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join(name), body).expect("write neighbour");
+    let root_dir = dir.path().join("root");
+    std::fs::create_dir_all(root_dir.join("app")).expect("mkdir root");
+    std::fs::write(root_dir.join("app/a.txt"), b"a").expect("write");
+    let root = FsRoot::new(&root_dir).expect("root");
+    (dir, AppState::new().with_fs_root(root))
 }
 
 /// A request whose final component is `..` passes the full-path resolution
@@ -2747,7 +2781,8 @@ async fn a_second_session_for_the_same_destination_is_refused() {
 
 #[tokio::test]
 async fn an_upload_may_not_target_a_path_outside_the_root() {
-    let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
+    let (dir, state) = state_with_a_neighbour("keep.txt", b"k");
+    let escape = dir.path().join("escape.bin");
 
     let response = create_router_with_state(state)
         .oneshot(
@@ -2769,6 +2804,56 @@ async fn an_upload_may_not_target_a_path_outside_the_root() {
         .expect("response");
 
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    // Refusing the session is not the same as having created nothing. A
+    // `create` that opened its staging file before resolving the destination
+    // would answer `403` and still have written outside the root, and the
+    // status alone could never tell the two apart.
+    assert!(
+        !escape.exists(),
+        "a refused session must not have created anything outside the root"
+    );
+    // Under a jail the staging directory hangs off the root, not off the
+    // destination — so that, and not a directory beside `escape.bin`, is where
+    // a session that got past the guard would have left its trace. Checking
+    // the wrong one of the two would have made this assertion unfalsifiable.
+    assert!(
+        !dir.path().join("root/.shell-tunnel-uploads").exists(),
+        "nor a staging file for a session that should never have opened"
+    );
+}
+
+/// The control for the assertion above. If a refused session left no staging
+/// directory simply because *no* session ever leaves one at that path, the
+/// check would be unfalsifiable — so this opens a legitimate session against
+/// the identical fixture and confirms the directory does appear there.
+#[tokio::test]
+async fn a_permitted_upload_into_the_same_fixture_does_create_staging() {
+    let (dir, state) = state_with_a_neighbour("keep.txt", b"k");
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/fine.bin",
+                        "size": 11,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert!(
+        dir.path().join("root/.shell-tunnel-uploads").is_dir(),
+        "the path the refusal test watches must be one a real session uses"
+    );
 }
 
 /// The one small-payload test above cannot catch the axum-core body-limit gap
