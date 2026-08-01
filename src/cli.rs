@@ -28,7 +28,7 @@ pub struct Args {
     pub require_auth: bool,
     /// Capability strings scoping the issued token(s) (empty = full-control).
     pub capabilities: Vec<String>,
-    /// Role preset scoping the issued token(s) (operator/read-only/full-control).
+    /// Role preset scoping the issued token(s) (operator/file-write/file-read/full-control).
     pub preset: Option<String>,
     /// Disable rate limiting.
     pub no_rate_limit: bool,
@@ -344,12 +344,13 @@ OPTIONS:
     -c, --config <FILE>     Path to configuration file (JSON)
     -k, --api-key <KEY>     API key callers present to run commands here
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
-        --no-auth           Disable authentication
+        --no-auth           Disable authentication (refused when reachable)
         --require-auth      Require auth, auto-generating an API key if none given
         --capabilities <C>  Scope issued token(s): comma-separated capabilities
-                            (e.g. exec,session.read). Default: full-control
+                            (e.g. exec,session.read). Default: full-control, or
+                            operator when the server is reachable
         --preset <NAME>     Scope issued token(s) by role preset
-                            (operator | read-only | full-control)
+                            (operator | file-write | file-read | full-control)
         --no-rate-limit     Disable rate limiting
         --tunnel            Expose publicly via a Cloudflare quick tunnel
                             (requires `cloudflared`; implies authentication)
@@ -364,15 +365,19 @@ OPTIONS:
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
         --allow-host <HOST> Also answer to this host name. A loopback-bound
-                            server otherwise answers only to localhost, which is
-                            what stops DNS rebinding. Repeatable
-        --audit-log <FILE>  Append every execution and refusal to this file
-                            (JSON per line; the token itself is never written)
+                            server that is not published otherwise answers only
+                            to localhost, which is what stops DNS rebinding.
+                            Published, nothing is host-checked. Repeatable
+        --audit-log <FILE>  Append executions, denied requests, and file
+                            operations to this file (JSON per line; the token
+                            itself is never written)
+                            [default: off; shell-tunnel-audit.jsonl when reachable]
         --audit-max-bytes <N>
                             Rotate the audit trail to <FILE>.1 past this size
                             [default: unbounded]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
-        --fs-root <PATH>    Enable the file API, confined to this directory
+        --fs-root <PATH>    Confine the file API to this directory. Without it
+                            the API reaches everything this account can
         --fs-chunk-size <N> Upload chunk size in bytes (default 4194304)
 
 TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
@@ -401,9 +406,10 @@ RELAY OPTIONS (with `relay`):
     -V, --version           Print version
 
 ENVIRONMENT VARIABLES:
-    SHELL_TUNNEL_HOST       Host address (overrides config)
-    SHELL_TUNNEL_PORT       Port number (overrides config)
-    SHELL_TUNNEL_API_KEY    API key (overrides config)
+    SHELL_TUNNEL_HOST       No effect: -H sets the bind address on every start
+    SHELL_TUNNEL_PORT       No effect: -p sets the port on every start
+    SHELL_TUNNEL_API_KEY    Adds an API key and turns auth on. Keys from the
+                            config file stay valid alongside it
     SHELL_TUNNEL_LOG_LEVEL  Log level (overrides config)
     RUST_LOG                Alternative log level setting
 
@@ -436,8 +442,8 @@ EXAMPLES:
     # Behind a proxy that forwards 443 here, name the port devices dial
     shell-tunnel relay -H 0.0.0.0 -p 8443 --public-base https://relay.example.com:443
 
-    # Issue a fine-grained, read-only token
-    shell-tunnel -k readonly-key --preset read-only
+    # Issue a token that can only read files, confined to one directory
+    shell-tunnel -k readonly-key --preset file-read --fs-root /srv/deploy
 
     # Issue a token scoped to specific capabilities
     shell-tunnel -k ci-key --capabilities exec,session.read

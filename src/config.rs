@@ -110,7 +110,7 @@ pub struct AuthSection {
     pub api_keys: Vec<String>,
     /// Capability strings scoping the keys (empty = full-control).
     pub capabilities: Vec<String>,
-    /// Role preset scoping the keys (operator/read-only/full-control).
+    /// Role preset scoping the keys (operator/file-write/file-read/full-control).
     pub preset: Option<String>,
 }
 
@@ -207,7 +207,7 @@ impl Config {
 
         // Token scoping (fine-grained capabilities / preset). Specifying a scope
         // implies auth-on — otherwise the scope would be silently ignored and the
-        // server would start open, the opposite of what `--preset read-only` asks
+        // server would start open, the opposite of what `--preset file-read` asks
         // for. Applied before `no_auth` so an explicit `--no-auth` still wins.
         if !args.capabilities.is_empty() {
             self.security.auth.capabilities = args.capabilities.clone();
@@ -305,6 +305,27 @@ impl Config {
         }
     }
 
+    /// Determine how far this configuration is exposed.
+    ///
+    /// `tunnel_configured` is a single fact after the CLI (`--tunnel`/`--tunnel-command`)
+    /// and config file (`transport.mode`) are merged — this function does not need to know
+    /// which input path it came from. `relay_attached` indicates whether `--relay` was given.
+    ///
+    /// Bind address is judged by `!ip.is_loopback()` alone. This condition is the same one
+    /// this file already uses for warnings — no new rules are introduced.
+    pub fn posture(&self, tunnel_configured: bool, relay_attached: bool) -> Posture {
+        if tunnel_configured || relay_attached {
+            return Posture::Exposed;
+        }
+        match self.server.host.parse::<IpAddr>() {
+            Ok(ip) if ip.is_loopback() => Posture::Local,
+            // Parse failures are already rejected by `to_server_config` with `InvalidHost`,
+            // so this branch is not reached in practice. Even so, we answer Exposed: inability
+            // to judge is not evidence of safety.
+            _ => Posture::Exposed,
+        }
+    }
+
     /// Harden the configuration for a publicly reachable deployment.
     ///
     /// Exposing the server through a tunnel turns every weak default into an
@@ -312,11 +333,12 @@ impl Config {
     /// authentication is switched on, and a key is generated when none was
     /// supplied (the caller reports it — an unusable server would be worse).
     /// `--no-auth` is refused outright instead of being silently overridden.
+    /// An unscoped token is likewise defaulted rather than warned about: it is
+    /// scoped to the `operator` preset unless the consumer already chose a
+    /// scope.
     ///
-    /// The remaining risks are real but legitimate choices, so they are warned
-    /// about rather than blocked: a full-control token on a public URL, rate
-    /// limiting turned off, and binding a non-loopback address in addition to
-    /// the tunnel.
+    /// The remaining risk is a real but legitimate choice, so it is warned
+    /// about rather than blocked: rate limiting turned off.
     pub fn harden_for_public_exposure(
         &mut self,
         args: &Args,
@@ -335,23 +357,27 @@ impl Config {
             None
         };
 
-        let mut warnings = Vec::new();
+        // A default, not a warning. Warning about it is an admission that the
+        // default is wrong for the situation, and here the default can follow
+        // the situation instead.
+        //
+        // The actual reach is the same as `full-control` — `operator` already
+        // has `exec`, and `exec` reaches every file this process can reach.
+        // Only one thing changes: it does not automatically pick up
+        // capabilities added later. That is the wildcard's real danger.
+        //
+        // An explicit scope is left untouched. If the consumer chose it, that
+        // is the answer.
         if self.security.auth.preset.is_none() && self.security.auth.capabilities.is_empty() {
-            warnings.push(
-                "the issued token has full control over this machine and is reachable from the internet; scope it with --preset operator or --capabilities"
-                    .to_string(),
-            );
+            self.security.auth.preset = Some("operator".to_string());
         }
+
+        let mut warnings = Vec::new();
+        // The one warning left. This is a defense the consumer explicitly
+        // turned off, so a default cannot decide it on their behalf, and a
+        // warning is right.
         if !self.security.rate_limit.enabled {
             warnings.push("rate limiting is disabled on a publicly reachable server".to_string());
-        }
-        if let Ok(ip) = self.server.host.parse::<IpAddr>() {
-            if !ip.is_loopback() {
-                warnings.push(format!(
-                    "binding {} exposes the server directly in addition to the tunnel; 127.0.0.1 is enough when a tunnel provides reachability",
-                    ip
-                ));
-            }
         }
 
         Ok(PublicExposure {
@@ -416,6 +442,20 @@ impl Config {
         Ok(server_config)
     }
 
+    /// The capability set an issued token will actually carry.
+    ///
+    /// `None` means nothing narrowed it — the full-control default, which is
+    /// the wildcard. Resolved from the same two fields `to_server_config` uses
+    /// and through the same function, so a caller that wants to *describe* the
+    /// scope cannot drift from the one that enforces it. Call it after
+    /// `harden_for_public_exposure`, or the answer predates the promotion.
+    pub fn resolved_capabilities(&self) -> Result<Option<CapabilitySet>, ConfigError> {
+        resolve_capabilities(
+            self.security.auth.preset.as_deref(),
+            &self.security.auth.capabilities,
+        )
+    }
+
     /// Get the log level filter string.
     pub fn log_filter(&self) -> &str {
         &self.logging.level
@@ -444,6 +484,19 @@ fn resolve_capabilities(
         set.insert(capability.clone());
     }
     Ok(Some(set))
+}
+
+/// How far this process is exposed.
+///
+/// **Derived from arguments and not selectable by the user** — there is no option to choose
+/// a posture, and there should not be one. What has already been chosen (tunnel, relay, bind
+/// address) determines the posture, and the posture determines the security defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posture {
+    /// Reachable only from this machine. No reason to narrow the defaults.
+    Local,
+    /// Reachable from other machines — one or more of: tunnel, relay, or non-loopback bind.
+    Exposed,
 }
 
 /// Outcome of hardening a configuration for public exposure.
@@ -478,9 +531,19 @@ impl std::fmt::Display for ConfigError {
             Self::Io(e) => write!(f, "failed to read config file: {}", e),
             Self::Json(e) => write!(f, "failed to parse config file: {}", e),
             Self::InvalidHost(host) => write!(f, "invalid host address: {}", host),
+            Self::InvalidPreset(name) if name == "read-only" => {
+                write!(
+                    f,
+                    // Names the config key as well as the flags: this error is
+                    // reached just as readily from `security.auth.preset` in a
+                    // config file, where an operator told to change a flag they
+                    // never passed has nowhere to look.
+                    "the 'read-only' preset was removed: it granted only session.read, so it could not read a file despite its name. Use file-read to read files, or capabilities session.read for the old behaviour — as --preset/--capabilities, or as security.auth.preset/security.auth.capabilities in a config file"
+                )
+            }
             Self::InvalidPreset(name) => write!(
                 f,
-                "unknown role preset: '{}' (expected operator, read-only, or full-control)",
+                "unknown role preset: '{}' (expected operator, file-write, file-read, or full-control)",
                 name
             ),
             Self::MissingTunnelCommand => write!(
@@ -489,7 +552,7 @@ impl std::fmt::Display for ConfigError {
             ),
             Self::RemoteWithoutAuth => write!(
                 f,
-                "--no-auth cannot be combined with a public tunnel: that would expose an unauthenticated shell to the internet. Drop --no-auth (a key is generated for you), or drop the tunnel"
+                "--no-auth cannot be combined with a publicly reachable server: that would expose an unauthenticated shell. It is refused for a tunnel, a relay, and a non-loopback bind alike. Drop --no-auth (a key is generated for you), or bind loopback and drop the public path"
             ),
         }
     }
@@ -577,6 +640,43 @@ mod tests {
         assert!(!config.security.rate_limit.enabled);
     }
 
+    /// Neither `server.host` nor `server.port` survives `apply_args`: both are
+    /// assigned unconditionally from `Args`, whose defaults are `127.0.0.1` and
+    /// `3000`, so a value from a config file or the environment is overwritten
+    /// even when the user passed no flag at all. `port_explicit` does not guard
+    /// this — it is read in one place, to pick an ephemeral port behind a relay.
+    ///
+    /// This pins what the code does today, not what it ought to do. It exists
+    /// because the documentation twice described a precedence that was never
+    /// implemented, and because the only test to touch a configured port passed
+    /// `-p` explicitly, which is exactly what hid the behaviour. Whichever way
+    /// the eventual fix goes, this test has to be updated deliberately.
+    #[test]
+    fn the_cli_default_overwrites_a_configured_host_and_port() {
+        let mut config = Config::default();
+        // As a config file or `SHELL_TUNNEL_HOST`/`SHELL_TUNNEL_PORT` would
+        // leave it: `Config::load` runs `apply_env` before `apply_args`, so
+        // both arrive here indistinguishable from one another.
+        config.server.host = "0.0.0.0".to_string();
+        config.server.port = 8080;
+
+        let nothing_passed = Args::default();
+        assert!(
+            !nothing_passed.port_explicit,
+            "the premise: no flag was given"
+        );
+        config.apply_args(&nothing_passed);
+
+        assert_eq!(
+            config.server.host, "127.0.0.1",
+            "a configured bind address does not survive the CLI default"
+        );
+        assert_eq!(
+            config.server.port, 3000,
+            "and neither does a configured port"
+        );
+    }
+
     #[test]
     fn test_apply_no_auth() {
         let mut config = Config::default();
@@ -646,7 +746,7 @@ mod tests {
         // still turns auth on, so the server does not start open with the scope ignored.
         let mut by_preset = Config::default();
         by_preset.apply_args(&Args {
-            preset: Some("read-only".to_string()),
+            preset: Some("file-read".to_string()),
             ..Args::default()
         });
         assert!(by_preset.security.auth.enabled);
@@ -664,7 +764,7 @@ mod tests {
         // Explicit --no-auth wins even when a scope is given.
         let mut config = Config::default();
         config.apply_args(&Args {
-            preset: Some("read-only".to_string()),
+            preset: Some("file-read".to_string()),
             no_auth: true,
             ..Args::default()
         });
@@ -680,7 +780,7 @@ mod tests {
                 "auth": {
                     "enabled": true,
                     "api_keys": ["scoped"],
-                    "preset": "read-only",
+                    "preset": "file-read",
                     "capabilities": ["exec"]
                 }
             }
@@ -689,7 +789,7 @@ mod tests {
         file.write_all(json.as_bytes()).unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.security.auth.preset, Some("read-only".to_string()));
+        assert_eq!(config.security.auth.preset, Some("file-read".to_string()));
         assert_eq!(config.security.auth.capabilities, vec!["exec"]);
 
         let server_config = config.to_server_config().unwrap();
@@ -697,7 +797,7 @@ mod tests {
             .security
             .capabilities
             .expect("capabilities scoped from file");
-        assert!(caps.satisfies("session.read")); // from read-only preset
+        assert!(caps.satisfies("fs.read")); // from file-read preset
         assert!(caps.satisfies("exec")); // unioned explicit capability
         assert!(!caps.satisfies("session.manage"));
     }
@@ -710,11 +810,11 @@ mod tests {
 
     #[test]
     fn test_resolve_capabilities_preset_plus_extra() {
-        // read-only preset unioned with an explicit `exec`.
-        let set = resolve_capabilities(Some("read-only"), &["exec".to_string()])
+        // file-read preset unioned with an explicit `exec`.
+        let set = resolve_capabilities(Some("file-read"), &["exec".to_string()])
             .unwrap()
             .unwrap();
-        assert!(set.satisfies("session.read"));
+        assert!(set.satisfies("fs.read"));
         assert!(set.satisfies("exec"));
         assert!(!set.satisfies("session.manage"));
     }
@@ -730,14 +830,14 @@ mod tests {
         let mut config = Config::default();
         config.security.auth.enabled = true;
         config.security.auth.api_keys = vec!["scoped".to_string()];
-        config.security.auth.preset = Some("read-only".to_string());
+        config.security.auth.preset = Some("file-read".to_string());
 
         let server_config = config.to_server_config().unwrap();
         let caps = server_config
             .security
             .capabilities
             .expect("capabilities scoped");
-        assert!(caps.satisfies("session.read"));
+        assert!(caps.satisfies("fs.read"));
         assert!(!caps.satisfies("exec"));
     }
 
@@ -749,6 +849,39 @@ mod tests {
             config.to_server_config(),
             Err(ConfigError::InvalidPreset(_))
         ));
+    }
+
+    #[test]
+    fn the_read_only_refusal_names_its_replacement() {
+        let err = ConfigError::InvalidPreset("read-only".to_string());
+        let message = err.to_string();
+        assert!(
+            message.contains("file-read"),
+            "must point at the replacement: {message}"
+        );
+        assert!(
+            message.contains("session.read"),
+            "must offer the exact escape: {message}"
+        );
+        // `security.auth.preset` reaches this error too, and an operator who
+        // set it there never passed a flag to correct.
+        assert!(
+            message.contains("security.auth.preset"),
+            "must name the config key, not only the flags: {message}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_preset_lists_the_valid_ones() {
+        let err = ConfigError::InvalidPreset("nonsense".to_string());
+        let message = err.to_string();
+        for name in ["operator", "file-write", "file-read", "full-control"] {
+            assert!(message.contains(name), "must list {name}: {message}");
+        }
+        assert!(
+            !message.contains("read-only"),
+            "must not advertise a removed preset: {message}"
+        );
     }
 
     #[test]
@@ -812,11 +945,11 @@ mod tests {
     }
 
     #[test]
-    fn test_public_exposure_warns_about_an_unscoped_token() {
+    fn test_public_exposure_no_longer_warns_about_an_unscoped_token_because_it_scopes_it() {
         let mut config = Config::default();
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
         assert!(
-            exposure.warnings.iter().any(|w| w.contains("full control")),
+            !exposure.warnings.iter().any(|w| w.contains("full control")),
             "{:?}",
             exposure.warnings
         );
@@ -835,10 +968,9 @@ mod tests {
     }
 
     #[test]
-    fn test_public_exposure_warns_about_disabled_rate_limit_and_public_bind() {
+    fn test_public_exposure_warns_about_disabled_rate_limit() {
         let mut config = Config::default();
         config.security.rate_limit.enabled = false;
-        config.server.host = "0.0.0.0".to_string();
 
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
 
@@ -846,7 +978,6 @@ mod tests {
             .warnings
             .iter()
             .any(|w| w.contains("rate limiting")));
-        assert!(exposure.warnings.iter().any(|w| w.contains("0.0.0.0")));
     }
 
     #[test]
@@ -855,6 +986,91 @@ mod tests {
         config.security.auth.preset = Some("operator".to_string());
         let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
         assert!(exposure.warnings.is_empty(), "{:?}", exposure.warnings);
+    }
+
+    #[test]
+    fn exposure_scopes_the_issued_token_instead_of_warning_about_it() {
+        let mut config = Config::default();
+        assert!(config.security.auth.preset.is_none());
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        // The default handles the situation, so there is nothing left to warn about.
+        assert_eq!(config.security.auth.preset.as_deref(), Some("operator"));
+        assert!(
+            !exposure.warnings.iter().any(|w| w.contains("full control")),
+            "the warning must be gone, not merely reworded: {:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn the_exposed_token_is_not_a_wildcard() {
+        // The actual reach is unchanged. What changes is one thing: it does not
+        // automatically pick up capabilities added later. That is the wildcard's
+        // real danger.
+        let mut config = Config::default();
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        let set = resolve_capabilities(
+            config.security.auth.preset.as_deref(),
+            &config.security.auth.capabilities,
+        )
+        .unwrap()
+        .expect("an exposed token must have an explicit set");
+        assert!(!set.is_wildcard());
+        assert!(set.satisfies("exec"));
+        assert!(set.satisfies("fs.write"));
+    }
+
+    #[test]
+    fn an_explicit_scope_is_left_alone() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("file-read".to_string());
+
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert_eq!(config.security.auth.preset.as_deref(), Some("file-read"));
+    }
+
+    #[test]
+    fn explicit_capabilities_are_left_alone_too() {
+        let mut config = Config::default();
+        config.security.auth.capabilities = vec!["exec".to_string()];
+
+        config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(config.security.auth.preset.is_none());
+        assert_eq!(config.security.auth.capabilities, vec!["exec".to_string()]);
+    }
+
+    #[test]
+    fn a_non_loopback_bind_no_longer_warns_because_it_now_decides_the_posture() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(
+            !exposure.warnings.iter().any(|w| w.contains("binding")),
+            "posture covers this now: {:?}",
+            exposure.warnings
+        );
+    }
+
+    #[test]
+    fn a_disabled_rate_limit_still_warns() {
+        // This is a risk the consumer explicitly chose, so a warning is right —
+        // it is not the kind of thing a default can decide on their behalf.
+        let mut config = Config::default();
+        config.security.rate_limit.enabled = false;
+
+        let exposure = config.harden_for_public_exposure(&tunnel_args()).unwrap();
+
+        assert!(exposure
+            .warnings
+            .iter()
+            .any(|w| w.contains("rate limiting")));
     }
 
     #[test]
@@ -961,5 +1177,50 @@ mod tests {
             serde_json::from_str(r#"{"transport":{"mode":"cloudflared"}}"#).unwrap();
         config.apply_args(&Args::default());
         assert_eq!(config.transport.mode, TransportMode::Cloudflared);
+    }
+
+    #[test]
+    fn loopback_bind_without_a_public_path_is_local() {
+        let config = Config::default();
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.posture(false, false), Posture::Local);
+    }
+
+    #[test]
+    fn a_tunnel_or_a_relay_makes_it_exposed() {
+        let config = Config::default();
+        assert_eq!(config.posture(true, false), Posture::Exposed);
+        assert_eq!(config.posture(false, true), Posture::Exposed);
+    }
+
+    #[test]
+    fn a_non_loopback_bind_is_exposed_on_its_own() {
+        // No tunnel and no relay. Open to the LAN alone is exposure — reachable from another machine.
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        assert_eq!(config.posture(false, false), Posture::Exposed);
+
+        config.server.host = "192.168.1.10".to_string();
+        assert_eq!(config.posture(false, false), Posture::Exposed);
+
+        config.server.host = "::".to_string();
+        assert_eq!(config.posture(false, false), Posture::Exposed);
+    }
+
+    #[test]
+    fn ipv6_loopback_is_local() {
+        let mut config = Config::default();
+        config.server.host = "::1".to_string();
+        assert_eq!(config.posture(false, false), Posture::Local);
+    }
+
+    #[test]
+    fn an_unparseable_host_is_exposed_rather_than_local() {
+        // `to_server_config` already rejects this with `InvalidHost` at startup, so this
+        // branch is not actually reachable. Even so, we fix the fail-closed direction — the
+        // moment we read "unable to judge" as "safe", it becomes speculation, not proof.
+        let mut config = Config::default();
+        config.server.host = "not-an-ip".to_string();
+        assert_eq!(config.posture(false, false), Posture::Exposed);
     }
 }

@@ -106,16 +106,36 @@ another provider, or the relay.
 
 See [§5](#5-self-hosted-relay).
 
-### What a public path changes
+### What else a reachable server does
 
-Publishing turns weak defaults into internet-facing ones, so it is enforced
-rather than advised:
+Two things the table below doesn't cover:
 
-- authentication is switched on; a key is generated and printed if none was given
-- `--no-auth` combined with a tunnel or relay is **refused**, not overridden
-- warnings for an unscoped full-control token, disabled rate limiting, and a
-  non-loopback bind
+- a warning, not a refusal, is printed if rate limiting is disabled — turning it
+  off is a legitimate, deliberate choice, so it stays a warning
 - only a *generated* key is echoed — a key you supplied is never written to stdout
+
+### What reachability changes
+
+The defaults follow the reachability you asked for. There is no flag to pick a
+posture — the bind address and the public path decide it.
+
+| | Loopback bind, no tunnel or relay | Tunnel, relay, or a non-loopback bind |
+|---|---|---|
+| Authentication | as configured | **required**; a key is generated if none is given |
+| Issued token | full control (wildcard) | **`operator`** — the same reach today, but it does not inherit capabilities added later |
+| Audit trail | off | **on**, at `shell-tunnel-audit.jsonl` in the working directory unless `--audit-log` says otherwise |
+| `--no-auth` | honoured | **refused** |
+
+These rows are not all the same kind of rule. Authentication and the `--no-auth`
+refusal are *enforced*: nothing you pass turns them off on a reachable server.
+The audit trail is enforced only in that one exists — `--audit-log` moves it.
+The issued token's scope is a *default*: naming a scope explicitly (`--preset`,
+`--capabilities`) always wins over it, and `--preset full-control` keeps the
+wildcard on a reachable server.
+
+A non-loopback bind counts on its own: a LAN is other people's machines. Host
+checking (`--allow-host`) answers a different question — which names this server
+responds to — and does not narrow what a token can do.
 
 ---
 
@@ -318,8 +338,9 @@ transfer never accumulates forever.
 ## 4. Authentication and capabilities
 
 Opaque bearer tokens in `Authorization: Bearer <token>`. `/health` never
-requires one. Authentication is off by default and on whenever a public path is
-used.
+requires one. Authentication is off by default and on whenever the server is
+reachable from other machines — a tunnel, a relay, or a non-loopback bind; see
+[§2](#2-running-it).
 
 Each token carries a set of capabilities; each route declares the one it needs:
 
@@ -340,29 +361,39 @@ Presets are a convenience, not a wire contract:
 | Preset | Capabilities |
 |---|---|
 | `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write` |
-| `read-only` | `session.read` |
+| `file-write` | `fs.read`, `fs.write` — no `exec` |
+| `file-read` | `fs.read` — no `exec` |
 | `full-control` | `*` |
 
-**`operator` carries the file capabilities; `read-only` does not, and the difference is
-`exec`.** A token that can run commands can already read and write every file the server
-can, so withholding the file API from `operator` confined nothing — it only pushed
-callers onto a slower route to the same bytes. `read-only` has no `exec`, so withholding
-`fs.read` there is a real boundary: such a token has no other way to a file's contents.
-Name the capability explicitly if you want a read-only token to read files.
+The cut line is `exec`. A token holding it reaches every file this process can,
+so withholding the file API from it confines nothing — which is why `operator`
+carries `fs.*`. The `file-*` presets carry no `exec`, and there a `--fs-root`
+jail is a real boundary rather than a slow path.
 
-That also means `--fs-root` is a meaningful jail only for a token holding `fs.*` without
-`exec` — a deploy push, say:
+`read-only` was removed in 0.14.0: it granted only `session.read`, so it could
+not read a file despite its name. Use `file-read` to read files, or
+`--capabilities session.read` for the old set.
+
+**A `file-*` preset is only meaningfully confined when paired with `--fs-root`.**
+Without it, a `file-read` token on a reachable server reads every file the
+process can — there is no `exec` to make that moot, only the fact that nobody
+narrowed the file API. This hazard was always reachable with
+`--capabilities fs.read`; a friendly preset name just makes it far easier to
+reach by accident. Pair the preset with `--fs-root` whenever the token is meant
+to stay inside one directory:
 
 ```bash
-shell-tunnel -k readonly-key --preset read-only
+shell-tunnel -k readonly-key --preset file-read --fs-root /srv/deploy
 shell-tunnel -k ci-key --capabilities exec,session.read
-shell-tunnel --fs-root /srv/deploy -k deploy-key --capabilities fs.write
+shell-tunnel --fs-root /srv/deploy -k deploy-key --preset file-write
 ```
 
 Passing `--capabilities` or `--preset` turns authentication on, since a scope
 with auth off would be silently meaningless. `--no-auth` still overrides, except
-on a public path where it is refused. A key issued without either is
-full-control, so existing setups never start failing with 403.
+on a reachable server (tunnel, relay, or non-loopback bind), where it is
+refused. A key issued without either is full-control unless the server is
+reachable, in which case it is `operator`; either way existing setups never
+start failing with 403.
 
 ### Host checking
 
@@ -379,14 +410,27 @@ traffic instead.
 
 ### Audit trail
 
-`--audit-log <file>` appends one JSON object per line for every execution and
-every refusal. Off unless a path is given — creating a file nobody asked for is
-its own kind of surprise.
+`--audit-log <file>` appends one JSON object per line for every execution, for
+every request the authentication layer refuses, and for the file operations
+listed in the `kind` table below. **That table is the whole list** — an outcome
+absent from it leaves no entry, and refusals decided inside a handler are not
+all there: a delete refused with `400 recursive-required` or `409
+staging-in-tree` writes nothing.
 
-If `--fs-root` is also given, the audit log may not resolve inside it: startup
-is refused rather than allowed, since an `fs.write` token could otherwise delete
-or overwrite the trail recording its own actions. Point `--audit-log` at a
-directory outside the fs root.
+Off on a loopback bind with no tunnel or relay — creating a file
+nobody asked for is its own kind of surprise there. A server reachable from
+other machines writes one by default, at `shell-tunnel-audit.jsonl` in the
+working directory, unless `--audit-log` names another path; see
+[§2](#2-running-it).
+
+If `--fs-root` is also given, the audit log — named or defaulted — may not
+resolve inside it: startup is refused rather than allowed, since an `fs.write`
+token could otherwise delete or overwrite the trail recording its own actions.
+This can catch a reachable server that named no `--audit-log`: its default path
+lives in the working directory, and if `--fs-root` covers the working directory
+too, startup refuses over a file nobody explicitly asked for. Point
+`--audit-log` at a directory outside the fs root, or point `--fs-root`
+somewhere that excludes the working directory.
 
 ```bash
 shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
@@ -652,8 +696,8 @@ still sees the real address.
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
 | `--require-auth` | Enable auth, generating a key if none given | `false` |
-| `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control |
-| `--preset <NAME>` | `operator` / `read-only` / `full-control` | full-control |
+| `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
+| `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
 | `--no-rate-limit` | Disable rate limiting | `false` |
 | `--cors-allow-any` | Allow any CORS origin | `false` |
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |
@@ -662,12 +706,12 @@ still sees the real address.
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
 | `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
 | `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
-| `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names only |
+| `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
-| `--audit-log <FILE>` | Append executions and refusals as JSON lines | off |
+| `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
-| `--fs-root <PATH>` | Enable the filesystem API, confined to this directory | off |
+| `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
 | `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
@@ -678,8 +722,17 @@ still sees the real address.
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 
-Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
-`SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
+Environment: `SHELL_TUNNEL_API_KEY`, `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
+
+`SHELL_TUNNEL_HOST` and `SHELL_TUNNEL_PORT` are read but have no effect. The
+bind address and the port are both taken from `-H` and `-p` on every start, and
+the command line supplies its own defaults (`127.0.0.1`, `3000`) when you pass
+nothing — so whatever the environment or a config file says is overwritten
+either way. **Give the bind address and the port on the command line.** Under
+`--relay` the local port is deliberately left for the OS to pick, since nothing
+outside this machine dials it; passing `-p` is what overrides that. The two
+variable names are listed here rather than deleted, so that anyone who already
+set them learns why nothing changed.
 
 ---
 
@@ -687,7 +740,7 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 
 ```json
 {
-  "server": { "host": "0.0.0.0", "port": 8080, "graceful_shutdown": true },
+  "server": { "graceful_shutdown": true },
   "security": {
     "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 },
@@ -699,7 +752,31 @@ Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 ```
 
 `transport.mode` is `none`, `cloudflared`, or `command` (with `command` naming
-the client to run). CLI flags override the file, as with every setting.
+the client to run).
+
+For most keys, passing the matching CLI flag overrides what the file says.
+Three cases do not work that way, and each can surprise you:
+
+- **`server.host` and `server.port` are overwritten even when you pass no
+  flag.** Both are taken from `-H` and `-p` on every start, and those flags
+  carry their own defaults (`127.0.0.1`, `3000`), so a value in the file never
+  takes effect. That is why the example above names neither. Give the bind
+  address and the port on the command line.
+- **`--capabilities` and `--api-key` add to the file rather than replacing
+  it.** `--capabilities` does not clear a preset the file named; the two are
+  unioned. A file saying `"preset": "operator"` plus a command line saying
+  `--capabilities fs.read` issues a token holding operator's whole set *and*
+  `fs.read` — `exec` still among them, though the intent was to narrow. A key
+  in the file likewise stays valid alongside a key given with `-k`. (`--preset`
+  replaces the file's `preset`, but a `capabilities` list in the file is still
+  unioned on top of it — so narrowing with `--preset` instead does not escape
+  this either.) The startup banner prints the set that is actually in force;
+  read it there rather than inferring it from either input.
+- **A file asking for a tunnel or a relay changes the auth keys by itself.**
+  `transport.mode` of `cloudflared` or `command` makes the server reachable, and
+  a reachable server turns `security.auth.enabled` on and scopes an otherwise
+  unscoped token to `operator` — with no flag passed at all. See
+  [§2](#what-reachability-changes).
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json
@@ -717,7 +794,9 @@ startup rather than serving local-only.
 | `tunnel error: \`cloudflared\` is not installed` | not on `PATH` | install it, or use `--tunnel-command` |
 | `did not publish a public URL within 30s` | tunnel client never printed one | check its own output at `-l debug` |
 | `Tunnel closed: the public URL is no longer reachable` | tunnel client died; server exited with it | restart (a new URL is allocated) |
-| `--no-auth cannot be combined with a public tunnel` | refused by design | drop `--no-auth` |
+| `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
+| `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
+| `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |

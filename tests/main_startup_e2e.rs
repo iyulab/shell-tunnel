@@ -1,5 +1,6 @@
-//! End-to-end tests for startup-time refusals that only the real binary can
-//! prove are actually wired up.
+//! End-to-end tests for startup-time behaviour that only the real binary can
+//! prove is actually wired up — the refusals below, and the posture banner,
+//! whose text depends on *when* in `async_main` its inputs are read.
 //!
 //! `src/main.rs`'s `audit_log_is_inside_fs_root` is unit-tested directly as a
 //! pure comparison, but nothing in that unit test proves `async_main` calls
@@ -7,8 +8,8 @@
 //! leave every one of those unit tests green. Spawning the real process with
 //! both flags for real is the only thing that closes that gap.
 
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::io::{BufRead, BufReader, Read};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -31,8 +32,18 @@ const BIN: &str = env!("CARGO_BIN_EXE_shell-tunnel");
 /// refusals here are specified to exit 2, and "some non-zero code" would not
 /// distinguish them from a panic or a different refusal entirely.
 fn run_with_timeout(args: &[&str], timeout: Duration) -> (Option<i32>, String, String) {
-    let mut child = Command::new(BIN)
-        .args(args)
+    let mut command = Command::new(BIN);
+    command.args(args);
+    run_command_with_timeout(command, timeout)
+}
+
+/// As `run_with_timeout`, for a command that needs more than arguments set on
+/// it — a working directory, in the one case that has one.
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+) -> (Option<i32>, String, String) {
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -113,5 +124,142 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
     assert!(
         !audit_log.exists(),
         "a refused startup must not have created the audit log file"
+    );
+}
+
+/// Kill a server that is expected to keep running, on the way out of a test.
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Read the server's stdout until a line matches `predicate`, or time runs out.
+///
+/// The refusals above exit on their own and are read with `run_with_timeout`;
+/// a banner assertion is the opposite shape — the process is *supposed* to
+/// stay up, so its output has to be streamed while it runs.
+fn wait_for_line(
+    server: &mut Killed,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> String {
+    let stdout = server.0.stdout.take().expect("stdout is piped");
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let mut seen = Vec::new();
+    while std::time::Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if predicate(&line) {
+                    return line;
+                }
+                seen.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    panic!(
+        "expected line not seen within {timeout:?}; got:\n{}",
+        seen.join("\n")
+    );
+}
+
+/// The banner must name the scope `harden_for_public_exposure` actually chose,
+/// which means reading it *after* that call rather than before.
+///
+/// Nothing else pins the ordering. Move the read above the hardening and all
+/// fifteen unit tests in `src/main.rs` stay green — `token_scope` and
+/// `posture_banner` are pure and would be handed the pre-promotion state,
+/// which they would describe perfectly accurately as the wildcard. Only the
+/// real binary can tell the two apart, and the difference is the whole defect
+/// this banner was already fixed for once: a wildcard claim for a token that
+/// is in fact scoped to `operator`.
+#[test]
+fn the_exposed_banner_names_the_scope_the_hardening_chose() {
+    // cwd is a tempdir because an exposed run derives an audit trail relative
+    // to it; the crate root would collect one per test run.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "0.0.0.0", "--port", "39882"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let line = wait_for_line(&mut server, Duration::from_secs(30), |l| {
+        l.starts_with("Reachable:")
+    });
+
+    assert!(
+        line.contains("operator"),
+        "the promoted preset must be what the banner names: {line}"
+    );
+    assert!(
+        !line.contains("wildcard `*`"),
+        "reading the scope before hardening would report the wildcard here: {line}"
+    );
+}
+
+/// A bare non-loopback bind is exposed on its own, and an exposed run derives
+/// an audit log it was never asked for — so the derived path faces the same
+/// containment check as a chosen one, and refuses startup when it lands inside
+/// the jail.
+///
+/// This is the only test that proves the derivation is *wired*. `src/main.rs`'s
+/// `effective_audit_log` and `posture_banner` are unit-tested as pure
+/// functions, but re-pointing `async_main` back at the raw `--audit-log` value
+/// would leave every one of those unit tests green — the same gap this file
+/// exists to close for `audit_log_is_inside_fs_root`. It pins three facts at
+/// once: the posture is computed from the bind address alone (no tunnel, no
+/// relay, no `--audit-log` here), the derived path is what the containment
+/// check sees, and its refusal is reachable.
+#[test]
+fn an_exposed_bind_deriving_an_audit_log_inside_the_fs_root_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).expect("mkdir root");
+
+    // The working directory is the root itself, which is what puts the derived
+    // default path (a bare file name) inside the jail.
+    let mut child = Command::new(BIN);
+    child.current_dir(&root).args([
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "39881",
+        "--fs-root",
+        root.to_str().expect("utf-8 path"),
+    ]);
+    let (code, _stdout, stderr) = run_command_with_timeout(child, Duration::from_secs(10));
+
+    assert_eq!(code, Some(2), "expected exit 2; stderr: {stderr}");
+    // Matched on text unique to the derived branch: the chosen-path refusal
+    // above also exits 2 and also names `--fs-root`, so asserting less would
+    // pass just as happily if the derived path were reported as one the user
+    // had picked — the mistake that branch exists to avoid.
+    assert!(
+        stderr.contains("A publicly reachable server writes an audit trail"),
+        "the refusal must be the derived-path branch, not the chosen-path one: {stderr}"
+    );
+
+    // Nothing was created inside the jail on the way to refusing.
+    assert!(
+        !root.join("shell-tunnel-audit.jsonl").exists(),
+        "a refused startup must not have created the audit log it refused"
     );
 }

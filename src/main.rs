@@ -1,11 +1,12 @@
 //! Shell-tunnel binary entry point.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use shell_tunnel::config::PublicExposure;
+use shell_tunnel::config::{Posture, PublicExposure};
 use shell_tunnel::relay::{serve_relay, RelayConfig};
+use shell_tunnel::security::CapabilitySet;
 use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
@@ -112,10 +113,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             std::process::exit(1);
         }
     };
-    // Attaching to a relay publishes this machine just as a tunnel does, so it
-    // goes through the same hardening rather than a parallel set of rules.
-    let public = provider.is_some() || args.relay_url.is_some();
-    let exposure = if public {
+    // The posture decides the security defaults. Attaching to a relay publishes
+    // this machine just as a tunnel does, so it goes through the same hardening
+    // rather than a parallel set of rules — and so does a non-loopback bind: a
+    // LAN is other people's machines too, and host checking (the DNS rebinding
+    // defence) is a different axis that does not fill this gap.
+    let posture = config.posture(provider.is_some(), args.relay_url.is_some());
+    let exposure = if posture == Posture::Exposed {
         match config.harden_for_public_exposure(&args) {
             Ok(exposure) => exposure,
             Err(e) => {
@@ -161,7 +165,11 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
 
     // Convert to server config
-    let allowed_hosts = config.allowed_hosts(&args, public);
+    // Unchanged in outcome by the posture switch above: `allowed_hosts` already
+    // declines to check the `Host` header on a non-loopback bind of its own
+    // accord, so the one quadrant where the posture is broader than the old
+    // `provider.is_some() || relay` test was returning `None` here anyway.
+    let allowed_hosts = config.allowed_hosts(&args, posture == Posture::Exposed);
     let server_config = match config.to_server_config() {
         Ok(mut c) => {
             if let Some(hosts) = allowed_hosts {
@@ -207,16 +215,22 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             }
         }
     } else {
-        // No flag means the whole machine, not "off". A token that can reach
-        // the file API at all holds `fs.read`/`fs.write`, and every preset that
-        // carries those also carries `exec`, which can already read and write
-        // anything this process can — so confining the file API to one subtree
-        // by default withheld no access, it only forced callers onto the slow
-        // path for every destination outside it. `--fs-root` still narrows,
-        // for the one case where narrowing bites: a token granted `fs.*`
-        // *without* `exec`.
+        // No flag means the whole machine, not "off". A token holding `exec`
+        // already reads and writes anything this process can, so confining
+        // the file API by default withholds nothing from `operator` or
+        // `full-control` — it only forces callers onto the slow path for
+        // every destination outside the jail. `file-read` and `file-write`
+        // hold `fs.*` without `exec`, so that reasoning does not cover them:
+        // for those two presets `--fs-root` is the only confinement there
+        // is, and it has to be asked for explicitly (see docs/USAGE.md).
         shell_tunnel::FsRoot::machine_wide()
     };
+
+    // Derived once, here. The containment check below and the sink creation
+    // after it both read this value — the default path lives in the working
+    // directory too, so it can land inside `--fs-root`, and it has to face the
+    // same check when it does.
+    let audit_log = effective_audit_log(args.audit_log.as_deref(), posture);
 
     // The audit log must not sit inside the fs jail: from that moment an
     // fs.write token could DELETE or overwrite-by-upload the trail recording
@@ -233,20 +247,33 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     //
     // Only when `--fs-root` narrows the scope. Machine-wide there is nowhere
     // outside to point the log at, so this refusal has nothing to offer: the
-    // trail is reachable by the file API wherever it sits — as it already is
-    // by `exec`, which every preset carrying `fs.*` also carries. The banner
-    // says so rather than pretending otherwise.
-    if let (Some(audit_log), Some(jail)) = (args.audit_log.as_ref(), fs_root.jail_path()) {
-        match audit_log_is_inside_fs_root(audit_log, jail) {
+    // trail is reachable by the file API wherever it sits. (This used to add
+    // "as it already is by `exec`, which every preset carrying `fs.*` also
+    // carries" — no longer true of `file-read`/`file-write`, which hold `fs.*`
+    // without `exec`. The conclusion is unaffected: machine-wide means nothing
+    // is outside, whatever the token holds.) The banner says so rather than
+    // pretending otherwise.
+    if let (Some(path), Some(jail)) = (audit_log.as_ref(), fs_root.jail_path()) {
+        match audit_log_is_inside_fs_root(path, jail) {
+            // Two refusals, because there are two different mistakes to
+            // correct. Telling someone their chosen path is wrong when they
+            // never chose one sends them looking for a flag they did not pass.
             Ok(true) => {
-                eprintln!(
-                    "--audit-log {} cannot be used: it resolves inside --fs-root {}",
-                    audit_log.display(),
-                    jail.display()
-                );
-                eprintln!(
-                    "An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root."
-                );
+                if args.audit_log.is_some() {
+                    eprintln!(
+                        "--audit-log {} cannot be used: it resolves inside --fs-root {}",
+                        path.display(),
+                        jail.display()
+                    );
+                    eprintln!("An fs.write token could delete or overwrite the trail recording its own actions. Point --audit-log outside the fs root.");
+                } else {
+                    eprintln!(
+                        "A publicly reachable server writes an audit trail, and its default location ({}) resolves inside --fs-root {}",
+                        DEFAULT_AUDIT_LOG,
+                        jail.display()
+                    );
+                    eprintln!("An fs.write token could delete or overwrite the trail recording its own actions. Pass --audit-log with a path outside the fs root.");
+                }
                 std::process::exit(2);
             }
             Ok(false) => {}
@@ -259,7 +286,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             Err(e) => {
                 eprintln!(
                     "--audit-log {} cannot be checked against --fs-root {}: {e}",
-                    audit_log.display(),
+                    path.display(),
                     jail.display()
                 );
                 std::process::exit(2);
@@ -271,12 +298,26 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // so a path that cannot be written still stops startup here rather than
     // leaving an operator believing there is a trail, and a path inside the
     // fs jail never gets this far at all.
-    let audit = match &args.audit_log {
+    let audit = match &audit_log {
         Some(path) => {
             match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_max_bytes) {
                 Ok(sink) => std::sync::Arc::new(sink),
+                // Two failures again, for the same reason the containment check
+                // above splits: an exposed server in an unwritable working
+                // directory never named this path, and a bare `Configuration
+                // error:` sends such an operator looking for the flag they did
+                // not pass — with no hint that an audit trail exists at all.
+                // Reachable without doing anything unusual: a service unit with
+                // a read-only working directory, a network share, an install
+                // location the account cannot write.
                 Err(e) => {
-                    eprintln!("Configuration error: {}", e);
+                    if args.audit_log.is_some() {
+                        eprintln!("--audit-log {} cannot be used: {e}", path.display());
+                        eprintln!("The parent directory must exist and be writable.");
+                    } else {
+                        eprintln!("A publicly reachable server writes an audit trail, and its default location ({}) cannot be created: {e}", DEFAULT_AUDIT_LOG);
+                        eprintln!("Start the server in a writable directory, or pass --audit-log with a path elsewhere.");
+                    }
                     std::process::exit(1);
                 }
             }
@@ -284,18 +325,63 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         None => std::sync::Arc::new(shell_tunnel::audit::AuditSink::Disabled),
     };
     if audit.is_enabled() {
-        info!(
-            "audit trail: {}",
-            args.audit_log.as_ref().unwrap().display()
-        );
+        info!("audit trail: {}", audit_log.as_ref().unwrap().display());
     }
     // The banner is the whole mitigation for a file API that no longer needs a
     // flag to exist: an operator who never passes `--fs-root` still has to be
     // told, in one unmissable line, what the API can reach. Printed before the
     // server starts so it is not buried under request logging.
+    // Read after `harden_for_public_exposure` (far above), so the promoted
+    // `operator` is what gets described rather than the pre-promotion state.
+    // An `Err` is unreachable here: `to_server_config` resolved these same two
+    // fields earlier and exited on an unknown preset. Should that ever change,
+    // falling back to `None` reports the wildcard — the direction that
+    // overstates the grant rather than understating it.
+    //
+    // Resolved once and shared with the file-scope test below. Two call sites
+    // resolving the same thing separately is exactly the drift both lines exist
+    // to avoid: they must describe one token, not two independent guesses at it.
+    let resolved = config.resolved_capabilities().ok().flatten();
+    let scope = token_scope(config.security.auth.preset.as_deref(), resolved.as_ref());
+    for line in posture_banner(posture, &scope, audit_log.as_deref()) {
+        println!("{line}");
+    }
+    // The generated key belongs with the reachability it unlocks, not after the
+    // file-API block. Only the bare-bind path prints it here: a tunnel prints
+    // its own banner once the URL exists (`print_banner`), and a relay prints
+    // one beside its attach output (`run_with_relay`), so printing here too
+    // would report the same key twice.
+    if provider.is_none() && args.relay_url.is_none() {
+        if let Some(key) = &exposure.generated_key {
+            println!("API key:     {key}   (generated)");
+        }
+    }
     println!("File API:    {}", fs_root.describe());
-    if fs_root.jail_path().is_none() && args.audit_log.is_some() {
-        println!("             the audit log is within this scope — as it already is for `exec`");
+    // The one combination the lines above describe truthfully and still leave
+    // an operator to assemble for themselves. For `operator` or `full-control`
+    // a machine-wide file API withholds nothing that `exec` did not already
+    // grant, so there is nothing to say; for a token holding `fs.*` without
+    // `exec` the file API *is* the whole grant, and `--fs-root` is the only
+    // thing that would have narrowed it. A preset name that sounds narrow
+    // ("file-read") is precisely how this is reached by accident.
+    if fs_root.jail_path().is_none()
+        && file_scope_is_the_whole_grant(config.security.auth.enabled, resolved.as_ref())
+    {
+        println!("             this token holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given");
+    }
+    if fs_root.jail_path().is_none() && audit_log.is_some() {
+        // The `exec` clause this line used to carry ("as it already is for
+        // `exec`") assumed every token reaching the file API also holds `exec`.
+        // `file-read` and `file-write` hold `fs.*` without it, so the clause was
+        // false for exactly the scopes drawn around that boundary — and this
+        // line now prints on every exposed run, not only when `--audit-log` was
+        // passed. What remains names no capability at all: the subject is the
+        // file API's reach, which is what this line actually knows. Naming one
+        // — even conditionally, as "a token holding `fs.write` could overwrite
+        // it" — puts the same token-shaped assumption back in a different
+        // grammatical costume, and under `--preset file-read` no token this
+        // server issues holds `fs.write` to begin with.
+        println!("             the audit log is within this scope — nothing is outside a machine-wide file API");
     }
 
     let state = shell_tunnel::AppState::new()
@@ -374,6 +460,15 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
 
     let Some(provider) = provider else {
+        // A non-loopback bind reaches here with neither tunnel nor relay to
+        // print for it, and it is now hardened like both — so its warnings are
+        // reported here as well. The generated key is not: it is printed with
+        // the posture banner above, beside the reachability it unlocks.
+        // Locally `PublicExposure::default()` is empty and both stay silent, so
+        // the zero-friction local path is untouched.
+        for warning in &exposure.warnings {
+            warn!("{}", warning);
+        }
         return shell_tunnel::api::serve_with_state(server_config, state).await;
     };
 
@@ -691,6 +786,137 @@ fn print_banner(tunnel: &TunnelHandle, generated_key: Option<&str>) {
     );
 }
 
+/// The file name an audit trail lands on by default once the server is exposed.
+///
+/// Created in the working directory and reused across restarts — the same
+/// structure as the self-signed certificate (`shell-tunnel-cert.pem`).
+const DEFAULT_AUDIT_LOG: &str = "shell-tunnel-audit.jsonl";
+
+/// The audit log path actually used.
+///
+/// An explicitly named path wins. Absent one, an exposed server gets the
+/// default path; a local one gets nothing — locally we still create no file
+/// nobody asked for.
+fn effective_audit_log(explicit: Option<&Path>, posture: Posture) -> Option<PathBuf> {
+    match (explicit, posture) {
+        (Some(path), _) => Some(path.to_path_buf()),
+        (None, Posture::Exposed) => Some(PathBuf::from(DEFAULT_AUDIT_LOG)),
+        (None, Posture::Local) => None,
+    }
+}
+
+/// What a token issued by this server actually holds.
+///
+/// The banner used to assume the answer was always `operator`, which is only
+/// true when nothing was chosen and the default promoted it. Naming the three
+/// cases makes the wildcard impossible to describe as a scope by accident.
+#[derive(Debug, PartialEq, Eq)]
+enum TokenScope {
+    /// Every capability, including any added in later versions.
+    Wildcard,
+    /// A named preset, holding exactly what that name grants.
+    Preset(String),
+    /// An explicit set of capability strings, in a stable order.
+    Explicit(Vec<String>),
+}
+
+/// Describe the scope in force from the *resolved* facts.
+///
+/// `capabilities` is the set that actually reaches the server, so it — not the
+/// preset name — decides whether anything is scoped at all. `None` means
+/// nothing narrowed it: the full-control default, which is the wildcard.
+///
+/// The preset name is used only when it still describes the whole set. A preset
+/// with capabilities unioned on top grants more than its name promises, and
+/// naming it there would understate the token.
+fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> TokenScope {
+    let Some(set) = capabilities else {
+        return TokenScope::Wildcard;
+    };
+    if set.is_wildcard() {
+        return TokenScope::Wildcard;
+    }
+    match preset {
+        Some(name) if shell_tunnel::security::preset(name).as_ref() == Some(set) => {
+            TokenScope::Preset(name.to_string())
+        }
+        _ => {
+            // Sorted because the set is a `HashSet`: unsorted, the same
+            // configuration would print a different banner on every run.
+            let mut listed: Vec<String> = set.iter().cloned().collect();
+            listed.sort();
+            TokenScope::Explicit(listed)
+        }
+    }
+}
+
+/// Whether the file API is the whole of what a token this server issues holds.
+///
+/// True exactly when authentication is on and the token reaches `fs.read` or
+/// `fs.write` without holding `exec`. That is the one shape for which
+/// `--fs-root` confines anything: with `exec` the file API grants no reach the
+/// token did not already have, so its absence is not a hazard worth a line.
+///
+/// Decided from the *resolved* capability set rather than the preset name, so
+/// it cannot drift from what the router enforces — and so it covers
+/// `--capabilities fs.read` as readily as `--preset file-read`. `None` is the
+/// full-control default, which is the wildcard: `satisfies` answers `true` for
+/// `exec` there, so the wildcard falls out of the same test rather than needing
+/// its own arm.
+///
+/// `auth_enabled` is not a refinement of that test but a precondition for it
+/// meaning anything. With authentication off, `capability_auth_middleware`
+/// (`src/api/router.rs`) returns before a token is ever looked for, so every
+/// route is open — `exec` included — no matter what `--preset` or
+/// `security.auth.preset` says. Describing such a server as holding a scope
+/// without `exec` would be false in the reassuring direction, on the one
+/// surface meant to be trusted. Reachable with `--no-auth --preset file-read`
+/// and with `auth.enabled: false` alongside a preset in a config file; an
+/// exposed server cannot reach it, since the posture turns authentication on
+/// and refuses `--no-auth`.
+fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&CapabilitySet>) -> bool {
+    let Some(set) = capabilities.filter(|_| auth_enabled) else {
+        return false;
+    };
+    !set.satisfies("exec") && (set.satisfies("fs.read") || set.satisfies("fs.write"))
+}
+
+/// The banner lines announcing the posture. Local is an empty list — with
+/// nothing narrowed there is nothing to report.
+///
+/// The strings come out of a function so that tests can hold them in place.
+/// User-facing text in this repository has broken four times, every one of
+/// them somewhere no test was looking.
+fn posture_banner(posture: Posture, scope: &TokenScope, audit_log: Option<&Path>) -> Vec<String> {
+    if posture == Posture::Local {
+        return Vec::new();
+    }
+    // The wildcard line deliberately avoids the word "scoped": the wildcard is
+    // the absence of scoping, and this line is the only place a consumer
+    // confirms which of the two they have.
+    let reach = match scope {
+        TokenScope::Wildcard => "Reachable:   from other machines — tokens hold the wildcard `*`: every capability, including any added in later versions".to_string(),
+        TokenScope::Preset(name) => {
+            format!("Reachable:   from other machines — tokens are scoped to `{name}`, not wildcard")
+        }
+        // Each capability is backticked, as the `Preset` arm backticks its
+        // name: unquoted, "scoped to exec, fs.read, not wildcard" reads as if
+        // `not wildcard` were a third item in the list.
+        TokenScope::Explicit(listed) => {
+            let quoted: Vec<String> = listed.iter().map(|c| format!("`{c}`")).collect();
+            format!(
+                "Reachable:   from other machines — tokens are scoped to {}, not wildcard",
+                quoted.join(", ")
+            )
+        }
+    };
+    let mut lines = vec![reach];
+    if let Some(path) = audit_log {
+        lines.push(format!("Audit trail: {}", path.display()));
+    }
+    lines
+}
+
 /// Whether `audit_log`'s canonical location sits under `fs_root`.
 ///
 /// `fs_root` is expected already canonicalised (`FsRoot::new` does this
@@ -789,6 +1015,220 @@ mod tests {
                 .expect("the parent directory exists"),
             "a nested audit log must be detected as inside the root too"
         );
+    }
+
+    #[test]
+    fn an_exposed_run_gets_an_audit_trail_it_did_not_ask_for() {
+        // Same shape as the self-signed certificate: being exposed is the
+        // circumstance that justifies an exception to the "create no file
+        // nobody asked for" rule.
+        let derived = effective_audit_log(None, Posture::Exposed);
+        assert_eq!(derived, Some(PathBuf::from(DEFAULT_AUDIT_LOG)));
+    }
+
+    #[test]
+    fn a_local_run_still_creates_nothing() {
+        assert_eq!(effective_audit_log(None, Posture::Local), None);
+    }
+
+    #[test]
+    fn an_explicit_audit_path_wins_in_either_posture() {
+        let chosen = PathBuf::from("/var/log/st.jsonl");
+        assert_eq!(
+            effective_audit_log(Some(&chosen), Posture::Exposed),
+            Some(chosen.clone())
+        );
+        assert_eq!(
+            effective_audit_log(Some(&chosen), Posture::Local),
+            Some(chosen)
+        );
+    }
+
+    /// Resolve a preset name the way `Config` does, for the tests below.
+    fn resolved(name: &str) -> CapabilitySet {
+        shell_tunnel::security::preset(name).expect("preset exists")
+    }
+
+    #[test]
+    fn the_exposed_banner_names_the_scope_and_the_trail() {
+        // The default-promoted case: no preset and no capabilities were given,
+        // so `harden_for_public_exposure` set `operator`.
+        let path = PathBuf::from("shell-tunnel-audit.jsonl");
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let lines = posture_banner(Posture::Exposed, &scope, Some(&path));
+        let text = lines.join("\n");
+        assert!(text.contains("Reachable:"), "{text}");
+        assert!(
+            text.contains("operator"),
+            "must name the scope in force: {text}"
+        );
+        assert!(
+            text.contains("shell-tunnel-audit.jsonl"),
+            "must name the trail: {text}"
+        );
+        // Two facts never fold onto one line — a banner is skimmed, not read.
+        assert!(lines.len() >= 2, "{lines:?}");
+    }
+
+    /// The defect this signature exists to fix: `--preset full-control` resolves
+    /// to the wildcard, and the banner used to call it "scoped to `operator`"
+    /// regardless — false on the one surface a consumer uses to confirm what a
+    /// token can do.
+    #[test]
+    fn a_wildcard_scope_is_never_described_as_scoped() {
+        let scope = token_scope(Some("full-control"), Some(&resolved("full-control")));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(
+            !text.contains("operator"),
+            "a wildcard token must not be reported as `operator`: {text}"
+        );
+        assert!(
+            !text.contains("scoped"),
+            "the wildcard is the absence of scoping — saying `scoped` here is the lie being fixed: {text}"
+        );
+        assert!(
+            text.contains("wildcard"),
+            "it must say plainly that the token holds the wildcard: {text}"
+        );
+    }
+
+    /// A `None` resolution is the legacy full-control default, which is also the
+    /// wildcard — it must not be mistaken for "nothing granted".
+    #[test]
+    fn an_unresolved_scope_is_the_wildcard() {
+        assert_eq!(token_scope(None, None), TokenScope::Wildcard);
+    }
+
+    #[test]
+    fn an_explicit_preset_is_named_rather_than_the_promoted_one() {
+        let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(text.contains("file-read"), "{text}");
+        assert!(
+            !text.contains("operator"),
+            "the preset in force is file-read, not the default: {text}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_capability_list_is_spelled_out() {
+        let caps: CapabilitySet = ["exec", "fs.read"].into_iter().collect();
+        let scope = token_scope(None, Some(&caps));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(text.contains("exec"), "{text}");
+        assert!(text.contains("fs.read"), "{text}");
+    }
+
+    /// A preset with extra capabilities unioned on top holds more than the
+    /// preset's name promises, so the name alone would understate the grant.
+    #[test]
+    fn a_preset_with_extras_is_listed_rather_than_named() {
+        let mut caps = resolved("file-read");
+        caps.insert("exec");
+        let scope = token_scope(Some("file-read"), Some(&caps));
+        let text = posture_banner(Posture::Exposed, &scope, None).join("\n");
+        assert!(
+            !text.contains("file-read"),
+            "naming the preset would hide the `exec` unioned on top of it: {text}"
+        );
+        assert!(text.contains("exec"), "{text}");
+    }
+
+    /// Capability order must not depend on `HashSet` iteration order, or the
+    /// banner would differ between runs of the same configuration.
+    #[test]
+    fn an_explicit_capability_list_is_ordered() {
+        let caps: CapabilitySet = ["session.read", "exec", "fs.read"].into_iter().collect();
+        match token_scope(None, Some(&caps)) {
+            TokenScope::Explicit(listed) => {
+                assert_eq!(listed, vec!["exec", "fs.read", "session.read"]);
+            }
+            other => panic!("expected an explicit list, got {other:?}"),
+        }
+    }
+
+    /// The presets drawn on the far side of the `exec` boundary: for these the
+    /// file API is the entire grant, so a machine-wide one is the hazard the
+    /// extra banner line names.
+    #[test]
+    fn the_file_presets_have_nothing_but_the_file_api() {
+        assert!(file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("file-read"))
+        ));
+        assert!(file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("file-write"))
+        ));
+    }
+
+    /// With authentication off there is no token: `capability_auth_middleware`
+    /// returns before it looks for one, so `exec` answers every caller whatever
+    /// the preset says. Claiming a scope without `exec` there would be a
+    /// reassuring falsehood on the surface this banner exists to be trusted on.
+    /// Reachable as `--no-auth --preset file-read`, and from a config file
+    /// pairing `auth.enabled: false` with `security.auth.preset`.
+    #[test]
+    fn an_unauthenticated_server_has_no_token_to_describe() {
+        assert!(!file_scope_is_the_whole_grant(
+            false,
+            Some(&resolved("file-read"))
+        ));
+        assert!(!file_scope_is_the_whole_grant(
+            false,
+            Some(&resolved("file-write"))
+        ));
+        let named: CapabilitySet = ["fs.read"].into_iter().collect();
+        assert!(!file_scope_is_the_whole_grant(false, Some(&named)));
+    }
+
+    /// The line must not fire for a token holding `exec`: there a machine-wide
+    /// file API grants nothing `exec` did not already reach, and printing a
+    /// confinement warning would train operators to ignore it.
+    #[test]
+    fn a_token_holding_exec_is_not_confined_by_the_file_root() {
+        assert!(!file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("operator"))
+        ));
+        assert!(!file_scope_is_the_whole_grant(
+            true,
+            Some(&resolved("full-control"))
+        ));
+        // The wildcard has no arm of its own — `satisfies("exec")` answers for
+        // it. Asserted so that stays true if the predicate is rewritten.
+        assert!(resolved("full-control").is_wildcard());
+    }
+
+    /// `None` is the legacy full-control default, which is the wildcard — not
+    /// "nothing granted", which would make this the loudest possible line on
+    /// the most permissive possible token.
+    #[test]
+    fn an_unresolved_scope_is_not_treated_as_file_only() {
+        assert!(!file_scope_is_the_whole_grant(true, None));
+    }
+
+    /// Named capabilities reach the same state as `--preset file-read` and were
+    /// always able to; deciding from the resolved set rather than the preset
+    /// name is what makes this case covered rather than merely adjacent.
+    #[test]
+    fn an_explicit_file_capability_list_counts_too() {
+        let read: CapabilitySet = ["fs.read"].into_iter().collect();
+        assert!(file_scope_is_the_whole_grant(true, Some(&read)));
+
+        let with_exec: CapabilitySet = ["fs.read", "exec"].into_iter().collect();
+        assert!(!file_scope_is_the_whole_grant(true, Some(&with_exec)));
+
+        // Neither half of the file API: nothing to confine, so nothing to say.
+        let sessions: CapabilitySet = ["session.read"].into_iter().collect();
+        assert!(!file_scope_is_the_whole_grant(true, Some(&sessions)));
+    }
+
+    #[test]
+    fn the_local_banner_says_nothing() {
+        // Local is zero friction. Nothing was narrowed, so there is nothing
+        // to report.
+        assert!(posture_banner(Posture::Local, &TokenScope::Wildcard, None).is_empty());
     }
 
     /// The `Err` arm itself: a path whose *parent* cannot be canonicalised

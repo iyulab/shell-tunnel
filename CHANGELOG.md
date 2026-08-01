@@ -3,6 +3,64 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.14.0 — 2026-07-31
+
+### Changed
+
+- **The defaults now follow reachability.** A tunnel, a relay, or a non-loopback
+  bind puts the server in a reachable posture: authentication is required, the
+  issued token is scoped rather than wildcard, and an audit trail is written. A
+  loopback bind with no public path is unchanged — no file is created and
+  nothing is narrowed. There is no flag to select this; the reachability you
+  asked for decides it.
+
+- **A non-loopback bind counts as reachable on its own.** Previously only a
+  tunnel or a relay did, and `-H 0.0.0.0` merely produced a warning when
+  combined with one. A LAN is other people's machines.
+
+- **The startup banner names the one combination that is a hazard.** A token
+  holding `fs.read`/`fs.write` without `exec` — what `--preset file-read` and
+  `--preset file-write` grant — has no route to a file except the file API, so
+  `--fs-root` is the only thing that confines it. Run without one, the banner
+  now says so on its own line instead of leaving the operator to draw the
+  conclusion from three separately true lines. The test is the resolved
+  capability set, not the preset name, so `--capabilities fs.read` reaches it
+  too; a token holding `exec` never does, since there the file API grants
+  nothing `exec` did not already reach. It also requires authentication to be
+  on: with `--no-auth` no token is ever demanded and every route is open, so
+  there is no scope in force to describe.
+
+### Breaking
+
+- **`--preset read-only` is removed.** It granted only `session.read`, so it
+  could not read a file despite its name. `file-read` (`fs.read`) and
+  `file-write` (`fs.read`, `fs.write`) replace it with sets that name what they
+  grant; `--capabilities session.read` reproduces the old set exactly. An
+  unknown preset already refused startup, so this cannot pass silently.
+
+- **A token issued on a reachable server carries `operator`, not the wildcard.**
+  Its reach today is the same — `operator` holds `exec`, which reaches every
+  file the process can. What changes is that it no longer inherits capabilities
+  added in later versions. Pass `--preset full-control` to keep the wildcard.
+
+- **`--no-auth` is refused with a non-loopback bind**, as it already was with a
+  tunnel or a relay.
+
+- **A reachable server writes `shell-tunnel-audit.jsonl`** in the working
+  directory unless `--audit-log` names another path. This is the second
+  exception to "no file is created that nobody asked for" — the first is the
+  self-signed certificate, and the shape is the same.
+
+### Fixed
+
+- **`--audit-log` no longer claims to record every refusal.** It records
+  executions, requests the authentication layer denies, and the file operations
+  the event-kind table lists — but a delete refused with `400
+  recursive-required` or `409 staging-in-tree` writes nothing, so the promise
+  was wider than the trail. The documentation now names what is recorded and
+  says the table is the whole list; the missing delete entries are a separate
+  change. Nothing about what is written has changed.
+
 ## 0.13.0 — 2026-07-31
 
 ### Added

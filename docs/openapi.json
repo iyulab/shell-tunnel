@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.13.0",
+    "version": "0.14.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -1138,7 +1138,7 @@
       "bearerAuth": {
         "type": "http",
         "scheme": "bearer",
-        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator (exec, session.read, session.manage, fs.read, fs.write), read-only (session.read), full-control (*). operator carries the file capabilities because it already carries exec, which reaches every file the server can; withholding them confined nothing. read-only carries neither, and there the exclusion is a real boundary — with no exec it has no other route to a file's contents — so name fs.read explicitly if a read-only token should read files."
+        "description": "Opaque bearer token via the Authorization header. Each token carries a set of capabilities (exec, session.read, session.manage, fs.read, fs.write; '*' wildcard). A route declares a required capability: a missing/invalid token yields 401, a valid token lacking the capability yields 403. Role presets: operator (exec, session.read, session.manage, fs.read, fs.write); file-write (fs.read, fs.write); file-read (fs.read); full-control (*). The cut line is exec: a token holding it already reaches every file the server can, so operator carries the file capabilities too. The file-* presets carry no exec, and there the file capabilities are the whole grant."
       }
     },
     "parameters": {
@@ -1171,7 +1171,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.11.0"
+            "example": "0.14.0"
           },
           "status": {
             "type": "string",

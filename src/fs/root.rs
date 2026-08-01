@@ -49,11 +49,17 @@ enum Scope {
     /// it names (a drive root on Windows, `/` on Unix).
     ///
     /// Not a hole in the jail — the jail was never a boundary against a token
-    /// holding `exec`, which can read and write anything this process can. See
-    /// `KNOWN_CAPABILITIES` in `src/security/capability.rs`. What this shape
-    /// buys is that the file API reaches the same places `exec` does, so an
-    /// agent does not have to fall back to piping bytes through a command for
-    /// any destination outside one chosen subtree.
+    /// holding `exec`, which can read and write anything this process can. What
+    /// this shape buys is that the file API reaches the same places `exec`
+    /// does, so an agent does not have to fall back to piping bytes through a
+    /// command for any destination outside one chosen subtree.
+    ///
+    /// That reasoning has one exception, and it is the reason `--fs-root` still
+    /// exists: a token holding `fs.*` *without* `exec` — what the `file-read`
+    /// and `file-write` presets grant — has no other route to a file, so for it
+    /// the jail is a real boundary and this shape is the whole machine. See
+    /// `KNOWN_CAPABILITIES` in `src/security/capability.rs`, which states both
+    /// halves. The startup banner says so on a run that combines the two.
     Machine(Vec<PathBuf>),
 }
 

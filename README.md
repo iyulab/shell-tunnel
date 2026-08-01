@@ -132,22 +132,29 @@ remove one file this way can remove anything the server can reach.
 To confine them to one directory instead, name it:
 
 ```bash
-shell-tunnel --fs-root /srv/deploy --require-auth --capabilities fs.write
+shell-tunnel --fs-root /srv/deploy --require-auth --preset file-write
 ```
 
 That confinement is worth something for a token holding `fs.read`/`fs.write` and **not**
-`exec` — a deploy push, say. It is not a boundary against a token that can run commands,
-since such a token can already read and write anything the server can. The startup banner
-states the effective scope either way.
+`exec` — a deploy push, say. `--preset file-write` (`fs.read`, `fs.write`) and
+`--preset file-read` (`fs.read`) are exactly those tokens, and they are the only presets
+`--fs-root` genuinely confines: it is not a boundary against a token that can run
+commands, since such a token can already read and write anything the server can. Pair a
+`file-*` preset with `--fs-root` — without it the token reaches the whole machine, and
+the startup banner says so.
 
 ## A word on exposure
 
 Publishing a shell means anyone holding the token can run commands as the user running
-shell-tunnel. So a public path (`--tunnel` or `--relay`) turns authentication on, generates a
-key if you gave none, and refuses `--no-auth`. Scope the token with `--preset operator` rather
-than leaving it full-control, keep rate limiting on, and treat the URL and token as
-credentials. TLS is not optional over the internet — `--tls-self-signed` on the relay is one
-flag, and the fingerprint it prints keeps the connection authenticated, not just encrypted.
+shell-tunnel. So a public path (`--tunnel` or `--relay`), or simply binding to a
+non-loopback address, turns authentication on, generates a key if you gave none,
+refuses `--no-auth`, scopes the issued token to `operator` instead of the
+wildcard, and appends an audit trail to `shell-tunnel-audit.jsonl` in the working
+directory (`--audit-log` puts it elsewhere). Naming a scope yourself still wins —
+`--preset full-control` keeps the wildcard. Keep rate limiting on, and treat the URL
+and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
+on the relay is one flag, and the fingerprint it prints keeps the connection
+authenticated, not just encrypted. The startup banner states what is actually in force.
 
 ## Documentation
 
