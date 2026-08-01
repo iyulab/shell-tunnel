@@ -78,6 +78,32 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Breaking
 
+- **A configured bind address and port now take effect.** `server.host`,
+  `server.port`, `SHELL_TUNNEL_HOST`, and `SHELL_TUNNEL_PORT` were read and
+  then overwritten: both fields were assigned from `-H` and `-p` on every
+  start, and those flags carry their own defaults, so a configured value never
+  survived even when no flag was passed. They now apply unless a flag names
+  one.
+
+  **This can change how an existing configuration starts.** A file saying
+  `"host": "0.0.0.0"` previously produced a quiet loopback server; it now binds
+  `0.0.0.0`, which is a reachable posture — so that server requires
+  authentication, scopes its issued token, and writes an audit trail. If a
+  loopback bind is what you want, remove the setting or pass `-H 127.0.0.1`.
+
+- **Naming a scope on the command line replaces the file's scope.**
+  `--capabilities` did not clear a `preset` the file named; the two were
+  unioned, so a file saying `"preset": "operator"` plus a command line saying
+  `--capabilities fs.read` issued a token holding operator's whole set *and*
+  `fs.read` — `exec` still among them, though the command line was narrowing.
+  Either flag now clears both of the file's scope settings before applying what
+  was named. Within one command line the union stays: `--preset operator
+  --capabilities fs.read` is still a request to add.
+
+  A configuration that relied on adding a capability to a file's preset from
+  the command line must now name the whole set it wants, on one side or the
+  other. `--api-key` is unchanged and still adds.
+
 - **`--preset read-only` is removed.** It granted only `session.read`, so it
   could not read a file despite its name. `file-read` (`fs.read`) and
   `file-write` (`fs.read`, `fs.write`) replace it with sets that name what they

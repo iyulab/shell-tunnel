@@ -134,10 +134,16 @@ fn test_config_priority_cli_over_file() {
     let mut file = NamedTempFile::new().unwrap();
     file.write_all(json.as_bytes()).unwrap();
 
-    // CLI args should override file
+    // CLI args should override file. `host_explicit`/`port_explicit` are what
+    // the parser sets when the flag really is on the command line, and
+    // `apply_args` reads them to tell a stated bind address from the default
+    // one it would otherwise overwrite a configured value with. A literal that
+    // sets only the value is describing a default, not a choice.
     let args = Args {
         host: "192.168.1.1".parse().unwrap(),
+        host_explicit: true,
         port: 8080,
+        port_explicit: true,
         config: Some(file.path().to_path_buf()),
         ..Args::default()
     };
@@ -196,7 +202,9 @@ fn test_config_no_auth_disables() {
 fn test_config_to_server_config() {
     let args = Args {
         host: "0.0.0.0".parse().unwrap(),
+        host_explicit: true,
         port: 8080,
+        port_explicit: true,
         api_key: Some("test-key".to_string()),
         ..Args::default()
     };

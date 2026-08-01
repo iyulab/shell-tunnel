@@ -188,9 +188,27 @@ impl Config {
     }
 
     /// Apply CLI argument overrides.
+    ///
+    /// A flag that was passed replaces what the file or the environment said;
+    /// a flag that was not passed leaves them alone. That reading is only
+    /// possible for arguments that can tell "not passed" from "passed the
+    /// default value" — hence `host_explicit`/`port_explicit`, since `Args`
+    /// carries `127.0.0.1` and `3000` either way and an unconditional
+    /// assignment made a configured bind address unreachable.
+    ///
+    /// It is not a universal, and the exceptions are not accidents. The
+    /// boolean flags below (`--no-auth`, `--require-auth`, `--no-rate-limit`,
+    /// `--cors-allow-any`) are one-way: passing one sets it, omitting one
+    /// leaves the file's value, and there is no flag that turns rate limiting
+    /// back *on* from the command line. Documenting the rule as universal has
+    /// been tried three times here and was false each time.
     pub fn apply_args(&mut self, args: &Args) {
-        self.server.host = args.host.to_string();
-        self.server.port = args.port;
+        if args.host_explicit {
+            self.server.host = args.host.to_string();
+        }
+        if args.port_explicit {
+            self.server.port = args.port;
+        }
 
         if let Some(ref key) = args.api_key {
             self.security.auth.enabled = true;
@@ -209,13 +227,28 @@ impl Config {
         // implies auth-on — otherwise the scope would be silently ignored and the
         // server would start open, the opposite of what `--preset file-read` asks
         // for. Applied before `no_auth` so an explicit `--no-auth` still wins.
+        //
+        // Naming *either* one on the command line clears *both* of the file's
+        // scope settings before applying what was named. `resolve_capabilities`
+        // unions a preset with an explicit list, which is right within one
+        // source — `--preset operator --capabilities fs.read` on one line is
+        // plainly a request to add — but across sources it inverted the
+        // operator's intent: a file saying `"preset": "operator"` plus a
+        // command line saying `--capabilities fs.read` issued a token holding
+        // operator's whole set *and* `fs.read`, `exec` still among them, when
+        // the command line was narrowing. A scope input that cannot narrow is
+        // not a scope input, and this failed in the reassuring direction.
+        let scope_named = !args.capabilities.is_empty() || args.preset.is_some();
+        if scope_named {
+            self.security.auth.capabilities.clear();
+            self.security.auth.preset = None;
+            self.security.auth.enabled = true;
+        }
         if !args.capabilities.is_empty() {
             self.security.auth.capabilities = args.capabilities.clone();
-            self.security.auth.enabled = true;
         }
         if let Some(ref preset) = args.preset {
             self.security.auth.preset = Some(preset.clone());
-            self.security.auth.enabled = true;
         }
 
         if args.no_auth {
@@ -621,7 +654,14 @@ mod tests {
         let mut config = Config::default();
         let args = Args {
             host: "192.168.1.1".parse().unwrap(),
+            // Both `_explicit` flags are what the parser sets when the flag is
+            // actually on the command line; a struct literal that sets only
+            // the value is describing a default, not a choice, and the two
+            // have to stay distinguishable here for the same reason
+            // `apply_args` distinguishes them.
+            host_explicit: true,
             port: 5000,
+            port_explicit: true,
             api_key: Some("test-key".to_string()),
             no_rate_limit: true,
             ..Args::default()
@@ -640,19 +680,16 @@ mod tests {
         assert!(!config.security.rate_limit.enabled);
     }
 
-    /// Neither `server.host` nor `server.port` survives `apply_args`: both are
-    /// assigned unconditionally from `Args`, whose defaults are `127.0.0.1` and
-    /// `3000`, so a value from a config file or the environment is overwritten
-    /// even when the user passed no flag at all. `port_explicit` does not guard
-    /// this — it is read in one place, to pick an ephemeral port behind a relay.
+    /// A configured bind address and port survive when no flag names them.
     ///
-    /// This pins what the code does today, not what it ought to do. It exists
-    /// because the documentation twice described a precedence that was never
-    /// implemented, and because the only test to touch a configured port passed
-    /// `-p` explicitly, which is exactly what hid the behaviour. Whichever way
-    /// the eventual fix goes, this test has to be updated deliberately.
+    /// This test was the inverse: it pinned an unconditional assignment from
+    /// `Args`, whose defaults are `127.0.0.1` and `3000`, which overwrote a
+    /// configured value even when the user passed no flag at all. It was
+    /// written to be inverted — the documentation twice described a precedence
+    /// that was never implemented, and the only other test to touch a
+    /// configured port passed `-p`, which is exactly what hid the behaviour.
     #[test]
-    fn the_cli_default_overwrites_a_configured_host_and_port() {
+    fn a_configured_host_and_port_survive_when_no_flag_names_them() {
         let mut config = Config::default();
         // As a config file or `SHELL_TUNNEL_HOST`/`SHELL_TUNNEL_PORT` would
         // leave it: `Config::load` runs `apply_env` before `apply_args`, so
@@ -662,18 +699,58 @@ mod tests {
 
         let nothing_passed = Args::default();
         assert!(
-            !nothing_passed.port_explicit,
+            !nothing_passed.port_explicit && !nothing_passed.host_explicit,
             "the premise: no flag was given"
         );
         config.apply_args(&nothing_passed);
 
+        assert_eq!(config.server.host, "0.0.0.0");
+        assert_eq!(config.server.port, 8080);
+    }
+
+    /// The flags still win when they are actually passed — the other half of
+    /// the same rule, and the half that was never broken.
+    #[test]
+    fn a_named_host_and_port_beat_the_configured_ones() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.server.port = 8080;
+
+        config.apply_args(&Args {
+            host: "10.0.0.5".parse().expect("addr"),
+            host_explicit: true,
+            port: 9999,
+            port_explicit: true,
+            ..Args::default()
+        });
+
+        assert_eq!(config.server.host, "10.0.0.5");
+        assert_eq!(config.server.port, 9999);
+    }
+
+    /// The consequence worth pinning separately. `server.host` is not just a
+    /// bind address since 0.14.0 — it decides the security posture, and a
+    /// configured `0.0.0.0` that now actually takes effect makes the server
+    /// reachable, which forces authentication and an audit trail.
+    ///
+    /// It also re-checks the fail-closed property the old behaviour had by
+    /// accident: `posture()` and `to_server_config()` must read the same
+    /// field, so the posture can never describe a bind that did not happen.
+    #[test]
+    fn a_configured_non_loopback_host_now_decides_the_posture() {
+        let mut config = Config::default();
+        config.server.host = "0.0.0.0".to_string();
+        config.apply_args(&Args::default());
+
         assert_eq!(
-            config.server.host, "127.0.0.1",
-            "a configured bind address does not survive the CLI default"
+            config.posture(false, false),
+            Posture::Exposed,
+            "a bind address that now takes effect must also be seen by the posture"
         );
+        let server = config.to_server_config().expect("valid config");
         assert_eq!(
-            config.server.port, 3000,
-            "and neither does a configured port"
+            server.host, "0.0.0.0",
+            "the posture and the listener must read the same field"
         );
     }
 
@@ -757,6 +834,87 @@ mod tests {
             ..Args::default()
         });
         assert!(by_caps.security.auth.enabled);
+    }
+
+    /// Naming a scope on the command line replaces the file's scope entirely,
+    /// rather than being unioned on top of it.
+    ///
+    /// The union is right *within* one source — `--preset operator
+    /// --capabilities fs.read` on one command line is plainly a request to add
+    /// — but across sources it inverted the operator's intent: a file saying
+    /// `"preset": "operator"` plus a command line saying `--capabilities
+    /// fs.read` issued a token holding operator's whole set *and* `fs.read`,
+    /// `exec` still among them, when the command line was narrowing. A scope
+    /// input that cannot narrow is not a scope input.
+    #[test]
+    fn a_scope_named_on_the_command_line_replaces_the_files_scope() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("operator".to_string());
+
+        config.apply_args(&Args {
+            capabilities: vec!["fs.read".to_string()],
+            ..Args::default()
+        });
+
+        assert_eq!(
+            config.security.auth.preset, None,
+            "the file's preset must not survive a scope named on the command line"
+        );
+        assert_eq!(config.security.auth.capabilities, vec!["fs.read"]);
+        assert_eq!(
+            resolve_capabilities(
+                config.security.auth.preset.as_deref(),
+                &config.security.auth.capabilities,
+            )
+            .expect("valid")
+            .expect("a scope was named")
+            .iter()
+            .collect::<Vec<_>>(),
+            vec!["fs.read"],
+            "and the resolved set is what was asked for, with no exec left in it"
+        );
+    }
+
+    /// The mirror case: a `capabilities` list in the file does not survive a
+    /// `--preset` either. Narrowing with `--preset` has to escape the union
+    /// from the same side.
+    #[test]
+    fn a_preset_named_on_the_command_line_replaces_the_files_capabilities() {
+        let mut config = Config::default();
+        config.security.auth.capabilities = vec!["exec".to_string()];
+
+        config.apply_args(&Args {
+            preset: Some("file-read".to_string()),
+            ..Args::default()
+        });
+
+        assert!(
+            config.security.auth.capabilities.is_empty(),
+            "the file's capability list must not survive a preset named on the command line"
+        );
+        assert_eq!(config.security.auth.preset, Some("file-read".to_string()));
+    }
+
+    /// Within one source the union stays: both given on one command line is a
+    /// request to add, and this is what keeps the replacement above from being
+    /// a blunt instrument.
+    #[test]
+    fn a_preset_and_capabilities_on_one_command_line_still_union() {
+        let mut config = Config::default();
+        config.apply_args(&Args {
+            preset: Some("file-read".to_string()),
+            capabilities: vec!["session.read".to_string()],
+            ..Args::default()
+        });
+
+        let resolved = resolve_capabilities(
+            config.security.auth.preset.as_deref(),
+            &config.security.auth.capabilities,
+        )
+        .expect("valid")
+        .expect("a scope was named");
+        assert!(resolved.satisfies("fs.read"), "from the preset");
+        assert!(resolved.satisfies("session.read"), "from the list");
     }
 
     #[test]

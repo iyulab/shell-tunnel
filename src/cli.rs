@@ -11,12 +11,22 @@ use std::path::PathBuf;
 pub struct Args {
     /// Host address to bind to.
     pub host: IpAddr,
+    /// Whether the bind address was stated rather than defaulted.
+    ///
+    /// Without this the default is indistinguishable from a choice, and
+    /// `apply_args` overwrites a configured `server.host` with `127.0.0.1` for
+    /// a user who passed no flag at all. Since 0.14.0 that field also decides
+    /// the security posture, so "not stated" has to be a fact the config layer
+    /// can read rather than one it has to guess.
+    pub host_explicit: bool,
     /// Port to listen on.
     pub port: u16,
     /// Whether the port was stated rather than defaulted.
     ///
     /// A relay-attached device serves only itself on loopback, so the port is an
     /// implementation detail there — but only if the user did not ask for one.
+    /// Also what keeps `apply_args` from overwriting a configured
+    /// `server.port`, the same way `host_explicit` does above.
     pub port_explicit: bool,
     /// Path to configuration file.
     pub config: Option<PathBuf>,
@@ -87,6 +97,7 @@ impl Default for Args {
         Self {
             host: "127.0.0.1".parse().unwrap(),
             port: 3000,
+            host_explicit: false,
             port_explicit: false,
             config: None,
             api_key: None,
@@ -151,6 +162,7 @@ where
                 result.host = value
                     .parse()
                     .map_err(|_| ArgsError::InvalidValue("host", value))?;
+                result.host_explicit = true;
             }
             Short('p') | Long("port") => {
                 let value: String = parser.value()?.parse()?;
@@ -406,8 +418,8 @@ RELAY OPTIONS (with `relay`):
     -V, --version           Print version
 
 ENVIRONMENT VARIABLES:
-    SHELL_TUNNEL_HOST       No effect: -H sets the bind address on every start
-    SHELL_TUNNEL_PORT       No effect: -p sets the port on every start
+    SHELL_TUNNEL_HOST       Bind address, unless -H names one
+    SHELL_TUNNEL_PORT       Port, unless -p names one
     SHELL_TUNNEL_API_KEY    Adds an API key and turns auth on. Keys from the
                             config file stay valid alongside it
     SHELL_TUNNEL_LOG_LEVEL  Log level (overrides config)
