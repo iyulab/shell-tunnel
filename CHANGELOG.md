@@ -5,6 +5,28 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## 0.14.0 — 2026-07-31
 
+### Added
+
+- **Two audit kinds for a delete that removed nothing.** `fs.delete.refused`
+  records a removal the server turned away before touching the disk, with
+  `reason` carrying the same code the HTTP body does — `recursive-required`,
+  `staging-in-tree`, or `reserved-path`. `fs.delete.failed` records one that
+  was attempted and the filesystem turned down, with the underlying error as
+  its `reason`. Both carry `status`, the shape the authentication layer's
+  `denied` events already use.
+
+  Every other refusal in the file API already left a trail: the authentication
+  layer writes `denied`, and an upload that does not complete writes
+  `upload.rejected` or `upload.failed`. Delete recorded only its successes, so
+  "why did that cleanup not go through" had no answer after the fact — and the
+  refusal worth asking that about, a tree held back by an upload in flight, was
+  the one leaving no evidence beyond the `409` the caller saw.
+
+  Not split per reason, unlike the four kinds on the success side: those differ
+  in how exact their counts are, which is what an operator greps for. Neither
+  of these carries counts, so `reason` distinguishes them and the grep surface
+  stays where it is.
+
 ### Changed
 
 - **The defaults now follow reachability.** A tunnel, a relay, or a non-loopback
@@ -55,11 +77,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 - **`--audit-log` no longer claims to record every refusal.** It records
   executions, requests the authentication layer denies, and the file operations
-  the event-kind table lists — but a delete refused with `400
-  recursive-required` or `409 staging-in-tree` writes nothing, so the promise
-  was wider than the trail. The documentation now names what is recorded and
-  says the table is the whole list; the missing delete entries are a separate
-  change. Nothing about what is written has changed.
+  the event-kind table lists. The promise was wider than the trail — the two
+  delete refusals it missed are recorded as of the `Added` entry above, but a
+  request whose *path* does not resolve still writes nothing on any file route,
+  and the documentation now says so instead of implying otherwise.
 
 ## 0.13.0 — 2026-07-31
 
