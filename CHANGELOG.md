@@ -29,6 +29,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A recursive-delete preview is no longer refused by an upload in flight.**
+  `dry_run=true` was turned away with the same `409 staging-in-tree` as the
+  removal, which left a caller holding a refusal and no way to learn how large
+  the tree was or what was holding it — the question a preview exists to answer.
+  A preview touches nothing, so there is no upload to protect it from. It now
+  answers `200` with a new `staging_in_tree` field, present on every tree
+  answer including when `false`, so a successful preview cannot be mistaken for
+  permission to proceed. The removal itself is still refused.
+
 - **A generated relay enrolment token says that it is not saved.** Starting
   `shell-tunnel relay` without `--enroll-token` generates one and keeps it
   nowhere, so a restart invalidates every attached device's join line at once —
