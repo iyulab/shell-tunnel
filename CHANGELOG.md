@@ -63,6 +63,14 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **`--help` says that `--api-key` adds to a config file's keys.** It described
+  what the flag is for but not how it combines, while `--capabilities` and
+  `--preset` — right below it, and *replacing* a file's scope since this
+  release — read the same way at a glance. An operator passing `-k` to rotate a
+  key would leave the file's key valid and have no indication of it. The
+  operating guide already said so; the two surfaces drift independently, which
+  is why this one went unnoticed.
+
 - **A device no longer treats a failed body read as an empty body.** Reading
   the forwarded request body matched only the success case and fell through to
   an empty `Vec` for everything else, so a read error would have replayed the

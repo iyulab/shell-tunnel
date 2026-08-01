@@ -839,7 +839,7 @@ still sees the real address.
 | `-H, --host <ADDR>` | Bind address | `server.host` or `SHELL_TUNNEL_HOST`, else `127.0.0.1` |
 | `-p, --port <PORT>` | Port | `server.port` or `SHELL_TUNNEL_PORT`, else `3000`; OS-chosen with `--relay` |
 | `-c, --config <FILE>` | JSON config file | - |
-| `-k, --api-key <KEY>` | Key callers present to run commands here | - |
+| `-k, --api-key <KEY>` | Key callers present to run commands here. **Adds to** a config file's keys rather than replacing them (§7) — unlike `--capabilities`/`--preset`, which replace | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
 | `--require-auth` | Enable auth, generating a key if none given | `false` |
