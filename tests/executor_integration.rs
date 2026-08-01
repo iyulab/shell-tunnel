@@ -107,3 +107,104 @@ async fn streaming_execute_async_yields_chunks_and_final_result() {
     assert_eq!(result.exit_code, Some(0));
     assert!(!result.timed_out);
 }
+
+/// Emit `n` bytes to stdout, on either platform.
+///
+/// Written without a redirect or a pipe so the shell cannot change the exit
+/// code out from under the assertion — the whole reason a caller should not
+/// have to reach for `| head -c` to bound output.
+///
+/// The Windows form carries no double quotes on purpose: the command goes
+/// through `cmd /c`, which strips them before PowerShell sees the argument, and
+/// the quoted form then reaches `-Command` as a literal string that PowerShell
+/// dutifully echoes — 32 bytes of source text instead of `n` bytes of output.
+/// Verified by running both forms through `cmd /c`.
+fn emit_bytes_command(n: usize) -> String {
+    #[cfg(windows)]
+    {
+        format!("powershell -NoProfile -Command [Console]::Out.Write(('x'*{n}))")
+    }
+    #[cfg(unix)]
+    {
+        format!("printf 'x%.0s' $(seq 1 {n})")
+    }
+}
+
+#[tokio::test]
+async fn output_over_the_cap_is_truncated_and_says_so() {
+    // Nothing bounded `output` before 0.14.0: the only effective limit was the
+    // timeout, which bounds time rather than size. A caller had no way to tell
+    // a complete answer from one the transport could not carry, because there
+    // was no field to tell them with.
+    let exec = executor();
+    let produced = 64 * 1024;
+    let cap = 4 * 1024;
+
+    let cmd = Command::new(emit_bytes_command(produced)).max_output_bytes(cap as u64);
+    let result = exec.execute(&cmd).await.expect("execute failed");
+
+    assert_eq!(result.exit_code, Some(0));
+    assert!(
+        result.truncated,
+        "producing {produced} bytes under a {cap}-byte cap must set truncated"
+    );
+    assert_eq!(
+        result.raw_output.len(),
+        cap,
+        "the kept output must stop exactly at the cap"
+    );
+    // The figure a caller acts on: what the command produced, not what survived.
+    assert_eq!(
+        result.total_bytes, produced as u64,
+        "total_bytes must report what was produced, not what was kept"
+    );
+}
+
+#[tokio::test]
+async fn output_under_the_cap_is_whole_and_not_flagged() {
+    // The other half of the contract, and the one a mutation that always sets
+    // `truncated` would break: a short answer must not claim to be cut.
+    let exec = executor();
+    let result = exec
+        .execute(&Command::new("echo small_output"))
+        .await
+        .expect("execute failed");
+
+    assert!(!result.truncated, "a short answer must not be flagged");
+    assert_eq!(
+        result.total_bytes,
+        result.raw_output.len() as u64,
+        "with nothing discarded the two figures must agree"
+    );
+    assert!(result.total_bytes > 0, "echo produced nothing");
+}
+
+#[tokio::test]
+async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
+    // The cap governs the collected result, not the pipe. A WebSocket consumer
+    // sees every chunk as it arrives, so capping the result must not silently
+    // shorten the stream — and `total_bytes` is what lets that consumer confirm
+    // it received everything.
+    let exec = executor();
+    let produced = 64 * 1024;
+    let cap = 4 * 1024;
+
+    let cmd = Command::new(emit_bytes_command(produced)).max_output_bytes(cap as u64);
+    let (mut rx, handle) = exec
+        .execute_async(&cmd)
+        .await
+        .expect("execute_async failed");
+
+    let mut streamed = 0usize;
+    while let Some(chunk) = rx.recv().await {
+        streamed += chunk.raw.len();
+    }
+    let result = handle.await.expect("join failed").expect("execute failed");
+
+    assert_eq!(
+        streamed, produced,
+        "the stream must carry everything even though the result is capped"
+    );
+    assert_eq!(result.total_bytes, produced as u64);
+    assert!(result.truncated, "the collected result is still capped");
+}

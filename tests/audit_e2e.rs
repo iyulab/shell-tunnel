@@ -273,3 +273,59 @@ async fn a_websocket_execution_is_recorded_too() {
     assert_eq!(event.route.as_deref(), Some("WS /api/v1/ws"));
     assert!(event.identity.is_some());
 }
+
+#[tokio::test]
+async fn a_capped_execution_records_how_much_output_there_was() {
+    // The response is not kept anywhere, so once a caller has a short `output`
+    // the trail is the only place left to learn whether the command said more.
+    // Without this field a truncated result is indistinguishable from a command
+    // that simply printed little.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    #[cfg(windows)]
+    let command = "powershell -NoProfile -Command [Console]::Out.Write(('x'*65536))";
+    #[cfg(unix)]
+    let command = "printf 'x%.0s' $(seq 1 65536)";
+
+    let body = serde_json::json!({ "command": command, "max_output_bytes": 4096 }).to_string();
+    let status = post(addr, "/api/v1/execute", Some("audit-key"), &body).await;
+    assert_eq!(status, 200);
+
+    let event = events(&trail, 1).await.remove(0);
+    assert_eq!(event.kind, "execute");
+    assert_eq!(
+        event.output_bytes,
+        Some(65536),
+        "the trail must carry what the command produced, not what was returned"
+    );
+}
+
+#[tokio::test]
+async fn an_uncapped_execution_carries_no_output_size() {
+    // The field's *presence* is the truncation signal, so an execution that
+    // returned everything must not carry it. Proven against the raw line: a
+    // round-trip through `AuditEvent` cannot tell an absent key from a null
+    // one, the same trap the fs-only keys above are checked against.
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    let status = post(
+        addr,
+        "/api/v1/execute",
+        Some("audit-key"),
+        r#"{"command":"echo short"}"#,
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let _ = events(&trail, 1).await;
+    let raw_line = std::fs::read_to_string(&trail).unwrap();
+    let raw: serde_json::Value = serde_json::from_str(raw_line.lines().next().unwrap()).unwrap();
+    assert!(
+        !raw.as_object()
+            .expect("object")
+            .contains_key("output_bytes"),
+        "an execution that returned everything must not carry `output_bytes` at all"
+    );
+}

@@ -89,7 +89,8 @@ fn execution_event(
             result.exit_code,
             result.timed_out,
             result.duration.as_millis() as u64,
-        );
+        )
+        .with_truncated_output(result.truncated, result.total_bytes);
     if let Some(id) = session_id {
         event = event.with_session(id);
     }
@@ -274,6 +275,9 @@ pub async fn execute_command(
     if let Some(timeout) = req.timeout() {
         cmd = cmd.timeout(timeout);
     }
+    if let Some(bytes) = req.max_output_bytes {
+        cmd = cmd.max_output_bytes(bytes);
+    }
     for (key, value) in &req.env {
         cmd = cmd.env(key, value);
     }
@@ -322,6 +326,9 @@ pub async fn execute_oneshot(
     }
     if let Some(timeout) = req.timeout() {
         cmd = cmd.timeout(timeout);
+    }
+    if let Some(bytes) = req.max_output_bytes {
+        cmd = cmd.max_output_bytes(bytes);
     }
     for (key, value) in &req.env {
         cmd = cmd.env(key, value);

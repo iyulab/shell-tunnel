@@ -354,7 +354,9 @@ OPTIONS:
     -H, --host <ADDR>       Host address to bind [default: 127.0.0.1]
     -p, --port <PORT>       Port to listen on [default: 3000]
     -c, --config <FILE>     Path to configuration file (JSON)
-    -k, --api-key <KEY>     API key callers present to run commands here
+    -k, --api-key <KEY>     API key callers present to run commands here. Adds to
+                            any keys a config file lists rather than replacing
+                            them; edit the file to retire a key
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication (refused when reachable)
         --require-auth      Require auth, auto-generating an API key if none given

@@ -19,6 +19,29 @@ use crate::Result;
 /// Default execution timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How much output a command's result keeps, unless the caller asks for less.
+///
+/// Until 0.14.0 nothing bounded this: the only effective limit was the timeout,
+/// which bounds time rather than size, so a single `cat` of a large file was
+/// held whole in memory and then serialised into one JSON response. Behind a
+/// relay that response could not even be delivered.
+///
+/// 1 MiB sits well under every ceiling downstream of it, so a capped result
+/// behaves the same locally and across a relay — a limit that only bites on one
+/// path is worse than none, because it is discovered in production.
+///
+/// The cap governs what a *result* carries. A streaming (WebSocket) consumer
+/// receives every chunk as it arrives and is not affected.
+pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
+
+/// The largest cap a caller may ask for.
+///
+/// A request may lower [`DEFAULT_MAX_OUTPUT_BYTES`] or raise it to here, but
+/// not past it: the point of the cap is that a response stays deliverable, and
+/// a caller opting out entirely would restore exactly the failure it exists to
+/// prevent.
+pub const MAX_OUTPUT_BYTES_CEILING: u64 = 8 * 1024 * 1024;
+
 /// Default buffer size for reading process output.
 const READ_BUFFER_SIZE: usize = 4096;
 
@@ -112,13 +135,37 @@ fn run_command_streaming(
     let err_handle = stderr.map(|s| spawn_pipe_reader(s, tx));
 
     // Non-blocking control loop.
+    let cap = command
+        .max_output_bytes
+        .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
+        .min(MAX_OUTPUT_BYTES_CEILING);
     let mut raw_output = Vec::new();
+    let mut total_bytes: u64 = 0;
     let mut exit_status = None;
     let mut timed_out = false;
+
+    // Every chunk goes to `on_chunk` and counts toward `total_bytes`; only what
+    // fits under the cap is kept. Streaming consumers therefore still see the
+    // whole stream — the cap governs the collected result, not the pipe — and
+    // `total_bytes` stays the true figure rather than the kept one.
+    //
+    // Draining continues after the cap is reached rather than stopping: the
+    // reader threads must keep emptying the pipes, or a child writing more than
+    // the cap would block on a full pipe buffer and never exit.
+    let mut absorb = |chunk: &[u8], raw_output: &mut Vec<u8>, total: &mut u64| {
+        on_chunk(chunk);
+        *total += chunk.len() as u64;
+        let kept = raw_output.len() as u64;
+        if kept < cap {
+            let room = (cap - kept) as usize;
+            let take = room.min(chunk.len());
+            raw_output.extend_from_slice(&chunk[..take]);
+        }
+    };
+
     loop {
         while let Ok(chunk) = rx.try_recv() {
-            on_chunk(&chunk);
-            raw_output.extend_from_slice(&chunk);
+            absorb(&chunk, &mut raw_output, &mut total_bytes);
         }
 
         match child.try_wait() {
@@ -153,10 +200,7 @@ fn run_command_streaming(
     let collect_deadline = Instant::now() + COLLECT_GRACE;
     loop {
         match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(chunk) => {
-                on_chunk(&chunk);
-                raw_output.extend_from_slice(&chunk);
-            }
+            Ok(chunk) => absorb(&chunk, &mut raw_output, &mut total_bytes),
             Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
                 if Instant::now() >= collect_deadline {
@@ -168,13 +212,16 @@ fn run_command_streaming(
 
     let duration = start.elapsed();
     let text = OutputSanitizer::strip_ansi(&raw_output);
+    let truncated = total_bytes > raw_output.len() as u64;
 
     if timed_out {
-        return Ok(ExecutionResult::timeout(raw_output, text, duration));
+        return Ok(ExecutionResult::timeout(raw_output, text, duration)
+            .with_output_extent(total_bytes, truncated));
     }
 
     let exit_code = exit_status.and_then(|s| s.code());
-    let mut result = ExecutionResult::new(raw_output, text, duration);
+    let mut result =
+        ExecutionResult::new(raw_output, text, duration).with_output_extent(total_bytes, truncated);
     if let Some(code) = exit_code {
         result = result.with_exit_code(code);
     }

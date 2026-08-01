@@ -267,6 +267,60 @@ async fn a_request_with_expect_100_continue_is_answered_by_the_device() {
 }
 
 #[tokio::test]
+async fn a_download_too_large_for_one_frame_is_not_reported_as_success() {
+    // The device returns a response body as a single binary frame, so a file
+    // over the WebSocket message limit (16 MiB by default on both ends) fails
+    // the relay's *read* of that frame. That failure used to be indistinguishable
+    // from a clean close: the receive loop was `while let Some(Ok(_))`, so it
+    // simply stopped, and the status — already taken from the header frame that
+    // arrived before the body — went out as the device's `200`. A caller asking
+    // for a 20 MiB file got `200 OK`, `content-type: application/json`,
+    // `content-length: 0`, and no way to tell the file had not been delivered.
+    //
+    // Live-verified before the fix, over a real relay: 16,777,100 bytes came
+    // back whole, 16,777,216 came back as `200` with an empty body. The same
+    // threshold hit `/execute` output.
+    //
+    // What this pins is the *honesty* of the answer, not a particular limit: a
+    // body that cannot be carried must not arrive wearing a success status.
+    let relay_addr = start_relay().await;
+    let (dir, local_addr) = start_device_server().await;
+
+    let device_name = "oversize-device";
+    spawn_device(relay_addr, local_addr, device_name);
+    let base = format!("http://{relay_addr}/d/{device_name}");
+    wait_until_attached(&base).await;
+
+    // Comfortably over the 16 MiB frame limit, so the read fails rather than
+    // landing near a boundary this test would then be asserting about.
+    let payload = vec![b'x'; 20 * 1024 * 1024];
+    std::fs::write(dir.path().join("oversize.bin"), &payload).expect("write");
+
+    let (status, body) = http_request(
+        &format!("{base}/api/v1/fs/file?path=oversize.bin"),
+        "GET",
+        &[],
+        &[],
+    )
+    .await;
+
+    if status == 200 {
+        assert_eq!(
+            body.len(),
+            payload.len(),
+            "a 200 must carry the whole file; a short body under 200 is the \
+             silent truncation this test exists to catch"
+        );
+    } else {
+        assert_eq!(
+            status, 502,
+            "a body the relay cannot carry is a failed upstream read, which is \
+             what 502 means; got {status}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn an_upload_completes_over_the_relay() {
     let relay_addr = start_relay().await;
     let (dir, local_addr) = start_device_server().await;

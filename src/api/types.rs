@@ -88,6 +88,13 @@ pub struct ExecuteCommandRequest {
     /// Timeout in seconds.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Cap on the output this response carries, in bytes.
+    ///
+    /// Omitted means the server default. A value above the server's ceiling is
+    /// clamped rather than refused: the caller asked for "as much as possible",
+    /// and `total_bytes` reports what the command actually produced either way.
+    #[serde(default)]
+    pub max_output_bytes: Option<u64>,
 }
 
 impl ExecuteCommandRequest {
@@ -113,6 +120,15 @@ pub struct ExecuteCommandResponse {
     pub duration_ms: u64,
     /// Whether the command timed out.
     pub timed_out: bool,
+    /// Bytes the command produced, including any this response does not carry.
+    ///
+    /// Equal to the size of `output` unless `truncated` is set.
+    pub total_bytes: u64,
+    /// Whether `output` is a prefix of what the command produced.
+    ///
+    /// Always present, including when false: a caller must not have to infer
+    /// completeness from the absence of a field.
+    pub truncated: bool,
 }
 
 impl ExecuteCommandResponse {
@@ -124,6 +140,8 @@ impl ExecuteCommandResponse {
             raw_output: None, // Only include if requested
             duration_ms: result.duration.as_millis() as u64,
             timed_out: result.timed_out,
+            total_bytes: result.total_bytes,
+            truncated: result.truncated,
         }
     }
 
@@ -203,11 +221,17 @@ pub enum WsMessage {
         is_final: bool,
     },
     /// Server sends execution result.
+    ///
+    /// Carries `total_bytes` but not `truncated`, unlike the REST response:
+    /// every chunk reaches a streaming consumer as it arrives, so there is
+    /// nothing here for a cap to discard. The figure is what a consumer needs
+    /// to confirm it received the whole stream.
     Result {
         success: bool,
         exit_code: Option<i32>,
         duration_ms: u64,
         timed_out: bool,
+        total_bytes: u64,
     },
     /// Error message.
     Error {

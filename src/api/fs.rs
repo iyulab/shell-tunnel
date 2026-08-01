@@ -116,6 +116,19 @@ pub fn mtime_ms(meta: &std::fs::Metadata) -> u64 {
 }
 
 /// Build an entry for one already-resolved path.
+///
+/// `absolute` must have come through the jail — `resolve_existing`, or a `walk`
+/// rooted at a resolved base. That precondition is what makes the
+/// `unwrap_or_default()` below sound: `relative()` returns `None` only for a
+/// path outside the scope, which a resolved path cannot be, so the default is
+/// unreachable rather than a fallback anyone should rely on.
+///
+/// **If it were ever reached it would publish an entry with an empty `path`** —
+/// a name that resolves to nothing, in a response a client reads as a real
+/// file. Both callers were checked when this was written (`stat` passes a
+/// `resolve_existing` result; `list` passes a `walk` entry from a resolved
+/// base). A third caller that can hand over an unresolved path must not use
+/// this function.
 pub fn entry_for(
     root: &FsRoot,
     absolute: &std::path::Path,

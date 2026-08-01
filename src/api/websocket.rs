@@ -138,6 +138,7 @@ async fn handle_socket(
                                     exit_code: result.exit_code,
                                     duration_ms: result.duration.as_millis() as u64,
                                     timed_out: result.timed_out,
+                                    total_bytes: result.total_bytes,
                                 };
                                 if let Ok(json) = serde_json::to_string(&result_msg) {
                                     let _ = sink.send(Message::Text(json.into())).await;
@@ -275,6 +276,7 @@ async fn handle_oneshot_socket(
                                     exit_code: result.exit_code,
                                     duration_ms: result.duration.as_millis() as u64,
                                     timed_out: result.timed_out,
+                                    total_bytes: result.total_bytes,
                                 };
                                 if let Ok(json) = serde_json::to_string(&result_msg) {
                                     let _ = sink.send(Message::Text(json.into())).await;
