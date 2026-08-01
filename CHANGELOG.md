@@ -3,6 +3,77 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.15.0 — 2026-08-01
+
+### Fixed
+
+- **A request field this server does not recognise is now refused instead of
+  dropped.** Every request type accepted unknown fields silently, which is
+  serde's default. That is ordinarily harmless, but not here: the optional
+  fields on this API either ask for something *safer* or say *where* to act, so
+  dropping one leaves the less safe default in place — and the response still
+  reports success.
+
+  What that cost, all confirmed against a running server:
+
+  - `DELETE .../fs/file?dryRun=true` **deleted the file it was asked to
+    preview**, and answered `204`. The correct spelling, `dry_run=true`,
+    answers `200` with the preview and removes nothing. The two differ by one
+    letter's case and both are success statuses.
+  - `timeoutSecs` ran the command with no timeout at all — five seconds against
+    a requested one — and reported `timed_out: false`, which reads as having
+    finished within the limit.
+  - `workingDir` ran the command in the server's default directory rather than
+    the requested one, and reported `success: true`.
+  - `{"command": "cmd", "args": [...]}` — the shape `spawn`-style APIs use —
+    started a bare shell that exited at EOF and reported `success: true,
+    exit_code: 0`, byte-identical to sending no arguments at all. The command
+    the caller asked for never ran. (`command` is the whole command line here;
+    there is no `args` array.)
+
+  Not every field failed this way, and the exception is the useful one:
+  `recursive` already refused a typo, because omitting it is a `400`. It is an
+  opt-in to the *destructive* behaviour, so a slip fails safe. `dry_run` is the
+  opposite shape, and that is what made the same slip destructive.
+
+  Refusals name the offending field and list the accepted ones, so a caller can
+  correct the request from the response alone.
+
+### Changed
+
+- **Breaking: a request carrying an unknown field now fails.** Callers sending
+  extra fields will see a refusal where they previously saw success. Those
+  fields were already being ignored, so the refusal exposes an existing
+  misbehaviour rather than introducing one — a client that relied on a field
+  being honoured was not getting that, and a client that sent one harmlessly
+  need only stop sending it.
+
+  The refusal is **`422`** for a JSON body and **`400`** for a query string,
+  both as `text/plain` rather than the JSON error envelope. The two codes come
+  from different layers of request parsing and are documented rather than
+  normalised; normalising them would mean a custom extractor on every route
+  whose only job is to relabel a status. A request the authentication layer
+  turns away first still answers `401`, unchanged.
+
+  Neither refusal reaches the audit trail — both happen before any handler
+  runs. `USAGE.md` §4 names the gap alongside the one it already had.
+
+- **Breaking: `WsMessage` is split into `WsClientMessage` and
+  `WsServerMessage`.** The two directions want opposite strictness and one
+  shared type could only have one. Client input is strict, for the reason
+  above. Server output is deliberately *not*, so a consumer built against this
+  version keeps parsing a later server that adds a field — locking that down
+  would trade one silent failure for another. A client that sent a
+  server-shaped message (`output`, `result`, `error`) now gets a parse error
+  where it was previously ignored.
+
+### Documentation
+
+- `openapi.json` declares `additionalProperties: false` on request schemas, and
+  §8 gains the unknown-field refusal. The `/execute` description now states
+  that `command` is a whole command line with no `args` array — the mismatch
+  with `spawn`-style APIs is what produced the silent no-op above.
+
 ## 0.14.1 — 2026-08-01
 
 ### Fixed

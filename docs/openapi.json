@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.14.1",
+    "version": "0.15.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -168,6 +168,17 @@
                 "example": "Failed to buffer the request body: length limit exceeded"
               }
             }
+          },
+          "422": {
+            "description": "A field in the request body that this server does not recognise. Plain text, not the JSON error envelope: the body is rejected while being deserialised, before any handler sees it. The message names the offending field and lists the accepted ones. Usually a misspelling (`workingDir` for `working_dir`), or an `args` array, which this API does not take — `command` is the whole command line. Before 0.15.0 the field was dropped and the request ran with that field's default, answering success.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
+              }
+            }
           }
         }
       }
@@ -320,6 +331,17 @@
                 "example": "Failed to buffer the request body: length limit exceeded"
               }
             }
+          },
+          "422": {
+            "description": "A field in the request body that this server does not recognise. Plain text, not the JSON error envelope: the body is rejected while being deserialised, before any handler sees it. The message names the offending field and lists the accepted ones. Usually a misspelling (`workingDir` for `working_dir`), or an `args` array, which this API does not take — `command` is the whole command line. Before 0.15.0 the field was dropped and the request ran with that field's default, answering success.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
+              }
+            }
           }
         }
       }
@@ -378,6 +400,17 @@
                   "type": "string"
                 },
                 "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
+          },
+          "422": {
+            "description": "A field in the request body that this server does not recognise. Plain text, not the JSON error envelope: the body is rejected while being deserialised, before any handler sees it. The message names the offending field and lists the accepted ones. Usually a misspelling (`workingDir` for `working_dir`), or an `args` array, which this API does not take — `command` is the whole command line. Before 0.15.0 the field was dropped and the request ran with that field's default, answering success.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
               }
             }
           }
@@ -505,12 +538,18 @@
             }
           },
           "400": {
-            "description": "`bad-path` (malformed path), `not-a-directory` (path names a file; use `/api/v1/fs/stat`), or `bad-cursor` (cursor is not a value this endpoint produced).",
+            "description": "`bad-path` (malformed path), `not-a-directory` (path names a file; use `/api/v1/fs/stat`), or `bad-cursor` (cursor is not a value this endpoint produced). Also a query parameter this server does not recognise — answered as plain text rather than the JSON envelope, naming the parameter and listing the accepted ones. Before 0.15.0 it was dropped and the parameter's default applied.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize query string: dryRun: unknown field `dryRun`, expected one of `path`, `recursive`, `dry_run`, `limit`"
               }
             }
           },
@@ -575,12 +614,18 @@
             }
           },
           "400": {
-            "description": "`bad-path` — malformed path.",
+            "description": "`bad-path` — malformed path. Also a query parameter this server does not recognise — answered as plain text rather than the JSON envelope, naming the parameter and listing the accepted ones. Before 0.15.0 it was dropped and the parameter's default applied.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize query string: dryRun: unknown field `dryRun`, expected one of `path`, `recursive`, `dry_run`, `limit`"
               }
             }
           },
@@ -658,12 +703,18 @@
             "description": "The requested byte range. Headers as for 200, plus `content-range: bytes <start>-<end>/<size>`."
           },
           "400": {
-            "description": "`bad-path` (malformed path), or `not-a-file` (path is a directory or other non-regular entry; use `/api/v1/fs/list`).",
+            "description": "`bad-path` (malformed path), or `not-a-file` (path is a directory or other non-regular entry; use `/api/v1/fs/list`). Also a query parameter this server does not recognise — answered as plain text rather than the JSON envelope, naming the parameter and listing the accepted ones. Before 0.15.0 it was dropped and the parameter's default applied.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize query string: dryRun: unknown field `dryRun`, expected one of `path`, `recursive`, `dry_run`, `limit`"
               }
             }
           },
@@ -761,12 +812,18 @@
             "description": "Removed. Only for an actual removal of a file, symlink, or other non-directory node — `dry_run` unset or `false`, the default and the backward-compatible case: a single-file delete with no flags at all behaves exactly as before this endpoint gained `recursive`/`dry_run`. A directory always answers 200 or an error instead, never this."
           },
           "400": {
-            "description": "`bad-path`, or `recursive-required` (path is a real directory; pass `recursive=true` to remove it and everything under it).",
+            "description": "`bad-path`, or `recursive-required` (path is a real directory; pass `recursive=true` to remove it and everything under it). Also a query parameter this server does not recognise — answered as plain text rather than the JSON envelope, naming the parameter and listing the accepted ones. On this route that refusal is what stops `?dryRun=true` from deleting the tree it was asked to preview; before 0.15.0 the parameter was dropped and the default `false` applied.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorResponse"
                 }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize query string: dryRun: unknown field `dryRun`, expected one of `path`, `recursive`, `dry_run`, `limit`"
               }
             }
           },
@@ -893,6 +950,17 @@
                   "type": "string"
                 },
                 "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
+          },
+          "422": {
+            "description": "A field in the request body that this server does not recognise. Plain text, not the JSON error envelope: the body is rejected while being deserialised, before any handler sees it. The message names the offending field and lists the accepted ones. Usually a misspelling (`workingDir` for `working_dir`), or an `args` array, which this API does not take — `command` is the whole command line. Before 0.15.0 the field was dropped and the request ran with that field's default, answering success.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
               }
             }
           },
@@ -1219,7 +1287,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.14.1"
+            "example": "0.15.0"
           },
           "status": {
             "type": "string",
@@ -1229,6 +1297,7 @@
       },
       "CreateSessionRequest": {
         "type": "object",
+        "additionalProperties": false,
         "properties": {
           "shell": {
             "type": "string",
@@ -1363,6 +1432,7 @@
       },
       "ExecuteCommandRequest": {
         "type": "object",
+        "additionalProperties": false,
         "required": [
           "command"
         ],
@@ -1460,66 +1530,6 @@
             "additionalProperties": true
           }
         }
-      },
-      "WsMessage": {
-        "type": "object",
-        "description": "WebSocket message format",
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "command"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "execute"
-                ]
-              },
-              "command": {
-                "type": "string"
-              },
-              "timeout_secs": {
-                "type": "integer"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type",
-              "data"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "output"
-                ]
-              },
-              "data": {
-                "type": "string"
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "type": {
-                "type": "string",
-                "enum": [
-                  "ping",
-                  "pong"
-                ]
-              }
-            }
-          }
-        ]
       },
       "FsEntry": {
         "type": "object",
@@ -1678,6 +1688,7 @@
       },
       "CreateUpload": {
         "type": "object",
+        "additionalProperties": false,
         "required": [
           "path",
           "size",
@@ -1794,6 +1805,153 @@
             "description": "The sha256 actually computed over the assembled bytes."
           }
         }
+      },
+      "WsClientMessage": {
+        "type": "object",
+        "description": "A message the server accepts from a WebSocket client. Unknown members are refused rather than ignored: `timeoutSecs` for `timeout_secs` otherwise ran the command with no timeout and reported `timed_out: false`.",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "command"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "execute"
+                ]
+              },
+              "command": {
+                "type": "string"
+              },
+              "timeout_secs": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ping",
+                  "pong"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "WsServerMessage": {
+        "type": "object",
+        "description": "A message the server sends to a WebSocket client. Deliberately permissive about unknown members, so a consumer written against this version keeps parsing a later server that adds a field.",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "data"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "output"
+                ]
+              },
+              "data": {
+                "type": "string"
+              },
+              "is_final": {
+                "type": "boolean",
+                "description": "Whether this is the final chunk."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "success",
+              "duration_ms",
+              "timed_out",
+              "total_bytes"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "result"
+                ]
+              },
+              "success": {
+                "type": "boolean"
+              },
+              "exit_code": {
+                "type": "integer",
+                "nullable": true
+              },
+              "duration_ms": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "timed_out": {
+                "type": "boolean"
+              },
+              "total_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Bytes the command produced. Carried without a `truncated` flag, unlike the REST response: every chunk reaches a streaming consumer as it arrives, so there is nothing here for a cap to discard."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "code",
+              "message"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "error"
+                ]
+              },
+              "code": {
+                "type": "string",
+                "example": "PARSE_ERROR"
+              },
+              "message": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "ping",
+                  "pong"
+                ]
+              }
+            }
+          }
+        ]
       }
     },
     "responses": {

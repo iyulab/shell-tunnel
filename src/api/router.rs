@@ -314,7 +314,14 @@ async fn capability_auth_middleware(
             };
             tracing::debug!(%method, path = %matched, reason, "auth rejected (401)");
             // Probing is exactly what an audit trail is asked about afterwards,
-            // so refusals are recorded as well as successes.
+            // so this layer's refusals are recorded as well as successes.
+            //
+            // "This layer's" is the whole claim, not modesty. A request carrying
+            // a field the server does not recognise is turned away by the
+            // extractor, after this middleware has already let it through, and
+            // records nothing — so the trail is not a complete list of every
+            // refusal the server issued. `USAGE.md` §4 names that gap; keep the
+            // two in step if this ever grows a third case.
             audit.record(
                 crate::audit::AuditEvent::new("denied")
                     .with_route(format!("{method} {matched}"))
