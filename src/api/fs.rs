@@ -35,7 +35,13 @@ pub struct FsEntry {
 }
 
 /// Query parameters shared by the single-path endpoints.
+/// Query for the routes that take nothing but a path.
+///
+/// `deny_unknown_fields` reaches querystrings, not just JSON bodies — the
+/// extractor runs a different deserialiser, so this was confirmed rather than
+/// assumed. See `ExecuteCommandRequest` for why every request type is strict.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PathQuery {
     pub path: String,
 }
@@ -45,7 +51,13 @@ pub struct PathQuery {
 /// Not folded into `PathQuery`: `stat` and `download` share that type, and a
 /// `recursive`/`dry_run` that parses on those two routes but does nothing
 /// would read to a caller as if it did.
+/// Strictness matters most on this route. `recursive` already fails safe on a
+/// typo, because omitting it is a 400 — but `dry_run` is the opposite shape, an
+/// opt-in to the *safer* behaviour, so dropping it silently turned a preview
+/// into a deletion that answered `204`. The two spellings differed by one
+/// letter's case and both returned a success status.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteQuery {
     pub path: String,
     /// Must be set to remove a directory. Omitting it is a 400.
@@ -306,6 +318,7 @@ fn audit_delete_denial(
 
 /// Query parameters for `list`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ListQuery {
     pub path: String,
     #[serde(default)]
@@ -1335,6 +1348,7 @@ fn stat_blocking(root: &FsRoot, query: &PathQuery) -> Response {
 
 /// Body of `POST /api/v1/fs/uploads`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUpload {
     /// Destination, root-relative.
     pub path: String,

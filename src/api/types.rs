@@ -8,7 +8,11 @@ use serde::{Deserialize, Serialize};
 use crate::session::{SessionId, SessionState};
 
 /// Request to create a new session.
+///
+/// Strict about field names — see `ExecuteCommandRequest` for why every request
+/// type here is.
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct CreateSessionRequest {
     /// Shell command to use (e.g., "bash", "powershell.exe").
     #[serde(default)]
@@ -75,7 +79,25 @@ impl SessionStatusResponse {
 }
 
 /// Request to execute a command.
+///
+/// A misspelled field is refused rather than ignored, and that is a safety
+/// property rather than pedantry. Every optional field on this API either asks
+/// for something *safer* (`timeout_secs`, `dry_run` on the delete route) or
+/// says *where* to act (`working_dir`). Serde's default is to drop a field it
+/// does not recognise, which leaves the less safe default in place and reports
+/// success — a caller who wrote `timeoutSecs` got no timeout and a
+/// `timed_out: false` that looked like the command finished within one, and a
+/// caller who wrote `workingDir` had their command run somewhere else entirely.
+/// The same slip on `?dryRun=true` deleted the file it was asked to preview.
+///
+/// The refusal names the offending field and lists the accepted ones, so the
+/// caller can fix it from the response alone.
+///
+/// Note for callers coming from `spawn`-style APIs: `command` is the whole
+/// command line, and there is no `args` array. Sending one used to start a
+/// bare shell and report `success: true` without ever running the command.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteCommandRequest {
     /// The command line to execute.
     pub command: String,
@@ -203,24 +225,46 @@ impl ErrorResponse {
     }
 }
 
-/// WebSocket message types.
+/// A message the server accepts from a WebSocket client.
+///
+/// Split from `WsServerMessage` because the two directions want opposite
+/// strictness, and one shared type could only have one. Input is refused when
+/// it carries a field this server does not know — `timeoutSecs` for
+/// `timeout_secs` otherwise runs the command with no timeout at all and reports
+/// `timed_out: false`, which reads as "finished within the limit". Output stays
+/// permissive, so a client built against an older version of this crate keeps
+/// working when a later server adds a field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum WsMessage {
-    /// Client sends command to execute.
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WsClientMessage {
+    /// Run a command and stream its output back.
     Execute {
         command: String,
         #[serde(default)]
         timeout_secs: Option<u64>,
     },
-    /// Server sends output chunk.
+    /// Connection health. The server answers `Ping` with `Pong`.
+    Ping,
+    Pong,
+}
+
+/// A message the server sends to a WebSocket client.
+///
+/// Deliberately *not* `deny_unknown_fields`: this is the type a consumer
+/// deserialises the server's output with, and a new field on a later server
+/// must not make an older consumer reject the whole message. The strictness
+/// that fixes silently-dropped input belongs on `WsClientMessage` only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WsServerMessage {
+    /// One chunk of a running command's output.
     Output {
         data: String,
         /// Whether this is the final chunk.
         #[serde(default)]
         is_final: bool,
     },
-    /// Server sends execution result.
+    /// Terminal result of an execution.
     ///
     /// Carries `total_bytes` but not `truncated`, unlike the REST response:
     /// every chunk reaches a streaming consumer as it arrives, so there is
@@ -238,7 +282,7 @@ pub enum WsMessage {
         code: String,
         message: String,
     },
-    /// Ping/pong for connection health.
+    /// Connection health.
     Ping,
     Pong,
 }
@@ -299,7 +343,7 @@ mod tests {
 
     #[test]
     fn test_ws_message_execute() {
-        let msg = WsMessage::Execute {
+        let msg = WsClientMessage::Execute {
             command: "ls".to_string(),
             timeout_secs: Some(10),
         };
@@ -310,11 +354,69 @@ mod tests {
 
     #[test]
     fn test_ws_message_output() {
-        let msg = WsMessage::Output {
+        let msg = WsServerMessage::Output {
             data: "hello\n".to_string(),
             is_final: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("output"));
+    }
+
+    // --- Unknown fields are refused, not dropped. ---
+    //
+    // Each of these asserts the *pair*: the correct spelling parses and the
+    // near-miss is refused. Asserting only the refusal would pass just as well
+    // against a type that refuses everything.
+
+    #[test]
+    fn execute_request_refuses_an_unknown_field() {
+        let good = r#"{"command":"cd","working_dir":"/tmp","timeout_secs":1}"#;
+        let req: ExecuteCommandRequest = serde_json::from_str(good).unwrap();
+        assert_eq!(req.working_dir.as_deref(), Some("/tmp"));
+        assert_eq!(req.timeout_secs, Some(1));
+
+        // The two that ran wrong and reported success before this was strict.
+        for bad in [
+            r#"{"command":"cd","workingDir":"/tmp"}"#,
+            r#"{"command":"cd","timeoutSecs":1}"#,
+            // No `args` array exists on this API; sending one used to start a
+            // bare shell and answer `success: true`.
+            r#"{"command":"cmd","args":["/c","echo","hi"]}"#,
+        ] {
+            let err = serde_json::from_str::<ExecuteCommandRequest>(bad).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("unknown field"),
+                "expected a refusal naming the field, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_session_request_refuses_an_unknown_field() {
+        let req: CreateSessionRequest = serde_json::from_str(r#"{"working_dir":"/tmp"}"#).unwrap();
+        assert_eq!(req.working_dir.as_deref(), Some("/tmp"));
+        assert!(serde_json::from_str::<CreateSessionRequest>(r#"{"workingDir":"/tmp"}"#).is_err());
+    }
+
+    #[test]
+    fn ws_client_message_refuses_an_unknown_field() {
+        let good = r#"{"type":"execute","command":"ls","timeout_secs":5}"#;
+        assert!(serde_json::from_str::<WsClientMessage>(good).is_ok());
+
+        let typo = r#"{"type":"execute","command":"ls","timeoutSecs":5}"#;
+        let err = serde_json::from_str::<WsClientMessage>(typo).unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    /// The other half of the split: server output must stay permissive so a
+    /// consumer built against this version keeps parsing a later server that
+    /// added a field. Locking this down would trade one silent failure for
+    /// another.
+    #[test]
+    fn ws_server_message_tolerates_an_unknown_field() {
+        let from_a_later_server = r#"{"type":"result","success":true,"exit_code":0,
+            "duration_ms":1,"timed_out":false,"total_bytes":0,"some_new_field":"x"}"#;
+        assert!(serde_json::from_str::<WsServerMessage>(from_a_later_server).is_ok());
     }
 }

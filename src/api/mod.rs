@@ -47,5 +47,6 @@ pub use router::{
 };
 pub use types::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ExecuteCommandRequest,
-    ExecuteCommandResponse, ListSessionsResponse, SessionStatusResponse, WsMessage,
+    ExecuteCommandResponse, ListSessionsResponse, SessionStatusResponse, WsClientMessage,
+    WsServerMessage,
 };

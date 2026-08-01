@@ -2112,6 +2112,66 @@ async fn a_dry_run_reports_the_tree_and_leaves_it_alone() {
     assert!(dir.path().join("app/deep/b.txt").exists());
 }
 
+/// A misspelled `dry_run` is refused, not ignored.
+///
+/// Before this was strict, `?dryRun=true` dropped the field, took the default
+/// `false`, and *deleted the file the caller asked to preview* -- answering
+/// `204`, which is what a real delete answers. The two spellings differ by one
+/// letter's case and both looked like success.
+///
+/// Three cases together, because any one alone proves less than it appears: the
+/// typo must be refused, the correct spelling must still preview, and an
+/// unqualified delete must still delete. A type that refused everything would
+/// pass the first assertion on its own.
+///
+/// This goes through the router rather than `serde_json` because the query
+/// string runs a different deserialiser than the JSON body, and `deny_unknown_fields`
+/// reaching one is not evidence it reaches the other.
+#[tokio::test]
+async fn a_misspelled_dry_run_is_refused_rather_than_deleting_the_file() {
+    let delete = |state, query: &str| {
+        let uri = format!("/api/v1/fs/file?{query}");
+        async move {
+            create_router_with_state(state)
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+        }
+    };
+
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
+    let response = delete(state, "path=app/a.txt&dryRun=true").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a misspelled dry_run must be refused"
+    );
+    assert!(
+        dir.path().join("app/a.txt").exists(),
+        "the refused request deleted the file it was asked to preview"
+    );
+
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
+    let response = delete(state, "path=app/a.txt&dry_run=true").await;
+    assert_eq!(response.status(), StatusCode::OK, "the preview still works");
+    assert!(dir.path().join("app/a.txt").exists());
+
+    let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
+    let response = delete(state, "path=app/a.txt").await;
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "an ordinary delete still deletes"
+    );
+    assert!(!dir.path().join("app/a.txt").exists());
+}
+
 /// A preview that cannot enumerate everything is not a partial *delete* --
 /// nothing was removed at all, dry-run or not.
 ///

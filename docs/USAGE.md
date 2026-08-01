@@ -232,6 +232,21 @@ curl -X POST "$BASE/api/v1/execute" \
 Request fields: `command` (required), `working_dir`, `env` (object),
 `timeout_secs` (default 30), `max_output_bytes` (default 1 MiB, ceiling 8 MiB).
 
+`command` is the **whole command line**, and there is no `args` array — unlike
+`spawn`-style APIs, where the program and its arguments are separate. Sending
+one is refused (see below), which it was not before 0.15.0: `{"command":"cmd",
+"args":["/c","echo","hi"]}` used to drop the `args`, start a bare shell, and
+answer `success: true, exit_code: 0` without running the command.
+
+**A field this server does not recognise is refused, not ignored.** Misspell one
+— `workingDir` for `working_dir`, `timeoutSecs` for `timeout_secs` — and the
+request fails naming the field and listing the accepted ones, rather than
+running with that field's default and reporting success. This matters most on
+`DELETE .../fs/file`, where `?dryRun=true` used to delete the file it was asked
+to preview (§3.1). The refusal is **422** for a JSON body and **400** for a
+query string; the codes differ because the body and the query string are parsed
+by different layers, and the message is the same in both.
+
 ```json
 {"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false,
  "total_bytes":6,"truncated":false}
@@ -288,9 +303,20 @@ sending the same `Authorization` header. Messages are JSON, tagged by `type`:
 |---|---|
 | → server | `{"type":"execute","command":"...","timeout_secs":30}` |
 | ← server | `{"type":"output","data":"...","is_final":false}` |
-| ← server | `{"type":"result","success":true,"exit_code":0,"duration_ms":5,"timed_out":false}` |
+| ← server | `{"type":"result","success":true,"exit_code":0,"duration_ms":5,"timed_out":false,"total_bytes":6}` |
 | ← server | `{"type":"error","code":"...","message":"..."}` |
 | both | `{"type":"ping"}` / `{"type":"pong"}` |
+
+The two directions are not equally strict, and the asymmetry is deliberate. A
+message **to** the server carrying a field it does not recognise is answered
+with `{"type":"error","code":"PARSE_ERROR"}` rather than being accepted with
+that field dropped — `timeoutSecs` for `timeout_secs` otherwise ran the command
+with no timeout and reported `timed_out: false`. A message **from** the server
+may carry fields a given client does not know, so a consumer should ignore
+those rather than reject the message; that is what lets a client keep working
+against a later version. Sending a server-shaped message (`output`, `result`,
+`error`) to the server is a `PARSE_ERROR` as of 0.15.0, where it was previously
+ignored.
 
 WebSockets work over a direct connection, through a tunnel, and through the
 relay. Server-sent events do not pass through the relay.
@@ -390,6 +416,20 @@ not go; a `dry_run` that could not enumerate everything answers `500 preview-inc
 instead — nothing was removed there, so its counts are a lower bound rather than exact.
 The two share a body shape but not a meaning: treating them alike reports a deletion that
 never happened.
+
+**Spell it `dry_run`.** A parameter this server does not recognise is refused with
+`400` rather than dropped, which it was not before 0.15.0: `?dryRun=true` used to fall
+back to the default `false` and **delete the tree it was asked to preview**, answering
+`204` — the same status an ordinary removal answers. The two spellings differed by one
+letter's case and both looked like success. The refusal names the parameter and lists
+the accepted ones.
+
+`recursive` never had that failure mode, and the asymmetry is worth understanding
+before adding a parameter here: omitting `recursive` is already a `400`, so a
+misspelling of it lands on the refusal either way. `dry_run` is the opposite shape — an
+opt-in to the *safer* behaviour — so dropping it silently left the destructive default
+in place. An optional parameter that makes a request safer is only as reliable as the
+server's willingness to reject a name it does not know.
 
 This guards against a caller's mistake, not against a caller. A token holding `fs.write`
 can already remove anything the server can reach, so `recursive` and `dry_run` exist to
@@ -956,6 +996,8 @@ startup rather than serving local-only.
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
+| **422** `unknown field \`…\`, expected one of …` | a JSON body carries a field this server does not recognise — usually a misspelling such as `workingDir` for `working_dir`, or an `args` array, which `/execute` does not take (§3) | use the name the message lists. Nothing ran |
+| **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
 | **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |
 | **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |

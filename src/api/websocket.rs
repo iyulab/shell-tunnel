@@ -12,7 +12,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 
 use super::handlers::AppState;
-use super::types::WsMessage;
+use super::types::{WsClientMessage, WsServerMessage};
 use crate::execution::Command;
 use crate::session::SessionId;
 
@@ -41,7 +41,7 @@ async fn handle_socket(
     // Verify session exists
     if state.store.get(&id).ok().flatten().is_none() {
         let (mut sink, _) = socket.split();
-        let err = WsMessage::Error {
+        let err = WsServerMessage::Error {
             code: "SESSION_NOT_FOUND".to_string(),
             message: format!("Session {} not found", session_id),
         };
@@ -67,10 +67,10 @@ async fn handle_socket(
         };
 
         // Parse WebSocket message
-        let ws_msg: WsMessage = match serde_json::from_str(&msg) {
+        let ws_msg: WsClientMessage = match serde_json::from_str(&msg) {
             Ok(m) => m,
             Err(e) => {
-                let err = WsMessage::Error {
+                let err = WsServerMessage::Error {
                     code: "PARSE_ERROR".to_string(),
                     message: e.to_string(),
                 };
@@ -82,7 +82,7 @@ async fn handle_socket(
         };
 
         match ws_msg {
-            WsMessage::Execute {
+            WsClientMessage::Execute {
                 command,
                 timeout_secs,
             } => {
@@ -97,7 +97,7 @@ async fn handle_socket(
                     Ok((mut rx, handle)) => {
                         // Stream output chunks
                         while let Some(chunk) = rx.recv().await {
-                            let output = WsMessage::Output {
+                            let output = WsServerMessage::Output {
                                 data: String::from_utf8_lossy(&chunk.raw).to_string(),
                                 is_final: false,
                             };
@@ -132,7 +132,7 @@ async fn handle_socket(
                                     })
                                     .ok();
 
-                                let result_msg = WsMessage::Result {
+                                let result_msg = WsServerMessage::Result {
                                     success: result.exit_code.map(|c| c == 0).unwrap_or(false)
                                         && !result.timed_out,
                                     exit_code: result.exit_code,
@@ -145,7 +145,7 @@ async fn handle_socket(
                                 }
                             }
                             Ok(Err(e)) => {
-                                let err = WsMessage::Error {
+                                let err = WsServerMessage::Error {
                                     code: "EXECUTION_ERROR".to_string(),
                                     message: e.to_string(),
                                 };
@@ -154,7 +154,7 @@ async fn handle_socket(
                                 }
                             }
                             Err(e) => {
-                                let err = WsMessage::Error {
+                                let err = WsServerMessage::Error {
                                     code: "TASK_ERROR".to_string(),
                                     message: e.to_string(),
                                 };
@@ -165,7 +165,7 @@ async fn handle_socket(
                         }
                     }
                     Err(e) => {
-                        let err = WsMessage::Error {
+                        let err = WsServerMessage::Error {
                             code: "EXECUTION_ERROR".to_string(),
                             message: e.to_string(),
                         };
@@ -175,8 +175,8 @@ async fn handle_socket(
                     }
                 }
             }
-            WsMessage::Ping => {
-                let pong = WsMessage::Pong;
+            WsClientMessage::Ping => {
+                let pong = WsServerMessage::Pong;
                 if let Ok(json) = serde_json::to_string(&pong) {
                     let _ = sink.send(Message::Text(json.into())).await;
                 }
@@ -218,10 +218,10 @@ async fn handle_oneshot_socket(
             Err(_) => break,
         };
 
-        let ws_msg: WsMessage = match serde_json::from_str(&msg) {
+        let ws_msg: WsClientMessage = match serde_json::from_str(&msg) {
             Ok(m) => m,
             Err(e) => {
-                let err = WsMessage::Error {
+                let err = WsServerMessage::Error {
                     code: "PARSE_ERROR".to_string(),
                     message: e.to_string(),
                 };
@@ -233,7 +233,7 @@ async fn handle_oneshot_socket(
         };
 
         match ws_msg {
-            WsMessage::Execute {
+            WsClientMessage::Execute {
                 command,
                 timeout_secs,
             } => {
@@ -245,7 +245,7 @@ async fn handle_oneshot_socket(
                 match state.executor.execute_async(&cmd).await {
                     Ok((mut rx, handle)) => {
                         while let Some(chunk) = rx.recv().await {
-                            let output = WsMessage::Output {
+                            let output = WsServerMessage::Output {
                                 data: String::from_utf8_lossy(&chunk.raw).to_string(),
                                 is_final: false,
                             };
@@ -270,7 +270,7 @@ async fn handle_oneshot_socket(
                                         ),
                                 );
 
-                                let result_msg = WsMessage::Result {
+                                let result_msg = WsServerMessage::Result {
                                     success: result.exit_code.map(|c| c == 0).unwrap_or(false)
                                         && !result.timed_out,
                                     exit_code: result.exit_code,
@@ -283,7 +283,7 @@ async fn handle_oneshot_socket(
                                 }
                             }
                             Ok(Err(e)) => {
-                                let err = WsMessage::Error {
+                                let err = WsServerMessage::Error {
                                     code: "EXECUTION_ERROR".to_string(),
                                     message: e.to_string(),
                                 };
@@ -292,7 +292,7 @@ async fn handle_oneshot_socket(
                                 }
                             }
                             Err(e) => {
-                                let err = WsMessage::Error {
+                                let err = WsServerMessage::Error {
                                     code: "TASK_ERROR".to_string(),
                                     message: e.to_string(),
                                 };
@@ -303,7 +303,7 @@ async fn handle_oneshot_socket(
                         }
                     }
                     Err(e) => {
-                        let err = WsMessage::Error {
+                        let err = WsServerMessage::Error {
                             code: "EXECUTION_ERROR".to_string(),
                             message: e.to_string(),
                         };
@@ -313,8 +313,8 @@ async fn handle_oneshot_socket(
                     }
                 }
             }
-            WsMessage::Ping => {
-                let pong = WsMessage::Pong;
+            WsClientMessage::Ping => {
+                let pong = WsServerMessage::Pong;
                 if let Ok(json) = serde_json::to_string(&pong) {
                     let _ = sink.send(Message::Text(json.into())).await;
                 }
@@ -331,9 +331,9 @@ mod tests {
     #[test]
     fn test_ws_message_execute_parse() {
         let json = r#"{"type": "execute", "command": "echo hello"}"#;
-        let msg: WsMessage = serde_json::from_str(json).unwrap();
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         match msg {
-            WsMessage::Execute { command, .. } => assert_eq!(command, "echo hello"),
+            WsClientMessage::Execute { command, .. } => assert_eq!(command, "echo hello"),
             _ => panic!("Expected Execute message"),
         }
     }
@@ -341,7 +341,7 @@ mod tests {
     #[test]
     fn test_ws_message_ping_parse() {
         let json = r#"{"type": "ping"}"#;
-        let msg: WsMessage = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, WsMessage::Ping));
+        let msg: WsClientMessage = serde_json::from_str(json).unwrap();
+        assert!(matches!(msg, WsClientMessage::Ping));
     }
 }
