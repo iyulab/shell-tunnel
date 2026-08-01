@@ -29,6 +29,14 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A generated relay enrolment token says that it is not saved.** Starting
+  `shell-tunnel relay` without `--enroll-token` generates one and keeps it
+  nowhere, so a restart invalidates every attached device's join line at once —
+  and the devices do not report it, they retry in backoff against a token the
+  relay no longer knows. The self-signed certificate beside it *is* written to
+  disk and reused, which gave an operator every reason to assume the token was
+  too. The banner now says otherwise at the one moment they are looking at it.
+
 - **`--allow-host` no longer fails silently on a published server.** Host
   checking is off wherever the server is deliberately reachable under a name it
   may not know — a tunnel assigns one, a relay routes by path — and the flag was

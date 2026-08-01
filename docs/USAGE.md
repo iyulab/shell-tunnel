@@ -151,7 +151,7 @@ break is silent from the server's side:**
 |---|---|
 | `-k <key>` | a new key is generated, and every existing caller gets `401`. The new key is only on the console. |
 | `--device-name <n>` | defaults to the machine's name, which is stable — but if you set one, keep setting it, or the device URL moves |
-| `--enroll-token <t>` **on the relay** | a new one is generated and stored nowhere, so every attached device's join line stops working. The devices retry quietly in backoff; nothing says why. |
+| `--enroll-token <t>` **on the relay** | a new one is generated and stored nowhere, so every attached device's join line stops working. The devices retry quietly in backoff; nothing says why. The relay's own banner warns when it generated one. |
 
 Use a relay rather than a tunnel for anything unattended. A quick tunnel gets a
 new URL on every restart, and the server exits when the tunnel client does; a
