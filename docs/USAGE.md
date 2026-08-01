@@ -690,8 +690,8 @@ still sees the real address.
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
 | `--require-auth` | Enable auth, generating a key if none given | `false` |
-| `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control |
-| `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control |
+| `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
+| `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
 | `--no-rate-limit` | Disable rate limiting | `false` |
 | `--cors-allow-any` | Allow any CORS origin | `false` |
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |

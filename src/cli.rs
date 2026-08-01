@@ -347,7 +347,8 @@ OPTIONS:
         --no-auth           Disable authentication
         --require-auth      Require auth, auto-generating an API key if none given
         --capabilities <C>  Scope issued token(s): comma-separated capabilities
-                            (e.g. exec,session.read). Default: full-control
+                            (e.g. exec,session.read). Default: full-control, or
+                            operator when the server is reachable
         --preset <NAME>     Scope issued token(s) by role preset
                             (operator | file-write | file-read | full-control)
         --no-rate-limit     Disable rate limiting
@@ -372,7 +373,8 @@ OPTIONS:
                             Rotate the audit trail to <FILE>.1 past this size
                             [default: unbounded]
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
-        --fs-root <PATH>    Enable the file API, confined to this directory
+        --fs-root <PATH>    Confine the file API to this directory. Without it
+                            the API reaches everything this account can
         --fs-chunk-size <N> Upload chunk size in bytes (default 4194304)
 
 TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
@@ -401,9 +403,10 @@ RELAY OPTIONS (with `relay`):
     -V, --version           Print version
 
 ENVIRONMENT VARIABLES:
-    SHELL_TUNNEL_HOST       Host address (overrides config)
-    SHELL_TUNNEL_PORT       Port number (overrides config)
-    SHELL_TUNNEL_API_KEY    API key (overrides config)
+    SHELL_TUNNEL_HOST       No effect: -H sets the bind address on every start
+    SHELL_TUNNEL_PORT       No effect: -p sets the port on every start
+    SHELL_TUNNEL_API_KEY    Adds an API key and turns auth on. Keys from the
+                            config file stay valid alongside it
     SHELL_TUNNEL_LOG_LEVEL  Log level (overrides config)
     RUST_LOG                Alternative log level setting
 
