@@ -708,8 +708,8 @@ still sees the real address.
 
 | Option | Description | Default |
 |---|---|---|
-| `-H, --host <ADDR>` | Bind address | `127.0.0.1` |
-| `-p, --port <PORT>` | Port | `3000`, or OS-chosen with `--relay` |
+| `-H, --host <ADDR>` | Bind address | `server.host` or `SHELL_TUNNEL_HOST`, else `127.0.0.1` |
+| `-p, --port <PORT>` | Port | `server.port` or `SHELL_TUNNEL_PORT`, else `3000`; OS-chosen with `--relay` |
 | `-c, --config <FILE>` | JSON config file | - |
 | `-k, --api-key <KEY>` | Key callers present to run commands here | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
@@ -741,17 +741,20 @@ still sees the real address.
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 
-Environment: `SHELL_TUNNEL_API_KEY`, `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
+Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
+`SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
 
-`SHELL_TUNNEL_HOST` and `SHELL_TUNNEL_PORT` are read but have no effect. The
-bind address and the port are both taken from `-H` and `-p` on every start, and
-the command line supplies its own defaults (`127.0.0.1`, `3000`) when you pass
-nothing — so whatever the environment or a config file says is overwritten
-either way. **Give the bind address and the port on the command line.** Under
-`--relay` the local port is deliberately left for the OS to pick, since nothing
-outside this machine dials it; passing `-p` is what overrides that. The two
-variable names are listed here rather than deleted, so that anyone who already
-set them learns why nothing changed.
+`SHELL_TUNNEL_HOST` and `SHELL_TUNNEL_PORT` set the bind address and the port
+unless `-H` or `-p` names one, and a config file's `server.host`/`server.port`
+work the same way. Until 0.14.0 none of them did: both fields were taken from
+`-H` and `-p` on every start, and those flags carry their own defaults
+(`127.0.0.1`, `3000`), so a configured value was overwritten even when you
+passed no flag at all. **A config file that names `"host": "0.0.0.0"` now
+binds there** — and a non-loopback bind is a reachable posture, so that server
+requires authentication and writes an audit trail; see
+[§2](#what-reachability-changes). Under `--relay` the local port is deliberately
+left for the OS to pick, since nothing outside this machine dials it; passing
+`-p` is what overrides that.
 
 ---
 
@@ -759,7 +762,7 @@ set them learns why nothing changed.
 
 ```json
 {
-  "server": { "graceful_shutdown": true },
+  "server": { "host": "127.0.0.1", "port": 3000, "graceful_shutdown": true },
   "security": {
     "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 },
@@ -776,21 +779,14 @@ the client to run).
 For most keys, passing the matching CLI flag overrides what the file says.
 Three cases do not work that way, and each can surprise you:
 
-- **`server.host` and `server.port` are overwritten even when you pass no
-  flag.** Both are taken from `-H` and `-p` on every start, and those flags
-  carry their own defaults (`127.0.0.1`, `3000`), so a value in the file never
-  takes effect. That is why the example above names neither. Give the bind
-  address and the port on the command line.
-- **`--capabilities` and `--api-key` add to the file rather than replacing
-  it.** `--capabilities` does not clear a preset the file named; the two are
-  unioned. A file saying `"preset": "operator"` plus a command line saying
-  `--capabilities fs.read` issues a token holding operator's whole set *and*
-  `fs.read` — `exec` still among them, though the intent was to narrow. A key
-  in the file likewise stays valid alongside a key given with `-k`. (`--preset`
-  replaces the file's `preset`, but a `capabilities` list in the file is still
-  unioned on top of it — so narrowing with `--preset` instead does not escape
-  this either.) The startup banner prints the set that is actually in force;
-  read it there rather than inferring it from either input.
+- **`--api-key` adds to the file rather than replacing it.** A key in the file
+  stays valid alongside a key given with `-k`, and alongside
+  `SHELL_TUNNEL_API_KEY`. Replacing a key means editing the file, not passing a
+  different one on the command line.
+- **The `--no-auth`, `--require-auth`, `--no-rate-limit` and `--cors-allow-any`
+  flags are one-way.** Passing one sets it; omitting one leaves whatever the
+  file said. There is no flag that turns rate limiting back on for a file that
+  disabled it.
 - **A file asking for a tunnel or a relay changes the auth keys by itself.**
   `transport.mode` of `cloudflared` or `command` makes the server reachable, and
   a reachable server turns `security.auth.enabled` on and scopes an otherwise
