@@ -404,3 +404,52 @@ async fn an_upload_completes_over_the_relay() {
     let destination = dir.path().join("out.bin");
     assert_eq!(std::fs::read(&destination).expect("read"), payload);
 }
+
+/// A body the device's own route limit refuses must arrive as the device's
+/// `413`, not as a relay-invented `502`.
+///
+/// The gap this covers sits between two ceilings that are easy to conflate: the
+/// relay refuses a body over its own 8 MiB `MAX_BODY` and never forwards it,
+/// while a body under that but over the route's limit (axum's 2 MiB default on
+/// every route that does not set its own) is forwarded and refused by the
+/// device. The device answers `413` *before* the body has finished arriving and
+/// closes, which breaks `replay_locally`'s write mid-send — and a client that
+/// treats a write failure as "no response" throws away the `413` already sitting
+/// in the receive buffer.
+///
+/// It reproduced as a race rather than a constant: on loopback the write usually
+/// wins, so roughly one attempt in ten answered `502`. This test therefore
+/// repeats — a single pass proves nothing here, and a single pass is exactly
+/// what let the defect ship. Found in live verification across a relay, where
+/// the loser of that race is the common case.
+#[tokio::test]
+async fn a_body_over_the_route_limit_answers_413_not_502() {
+    let relay_addr = start_relay().await;
+    let (_dir, local_addr) = start_device_server().await;
+    let device_name = "toobig-device";
+    spawn_device(relay_addr, local_addr, device_name);
+    let base = format!("http://{relay_addr}/d/{device_name}");
+    wait_until_attached(&base).await;
+
+    // Over axum's 2 MiB `DefaultBodyLimit`, under the relay's 8 MiB `MAX_BODY`,
+    // so the relay forwards it and the device is the one that says no.
+    let body = vec![b'x'; 7 * 1024 * 1024];
+
+    for attempt in 0..12 {
+        let (status, reason) = http_request(
+            &format!("{base}/api/v1/fs/uploads"),
+            "POST",
+            &[("content-type", "application/json")],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            status,
+            413,
+            "attempt {attempt} answered {status} ({}): a 502 here means the \
+             device's own refusal was discarded and replaced with a guess \
+             about the connection",
+            String::from_utf8_lossy(&reason)
+        );
+    }
+}

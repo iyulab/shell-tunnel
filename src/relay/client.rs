@@ -610,7 +610,7 @@ async fn replay_locally(
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let mut stream = match tokio::net::TcpStream::connect(local).await {
+    let stream = match tokio::net::TcpStream::connect(local).await {
         Ok(stream) => stream,
         Err(e) => return bad_gateway(format!("local server unreachable: {e}")),
     };
@@ -631,12 +631,90 @@ async fn replay_locally(
     }
     head.push_str("\r\n");
 
-    if stream.write_all(head.as_bytes()).await.is_err() || stream.write_all(&body).await.is_err() {
-        return bad_gateway("local server closed the connection".to_string());
+    // Write and read at the same time, and stop writing the moment an answer
+    // starts arriving.
+    //
+    // A server that refuses a request on its body length answers *before* the
+    // body has finished arriving and then closes. Writing on into a closed peer
+    // draws a RST, and a RST discards whatever is still sitting unread in the
+    // receive buffer — so a client that writes to completion and only then
+    // reads loses the answer the server did send. That is how the device's
+    // `413` reached callers as a synthetic `502`, sending an operator to check
+    // whether the device was alive when what they needed was "split the
+    // request". It reproduced as a race, not a constant: on loopback the write
+    // usually finishes first, so roughly one attempt in ten lost it, while the
+    // first attempt across a relay lost it outright.
+    //
+    // Two halves of one fix, and neither alone is enough. Reading concurrently
+    // gets the bytes into memory, where a later RST cannot reach them. Stopping
+    // the write as soon as any arrive is what keeps the RST from being provoked
+    // in the first place — with the write left running, the reader is racing a
+    // reset that erases exactly what it came for.
+    //
+    // Chunked so the check happens more than once, and so each chunk boundary
+    // is a scheduling point where the reader can actually run.
+    let (mut read_half, mut write_half) = stream.into_split();
+    let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_answered = std::sync::Arc::clone(&answered);
+    let reader = tokio::spawn(async move {
+        let mut raw = Vec::new();
+        let mut buf = vec![0u8; 16 * 1024];
+        let ok = loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => break true,
+                Ok(n) => {
+                    // Published before the bytes are appended so the writer
+                    // stops at the earliest possible point; `raw` is read only
+                    // after this task is joined, so no ordering is owed to it.
+                    reader_answered.store(true, std::sync::atomic::Ordering::Release);
+                    raw.extend_from_slice(&buf[..n]);
+                }
+                Err(_) => break false,
+            }
+        };
+        (raw, ok)
+    });
+
+    let mut write_failed = write_half.write_all(head.as_bytes()).await.is_err();
+    if !write_failed {
+        for chunk in body.chunks(64 * 1024) {
+            // Hand the runtime a scheduling point. `write_all` into a socket
+            // with room in its send buffer completes without ever yielding, so
+            // without this the reader is not polled until the whole body is
+            // out — which is the very thing being fixed, and on a
+            // current-thread runtime it does not get polled at all.
+            tokio::task::yield_now().await;
+            if answered.load(std::sync::atomic::Ordering::Acquire) {
+                // The server has already answered. Everything still unwritten
+                // would only provoke the reset that erases that answer.
+                break;
+            }
+            if write_half.write_all(chunk).await.is_err() {
+                write_failed = true;
+                break;
+            }
+        }
     }
 
-    let mut raw = Vec::new();
-    if stream.read_to_end(&mut raw).await.is_err() {
+    // Deliberately *not* half-closed. The reader reaches EOF anyway, because
+    // the request above asks for `Connection: close` and the server closes once
+    // it has answered. Shutting the write side down instead makes every request
+    // fail: hyper does not serve a half-closed connection — it reads EOF from
+    // the client and abandons the response in progress, so the reader sees a
+    // clean close with zero bytes. Verified: with the shutdown in place
+    // `/health` answered an empty-bodied 502 on every call.
+    let (raw, read_ok) = reader.await.unwrap_or_else(|_| (Vec::new(), false));
+    drop(write_half);
+
+    // Whatever arrived wins over either failure: an answer the server actually
+    // sent is more informative than this function's guess at why it stopped.
+    if !raw.is_empty() {
+        return parse_response(&raw);
+    }
+    if write_failed {
+        return bad_gateway("local server closed the connection".to_string());
+    }
+    if !read_ok {
         return bad_gateway("local server response was cut short".to_string());
     }
 

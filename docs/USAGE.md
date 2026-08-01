@@ -952,7 +952,7 @@ startup rather than serving local-only.
 | **502** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
 | **504** from a relay URL | device did not answer in 120s | check the device. The command may still be running there |
-| **413** | request body over 8 MiB, or an upload chunk over `chunk_size` | split the request |
+| **413** | request body over 8 MiB (refused by the relay), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), or an upload chunk over `chunk_size` | split the request. Bulk bytes belong in an upload session, not in a JSON body |
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
@@ -1009,6 +1009,11 @@ documented here.
   buffer instead of streaming.
 - **Relay is single-tenant** (one shared enrol token, no isolation between devices).
 - **8 MiB** request body limit through the relay. Over it, the relay answers **413**.
+- **2 MiB** request body limit on the server's own routes — the lower of these two, so an
+  oversized `POST .../execute` or `POST .../fs/uploads` meets it first, with or without a
+  relay, and gets **413**. The `.../fs/uploads/{id}` routes are the ones that set their own
+  ceiling instead (8 MiB), which is what lets `chunk_size` be as large as it is. Bulk bytes
+  belong in an upload session; a large JSON body is not a supported way to move them.
 - **16 MiB** response body limit through the relay — a separate ceiling, and the one a
   `GET .../fs/file` on a large file reaches first. Over it, the relay answers **502**:
   the device carries a response body in a single frame, and a frame that large cannot be
