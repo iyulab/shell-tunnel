@@ -700,12 +700,12 @@ still sees the real address.
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
 | `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
 | `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
-| `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names only |
+| `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
 | `--audit-log <FILE>` | Append executions and refusals as JSON lines | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
-| `--fs-root <PATH>` | Enable the filesystem API, confined to this directory | off |
+| `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
 | `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
@@ -722,9 +722,11 @@ Environment: `SHELL_TUNNEL_API_KEY`, `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
 bind address and the port are both taken from `-H` and `-p` on every start, and
 the command line supplies its own defaults (`127.0.0.1`, `3000`) when you pass
 nothing — so whatever the environment or a config file says is overwritten
-either way. **Give the bind address and the port on the command line.** They are
-listed here rather than deleted so that anyone who already set them knows why
-nothing changed.
+either way. **Give the bind address and the port on the command line.** Under
+`--relay` the local port is deliberately left for the OS to pick, since nothing
+outside this machine dials it; passing `-p` is what overrides that. The two
+variable names are listed here rather than deleted, so that anyone who already
+set them learns why nothing changed.
 
 ---
 
@@ -744,14 +746,30 @@ nothing changed.
 ```
 
 `transport.mode` is `none`, `cloudflared`, or `command` (with `command` naming
-the client to run). A CLI flag you pass overrides the file, as with every
-setting — with the one exception below.
+the client to run).
 
-`server.host` and `server.port` are deliberately absent from the example,
-because they are the exception: both are taken from `-H` and `-p` on every
-start, and the CLI supplies its own defaults, so a value here is overwritten
-even when you pass no flag at all. Pass `-H` and `-p` instead. Every other key
-in the block is overridden only by a flag you actually give.
+For most keys, passing the matching CLI flag overrides what the file says.
+Three cases do not work that way, and each can surprise you:
+
+- **`server.host` and `server.port` are overwritten even when you pass no
+  flag.** Both are taken from `-H` and `-p` on every start, and those flags
+  carry their own defaults (`127.0.0.1`, `3000`), so a value in the file never
+  takes effect. That is why the example above names neither. Give the bind
+  address and the port on the command line.
+- **`--capabilities` and `--api-key` add to the file rather than replacing
+  it.** `--capabilities` does not clear a preset the file named; the two are
+  unioned. A file saying `"preset": "operator"` plus a command line saying
+  `--capabilities fs.read` issues a token holding operator's whole set *and*
+  `fs.read` — `exec` still among them, though the intent was to narrow. A key
+  in the file likewise stays valid alongside a key given with `-k`. (`--preset`
+  is not in this group: it replaces the file's preset outright.) The startup
+  banner prints the set that is actually in force; read it there rather than
+  inferring it from either input.
+- **A file asking for a tunnel or a relay changes the auth keys by itself.**
+  `transport.mode` of `cloudflared` or `command` makes the server reachable, and
+  a reachable server turns `security.auth.enabled` on and scopes an otherwise
+  unscoped token to `operator` — with no flag passed at all. See
+  [§2](#what-reachability-changes).
 
 ```bash
 shell-tunnel -c /etc/shell-tunnel/config.json
