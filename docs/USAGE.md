@@ -137,6 +137,82 @@ A non-loopback bind counts on its own: a LAN is other people's machines. Host
 checking (`--allow-host`) answers a different question — which names this server
 responds to — and does not narrow what a token can do.
 
+### Surviving a reboot
+
+Losing the connection is already handled: a relay-attached device reconnects
+with backoff, and `--device-name` (defaulting to the machine's name) keeps the
+same public URL across reconnects. Losing the *process* is not — nothing starts
+shell-tunnel again after a reboot, so unattended operation means a service unit.
+
+**Pin these first. Each one changes on restart if you leave it out, and each
+break is silent from the server's side:**
+
+| Leave it out | What breaks on restart |
+|---|---|
+| `-k <key>` | a new key is generated, and every existing caller gets `401`. The new key is only on the console. |
+| `--device-name <n>` | defaults to the machine's name, which is stable — but if you set one, keep setting it, or the device URL moves |
+| `--enroll-token <t>` **on the relay** | a new one is generated and stored nowhere, so every attached device's join line stops working. The devices retry quietly in backoff; nothing says why. |
+
+Use a relay rather than a tunnel for anything unattended. A quick tunnel gets a
+new URL on every restart, and the server exits when the tunnel client does; a
+relay-attached device keeps one URL.
+
+```ini
+# systemd: /etc/systemd/system/shell-tunnel.service
+[Unit]
+Description=shell-tunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/shell-tunnel --relay https://relay.example.com:8443 --enroll-token st_... --relay-fingerprint sha256:... -k <key> --preset operator --audit-log /var/log/shell-tunnel.jsonl
+Restart=always
+RestartSec=5
+User=shell-tunnel
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```powershell
+# Windows: a service via sc.exe, one line, quoted as one binPath
+sc.exe create shell-tunnel binPath= "\"C:\Program Files\shell-tunnel\shell-tunnel.exe\" --relay https://relay.example.com:8443 --enroll-token st_... --relay-fingerprint sha256:... -k <key> --preset operator" start= auto
+sc.exe failure shell-tunnel reset= 86400 actions= restart/5000
+```
+
+```xml
+<!-- launchd: ~/Library/LaunchAgents/com.example.shell-tunnel.plist -->
+<key>ProgramArguments</key>
+<array>
+  <string>/usr/local/bin/shell-tunnel</string>
+  <string>--relay</string><string>https://relay.example.com:8443</string>
+  <string>--enroll-token</string><string>st_...</string>
+  <string>-k</string><string>&lt;key&gt;</string>
+</array>
+<key>KeepAlive</key><true/>
+```
+
+**The enrolment token ends up in the service definition, in the clear.** The
+relay join flags are command line only — there is no `relay` section in the
+config file and no `SHELL_TUNNEL_RELAY_*` variable — so a unit file holds the
+secret where the process list shows it (`ps`, Task Manager) and where anyone who
+can read the unit can read it. The API key does not have this problem: put it in
+the config file or `SHELL_TUNNEL_API_KEY` and leave `-k` out. Until the join
+flags have the same options, restrict who can read the unit file, and treat the
+enrolment token as rotatable — a relay restarted with a new `--enroll-token`
+invalidates every device's join line at once, which is the recovery path as well
+as the hazard.
+
+**What a reboot takes with it, by design:**
+
+- Every session under `/api/v1/sessions`. They live in memory; a client that
+  held a session id gets `404` and opens a new one.
+- Every upload in flight. Its staging file is left behind and swept as an
+  orphan; the transfer starts over rather than resuming.
+
+Neither is recovered on restart, and neither is a failure to report — but a
+caller that assumes a session id outlives the process will see it as one.
+
 ---
 
 ## 3. Calling the API
@@ -415,6 +491,12 @@ The check applies only where that threat exists. A server bound to a public
 address, or published through a tunnel or relay, is deliberately reachable under
 a name shell-tunnel may not know, so checking there would refuse legitimate
 traffic instead.
+
+**So `--allow-host` does nothing on such a server, and the startup banner now
+says so** rather than accepting the flag in silence. It is not access control —
+withholding a name from the list does not keep anyone out, since a caller
+holding the token reaches the server under whatever name the tunnel or relay
+publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 
 ### Audit trail
 
