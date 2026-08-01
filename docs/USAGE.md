@@ -410,8 +410,14 @@ traffic instead.
 
 ### Audit trail
 
-`--audit-log <file>` appends one JSON object per line for every execution and
-every refusal. Off on a loopback bind with no tunnel or relay — creating a file
+`--audit-log <file>` appends one JSON object per line for every execution, for
+every request the authentication layer refuses, and for the file operations
+listed in the `kind` table below. **That table is the whole list** — an outcome
+absent from it leaves no entry, and refusals decided inside a handler are not
+all there: a delete refused with `400 recursive-required` or `409
+staging-in-tree` writes nothing.
+
+Off on a loopback bind with no tunnel or relay — creating a file
 nobody asked for is its own kind of surprise there. A server reachable from
 other machines writes one by default, at `shell-tunnel-audit.jsonl` in the
 working directory, unless `--audit-log` names another path; see
@@ -703,7 +709,7 @@ still sees the real address.
 | `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
-| `--audit-log <FILE>` | Append executions and refusals as JSON lines | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
+| `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
 | `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |

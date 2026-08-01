@@ -51,6 +51,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   exception to "no file is created that nobody asked for" — the first is the
   self-signed certificate, and the shape is the same.
 
+### Fixed
+
+- **`--audit-log` no longer claims to record every refusal.** It records
+  executions, requests the authentication layer denies, and the file operations
+  the event-kind table lists — but a delete refused with `400
+  recursive-required` or `409 staging-in-tree` writes nothing, so the promise
+  was wider than the trail. The documentation now names what is recorded and
+  says the table is the whole list; the missing delete entries are a separate
+  change. Nothing about what is written has changed.
+
 ## 0.13.0 — 2026-07-31
 
 ### Added
