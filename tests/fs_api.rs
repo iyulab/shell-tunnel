@@ -4755,3 +4755,43 @@ async fn a_clean_preview_reports_staging_in_tree_as_false() {
         "the field must be there and false, not absent: {body}"
     );
 }
+
+/// The schema calls `staging_in_tree` required on every `DeleteResult`, and
+/// that schema covers a preview of a single non-directory entry as well as a
+/// tree. That path built its body separately and left the field out, so a
+/// client coded against the contract read `undefined` — the absence-means-false
+/// failure the field's always-present rule exists to prevent, on the one route
+/// that forgot the rule. Directory previews were covered; this is the sibling
+/// nobody looked at.
+#[tokio::test]
+async fn a_single_entry_preview_carries_staging_in_tree_too() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app")).expect("mkdir");
+    std::fs::write(dir.path().join("app/a.txt"), b"xyz").expect("write");
+    let (state, _log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app/a.txt&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 1);
+    assert_eq!(body["dry_run"], true);
+    assert!(
+        body.get("staging_in_tree").is_some(),
+        "the field must be present, not merely falsy by omission: {body}"
+    );
+    assert_eq!(body["staging_in_tree"], false);
+    assert!(
+        dir.path().join("app/a.txt").exists(),
+        "a preview removes nothing"
+    );
+}

@@ -1555,6 +1555,7 @@
           "entries",
           "truncated",
           "dry_run",
+          "staging_in_tree",
           "failures",
           "error",
           "message"
