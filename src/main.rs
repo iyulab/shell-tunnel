@@ -604,6 +604,7 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     }
     if generated {
         println!("Enroll token: {enroll_token}   (generated)");
+        println!("{}", generated_enroll_token_note());
     }
     let join_url = reachable.unwrap_or_else(|| format!("{scheme}://<this-host>:{}", bind.port()));
 
@@ -884,6 +885,23 @@ fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&Capab
         return false;
     };
     !set.satisfies("exec") && (set.satisfies("fs.read") || set.satisfies("fs.write"))
+}
+
+/// The note printed beside an enrolment token this process generated.
+///
+/// The certificate is the contrast that makes this worth saying: a self-signed
+/// one is written to disk and reused, so its fingerprint survives a restart and
+/// the join lines built around it keep working. The enrolment token is
+/// generated the same way and kept nowhere, so a relay restarted without
+/// `--enroll-token` invalidates every attached device's join line at once — and
+/// the devices do not report it, they retry in backoff against a token the
+/// relay no longer knows. Nothing said so at the one moment an operator is
+/// looking at the token.
+///
+/// Aligned to the fourteen columns the labels above it use, so it reads as a
+/// continuation of the line it qualifies rather than a new fact.
+fn generated_enroll_token_note() -> &'static str {
+    "              not saved: a restart generates a new one and every attached device's join line stops working. Pass --enroll-token to keep it across restarts."
 }
 
 /// The banner lines announcing the posture. Local is an empty list — with
@@ -1282,6 +1300,27 @@ mod tests {
 ",
         );
         assert!(!text.contains("--allow-host"), "{text}");
+    }
+
+    /// The relay prints a generated enrolment token and, until now, nothing
+    /// else — while the self-signed certificate beside it *is* persisted, so
+    /// an operator had every reason to assume the token was too. It is not,
+    /// and the failure is silent on both ends: the relay forgets it, and the
+    /// devices retry in backoff against a token nobody holds any more.
+    #[test]
+    fn a_generated_enroll_token_says_it_is_not_saved() {
+        let note = generated_enroll_token_note();
+        assert!(
+            note.contains("not saved"),
+            "the fact has to be stated, not implied: {note}"
+        );
+        assert!(
+            note.contains("--enroll-token"),
+            "and it has to name the flag that fixes it: {note}"
+        );
+        // The line qualifies `Enroll token:` above it, whose label is fourteen
+        // columns wide. Left-aligned it reads as an unrelated fact.
+        assert!(note.starts_with("              "), "{note:?}");
     }
 
     #[test]
