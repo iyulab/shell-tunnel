@@ -1214,6 +1214,13 @@ fn delete_file_blocking(
                 "entries": [root.relative(&named).unwrap_or_default()],
                 "truncated": false,
                 "dry_run": true,
+                // Constant here, and present for exactly the reason it is
+                // present at all: a client told the field is always there must
+                // find it on every preview, or its absence starts meaning
+                // `false` again on the one path that forgot it. A staging file
+                // cannot live under something that is not a directory, so the
+                // guard the directory branch runs has nothing to test.
+                "staging_in_tree": false,
             })),
         )
             .into_response();
