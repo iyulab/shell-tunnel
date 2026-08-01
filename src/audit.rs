@@ -67,6 +67,18 @@ pub struct AuditEvent {
     /// How long it took.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Bytes the command's output ran to, when more than the response carried.
+    ///
+    /// Present only on an execution whose output was capped, so its presence
+    /// *is* the signal: a trail entry without it describes a response that
+    /// carried everything. Recorded because the response itself is not kept —
+    /// without this, "why was that result short?" has no answer after the fact,
+    /// and a short answer is indistinguishable from a short command.
+    ///
+    /// Separate from `bytes`, which counts what a transfer moved. Reusing it
+    /// would make one field mean two things depending on `kind`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_bytes: Option<u64>,
     /// HTTP status, for denial events.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
@@ -109,6 +121,7 @@ impl AuditEvent {
             exit_code: None,
             timed_out: None,
             duration_ms: None,
+            output_bytes: None,
             status: None,
             reason: None,
             file: None,
@@ -159,6 +172,18 @@ impl AuditEvent {
         self.exit_code = exit_code;
         self.timed_out = Some(timed_out);
         self.duration_ms = Some(duration_ms);
+        self
+    }
+
+    /// Record that an execution produced more output than was returned.
+    ///
+    /// A no-op when nothing was discarded, so callers can hand over both
+    /// figures unconditionally and the field stays a truncation signal rather
+    /// than a size that is present on every entry.
+    pub fn with_truncated_output(mut self, truncated: bool, total_bytes: u64) -> Self {
+        if truncated {
+            self.output_bytes = Some(total_bytes);
+        }
         self
     }
 

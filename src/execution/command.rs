@@ -17,6 +17,11 @@ pub struct Command {
     pub timeout: Option<Duration>,
     /// Whether to capture output.
     pub capture_output: bool,
+    /// Cap on the output the result keeps, in bytes.
+    ///
+    /// `None` means [`super::executor::DEFAULT_MAX_OUTPUT_BYTES`]. There is no
+    /// value meaning "unbounded" — see that constant.
+    pub max_output_bytes: Option<u64>,
 }
 
 impl Command {
@@ -28,6 +33,7 @@ impl Command {
             env: HashMap::new(),
             timeout: None,
             capture_output: true,
+            max_output_bytes: None,
         }
     }
 
@@ -67,6 +73,12 @@ impl Command {
         self.capture_output = capture;
         self
     }
+
+    /// Cap the output the result keeps.
+    pub fn max_output_bytes(mut self, bytes: u64) -> Self {
+        self.max_output_bytes = Some(bytes);
+        self
+    }
 }
 
 impl Default for Command {
@@ -83,6 +95,7 @@ pub struct CommandBuilder {
     env: HashMap<String, String>,
     timeout: Option<Duration>,
     capture_output: bool,
+    max_output_bytes: Option<u64>,
 }
 
 impl CommandBuilder {
@@ -134,6 +147,7 @@ impl CommandBuilder {
             env: self.env,
             timeout: self.timeout,
             capture_output: self.capture_output,
+            max_output_bytes: self.max_output_bytes,
         })
     }
 }

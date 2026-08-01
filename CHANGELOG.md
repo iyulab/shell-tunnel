@@ -3,7 +3,7 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## 0.14.0 — 2026-07-31
+## 0.14.0 — 2026-08-01
 
 ### Added
 
@@ -27,7 +27,67 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   of these carries counts, so `reason` distinguishes them and the grep surface
   stays where it is.
 
+- **`/execute` output is capped, and says when it was cut.** The response now
+  carries `total_bytes` (what the command produced) and `truncated` (whether
+  `output` is only a prefix), and `output` stops at `max_output_bytes` — 1 MiB
+  unless the request names a smaller figure, or a larger one up to an 8 MiB
+  ceiling. `truncated` is always present, including when false, so a complete
+  answer is never inferred from a missing field.
+
+  Nothing bounded this before: the only effective limit was the timeout, which
+  bounds time rather than size, so a single `cat` of a large file was held whole
+  in memory and then serialised into one JSON response — and behind a relay that
+  response could not be delivered at all. The filesystem API already worked the
+  other way, reporting `truncated` on a listing for exactly this reason;
+  `/execute` was the one route outside that rule.
+
+  The cap cannot be disabled, only moved within its ceiling: an uncapped
+  response is the failure this exists to prevent. To read more than it allows,
+  redirect the output to a file and fetch it with `GET /api/v1/fs/file`, which
+  supports `Range`. Streaming is unaffected — a WebSocket consumer receives
+  every chunk as it arrives, and its `result` message now carries `total_bytes`
+  so it can confirm the whole stream arrived.
+
+- **An `execute` audit entry says when output was capped.** A capped execution
+  now records `output_bytes` — what the command produced, not what the response
+  returned. The field appears *only* when output was discarded, so its presence
+  is the signal and an entry without it describes a response that carried
+  everything.
+
+  The response is not kept anywhere, so once a caller holds a short `output`
+  the trail was the only place left to learn whether the command had said more
+  — and it did not say. A truncated result was indistinguishable after the fact
+  from a command that simply printed little. Streaming executions never carry
+  it: a WebSocket consumer receives every chunk regardless of the cap, so there
+  is nothing about that delivery to flag.
+
 ### Fixed
+
+- **A device no longer treats a failed body read as an empty body.** Reading
+  the forwarded request body matched only the success case and fell through to
+  an empty `Vec` for everything else, so a read error would have replayed the
+  request locally without what it was carrying — a chunk `PATCH` appending
+  nothing and answering as though it had. The relay's own receive loop had the
+  mirror image of this on the response side. The relay caps a request body
+  before forwarding, which is what kept this unreachable; correctness resting
+  on an upstream limit is not a contract.
+
+- **A response too large for the relay no longer arrives as an empty `200`.**
+  A device returns a response body as a single frame, so a body over the
+  WebSocket message limit — 16 MiB — fails the relay's read of it. That failure was
+  indistinguishable from a clean close: the receive loop stopped, and the
+  status — already taken from the header frame that arrives before the body —
+  went out as the device's own. A caller downloading a 20 MiB file got
+  `200 OK`, `content-type: application/json`, `content-length: 0`, and no
+  indication the file had not been delivered. The same threshold truncated
+  large `execute` output.
+
+  The relay now answers `502`, which is what a failed read of an upstream
+  response means. Use `Range` to fetch a file larger than one response can
+  carry; the ceiling is on a single response, not on the file. Documented
+  under Limits alongside the request-body ceiling, which is a separate and
+  smaller number — the two were easy to conflate while only one of them was
+  written down.
 
 - **A recursive-delete preview is no longer refused by an upload in flight.**
   `dry_run=true` was turned away with the same `409 staging-in-tree` as the
@@ -107,6 +167,13 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   there is no scope in force to describe.
 
 ### Breaking
+
+- **`/execute` no longer returns unlimited output.** `output` stops at
+  `max_output_bytes` (1 MiB by default, 8 MiB ceiling). A caller that relied on
+  one response carrying a command's entire output must either lower what the
+  command produces, raise the cap within its ceiling, or write the output to a
+  file and fetch it with `GET /api/v1/fs/file`. `truncated` and `total_bytes`
+  on every response say which case applies. Described under Added above.
 
 - **A configured bind address and port now take effect.** `server.host`,
   `server.port`, `SHELL_TUNNEL_HOST`, and `SHELL_TUNNEL_PORT` were read and

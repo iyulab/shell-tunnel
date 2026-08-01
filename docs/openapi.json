@@ -586,7 +586,7 @@
           "Filesystem"
         ],
         "summary": "Download a file, or a range of it",
-        "description": "Returns the whole file, or one byte range of it via `Range`. Supports resumable downloads without any client-side protocol beyond ordinary HTTP: `If-Range` compares against the returned `etag` and refuses to stitch a stale prefix onto a file that changed mid-transfer, falling back to the whole file (200) rather than serving mismatched bytes.\n\n`HEAD` reaches this same route (axum serves it automatically) and reports identical status and headers with no body — same capability, `fs.read`.\n\nRequired capability: `fs.read`.",
+        "description": "Returns the whole file, or one byte range of it via `Range`. Supports resumable downloads without any client-side protocol beyond ordinary HTTP: `If-Range` compares against the returned `etag` and refuses to stitch a stale prefix onto a file that changed mid-transfer, falling back to the whole file (200) rather than serving mismatched bytes.\n\n`HEAD` reaches this same route (axum serves it automatically) and reports identical status and headers with no body — same capability, `fs.read`.\n\nBehind a relay, a whole-file response is capped: a body over 16 MiB cannot cross the relay and the caller receives 502 instead. `Range` is the way to fetch a larger file over that path — the limit is on one response, not on the file.\n\nRequired capability: `fs.read`.",
         "operationId": "fsDownload",
         "parameters": [
           {
@@ -776,8 +776,12 @@
               "application/json": {
                 "schema": {
                   "oneOf": [
-                    { "$ref": "#/components/schemas/ErrorResponse" },
-                    { "$ref": "#/components/schemas/PartialDeleteResult" }
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/PartialDeleteResult"
+                    }
                   ]
                 }
               }
@@ -1334,15 +1338,26 @@
             "default": 30,
             "minimum": 1,
             "maximum": 300
+          },
+          "max_output_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cap on the output this response carries, in bytes. A larger value is clamped to the ceiling rather than refused; the cap cannot be disabled. `total_bytes` reports what the command produced either way.",
+            "default": 1048576,
+            "minimum": 0,
+            "maximum": 8388608
           }
         }
       },
       "ExecuteCommandResponse": {
         "type": "object",
         "required": [
+          "success",
           "output",
-          "exit_code",
-          "duration_ms"
+          "duration_ms",
+          "timed_out",
+          "total_bytes",
+          "truncated"
         ],
         "properties": {
           "output": {
@@ -1351,7 +1366,7 @@
           },
           "exit_code": {
             "type": "integer",
-            "description": "Exit code (0 for success)"
+            "description": "Exit code (0 for success). Absent when the command was killed on timeout — the key is omitted rather than set to null."
           },
           "duration_ms": {
             "type": "integer",
@@ -1362,6 +1377,19 @@
             "type": "boolean",
             "description": "Whether the command timed out",
             "default": false
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Exit code was 0 and the command did not time out."
+          },
+          "total_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes the command produced, including any this response does not carry. Equal to the size of `output` unless `truncated` is set."
+          },
+          "truncated": {
+            "type": "boolean",
+            "description": "Whether `output` is a prefix of what the command produced. Always present, including when false, so completeness is never inferred from a missing field."
           }
         }
       },

@@ -291,9 +291,26 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
         return pipe_websocket(conn, config, &request).await;
     }
 
+    // A failed read is not an empty body. Treating the two alike would replay
+    // the request locally without whatever it was carrying — a `PATCH` writing
+    // an upload chunk would append nothing and answer as though it had. The
+    // relay's own receive loop had the mirror image of this on the response
+    // side, where it returned a truncated body under `200 OK`.
+    //
+    // The relay caps a request body at 8 MiB before forwarding, so nothing
+    // reaching here should be large enough to fail the read. Correctness that
+    // rests on an upstream limit is not a contract, and the cost of not relying
+    // on it is one match arm.
     let body = match conn.next().await {
         Some(Ok(Message::Binary(bytes))) => bytes.to_vec(),
-        _ => Vec::new(),
+        // No body frame at all: a GET, or the relay closed an idle connection.
+        None | Some(Ok(Message::Close(_))) => Vec::new(),
+        Some(Err(e)) => {
+            return Err(ShellTunnelError::Tunnel(format!(
+                "could not read the request body: {e}"
+            )))
+        }
+        Some(Ok(_)) => Vec::new(),
     };
 
     let (status, headers, body) = replay_locally(config.local, &request, body).await;

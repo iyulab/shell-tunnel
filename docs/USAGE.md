@@ -230,14 +230,38 @@ curl -X POST "$BASE/api/v1/execute" \
 ```
 
 Request fields: `command` (required), `working_dir`, `env` (object),
-`timeout_secs` (default 30).
+`timeout_secs` (default 30), `max_output_bytes` (default 1 MiB, ceiling 8 MiB).
 
 ```json
-{"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false}
+{"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false,
+ "total_bytes":6,"truncated":false}
 ```
 
 `output` merges stdout and stderr. On timeout, `timed_out` is `true` and the
 whole process tree is killed.
+
+**Output is capped.** `output` carries at most `max_output_bytes` — 1 MiB unless
+the request says otherwise — and `total_bytes` reports what the command actually
+produced. When the two differ, `truncated` is `true`:
+
+```bash
+curl -X POST "$BASE/api/v1/execute" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"cat big.log","max_output_bytes":4096}'
+# {"success":true,"exit_code":0,"output":"…4096 bytes…","duration_ms":31,
+#  "timed_out":false,"total_bytes":65536,"truncated":true}
+```
+
+`truncated` is always present, including when `false`, so a complete answer
+never has to be inferred from a missing field. A request may lower the cap or
+raise it to the 8 MiB ceiling; a larger value is clamped rather than refused,
+and there is no way to disable the cap — an uncapped response is one the relay
+cannot deliver (§10). To read more than the cap allows, write the output to a
+file and fetch it with `GET /api/v1/fs/file`, which supports `Range`.
+
+The cap applies to the collected result, not to the stream: a WebSocket
+consumer receives every chunk regardless, and its `result` message carries
+`total_bytes` to confirm the whole stream arrived.
 
 ### Sessions
 
@@ -579,7 +603,7 @@ capability token is the access control — withhold `exec` to deny execution.
 
 | `kind` | Recorded when | Notable fields |
 |---|---|---|
-| `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot) |
+| `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below) |
 | `denied` | a request was refused | `status`, `reason` |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
@@ -594,6 +618,14 @@ capability token is the access control — withhold `exec` to deny execution.
 | `upload.cancel` | a session was cancelled before completing | `file`, `bytes`, `upload_id` |
 | `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
+
+`output_bytes` appears on an `execute` entry **only when the output was capped**, and
+carries what the command produced rather than what the response returned (§3). Its
+presence is the signal — an entry without it describes a response that carried
+everything — so a truncated result stays distinguishable from a command that simply
+printed little, which is a question the response itself cannot answer once it is gone.
+Streaming (`WS …/ws`) executions never carry it: a WebSocket consumer receives every
+chunk regardless of the cap, so there is nothing about that delivery to flag.
 
 The `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
 on one shared kind — the same convention the `upload.*` kinds already use. It is what
@@ -915,9 +947,11 @@ startup rather than serving local-only.
 | **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
 | `invalid peer certificate: NotValidForName` | certificate does not cover the dialled name | restart the relay with `--public-base <name>` after deleting the certificate and key |
-| **502** from a relay URL | device is not attached | check `/relay/v1/devices` |
-| **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1` |
-| **504** from a relay URL | device did not answer in 120s | check the device |
+| **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
+| **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
+| **502** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay |
+| **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
+| **504** from a relay URL | device did not answer in 120s | check the device. The command may still be running there |
 | **413** | request body over 8 MiB, or an upload chunk over `chunk_size` | split the request |
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
@@ -929,6 +963,21 @@ startup rather than serving local-only.
 A relay connection that drops is retried with exponential backoff (1s→60s); the
 device keeps its URL, so callers need no change. A *tunnel* that dies takes the
 server down instead, because a restart would allocate a different URL.
+
+### Which failures are safe to retry
+
+A relay failure does not tell you, on its own, whether the request ran. Two of them do:
+
+- **`502 device is not connected`** and **`503`** are decided *before* the relay hands the
+  request to a device. Nothing ran. Retrying is safe for any request.
+- **`502 device did not answer`** and **`504`** happen *after* the exchange started. The
+  device may have run the command and failed only on the way back. Do not blindly retry a
+  request that is not safe to run twice.
+
+shell-tunnel does not deduplicate requests: there is no request id, and no result cache.
+A retried `POST /execute` is a second execution. Callers that issue commands which must
+not run twice need to check the effect themselves before retrying — via a subsequent
+`fs` or `execute` call that observes whether the first one landed.
 
 ---
 
@@ -959,7 +1008,12 @@ documented here.
 - **Relay proxies request/response HTTP and WebSocket.** Server-sent events
   buffer instead of streaming.
 - **Relay is single-tenant** (one shared enrol token, no isolation between devices).
-- **8 MiB** request body limit through the relay.
+- **8 MiB** request body limit through the relay. Over it, the relay answers **413**.
+- **16 MiB** response body limit through the relay — a separate ceiling, and the one a
+  `GET .../fs/file` on a large file reaches first. Over it, the relay answers **502**:
+  the device carries a response body in a single frame, and a frame that large cannot be
+  read. Range requests are the way to fetch a bigger file (§3.1); nothing about the file
+  itself is wrong.
 - Each device keeps **4 idle connections** pre-opened; beyond that, requests wait
   briefly for a refill and get **503** after 5 seconds.
 - **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a

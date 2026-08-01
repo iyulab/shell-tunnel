@@ -749,12 +749,21 @@ async fn forward(
         }
     };
 
+    // A read error here must not be mistaken for the end of the body. The
+    // device sends the response as a single binary frame, so a body over the
+    // WebSocket message limit fails the *read* — and `while let Some(Ok(_))`
+    // treats that failure exactly like a clean close, leaving `body` short (in
+    // practice empty) while the status, already taken from the header frame
+    // above, stays whatever the device answered. That shipped a truncated body
+    // under `200 OK`: silent data loss, reported as success. Live-verified at
+    // exactly 16 MiB against both `/execute` and a `fs/file` download.
     let mut body = Vec::new();
-    while let Some(Ok(message)) = conn.recv().await {
-        match message {
-            Message::Binary(chunk) => body.extend_from_slice(&chunk),
-            Message::Close(_) => break,
-            _ => continue,
+    loop {
+        match conn.recv().await {
+            Some(Ok(Message::Binary(chunk))) => body.extend_from_slice(&chunk),
+            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(_)) => continue,
+            Some(Err(_)) => return Err("response-body-truncated"),
         }
     }
 

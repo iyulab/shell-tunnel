@@ -29,7 +29,8 @@ From another terminal:
 curl -X POST http://127.0.0.1:3000/api/v1/execute \
   -H "Content-Type: application/json" \
   -d '{"command":"echo hello"}'
-# {"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false}
+# {"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false,
+#  "total_bytes":6,"truncated":false}
 ```
 
 That's the whole loop: run the binary, POST a command, get structured output. No config, no

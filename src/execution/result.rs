@@ -15,29 +15,60 @@ pub struct ExecutionResult {
     pub duration: Duration,
     /// Whether execution timed out.
     pub timed_out: bool,
+    /// Bytes the command produced, including any this result did not keep.
+    ///
+    /// Counted as the output arrives rather than measured from `raw_output`,
+    /// so it stays accurate once a cap has discarded the tail — which is the
+    /// only situation where the two numbers differ, and exactly the situation
+    /// a caller needs the real figure for.
+    pub total_bytes: u64,
+    /// Whether output was discarded because it exceeded the cap.
+    pub truncated: bool,
 }
 
 impl ExecutionResult {
     /// Create a new execution result.
+    ///
+    /// `total_bytes` is taken from `raw_output` and `truncated` is false: a
+    /// result built this way kept everything it was given. The executor, which
+    /// is the only place that can discard output, sets both explicitly through
+    /// [`Self::with_output_extent`].
     pub fn new(raw_output: Vec<u8>, text_output: String, duration: Duration) -> Self {
+        let total_bytes = raw_output.len() as u64;
         Self {
             raw_output,
             text_output,
             exit_code: None,
             duration,
             timed_out: false,
+            total_bytes,
+            truncated: false,
         }
     }
 
     /// Create a result indicating timeout.
     pub fn timeout(raw_output: Vec<u8>, text_output: String, duration: Duration) -> Self {
+        let total_bytes = raw_output.len() as u64;
         Self {
             raw_output,
             text_output,
             exit_code: None,
             duration,
             timed_out: true,
+            total_bytes,
+            truncated: false,
         }
+    }
+
+    /// Record how much output the command actually produced.
+    ///
+    /// Separate from the constructors because only the collecting loop knows
+    /// the figure once a cap is in play — `raw_output.len()` is what was kept,
+    /// not what was produced.
+    pub fn with_output_extent(mut self, total_bytes: u64, truncated: bool) -> Self {
+        self.total_bytes = total_bytes;
+        self.truncated = truncated;
+        self
     }
 
     /// Set the exit code.
@@ -75,6 +106,8 @@ impl Default for ExecutionResult {
             exit_code: None,
             duration: Duration::ZERO,
             timed_out: false,
+            total_bytes: 0,
+            truncated: false,
         }
     }
 }
