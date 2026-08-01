@@ -365,8 +365,9 @@ OPTIONS:
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
         --allow-host <HOST> Also answer to this host name. A loopback-bound
-                            server otherwise answers only to localhost, which is
-                            what stops DNS rebinding. Repeatable
+                            server that is not published otherwise answers only
+                            to localhost, which is what stops DNS rebinding.
+                            Published, nothing is host-checked. Repeatable
         --audit-log <FILE>  Append every execution and refusal to this file
                             (JSON per line; the token itself is never written)
                             [default: off; shell-tunnel-audit.jsonl when reachable]

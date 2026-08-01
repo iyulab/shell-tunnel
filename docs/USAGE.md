@@ -762,9 +762,10 @@ Three cases do not work that way, and each can surprise you:
   `--capabilities fs.read` issues a token holding operator's whole set *and*
   `fs.read` — `exec` still among them, though the intent was to narrow. A key
   in the file likewise stays valid alongside a key given with `-k`. (`--preset`
-  is not in this group: it replaces the file's preset outright.) The startup
-  banner prints the set that is actually in force; read it there rather than
-  inferring it from either input.
+  replaces the file's `preset`, but a `capabilities` list in the file is still
+  unioned on top of it — so narrowing with `--preset` instead does not escape
+  this either.) The startup banner prints the set that is actually in force;
+  read it there rather than inferring it from either input.
 - **A file asking for a tunnel or a relay changes the auth keys by itself.**
   `transport.mode` of `cloudflared` or `command` makes the server reachable, and
   a reachable server turns `security.auth.enabled` on and scopes an otherwise
