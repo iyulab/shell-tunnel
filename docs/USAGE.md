@@ -581,10 +581,20 @@ publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 `--audit-log <file>` appends one JSON object per line for every execution, for
 every request the authentication layer refuses, and for the file operations
 listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry. One gap is worth naming rather than leaving to
-be discovered: a request whose *path* does not resolve — missing, malformed, or
-escaping `--fs-root` — is turned away by machinery shared with `list`, `stat`,
-and `download`, and writes nothing on any of those routes.
+absent from it leaves no entry. Two gaps are worth naming rather than leaving to
+be discovered.
+
+A request whose *path* does not resolve — missing, malformed, or escaping
+`--fs-root` — is turned away by machinery shared with `list`, `stat`, and
+`download`, and writes nothing on any of those routes.
+
+A request refused for carrying a field this server does not recognise (§3) is
+turned away while the body or query string is still being parsed, before any
+handler runs, so it writes nothing either. A caller probing `?dryRun=true`
+against `DELETE .../fs/file` leaves no trace of having tried — though it also
+changes nothing, which is the point of the refusal. Requests the
+authentication layer turns away first are unaffected: those are recorded as
+`denied`, including when the request would also have failed to parse.
 
 Off on a loopback bind with no tunnel or relay — creating a file
 nobody asked for is its own kind of surprise there. A server reachable from

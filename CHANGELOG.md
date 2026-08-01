@@ -46,7 +46,17 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   fields were already being ignored, so the refusal exposes an existing
   misbehaviour rather than introducing one — a client that relied on a field
   being honoured was not getting that, and a client that sent one harmlessly
-  need only stop sending it. This applies to JSON bodies and to query strings.
+  need only stop sending it.
+
+  The refusal is **`422`** for a JSON body and **`400`** for a query string,
+  both as `text/plain` rather than the JSON error envelope. The two codes come
+  from different layers of request parsing and are documented rather than
+  normalised; normalising them would mean a custom extractor on every route
+  whose only job is to relabel a status. A request the authentication layer
+  turns away first still answers `401`, unchanged.
+
+  Neither refusal reaches the audit trail — both happen before any handler
+  runs. `USAGE.md` §4 names the gap alongside the one it already had.
 
 - **Breaking: `WsMessage` is split into `WsClientMessage` and
   `WsServerMessage`.** The two directions want opposite strictness and one
