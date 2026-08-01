@@ -3,6 +3,44 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.14.1 — 2026-08-01
+
+### Fixed
+
+- **A relayed request refused for its size now reports the refusal, not a
+  connection failure.** A request body over a route's own limit but under the
+  relay's 8 MiB ceiling is forwarded to the device, whose server answers `413`
+  before the body has finished arriving and then closes. Writing on into a
+  closed peer draws a RST, and a RST discards whatever is still unread in the
+  receive buffer — so the device's relay client, which wrote the body to
+  completion and only then read, lost the answer already sent and reported
+  `502 device could not reach its local server` in its place.
+
+  The two point in opposite directions: `413` means split the request, `502`
+  sends someone to check whether the device is still alive. It reproduced as a
+  race rather than a constant — on loopback the write usually wins, so roughly
+  one attempt in ten lost the `413`, while across a relay the first attempt
+  lost it.
+
+  The client now reads concurrently with the write and stops writing as soon as
+  an answer starts arriving. Neither half suffices alone: reading in parallel
+  gets the bytes somewhere a later RST cannot reach, and stopping the write is
+  what keeps the RST from being provoked at all.
+
+### Documentation
+
+- **The server's own 2 MiB request body limit is documented.** `USAGE.md`
+  counted two ceilings — the relay's 8 MiB request and 16 MiB response — and
+  never mentioned the limit that applies to every route setting none of its
+  own. It is the lowest of the three and therefore the first one an oversized
+  request meets, with or without a relay. §10 gains it, the §8 `413` row names
+  all three causes, and `openapi.json` declares `413` on the four routes that
+  take a body and do not raise it (`POST /api/v1/execute`, `POST
+  /api/v1/sessions`, `POST /api/v1/sessions/{sessionId}/execute`, `POST
+  /api/v1/fs/uploads`) — as `text/plain`, since that refusal comes from the
+  request layer rather than a handler and so does not carry the JSON error
+  envelope.
+
 ## 0.14.0 — 2026-08-01
 
 ### Added
