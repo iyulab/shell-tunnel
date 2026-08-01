@@ -4,7 +4,7 @@
 //! transfer verifies. A partial file therefore never appears at the destination
 //! — a consumer polling that path sees nothing or sees the finished article.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, RwLock};
@@ -155,19 +155,27 @@ struct Session {
 /// would reintroduce a real deadlock that no existing test would catch.
 pub struct UploadStore {
     sessions: RwLock<HashMap<String, Mutex<Session>>>,
-    /// Destinations currently claimed, so two sessions cannot race to one path.
+    /// Destinations currently claimed, so two sessions cannot race to one path,
+    /// each mapped to the staging directory that destination stages through.
     ///
-    /// A set, not a map: no caller has ever read a value out of this (an
-    /// earlier version stored the claiming session's id as the value, but
-    /// nothing looked it up — `sessions` is the source of truth for which
-    /// id owns which destination). Its length also doubles as the
-    /// live-session count for `MAX_CONCURRENT_UPLOADS`: every live session
-    /// claims exactly one destination and every destination is claimed by
-    /// at most one session, so checking `claimed.len()` under `claimed`'s
-    /// own lock is an atomic admission check — two concurrent callers
-    /// cannot both read a count under the cap and then both insert, because
-    /// the check and the insert share one critical section.
-    claimed: Mutex<HashSet<String>>,
+    /// A map, not a set. It was a set for as long as nothing read a value out
+    /// of it (an earlier version stored the claiming session's id, which
+    /// nothing looked up — `sessions` is the source of truth for which id owns
+    /// which destination). `release` now does read one: it reclaims an empty
+    /// staging directory once no remaining claim stages through it, and "which
+    /// directory, and is anyone else using it" is a question only this map can
+    /// answer under a single lock. Machine-wide, staging follows each
+    /// destination, so two claims routinely name two different directories and
+    /// a set could not tell them apart.
+    ///
+    /// Its length still doubles as the live-session count for
+    /// `MAX_CONCURRENT_UPLOADS`: every live session claims exactly one
+    /// destination and every destination is claimed by at most one session, so
+    /// checking `claimed.len()` under `claimed`'s own lock is an atomic
+    /// admission check — two concurrent callers cannot both read a count under
+    /// the cap and then both insert, because the check and the insert share
+    /// one critical section.
+    claimed: Mutex<HashMap<String, PathBuf>>,
     chunk_size: usize,
     counter: std::sync::atomic::AtomicU64,
 }
@@ -176,7 +184,7 @@ impl UploadStore {
     pub fn new(chunk_size: usize) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
-            claimed: Mutex::new(HashSet::new()),
+            claimed: Mutex::new(HashMap::new()),
             // Upper bound one *less* than `MAX_CHUNK_SIZE`, matching what
             // `--fs-chunk-size`'s own startup check enforces (`main.rs`
             // exits for `size >= MAX_CHUNK_SIZE`). Clamping to
@@ -273,20 +281,29 @@ impl UploadStore {
         size: u64,
         sha256: String,
     ) -> Result<String, UploadError> {
+        // Computed before the claim rather than after it, and recorded *with*
+        // the claim: `release` reclaims this directory once it is empty and no
+        // remaining claim stages through it, and it decides that under the
+        // same lock this insert takes. Claiming first is therefore what makes
+        // the directory safe to create afterwards — a concurrent `release`
+        // cannot be between "no other claim" and `remove_dir` while this claim
+        // is already in the map, so it can never delete the directory out from
+        // under the `create_dir_all` and `create_new` below.
+        let staging = Self::staging_dir(root, dest_abs);
+
         // Claim the destination first: a second session for the same path is a
         // silent-overwrite race, and last-writer-wins loses data quietly.
         {
             let mut claimed = self.claimed.lock().map_err(|_| poisoned())?;
-            if claimed.contains(&dest_rel) {
+            if claimed.contains_key(&dest_rel) {
                 return Err(UploadError::Conflict);
             }
             if claimed.len() >= MAX_CONCURRENT_UPLOADS {
                 return Err(UploadError::TooManySessions);
             }
-            claimed.insert(dest_rel.clone());
+            claimed.insert(dest_rel.clone(), staging.clone());
         }
 
-        let staging = Self::staging_dir(root, dest_abs);
         if let Err(e) = std::fs::create_dir_all(&staging) {
             self.release(&dest_rel);
             return Err(e.into());
@@ -356,9 +373,13 @@ impl UploadStore {
         sessions.insert(id.clone(), Mutex::new(session));
         drop(sessions);
 
-        if let Ok(mut claimed) = self.claimed.lock() {
-            claimed.insert(dest_rel);
-        }
+        // The claim was inserted at the top of this function and nothing on
+        // the path to here removes it — every `release` above is followed by
+        // `return Err`. A re-insert stood here and was a no-op for a set; for
+        // a map it would be worse than redundant, since it could resurrect a
+        // claim that a `sweep` running between the `sessions.insert` above and
+        // this line had just released, leaving a destination claimed by a
+        // session that no longer exists.
         Ok(id)
     }
 
@@ -552,8 +573,14 @@ impl UploadStore {
         let Ok(session) = cell.into_inner() else {
             return None;
         };
-        self.release(&session.dest_rel);
+        // Staging file first, claim second. `release` reclaims the staging
+        // directory when the last claim through it goes, and `remove_dir`
+        // refuses a directory that still holds this session's `.part` — so
+        // releasing first leaves exactly the empty directory this is meant to
+        // clear. The reverse order is safe for the claim too: nothing else can
+        // take this destination while the claim is still held.
         std::fs::remove_file(&session.part_path).ok();
+        self.release(&session.dest_rel);
         Some((session.dest_rel, session.offset))
     }
 
@@ -595,17 +622,54 @@ impl UploadStore {
             // never held at once.
             drop(sessions);
             if let Ok(session) = cell.into_inner() {
-                self.release(&session.dest_rel);
+                // Staging file before claim, for the reason `cancel` states.
                 std::fs::remove_file(&session.part_path).ok();
+                self.release(&session.dest_rel);
                 expired.push((id, session.dest_rel, session.offset));
             }
         }
         expired
     }
 
+    /// Drop a destination's claim, and reclaim its staging directory if that
+    /// was the last claim staging through it.
+    ///
+    /// The directory is this API's own artifact, and until now nothing removed
+    /// it: `.part` files were swept but the `.shell-tunnel-uploads` directory
+    /// holding them stayed forever, invisible to `list` and refused by `stat`
+    /// and `delete` alike — an artifact the file API created and the file API
+    /// could not remove. Machine-wide that is one per directory anyone has
+    /// ever uploaded to. Whoever made it cleans it up, which is also why this
+    /// does not instead relax the reservation guard on the delete route.
+    ///
+    /// **The `remove_dir` runs while the lock is held, deliberately.** Deciding
+    /// "no other claim stages here" and then releasing the lock before the
+    /// syscall reopens exactly the window this ordering closes: a `create` can
+    /// insert its claim and run `create_dir_all` in that gap, and the removal
+    /// would then delete the directory that create is about to place a `.part`
+    /// into. The cost is that `create`'s admission check can wait on one
+    /// `remove_dir`; shortening this critical section is not the optimisation
+    /// it looks like.
+    ///
+    /// `remove_dir`, never `remove_dir_all`: a directory holding another
+    /// session's staging file, or anything else, fails the call and is left
+    /// alone. The error is discarded because every reason it can fail — not
+    /// empty, already gone, no permission — is a reason to do nothing.
+    ///
+    /// Not extended to the orphan sweeps. `sweep_orphan_parts_in` is called
+    /// *from* `create`, one line before the directory is needed, and
+    /// `sweep_orphan_parts` runs on an interval without holding this lock;
+    /// removing a directory from either would race the very creation this
+    /// method's ordering protects. A directory left empty by a previous run's
+    /// crash is instead reclaimed the next time an upload through it finishes.
     fn release(&self, dest_rel: &str) {
         if let Ok(mut claimed) = self.claimed.lock() {
-            claimed.remove(dest_rel);
+            let Some(staging) = claimed.remove(dest_rel) else {
+                return;
+            };
+            if !claimed.values().any(|other| *other == staging) {
+                std::fs::remove_dir(&staging).ok();
+            }
         }
     }
 }
@@ -868,8 +932,13 @@ mod tests {
             "살아있는 세션이 있으므로 true를 반환한다"
         );
 
-        // 세션을 취소하고, 고아 `.part` 파일을 그 자리에 남김
+        // 세션을 취소하고, 고아 `.part` 파일을 그 자리에 남김.
+        // Cancelling now reclaims the staging directory as well, so it has to
+        // be recreated before an orphan can be planted in it — which is also
+        // the shape of the real case: a previous run's directory, remade by
+        // whichever upload comes next.
         store.cancel(&live_id);
+        std::fs::create_dir_all(&staging).expect("remake staging");
         let orphan_path = staging.join("up-0000000000000000.part");
         std::fs::write(&orphan_path, b"orphan content").expect("write orphan");
         assert!(
@@ -1052,12 +1121,23 @@ mod tests {
     #[test]
     fn sweeping_drops_sessions_past_their_ttl() {
         let (_dir, root, store) = store();
+        let staging = root.jail_path().expect("jailed").join(UPLOAD_DIR);
         let id = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
+        assert!(staging.is_dir(), "staging exists while the session is live");
 
         assert_eq!(store.sweep(Duration::ZERO).len(), 1);
         assert_eq!(store.offset(&id), None);
+        // The sweep path reclaims the directory too, and it only can because
+        // it removes the staging file *before* releasing the claim: `release`
+        // reclaims under the claim lock, and `remove_dir` refuses a directory
+        // that still holds a `.part`. This asserts that ordering from the
+        // outside, where reversing it leaves an empty directory behind.
+        assert!(
+            !staging.exists(),
+            "a swept session must not leave its staging directory behind"
+        );
     }
 
     /// `create` used to sweep opportunistically (with the real, fixed

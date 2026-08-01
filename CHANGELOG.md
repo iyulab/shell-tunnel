@@ -27,6 +27,30 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   of these carries counts, so `reason` distinguishes them and the grep surface
   stays where it is.
 
+### Fixed
+
+- **An upload no longer leaves its staging directory behind.**
+  `.shell-tunnel-uploads` was created for a transfer and never removed: `.part`
+  files were swept but the directory holding them stayed, and since `list`
+  hides it and `stat` and `delete` refuse it by name, the file API could not
+  clear an artifact the file API had made. Reaching the whole machine that was
+  one per directory anyone had ever uploaded to, and a token holding
+  `fs.read`/`fs.write` without `exec` — the case `--fs-root` exists for — had
+  no way to remove it at all.
+
+  It is now reclaimed when the last transfer staging through it ends, whether
+  that transfer completed, was abandoned, or was swept as idle. A directory
+  another session is still staging through is left alone, and the reservation
+  guard on `stat` and `delete` is unchanged: whoever made the directory clears
+  it, rather than the guard being relaxed to let callers do it.
+
+- **`--audit-log` no longer claims to record every refusal.** It records
+  executions, requests the authentication layer denies, and the file operations
+  the event-kind table lists. The promise was wider than the trail — the two
+  delete refusals it missed are recorded as of the `Added` section above, but a
+  request whose *path* does not resolve still writes nothing on any file route,
+  and the documentation now says so instead of implying otherwise.
+
 ### Changed
 
 - **The defaults now follow reachability.** A tunnel, a relay, or a non-loopback
@@ -72,15 +96,6 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   directory unless `--audit-log` names another path. This is the second
   exception to "no file is created that nobody asked for" — the first is the
   self-signed certificate, and the shape is the same.
-
-### Fixed
-
-- **`--audit-log` no longer claims to record every refusal.** It records
-  executions, requests the authentication layer denies, and the file operations
-  the event-kind table lists. The promise was wider than the trail — the two
-  delete refusals it missed are recorded as of the `Added` entry above, but a
-  request whose *path* does not resolve still writes nothing on any file route,
-  and the documentation now says so instead of implying otherwise.
 
 ## 0.13.0 — 2026-07-31
 

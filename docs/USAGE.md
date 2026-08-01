@@ -333,6 +333,14 @@ one to open. `DELETE .../uploads/{id}` abandons a session early, freeing its sta
 bytes; an idle session is swept automatically after an hour either way, so an abandoned
 transfer never accumulates forever.
 
+**While a transfer is in flight the bytes live in a `.shell-tunnel-uploads`
+directory**, beside the destination when the file API reaches the whole machine and at
+the root of `--fs-root` when one is given. It is removed once the last transfer staging
+through it ends — completed, abandoned, or swept — so a directory that receives an
+upload does not keep a marker afterwards. `list` never shows it and `stat` and `delete`
+refuse it by name while it exists, since a predictable session id would otherwise let
+one caller reach into another's transfer.
+
 ---
 
 ## 4. Authentication and capabilities

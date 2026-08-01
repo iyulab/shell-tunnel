@@ -4411,3 +4411,165 @@ async fn audited_state_with_a_staged_upload(
     let staging_path = format!(".shell-tunnel-uploads/{upload_id}.part");
     (dir, state, staging_path, log)
 }
+
+/// The staging directory is this API's own artifact, and nothing removed it:
+/// `list` hides it, `stat` and `delete` refuse it, so an upload left a
+/// directory behind that the file API itself could not clear. Machine-wide
+/// that is one per directory anyone has ever uploaded to.
+///
+/// Both scopes are asserted, and not because the behaviour differs: staging
+/// location is one of the two seams where scope actually changes what happens
+/// (`FsRoot::machine_wide` stages beside each destination, a jail stages once
+/// at the root), and `release` is a new consumer of it.
+#[tokio::test]
+async fn completing_an_upload_reclaims_its_staging_directory_in_a_jail() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, _log) = audited_state(&dir);
+    let staging = dir.path().join(".shell-tunnel-uploads");
+
+    let id = create_test_upload(state.clone(), "app/payload.bin", b"hello world").await;
+    assert!(
+        staging.is_dir(),
+        "the staging directory must exist while a session is live"
+    );
+
+    push_and_complete(state.clone(), &id, b"hello world").await;
+
+    assert!(
+        dir.path().join("app/payload.bin").is_file(),
+        "the upload must still land"
+    );
+    assert!(
+        !staging.exists(),
+        "an empty staging directory must not outlive the upload that made it"
+    );
+}
+
+#[tokio::test]
+async fn completing_an_upload_reclaims_its_staging_directory_machine_wide() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    // Machine-wide staging follows the destination rather than sitting at a
+    // root, so the directory to watch is the one beside the file.
+    let staging = dir.path().join("sub/.shell-tunnel-uploads");
+
+    let id = create_test_upload(
+        state.clone(),
+        &format!("{base}/sub/payload.bin"),
+        b"hello world",
+    )
+    .await;
+    assert!(
+        staging.is_dir(),
+        "staging must exist while a session is live"
+    );
+
+    push_and_complete(state.clone(), &id, b"hello world").await;
+
+    assert!(
+        dir.path().join("sub/payload.bin").is_file(),
+        "the upload must still land"
+    );
+    assert!(
+        !staging.exists(),
+        "an empty staging directory must not outlive the upload that made it"
+    );
+}
+
+/// A session that ends without publishing anything is the other half: the
+/// issue that prompted this saw directories left behind by abandoned uploads
+/// in two subdirectories at once.
+#[tokio::test]
+async fn cancelling_an_upload_reclaims_its_staging_directory() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, _log) = audited_state(&dir);
+    let staging = dir.path().join(".shell-tunnel-uploads");
+
+    let id = create_test_upload(state.clone(), "app/payload.bin", b"hello world").await;
+    assert!(
+        staging.is_dir(),
+        "staging must exist while a session is live"
+    );
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    assert!(
+        !staging.exists(),
+        "an abandoned session must not leave its directory behind"
+    );
+}
+
+/// The guard that makes the reclamation safe rather than merely tidy. Two
+/// sessions heading for the same directory share one staging directory
+/// machine-wide, and the first to finish must not remove it out from under
+/// the second — whose `.part` is still open in it.
+#[tokio::test]
+async fn a_sibling_session_keeps_the_staging_directory_alive() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    let staging = dir.path().join("sub/.shell-tunnel-uploads");
+
+    let first = create_test_upload(
+        state.clone(),
+        &format!("{base}/sub/one.bin"),
+        b"hello world",
+    )
+    .await;
+    let second = create_test_upload(
+        state.clone(),
+        &format!("{base}/sub/two.bin"),
+        b"hello world",
+    )
+    .await;
+
+    push_and_complete(state.clone(), &first, b"hello world").await;
+    assert!(
+        staging.is_dir(),
+        "a directory another session is still staging through must survive"
+    );
+
+    push_and_complete(state.clone(), &second, b"hello world").await;
+    assert!(!staging.exists(), "the last session out must reclaim it");
+    assert!(dir.path().join("sub/one.bin").is_file());
+    assert!(dir.path().join("sub/two.bin").is_file());
+}
+
+/// Send a whole payload as one chunk and complete the session.
+async fn push_and_complete(state: AppState, id: &str, payload: &[u8]) {
+    let last = payload.len() - 1;
+    let total = payload.len();
+    let patch = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header("content-range", format!("bytes 0-{last}/{total}"))
+                .body(Body::from(payload.to_vec()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(patch.status(), StatusCode::OK, "chunk must be accepted");
+
+    let complete = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/fs/uploads/{id}/complete"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(complete.status(), StatusCode::OK, "complete must succeed");
+}
