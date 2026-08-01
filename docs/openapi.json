@@ -758,7 +758,7 @@
             }
           },
           "409": {
-            "description": "`staging-in-tree` — an upload is in flight somewhere under this directory. Refused whole rather than removed around it; cancel the upload or wait for it to finish, then retry.",
+            "description": "`staging-in-tree` — an upload is in flight somewhere under this directory. Refused whole rather than removed around it; cancel the upload or wait for it to finish, then retry. A preview (`dry_run=true`) is not refused here — it touches nothing, and reports `staging_in_tree: true` instead so the caller can see both the size of the tree and what is holding it.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1511,7 +1511,8 @@
           "bytes",
           "entries",
           "truncated",
-          "dry_run"
+          "dry_run",
+          "staging_in_tree"
         ],
         "properties": {
           "removed": {
@@ -1538,6 +1539,10 @@
           "dry_run": {
             "type": "boolean",
             "description": "Echoes the request: `true` means nothing on disk was touched."
+          },
+          "staging_in_tree": {
+            "type": "boolean",
+            "description": "An upload is in flight somewhere under this directory. Only ever `true` on a preview: a real removal with an upload under it is refused with `409 staging-in-tree` instead, so this field is what keeps a successful preview from reading as permission to proceed. Always present, including when `false`."
           }
         }
       },

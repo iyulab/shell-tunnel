@@ -336,17 +336,31 @@ same walk the removal itself uses, without touching anything:
 ```bash
 curl -X DELETE "$BASE/api/v1/fs/file?path=app/build&recursive=true&dry_run=true"
 # {"removed":3,"bytes":142311,"entries":["app/build/index.html","app/build/app.js","app/build"],
-#  "truncated":false,"dry_run":true}
+#  "truncated":false,"dry_run":true,"staging_in_tree":false}
 ```
 
 Children are counted before their parent, so a directory follows its own contents in
 `entries` rather than leading them — and falls off the list entirely once `limit` cuts it
 short. `removed`/`bytes` still cover the whole tree regardless of where the list stops.
 
+**A preview reports everything the removal would take, which can include the
+`.shell-tunnel-uploads` directory that `list` hides.** The two disagree only while a
+transfer is in flight — the directory is removed once the last transfer through it ends —
+and `staging_in_tree: true` in the same response is what says so. The preview is not
+filtering the trees it reports to match `list`: a preview that hid part of what the
+removal would take would be the one lying, and this feature exists on the premise that
+it does not.
+
 Drop `dry_run` (or set it to `false`, the default) and the same request performs the
 removal, answering the same body shape. `removed`/`bytes` are exact there — but only when
 nothing failed. A tree holding an upload in flight is refused whole, `409
-staging-in-tree`, rather than partly removed. A removal where some entries survived
+staging-in-tree`, rather than partly removed. **A preview is not refused there** — it
+touches nothing, so there is no upload to protect it from, and "why can this tree not be
+removed" is the question a preview exists to answer. It answers `200` with
+`staging_in_tree: true`, which is what keeps a successful preview from reading as
+permission to proceed; the removal itself is still refused while that is true. The field
+is present on every preview, `false` included, so its absence never has to be
+interpreted. A removal where some entries survived
 answers `500 partial-delete` with those same fields plus `failures`, the paths that did
 not go; a `dry_run` that could not enumerate everything answers `500 preview-incomplete`
 instead — nothing was removed there, so its counts are a lower bound rather than exact.
@@ -909,7 +923,7 @@ startup rather than serving local-only.
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
-| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry |
+| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |
 | **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |
 
 A relay connection that drops is retried with exponential backoff (1s→60s); the

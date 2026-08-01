@@ -4658,3 +4658,100 @@ async fn push_and_complete(state: AppState, id: &str, payload: &[u8]) {
         .expect("response");
     assert_eq!(complete.status(), StatusCode::OK, "complete must succeed");
 }
+
+/// A preview touches nothing, so an upload in flight has nothing to be
+/// protected from — and "why can this tree not be removed" is exactly the
+/// question a preview exists to answer. It used to be refused with the same
+/// `409` as the removal, leaving the caller with no way to learn how large the
+/// tree was or that an upload was what held it.
+#[tokio::test]
+async fn a_preview_is_not_refused_by_an_upload_in_flight() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
+    let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
+
+    let response = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/api/v1/fs/file?path={base}/sub&recursive=true&dry_run=true"
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["dry_run"], true);
+    // The signal that keeps a preview from reading as permission to proceed:
+    // the removal itself is still refused while this is true.
+    assert_eq!(
+        body["staging_in_tree"], true,
+        "a preview must say what is holding the tree: {body}"
+    );
+    assert!(
+        body["removed"].as_u64().expect("removed") >= 2,
+        "and it must actually count the tree: {body}"
+    );
+    assert!(
+        dir.path().join("sub/keep.txt").exists(),
+        "a preview removes nothing"
+    );
+}
+
+/// The other half. Exempting the preview must not exempt the removal.
+#[tokio::test]
+async fn the_removal_is_still_refused_by_an_upload_in_flight() {
+    let (dir, state, base) = machine_wide_state();
+    std::fs::create_dir_all(dir.path().join("sub")).expect("mkdir");
+    std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
+    let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={base}/sub&recursive=true"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["error"], "staging-in-tree");
+    assert!(dir.path().join("sub/keep.txt").exists());
+}
+
+/// `staging_in_tree` is present on every tree answer, not only where it is
+/// `true`. A field that appears just when it matters is one a client learns to
+/// ignore, and its absence then reads the same as `false`.
+#[tokio::test]
+async fn a_clean_preview_reports_staging_in_tree_as_false() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("app/deep")).expect("mkdir");
+    std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
+    let (state, _log) = audited_state(&dir);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=app&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["staging_in_tree"], false,
+        "the field must be there and false, not absent: {body}"
+    );
+}

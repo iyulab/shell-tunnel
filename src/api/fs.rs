@@ -1101,7 +1101,16 @@ fn delete_file_blocking(
         // along with everything else destroys the upload — the same shape as
         // 0.12.0's data loss, an invariant that depended on the staging
         // location living somewhere else.
-        if uploads.has_live_part_under(&named) {
+        //
+        // A preview is exempt, and that is the point of the flag rather than
+        // an oversight: `dry_run` touches nothing, so there is no upload to
+        // protect from it, and "why can this tree not be removed" is exactly
+        // the question a preview exists to answer. Refusing it left the
+        // caller with a `409` and no way to find out how large the tree was
+        // or which upload was holding it. The answer carries `staging_in_tree`
+        // so a preview cannot be mistaken for permission to proceed.
+        let staging_in_tree = uploads.has_live_part_under(&named);
+        if staging_in_tree && !query.dry_run {
             // The refusal most worth having in the trail: "why did that
             // cleanup not happen" is exactly the question a trail answers
             // after the fact, and without this the only evidence a tree was
@@ -1156,6 +1165,11 @@ fn delete_file_blocking(
             "entries": outcome.entries,
             "truncated": outcome.truncated,
             "dry_run": query.dry_run,
+            // Always present rather than only on a preview: a field that
+            // appears just when it is `true` is one a client learns to ignore.
+            // On a real removal it is always `false` — the guard above
+            // returned otherwise.
+            "staging_in_tree": staging_in_tree,
         });
 
         if outcome.failures.is_empty() {
