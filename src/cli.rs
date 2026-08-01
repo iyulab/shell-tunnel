@@ -344,7 +344,7 @@ OPTIONS:
     -c, --config <FILE>     Path to configuration file (JSON)
     -k, --api-key <KEY>     API key callers present to run commands here
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
-        --no-auth           Disable authentication
+        --no-auth           Disable authentication (refused when reachable)
         --require-auth      Require auth, auto-generating an API key if none given
         --capabilities <C>  Scope issued token(s): comma-separated capabilities
                             (e.g. exec,session.read). Default: full-control, or
@@ -369,6 +369,7 @@ OPTIONS:
                             what stops DNS rebinding. Repeatable
         --audit-log <FILE>  Append every execution and refusal to this file
                             (JSON per line; the token itself is never written)
+                            [default: off; shell-tunnel-audit.jsonl when reachable]
         --audit-max-bytes <N>
                             Rotate the audit trail to <FILE>.1 past this size
                             [default: unbounded]
