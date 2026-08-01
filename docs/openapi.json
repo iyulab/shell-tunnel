@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.14.0",
+    "version": "0.14.1",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -157,6 +157,17 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "413": {
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
           }
         }
       }
@@ -283,6 +294,12 @@
               }
             }
           },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
           "404": {
             "description": "Session not found",
             "content": {
@@ -293,11 +310,16 @@
               }
             }
           },
-          "401": {
-            "$ref": "#/components/responses/UnauthorizedError"
-          },
-          "403": {
-            "$ref": "#/components/responses/ForbiddenError"
+          "413": {
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
           }
         }
       }
@@ -347,6 +369,17 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "413": {
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
           }
         }
       }
@@ -829,6 +862,9 @@
               }
             }
           },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
           "403": {
             "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (destination resolves into the upload staging directory) — a JSON body in every case. Also reached, with an empty body, when the token lacks `fs.write`.",
             "content": {
@@ -849,6 +885,17 @@
               }
             }
           },
+          "413": {
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Failed to buffer the request body: length limit exceeded"
+              }
+            }
+          },
           "429": {
             "description": "`too-many-uploads` — too many sessions are open; finish or cancel one and retry.",
             "content": {
@@ -858,9 +905,6 @@
                 }
               }
             }
-          },
-          "401": {
-            "$ref": "#/components/responses/UnauthorizedError"
           },
           "500": {
             "description": "`io-error` (destination directory could not be created, or another OS failure), `path-resolution-failed` (defensive: the destination's canonical path could not be recomputed after `resolve_for_create` already accepted it), or `create-upload-failed` (unexpected failure). See 507 for the out-of-space case."
@@ -1175,7 +1219,7 @@
           },
           "version": {
             "type": "string",
-            "example": "0.14.0"
+            "example": "0.14.1"
           },
           "status": {
             "type": "string",
