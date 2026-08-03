@@ -608,6 +608,8 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     #[cfg(feature = "tls")]
     let mut cert_names: Vec<String> = Vec::new();
     #[cfg(feature = "tls")]
+    let mut cert_missing: Vec<String> = Vec::new();
+    #[cfg(feature = "tls")]
     let mut cert_fingerprint: Option<String> = None;
     #[cfg(feature = "tls")]
     if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
@@ -618,9 +620,22 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
             match files.ensure_self_signed(&names) {
                 Ok(created) => {
                     generated_cert = created;
-                    cert_names = names;
                     // Read back rather than remembering what was written: on a
                     // reused certificate there is nothing in memory to remember.
+                    // That applies to the names as much as to the fingerprint —
+                    // remembering the requested ones is what let a reused
+                    // certificate be announced under a name it does not carry.
+                    // A certificate that cannot be read leaves both lists
+                    // empty, and the banner then says nothing about coverage
+                    // rather than guessing at it.
+                    if let Ok(covered) = files.covered_names(&names) {
+                        cert_missing = names
+                            .iter()
+                            .filter(|name| !covered.contains(name))
+                            .cloned()
+                            .collect();
+                        cert_names = covered;
+                    }
                     cert_fingerprint = files.fingerprint().ok();
                 }
                 Err(e) => {
@@ -749,33 +764,23 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         eprintln!();
     }
 
+    // Which names the certificate covers, because a certificate that does not
+    // name the address devices dial is the failure that shows up last.
     #[cfg(feature = "tls")]
     if args.tls_self_signed {
-        if generated_cert {
-            println!("Generated a self-signed certificate; restarts reuse it.");
-        }
-        // Which names it covers, because a certificate that does not name the
-        // address devices dial is the failure that shows up last.
-        if !cert_names.is_empty() {
-            println!("Certificate covers: {}", cert_names.join(", "));
-        }
-        // The join line already carries the trust anchor when the fingerprint
-        // is known; telling the operator to copy the certificate as well
-        // contradicts it, and that contradiction is exactly what a first-time
-        // operator trips over. The copy instruction survives only as the
-        // fallback for a certificate whose fingerprint could not be read.
-        if let Some(cert) = &args.tls_cert {
-            if cert_fingerprint.is_some() {
-                println!(
-                    "Nothing needs copying: the fingerprint in the join line is the trust anchor."
-                );
-                println!(
-                    "(Alternative: copy {} to devices and join with --relay-ca.)\n",
-                    cert.display()
-                );
-            } else {
-                println!("Copy {} to each device for --relay-ca.\n", cert.display());
+        let lines = certificate_banner(
+            generated_cert,
+            &cert_names,
+            &cert_missing,
+            args.tls_cert.as_deref(),
+            args.tls_key.as_deref(),
+            cert_fingerprint.is_some(),
+        );
+        if !lines.is_empty() {
+            for line in lines {
+                println!("{line}");
             }
+            println!();
         }
     }
 
@@ -1127,6 +1132,85 @@ fn posture_banner(
     }
     if let Some(path) = audit_log {
         lines.push(format!("Audit trail: {}", path.display()));
+    }
+    lines
+}
+
+/// The certificate lines of the relay banner.
+///
+/// `covered` are the names the certificate on disk is genuinely valid for;
+/// `missing` are the names this run asked for and did not get. That split only
+/// exists because a certificate is reused across restarts: this used to print
+/// the names it had *requested*, so a relay started with a `--public-base` its
+/// certificate predates announced coverage it did not have — and then offered
+/// `--relay-ca` as an alternative that could not verify the very name it had
+/// just failed to cover.
+///
+/// The strings come out of a function so that tests can hold them in place.
+/// User-facing text in this repository has broken five times, every one of them
+/// somewhere no test was looking.
+#[cfg(feature = "tls")]
+fn certificate_banner(
+    generated: bool,
+    covered: &[String],
+    missing: &[String],
+    cert: Option<&Path>,
+    key: Option<&Path>,
+    fingerprint_known: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if generated {
+        lines.push("Generated a self-signed certificate; restarts reuse it.".to_string());
+    }
+    if !covered.is_empty() {
+        lines.push(format!("Certificate covers: {}", covered.join(", ")));
+    }
+    if missing.is_empty() {
+        // The join line already carries the trust anchor when the fingerprint
+        // is known; telling the operator to copy the certificate as well
+        // contradicts it, and that contradiction is exactly what a first-time
+        // operator trips over. The copy instruction survives only as the
+        // fallback for a certificate whose fingerprint could not be read.
+        if let Some(cert) = cert {
+            if fingerprint_known {
+                lines.push(
+                    "Nothing needs copying: the fingerprint in the join line is the trust anchor."
+                        .to_string(),
+                );
+                lines.push(format!(
+                    "(Alternative: copy {} to devices and join with --relay-ca.)",
+                    cert.display()
+                ));
+            } else {
+                lines.push(format!(
+                    "Copy {} to each device for --relay-ca.",
+                    cert.display()
+                ));
+            }
+        }
+        return lines;
+    }
+
+    let absent = missing.join(", ");
+    // Why a name is absent has two answers and only one of them is ever true of
+    // a given run. Saying "it was reused" of a certificate this run generated
+    // would put a new false sentence where the old one stood.
+    if generated {
+        lines.push(format!("             but not {absent} — a name has to be a DNS name or an IP address to go into a certificate, and that one is neither."));
+    } else {
+        lines.push(format!("             but not {absent} — an existing certificate is reused rather than reissued, so a name added to --public-base afterwards is not in it."));
+    }
+    if fingerprint_known {
+        lines.push("             Devices joining with --relay-fingerprint are unaffected: it pins this certificate and never checks the name.".to_string());
+    }
+    lines.push(format!("             --relay-ca cannot be used for {absent} — a device dialling that name refuses this certificate."));
+    if let (Some(cert), Some(key)) = (cert, key) {
+        lines.push(format!(
+            "             To reissue: stop the relay, delete {} and {}, and start it again.",
+            cert.display(),
+            key.display()
+        ));
+        lines.push("             Every device pinning the old fingerprint then has to be given the new one.".to_string());
     }
     lines
 }
@@ -1516,5 +1600,170 @@ mod tests {
             audit_log_is_inside_fs_root(&never_created, &canonical_root).is_err(),
             "a path whose parent cannot be canonicalised must surface as Err, not Ok(false)"
         );
+    }
+
+    /// The certificate banner exists only where TLS is served, so its tests
+    /// live behind the same feature — otherwise the default build carries a
+    /// function nothing calls.
+    #[cfg(feature = "tls")]
+    mod certificate {
+        use super::super::*;
+
+        fn names(listed: &[&str]) -> Vec<String> {
+            listed.iter().map(|n| n.to_string()).collect()
+        }
+
+        fn cert_pair() -> (PathBuf, PathBuf) {
+            (
+                PathBuf::from("shell-tunnel-cert.pem"),
+                PathBuf::from("shell-tunnel-key.pem"),
+            )
+        }
+
+        /// The defect this signature exists to fix: a relay reusing a certificate
+        /// that predates its `--public-base` announced `Certificate covers:` with
+        /// that name on it. The certificate did not carry the name, so the one
+        /// surface an operator checks said the opposite of the truth.
+        #[test]
+        fn a_name_the_certificate_lacks_is_never_reported_as_covered() {
+            let (cert, key) = cert_pair();
+            let lines = certificate_banner(
+                false,
+                &names(&["relay-host", "localhost"]),
+                &names(&["relay.example.com"]),
+                Some(&cert),
+                Some(&key),
+                true,
+            );
+            let covers = lines
+                .iter()
+                .find(|line| line.starts_with("Certificate covers:"))
+                .expect("the covered names are still announced");
+
+            assert!(
+                !covers.contains("relay.example.com"),
+                "an absent name must not appear on the coverage line: {covers}"
+            );
+            assert!(
+                lines.iter().any(|line| line.contains("relay.example.com")),
+                "and its absence has to be stated rather than left silent: {lines:?}"
+            );
+        }
+
+        /// The second half of the same defect. Suppressing the false coverage line
+        /// alone would leave the banner recommending, two lines further down, a
+        /// join path that cannot verify the name it just failed to cover.
+        #[test]
+        fn a_certificate_missing_a_name_does_not_offer_the_ca_alternative() {
+            let (cert, key) = cert_pair();
+            let text = certificate_banner(
+                false,
+                &names(&["relay-host"]),
+                &names(&["relay.example.com"]),
+                Some(&cert),
+                Some(&key),
+                true,
+            )
+            .join("\n");
+
+            assert!(
+            !text.contains("Alternative: copy"),
+            "the --relay-ca alternative cannot be offered for a name the certificate lacks: {text}"
+        );
+            assert!(
+                text.contains("--relay-fingerprint"),
+                "the path that does still work has to be named: {text}"
+            );
+        }
+
+        /// An operator who cannot tell what to do next is only marginally better
+        /// off than one who was told something false.
+        #[test]
+        fn a_missing_name_comes_with_the_way_out() {
+            let (cert, key) = cert_pair();
+            let text = certificate_banner(
+                false,
+                &names(&["relay-host"]),
+                &names(&["relay.example.com"]),
+                Some(&cert),
+                Some(&key),
+                true,
+            )
+            .join("\n");
+
+            assert!(text.contains("shell-tunnel-cert.pem"), "{text}");
+            assert!(text.contains("shell-tunnel-key.pem"), "{text}");
+            assert!(
+            text.contains("fingerprint"),
+            "reissuing invalidates every pinned device, which is why it is not the default: {text}"
+        );
+        }
+
+        /// Reuse is why the name is absent — but only on a run that reused. Saying
+        /// it of a certificate this run generated would replace one false sentence
+        /// with another.
+        #[test]
+        fn a_freshly_generated_certificate_is_not_blamed_on_reuse() {
+            let (cert, key) = cert_pair();
+            let text = certificate_banner(
+                true,
+                &names(&["relay-host"]),
+                &names(&["under_score"]),
+                Some(&cert),
+                Some(&key),
+                true,
+            )
+            .join("\n");
+
+            assert!(
+                !text.contains("reused rather than reissued"),
+                "nothing was reused on this run: {text}"
+            );
+        }
+
+        /// The unchanged path. Every name asked for is in the certificate, so the
+        /// banner says what it always said.
+        #[test]
+        fn a_certificate_covering_everything_still_offers_the_ca_alternative() {
+            let (cert, key) = cert_pair();
+            let text = certificate_banner(
+                false,
+                &names(&["relay.example.com", "localhost"]),
+                &[],
+                Some(&cert),
+                Some(&key),
+                true,
+            )
+            .join("\n");
+
+            assert!(text.contains("Certificate covers: relay.example.com, localhost"));
+            assert!(text.contains("Nothing needs copying"), "{text}");
+            assert!(text.contains("Alternative: copy"), "{text}");
+            assert!(
+                !text.contains("but not"),
+                "nothing is missing, so nothing is withheld: {text}"
+            );
+        }
+
+        /// Without a readable fingerprint the join line carries no anchor, so the
+        /// sentence that calls fingerprint pinning unaffected would be false.
+        #[test]
+        fn an_unreadable_fingerprint_is_not_described_as_a_working_path() {
+            let (cert, key) = cert_pair();
+            let text = certificate_banner(
+                false,
+                &names(&["relay-host"]),
+                &names(&["relay.example.com"]),
+                Some(&cert),
+                Some(&key),
+                false,
+            )
+            .join("\n");
+
+            assert!(
+                !text.contains("are unaffected"),
+                "there is no fingerprint in the join line to be unaffected: {text}"
+            );
+        }
     }
 }

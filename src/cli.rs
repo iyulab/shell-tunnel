@@ -406,7 +406,11 @@ OPTIONS:
 TLS OPTIONS (with `relay`):
         --tls-self-signed   Serve HTTPS with a self-signed certificate,
                             generating one on first run and reusing it after.
-                            Needs no paths; devices trust it with --relay-ca
+                            Needs no paths; devices trust it with the
+                            --relay-fingerprint the banner prints. Its names are
+                            fixed when it is generated, so adding --public-base
+                            later does not add that name — the banner says which
+                            names it actually covers
         --tls-cert <FILE>   PEM certificate chain [default with --tls-self-signed:
                             shell-tunnel-cert.pem]
         --tls-key <FILE>    PEM private key matching the certificate
