@@ -69,7 +69,7 @@ Tunnel and relay are mutually exclusive; asking for both is refused at startup.
 
 ```bash
 shell-tunnel                      # 127.0.0.1:3000, no authentication
-shell-tunnel --require-auth       # generates and logs an API key
+shell-tunnel --require-auth       # generates a key and prints it on stdout
 shell-tunnel -k my-key --preset operator
 ```
 
@@ -892,7 +892,7 @@ still sees the real address.
 | `-k, --api-key <KEY>` | Key callers present to run commands here. **Adds to** a config file's keys rather than replacing them (§7) — unlike `--capabilities`/`--preset`, which replace | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
-| `--require-auth` | Enable auth, generating a key if none given | `false` |
+| `--require-auth` | Enable auth, generating a key if none given and printing it on stdout | `false` |
 | `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
 | `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
 | `--no-rate-limit` | Disable rate limiting | `false` |

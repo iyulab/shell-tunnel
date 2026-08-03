@@ -360,6 +360,8 @@ OPTIONS:
     -l, --log-level <LVL>   Log level (error, warn, info, debug, trace)
         --no-auth           Disable authentication (refused when reachable)
         --require-auth      Require auth, auto-generating an API key if none given
+                            and printing it on stdout (never in the log, which a
+                            log level can silence)
         --capabilities <C>  Scope issued token(s): comma-separated capabilities
                             (e.g. exec,session.read). Default: full-control, or
                             operator when the server is reachable

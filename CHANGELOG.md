@@ -3,6 +3,28 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.15.1 — 2026-08-03
+
+### Fixed
+
+- **A server that generates its own API key now prints it on stdout, at every
+  log level.** `--require-auth` (and `--preset`/`--capabilities`, which also
+  switch authentication on) generate a key when none was supplied. On a
+  loopback bind that key was created inside the server and reported only as an
+  `INFO` log line, so `-l warn` or quieter started a server that enforced
+  authentication and told nobody the key — no copy of it existed anywhere, and
+  the only symptom was every request answering `401`. The key is now issued
+  before the banner and printed there, which is not something a log level can
+  silence.
+
+  A reachable server (tunnel, relay, or non-loopback bind) already printed its
+  key on the banner and is unchanged.
+
+  Because the key now exists before the server starts, it is no longer written
+  to the application log at all. That closes a smaller gap in the same place:
+  the audit trail deliberately records no tokens, while the log was carrying
+  one in plaintext.
+
 ## 0.15.0 — 2026-08-01
 
 ### Fixed

@@ -382,13 +382,7 @@ impl Config {
 
         self.security.auth.enabled = true;
 
-        let generated_key = if self.security.auth.api_keys.is_empty() {
-            let key = crate::security::generate_api_key();
-            self.security.auth.api_keys.push(key.clone());
-            Some(key)
-        } else {
-            None
-        };
+        let generated_key = self.ensure_api_key();
 
         // A default, not a warning. Warning about it is an admission that the
         // default is wrong for the situation, and here the default can follow
@@ -417,6 +411,28 @@ impl Config {
             generated_key,
             warnings,
         })
+    }
+
+    /// Issue the API key this server will serve with, when authentication is
+    /// on and nothing supplied one.
+    ///
+    /// Returns the key that was generated — the only copy anyone gets — so the
+    /// caller can put it in front of the operator. `None` means there was
+    /// nothing to issue: a key was already supplied, or authentication is off.
+    /// Calling it twice is safe for the same reason.
+    ///
+    /// Issuing it here rather than inside the server is what makes it
+    /// printable. `serve_on` has no banner to print on, so a key created there
+    /// can only reach the operator as a `tracing` line — and that line is gone
+    /// at `-l warn` while the server still starts and still refuses every
+    /// request that does not carry the key nobody was told.
+    pub fn ensure_api_key(&mut self) -> Option<String> {
+        if !self.security.auth.enabled || !self.security.auth.api_keys.is_empty() {
+            return None;
+        }
+        let key = crate::security::generate_api_key();
+        self.security.auth.api_keys.push(key.clone());
+        Some(key)
     }
 
     /// Convert to ServerConfig for the API server.

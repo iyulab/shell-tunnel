@@ -119,7 +119,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // LAN is other people's machines too, and host checking (the DNS rebinding
     // defence) is a different axis that does not fill this gap.
     let posture = config.posture(provider.is_some(), args.relay_url.is_some());
-    let exposure = if posture == Posture::Exposed {
+    let mut exposure = if posture == Posture::Exposed {
         match config.harden_for_public_exposure(&args) {
             Ok(exposure) => exposure,
             Err(e) => {
@@ -130,6 +130,19 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     } else {
         PublicExposure::default()
     };
+    // Authentication is not only switched on by exposure: `--require-auth`,
+    // `--api-key`, a preset and a capability list each turn it on, and a
+    // loopback bind never reaches the hardening above. Whichever way it was
+    // asked for, the key has to exist *here* — before `to_server_config`
+    // below, and while there is still a banner to print it on. Left to the
+    // server (`serve_on`) the key was created after the banner, reported only
+    // as an `INFO` line, and at `-l warn` a `--require-auth` server started,
+    // enforced authentication, and told nobody the key: confirmed by running
+    // it, not inferred. `ensure_api_key` returns `None` when the hardening
+    // already issued one, so the exposed path is untouched.
+    if exposure.generated_key.is_none() {
+        exposure.generated_key = config.ensure_api_key();
+    }
 
     if args.relay_url.is_some() && args.enroll_token.is_none() {
         eprintln!("Configuration error: --relay requires --enroll-token");
@@ -356,6 +369,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // its own banner once the URL exists (`print_banner`), and a relay prints
     // one beside its attach output (`run_with_relay`), so printing here too
     // would report the same key twice.
+    //
+    // A loopback bind reaches this line too, and now has something to print:
+    // the block above is empty for `Posture::Local` (nothing was narrowed, so
+    // there is nothing to report), but a key issued for `--require-auth` is
+    // not reachability information — it is the one value the operator cannot
+    // start without, whoever can reach the port. stdout, unconditionally, is
+    // the only place that survives `-l warn`.
     if provider.is_none() && args.relay_url.is_none() {
         if let Some(key) = &exposure.generated_key {
             println!("API key:     {key}   (generated)");

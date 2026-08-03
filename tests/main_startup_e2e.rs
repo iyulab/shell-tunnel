@@ -263,3 +263,115 @@ fn an_exposed_bind_deriving_an_audit_log_inside_the_fs_root_refuses_to_start() {
         "a refused startup must not have created the audit log it refused"
     );
 }
+
+/// `GET /api/v1` over a bare socket, with an optional bearer token, returning
+/// the status code.
+///
+/// Written out rather than pulled from an HTTP client crate for the reason
+/// `tests/fs_relay_e2e.rs` writes its own requests: a status code is all that
+/// is being asked for here, and this file is otherwise synchronous and
+/// dependency-free. The connect retries because the banner under test is
+/// printed *before* the listener binds — seeing the line is not evidence the
+/// port accepts yet.
+fn get_status(port: u16, token: Option<&str>) -> u16 {
+    use std::io::Write;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+        }
+    };
+
+    let auth = match token {
+        Some(token) => format!("Authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
+    let request =
+        format!("GET /api/v1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{auth}\r\n");
+    stream.write_all(request.as_bytes()).expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next().expect("a response status line");
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("status code in {status_line:?} is not a number: {e}"))
+}
+
+/// A server that generates its own API key must print it on stdout whatever
+/// the log level is — and the key it prints must be the one that authenticates.
+///
+/// Both halves are load-bearing, and each covers a way the fix could be undone
+/// without the other noticing:
+///
+/// * **`warn` as well as `info`.** The key used to be issued inside `serve_on`
+///   and reported only as a `tracing::info!` line. At `-l warn` that line
+///   disappears while the server starts anyway and refuses every request — an
+///   unusable server that looks healthy, with no copy of the key anywhere. A
+///   test at the default level alone cannot see a level-dependent bug.
+/// * **stdout, with stderr discarded.** The banner and the log go to different
+///   streams, so a fix that moved the key to a `warn!` line would satisfy "it
+///   is printed at both levels" and still be lost to anyone redirecting only
+///   stdout. Dropping stderr here is what pins the stream.
+/// * **The key is exercised, not just matched.** Asserting on the shape of a
+///   printed string would pass just as happily if the banner reported a key
+///   that was generated, discarded, and replaced by a different one at serve
+///   time — which is close to the shape of the defect being fixed.
+#[test]
+fn a_generated_key_reaches_stdout_at_every_log_level() {
+    for (level, port) in [("info", 39883u16), ("warn", 39884u16)] {
+        // Loopback derives no audit trail, but a tempdir costs nothing and
+        // keeps the crate root clean should that ever change.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let child = Command::new(BIN)
+            .current_dir(dir.path())
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--require-auth",
+                "-l",
+                level,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("binary should start");
+        let mut server = Killed(child);
+
+        let line = wait_for_line(&mut server, Duration::from_secs(30), |l| {
+            l.starts_with("API key:")
+        });
+        let key = line
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_else(|| panic!("no key in {line:?} at -l {level}"));
+        assert!(
+            key.starts_with("st_"),
+            "at -l {level} the banner must carry the issued key, got {line:?}"
+        );
+
+        assert_eq!(
+            get_status(port, None),
+            401,
+            "at -l {level} the server must be enforcing authentication, \
+             or the key above proves nothing"
+        );
+        assert_eq!(
+            get_status(port, Some(key)),
+            200,
+            "at -l {level} the printed key must be the one the server accepts"
+        );
+    }
+}
