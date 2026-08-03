@@ -83,6 +83,34 @@ impl RelayClientConfig {
         format!("{}/relay/v1/data", self.base())
     }
 
+    /// The host and port a dial actually goes to.
+    ///
+    /// The relay URL appears in the startup banner and nowhere else; the line
+    /// that repeats on every retry never said where it was going, which left an
+    /// operator with a failure and no target to check. Written out rather than
+    /// parsed with a URL crate because `base` has already normalised the scheme
+    /// and nothing beyond the authority is wanted here.
+    pub fn dial_target(&self) -> String {
+        let base = self.base();
+        let (scheme, rest) = match base.split_once("://") {
+            Some((scheme, rest)) => (scheme.to_string(), rest.to_string()),
+            None => ("wss".to_string(), base.clone()),
+        };
+        let authority = rest.split('/').next().unwrap_or(&rest).to_string();
+        // An IPv6 literal carries colons inside its brackets, so only a colon
+        // after the closing bracket is a port.
+        let has_port = match authority.rsplit_once(']') {
+            Some((_, tail)) => tail.starts_with(':'),
+            None => authority.contains(':'),
+        };
+        if has_port {
+            authority
+        } else {
+            let implied = if scheme == "wss" { 443 } else { 80 };
+            format!("{authority}:{implied}")
+        }
+    }
+
     /// Normalise the relay URL to a WebSocket scheme without a trailing slash.
     ///
     /// Operators paste whatever they have — the `https://` they browse to, or
@@ -324,17 +352,71 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Append one advice line, indented to sit under the failure text.
+///
+/// A helper rather than newlines inside each literal: `cargo fmt` folds a
+/// backslash continuation into a run of spaces, and user-facing text in this
+/// repository has shipped broken that way four times.
+fn advise(message: &mut String, line: &str) {
+    message.push_str("\n  ");
+    message.push_str(line);
+}
+
+/// Proxy environment variables that are set on this machine.
+///
+/// Read only to *report* them. This client dials the relay directly and honours
+/// none of these, which on a network that mandates a proxy is the whole reason
+/// nothing connects — and the screen said nothing about it.
+/// Both casings are checked because Unix tools disagree about which to use, and
+/// the result is de-duplicated case-insensitively because Windows does not
+/// distinguish them at all — without that, a single variable is reported as
+/// `HTTPS_PROXY, https_proxy`, which reads as two problems. Found by running it.
+fn proxy_env_set() -> Vec<&'static str> {
+    let mut found: Vec<&'static str> = Vec::new();
+    for name in [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        if !std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            continue;
+        }
+        if found.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
+            continue;
+        }
+        found.push(name);
+    }
+    found
+}
+
 /// Turn a dial failure into something an operator can act on.
 ///
 /// rustls reports certificate problems in its own vocabulary — `BadSignature`
 /// says nothing about the far more likely cause, which is that the file passed
 /// to `--relay-ca` is not the certificate this relay is currently serving.
+///
+/// Reaching the relay at all is the other half, and for a long time it was the
+/// missing half: a device on a network that blocks outbound TCP repeated one
+/// raw OS error forever, with no target, no classification, and no next step.
+/// Certificate confusion happens once, when the configuration is first wrong;
+/// failing to reach the relay happens every time a device is placed on a
+/// constrained network, which is what this product is for.
+///
+/// Reachability is classified from [`std::io::ErrorKind`], never from the
+/// message: an OS error string is translated into the machine's own language,
+/// so matching on its text works on the machine it was written on and nowhere
+/// else. (The certificate branches below do match on text, but rustls writes
+/// that text itself and does not localise it.)
 fn explain_dial_failure(
     error: &tokio_tungstenite::tungstenite::Error,
     config: &RelayClientConfig,
 ) -> String {
     let text = error.to_string();
     let mut message = format!("cannot reach relay: {text}");
+    let target = config.dial_target();
 
     if text.contains("BadSignature") || text.contains("UnknownIssuer") {
         let ca = config
@@ -342,34 +424,105 @@ fn explain_dial_failure(
             .as_ref()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|| "the system trust store".to_string());
-        message.push_str(&format!(
-            "
-  {ca} does not vouch for the certificate this relay is presenting."
-        ));
-        message.push_str(
-            "
-  A relay that regenerated its certificate, or a copy taken from a different",
+        advise(
+            &mut message,
+            &format!("{ca} does not vouch for the certificate this relay is presenting."),
         );
-        message.push_str(
-            "
-  relay directory, both look like this. Copy the relay's current",
+        advise(
+            &mut message,
+            "A relay that regenerated its certificate, or a copy taken from a different",
         );
-        message.push_str(
-            "
-  shell-tunnel-cert.pem and pass it as --relay-ca.",
+        advise(
+            &mut message,
+            "relay directory, both look like this. Copy the relay's current",
+        );
+        advise(
+            &mut message,
+            "shell-tunnel-cert.pem and pass it as --relay-ca.",
         );
     } else if text.contains("NotValidForName") {
-        message.push_str(
-            "
-  The certificate does not cover the name being dialled.",
+        advise(
+            &mut message,
+            "The certificate does not cover the name being dialled.",
         );
-        message.push_str(
-            "
-  Start the relay with --public-base for that name, after deleting",
+        advise(
+            &mut message,
+            "Start the relay with --public-base for that name, after deleting",
         );
-        message.push_str(
-            "
-  shell-tunnel-cert.pem and shell-tunnel-key.pem so it is regenerated.",
+        advise(
+            &mut message,
+            "shell-tunnel-cert.pem and shell-tunnel-key.pem so it is regenerated.",
+        );
+    } else if let tokio_tungstenite::tungstenite::Error::Io(io) = error {
+        match io.kind() {
+            std::io::ErrorKind::TimedOut => {
+                advise(&mut message, &format!("Nothing answered at {target}."));
+                advise(
+                    &mut message,
+                    "The connection was not refused, it was swallowed — something between",
+                );
+                advise(
+                    &mut message,
+                    "this machine and that address is dropping it: a firewall, a route, or",
+                );
+                advise(&mut message, "an outbound policy.");
+                advise(
+                    &mut message,
+                    "No shell-tunnel flag changes this. The next thing to check is whether",
+                );
+                advise(
+                    &mut message,
+                    "this machine can open *any* outbound connection to that port; if the",
+                );
+                advise(
+                    &mut message,
+                    "relay can be moved to a port the network already allows out, try that.",
+                );
+            }
+            std::io::ErrorKind::ConnectionRefused => {
+                advise(
+                    &mut message,
+                    &format!("{target} was reached, and nothing is listening on it."),
+                );
+                advise(
+                    &mut message,
+                    "The address and the route to it are fine, so this is the relay's end:",
+                );
+                advise(
+                    &mut message,
+                    "check that it is running, and that it bound the port being dialled.",
+                );
+            }
+            // Everything else — name resolution among them, which has no
+            // portable `ErrorKind` — still gets the target, which is the part
+            // no failure used to carry.
+            _ => advise(&mut message, &format!("Dialling {target}.")),
+        }
+    } else {
+        advise(&mut message, &format!("Dialling {target}."));
+    }
+
+    let proxies = proxy_env_set();
+    if !proxies.is_empty() {
+        let (verb, pronoun) = if proxies.len() == 1 {
+            ("is", "it")
+        } else {
+            ("are", "them")
+        };
+        advise(
+            &mut message,
+            &format!(
+                "{} {verb} set, and this client does not use {pronoun}:",
+                proxies.join(", ")
+            ),
+        );
+        advise(
+            &mut message,
+            &format!("the relay at {target} is dialled directly. On a network that requires"),
+        );
+        advise(
+            &mut message,
+            "a proxy for outbound connections, that alone explains this.",
         );
     }
 
@@ -860,6 +1013,95 @@ mod tests {
         let message = explain_dial_failure(&error, &config("wss://relay.example.com"));
 
         assert!(message.contains("--public-base"), "{message}");
+    }
+
+    /// A timeout must be classified from the error's *kind*, whatever language
+    /// the operating system wrote its message in.
+    ///
+    /// This is the assertion that dies if anyone reaches for `text.contains`
+    /// again. The message below is the one a Korean-locale Windows machine
+    /// produced in the incident that prompted this branch — matching on the
+    /// English words that are not in it would leave exactly the operators this
+    /// message exists for reading a raw OS error and nothing else.
+    #[test]
+    fn a_timeout_is_recognised_from_its_kind_not_its_language() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        // One line on purpose: a `\` continuation inside a string literal is
+        // what has broken user-facing text here four times, and a test fixture
+        // that silently loses a space is no better.
+        let localised = "연결된 구성원으로부터 응답이 없어 연결하지 못했거나, 호스트로부터 응답이 없어 연결이 끊어 졌습니다. (os error 10060)";
+        let error = Error::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            localised.to_string(),
+        ));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"));
+
+        // Where it was going. The URL was only ever in the startup banner.
+        assert!(message.contains("relay.example.com:8443"), "{message}");
+        // And that the flags are not where to look next — the point the
+        // incident turned on. An operator stares at their own arguments
+        // because those are the only variable on screen.
+        assert!(message.contains("No shell-tunnel flag"), "{message}");
+        // The OS text is still there: it is the truth about that machine.
+        assert!(message.contains("os error 10060"), "{message}");
+        // Not mistaken for a certificate problem.
+        assert!(!message.contains("--relay-ca"), "{message}");
+    }
+
+    /// Windows reports a connect timeout as `10060`, and the incident's console
+    /// showed exactly that. Pinning the raw code proves the branch is reachable
+    /// from what the OS actually produces, not only from a hand-made `ErrorKind`.
+    #[test]
+    #[cfg(windows)]
+    fn the_os_code_from_the_incident_reaches_the_timeout_branch() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let error = Error::Io(std::io::Error::from_raw_os_error(10060));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"));
+        assert!(message.contains("Nothing answered at"), "{message}");
+    }
+
+    /// Refused and timed out mean different things and must not read the same.
+    /// One says the relay is not there; the other says nothing between here and
+    /// there will let a connection through.
+    #[test]
+    fn a_refusal_and_a_timeout_do_not_say_the_same_thing() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+        let refused = explain_dial_failure(&refused, &config("wss://relay.example.com:8443"));
+        let timed_out = Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
+        let timed_out = explain_dial_failure(&timed_out, &config("wss://relay.example.com:8443"));
+
+        assert!(refused.contains("nothing is listening"), "{refused}");
+        assert!(timed_out.contains("swallowed"), "{timed_out}");
+        assert_ne!(
+            refused, timed_out,
+            "the two must not collapse into one message"
+        );
+    }
+
+    /// A relay URL with no port still names the port that will be dialled —
+    /// the operator did not write it, so telling them the host alone leaves out
+    /// the half that outbound policies act on.
+    #[test]
+    fn an_implied_port_is_spelled_out() {
+        assert_eq!(
+            config("wss://relay.example.com").dial_target(),
+            "relay.example.com:443"
+        );
+        assert_eq!(
+            config("http://relay.example.com").dial_target(),
+            "relay.example.com:80"
+        );
+        assert_eq!(
+            config("https://relay.example.com:8443/").dial_target(),
+            "relay.example.com:8443"
+        );
+        // An IPv6 literal's own colons are not a port.
+        assert_eq!(config("wss://[::1]").dial_target(), "[::1]:443");
+        assert_eq!(config("wss://[::1]:9000").dial_target(), "[::1]:9000");
     }
 
     #[test]

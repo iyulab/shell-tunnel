@@ -256,6 +256,56 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
     }
 }
 
+/// The longest raw request path an audit entry will carry, in bytes.
+///
+/// Only an *unmatched* path is recorded raw, and an unmatched path is whatever
+/// the caller asked for — a probe can send four kilobytes of it and did, in the
+/// measurement that set this number. A matched route is a router template and
+/// is never truncated. The same log-flood worry already put the `tracing` line
+/// beside this one at `debug`; the trail cannot be silenced by a log level, so
+/// it needs the bound instead.
+const MAX_AUDITED_PATH: usize = 256;
+
+/// The `route` value for an audit entry.
+///
+/// A matched route is recorded as its template (`/api/v1/sessions/{id}`) so
+/// that entries group rather than exploding into one bucket per id. An
+/// unmatched path has no template, so the raw path is recorded: it is the only
+/// thing that says *what was probed*, and probing is precisely what the trail
+/// is asked about afterwards. Recording only the method left two different
+/// probes with byte-identical entries — five distinct requests produced five
+/// indistinguishable lines, confirmed against a running server, and a majority
+/// of the `denied` entries on an internet-facing deployment were of that shape.
+///
+/// The caller passes `uri().path()`, never `path_and_query()`, and that is a
+/// guarantee rather than a shortcut: a query string is caller-controlled too,
+/// and `USAGE.md` §4 promises the trail never carries a credential. A probe of
+/// `/nope?token=…` is recorded as `/nope` — confirmed by running it.
+///
+/// Truncation is marked with a suffix that begins with a space, which is not a
+/// byte a request path can contain: a space terminates the request target, so
+/// hyper answers `400` long before this function sees it. A caller therefore
+/// cannot forge the marker by asking for a path that ends in it. (Raw control
+/// bytes and invalid UTF-8 are refused at the same layer for the same kind of
+/// reason, so this function is not where they need handling — measured, not
+/// assumed, because "the parser surely rejects that" is the premise this
+/// repository has been wrong about before.)
+fn audited_route(method: &Method, matched: Option<&str>, raw_path: &str) -> String {
+    let Some(template) = matched else {
+        if raw_path.len() <= MAX_AUDITED_PATH {
+            return format!("{method} {raw_path}");
+        }
+        // Back off to a character boundary; index 0 is always one, so this
+        // terminates.
+        let mut end = MAX_AUDITED_PATH;
+        while !raw_path.is_char_boundary(end) {
+            end -= 1;
+        }
+        return format!("{method} {} (truncated)", &raw_path[..end]);
+    };
+    format!("{method} {template}")
+}
+
 /// Scope-aware authentication + authorization middleware (spec §5).
 ///
 /// 1. Resolve the route's required capability from `method` + `MatchedPath`.
@@ -279,12 +329,18 @@ async fn capability_auth_middleware(
 
     let method = request.method().clone();
     // Owned so it can be used in the rejection logs after `request` is consumed.
+    //
+    // `None` and `Some("")` are not the same thing and are no longer flattened
+    // together: a path the router did not match has no template, and the raw
+    // path is the only description of it that exists. Authorization still sees
+    // the empty string for it (`required_capability` fails closed on it), but
+    // the audit entry does not.
     let matched = request
         .extensions()
         .get::<MatchedPath>()
-        .map(|m| m.as_str().to_owned())
-        .unwrap_or_default();
-    let required = required_capability(&method, &matched);
+        .map(|m| m.as_str().to_owned());
+    let route = audited_route(&method, matched.as_deref(), request.uri().path());
+    let required = required_capability(&method, matched.as_deref().unwrap_or_default());
 
     // Public routes (e.g. /health) skip auth entirely.
     if required == RequiredCapability::Public {
@@ -312,19 +368,20 @@ async fn capability_auth_middleware(
             } else {
                 "invalid-token"
             };
-            tracing::debug!(%method, path = %matched, reason, "auth rejected (401)");
+            tracing::debug!(%method, path = %route, reason, "auth rejected (401)");
             // Probing is exactly what an audit trail is asked about afterwards,
             // so this layer's refusals are recorded as well as successes.
             //
-            // "This layer's" is the whole claim, not modesty. A request carrying
-            // a field the server does not recognise is turned away by the
-            // extractor, after this middleware has already let it through, and
-            // records nothing — so the trail is not a complete list of every
-            // refusal the server issued. `USAGE.md` §4 names that gap; keep the
-            // two in step if this ever grows a third case.
+            // "This layer's" is the whole claim, not modesty. Refusals that
+            // happen after this middleware has let a request through — an
+            // extractor turning away an unrecognised field, a malformed body, a
+            // path parameter that will not parse, a body over the size limit —
+            // record nothing, so the trail is not a complete list of every
+            // refusal the server issued. `USAGE.md` §4 names that gap and lists
+            // the measured cases; keep the two in step as the layer grows.
             audit.record(
                 crate::audit::AuditEvent::new("denied")
-                    .with_route(format!("{method} {matched}"))
+                    .with_route(route)
                     .with_denial(401, reason),
             );
             return Err(StatusCode::UNAUTHORIZED);
@@ -349,12 +406,12 @@ async fn capability_auth_middleware(
                 audit.record(
                     crate::audit::AuditEvent::new("denied")
                         .with_identity(identity)
-                        .with_route(format!("{method} {matched}"))
+                        .with_route(route.clone())
                         .with_denial(403, format!("missing-capability:{cap}")),
                 );
                 tracing::debug!(
                     %method,
-                    path = %matched,
+                    path = %route,
                     required = cap,
                     "authorization denied (403): insufficient capability"
                 );

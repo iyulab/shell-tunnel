@@ -220,8 +220,35 @@ pub fn relay_router(state: RelayState) -> Router {
         .with_state(state)
 }
 
-/// Run the relay server until shutdown.
+/// Take the relay's listening socket, before anything is announced.
+///
+/// Separate from serving for the reason [`crate::api::bind`] is: a caller that
+/// prints where the relay can be reached must be able to do it *after* the port
+/// is actually held. Announcing first and binding second made two lines false at
+/// once whenever the port was taken — a banner saying "listening on", a join
+/// command for a relay that does not exist, and then the failure. The gateway
+/// already had this split; the relay did not.
+pub async fn bind_relay(config: &RelayConfig) -> crate::Result<tokio::net::TcpListener> {
+    tokio::net::TcpListener::bind(config.bind)
+        .await
+        .map_err(crate::error::ShellTunnelError::Io)
+}
+
+/// Run the relay server until shutdown, binding its socket first.
+///
+/// Kept for callers that have nothing to print between the two steps. A caller
+/// that does — the binary, whose banner names the relay's address — should use
+/// [`bind_relay`] and [`serve_relay_on`] so the announcement follows the bind.
 pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
+    let listener = bind_relay(&config).await?;
+    serve_relay_on(listener, config).await
+}
+
+/// Serve on an already-bound listener.
+pub async fn serve_relay_on(
+    listener: tokio::net::TcpListener,
+    config: RelayConfig,
+) -> crate::Result<()> {
     let bind = config.bind;
     #[cfg(feature = "tls")]
     let tls = config.tls.clone();
@@ -241,11 +268,10 @@ pub async fn serve_relay(config: RelayConfig) -> crate::Result<()> {
         }
     });
 
+    // After the bind, not before: this line used to sit above it and said the
+    // relay was listening on a port it had not tried to take yet.
     tracing::info!("relay listening on {}", bind);
 
-    let listener = tokio::net::TcpListener::bind(bind)
-        .await
-        .map_err(ShellTunnelError::Io)?;
     // Connection info is what the rate limiter keys on; without it every caller
     // would look identical.
     let service = router.into_make_service_with_connect_info::<SocketAddr>();

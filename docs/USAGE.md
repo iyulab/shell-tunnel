@@ -69,7 +69,7 @@ Tunnel and relay are mutually exclusive; asking for both is refused at startup.
 
 ```bash
 shell-tunnel                      # 127.0.0.1:3000, no authentication
-shell-tunnel --require-auth       # generates and logs an API key
+shell-tunnel --require-auth       # generates a key and prints it on stdout
 shell-tunnel -k my-key --preset operator
 ```
 
@@ -238,6 +238,27 @@ one is refused (see below), which it was not before 0.15.0: `{"command":"cmd",
 "args":["/c","echo","hi"]}` used to drop the `args`, start a bare shell, and
 answer `success: true, exit_code: 0` without running the command.
 
+**The string is handed to a shell as written**, so quoting, redirection, pipes
+and `&&` are the shell's to interpret, and quoting a path with spaces works the
+way it does at a prompt:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/execute \
+  -H "Content-Type: application/json" \
+  -d '{"command":"dir /b \"C:\\Program Files\\Common Files\""}'
+```
+
+That shell is `cmd /c` on Windows and `/bin/sh -c` on Unix, on **both**
+`/execute` and a session's execute (§3.2) — a session runs each command in a
+fresh shell of its own, not in a persistent one. `POST /api/v1/sessions` accepts
+a `shell` field and it currently has no effect; nothing but `cmd`/`sh` is
+spawned either way. Neither does a session carry state between calls: `set
+FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
+
+Before 0.15.1 a quote in `command` reached the Windows shell as `\"`, so
+`dir /b "C:\Program Files"` was a syntax error and `powershell -c "a | b"` ran
+only `a`. A path containing a space had no working form at all.
+
 **A field this server does not recognise is refused, not ignored.** Misspell one
 — `workingDir` for `working_dir`, `timeoutSecs` for `timeout_secs` — and the
 request fails naming the field and listing the accepted ones, rather than
@@ -293,6 +314,14 @@ curl -X DELETE "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
 
 Create accepts `shell`, `working_dir`, `env`. Sessions are ready to execute the
 moment they are created.
+
+**A session groups commands; it does not keep a shell alive.** Each execute runs
+in its own `cmd /c` (Windows) or `sh -c` (Unix), the same as `/execute` — so
+`set FOO=bar` is not visible to the next call, a `cd` does not persist, and the
+`shell` field above currently changes nothing. What a session does give you is
+an id the audit trail records against, per-session `working_dir` and `env`, and
+a place for streaming to attach. Use `working_dir` rather than a leading `cd`,
+and pass what you need in `env`.
 
 ### Streaming over WebSocket
 
@@ -581,20 +610,44 @@ publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 `--audit-log <file>` appends one JSON object per line for every execution, for
 every request the authentication layer refuses, and for the file operations
 listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry. Two gaps are worth naming rather than leaving to
-be discovered.
+absent from it leaves no entry. Three gaps are worth naming rather than leaving
+to be discovered.
+
+**Reading is not recorded.** `list`, `stat` and `download` write nothing when
+they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.
+This is the gap with the widest operational reach — on a server started without
+`--fs-root`, a token holding `fs.read` can read every file the process can
+reach, and the trail stays empty throughout. Three successful reads, zero
+entries, measured against a running server rather than read off the table.
 
 A request whose *path* does not resolve — missing, malformed, or escaping
 `--fs-root` — is turned away by machinery shared with `list`, `stat`, and
 `download`, and writes nothing on any of those routes.
 
-A request refused for carrying a field this server does not recognise (§3) is
-turned away while the body or query string is still being parsed, before any
-handler runs, so it writes nothing either. A caller probing `?dryRun=true`
-against `DELETE .../fs/file` leaves no trace of having tried — though it also
-changes nothing, which is the point of the refusal. Requests the
-authentication layer turns away first are unaffected: those are recorded as
-`denied`, including when the request would also have failed to parse.
+A request turned away **before any handler runs** writes nothing either, and
+that is more than the one case this paragraph used to name. Each of these was
+sent to a running server with a valid token and left the trail empty:
+
+| Refusal | Status |
+|---|---|
+| a body carrying a field this server does not recognise (§3) | `422` |
+| a query string carrying one | `400` |
+| a malformed JSON body | `400` |
+| a path parameter that does not parse | `400` |
+| a body over the size limit | `413` |
+
+A caller probing `?dryRun=true` against `DELETE .../fs/file` therefore leaves no
+trace of having tried — though it also changes nothing, which is the point of
+the refusal. Requests the authentication layer turns away first are unaffected:
+those are recorded as `denied`, including when the request would also have
+failed to parse.
+
+A `denied` entry names the path that was refused, and an unmatched path is
+recorded as the caller sent it rather than as a router template — that is the
+only description of a probe that exists. Such a path is truncated past 256
+bytes, with ` (truncated)` appended; the marker starts with a space, which a
+request path cannot contain, so it cannot be forged by a caller who ends a short
+path with the same text.
 
 Off on a loopback bind with no tunnel or relay — creating a file
 nobody asked for is its own kind of surprise there. A server reachable from
@@ -892,7 +945,7 @@ still sees the real address.
 | `-k, --api-key <KEY>` | Key callers present to run commands here. **Adds to** a config file's keys rather than replacing them (§7) — unlike `--capabilities`/`--preset`, which replace | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
 | `--no-auth` | Disable authentication | `false` |
-| `--require-auth` | Enable auth, generating a key if none given | `false` |
+| `--require-auth` | Enable auth, generating a key if none given and printing it on stdout | `false` |
 | `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
 | `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
 | `--no-rate-limit` | Disable rate limiting | `false` |
@@ -901,8 +954,6 @@ still sees the real address.
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
-| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
-| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 | `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
@@ -912,12 +963,19 @@ still sees the real address.
 | `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
+The gateway's own socket is plaintext, and `--tls-cert`/`--tls-key`/
+`--tls-self-signed` are refused at startup if given to one. Reach it through a
+tunnel or a relay, which carry their own TLS, or put a reverse proxy in front —
+[§5](#tls-without-a-proxy) covers terminating TLS on the relay instead.
+
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
 | Option | Description | Default |
 |---|---|---|
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
+| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
+| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS on the relay (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
@@ -992,6 +1050,10 @@ startup rather than serving local-only.
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
+| `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
+| `cannot reach relay: … Nothing answered at <host:port>` | the connection was neither answered nor refused — something between the device and the relay is dropping it | not a flag problem. Check whether the device can open *any* outbound connection to that port; a relay on a port the network already allows out is the usual fix |
+| `cannot reach relay: … <host:port> was reached, and nothing is listening on it` | the address and route are fine; the relay is not serving there | check the relay is running and bound to that port |
+| `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
 | **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
@@ -1041,7 +1103,7 @@ The default build links no TLS stack, HTTP client, or WebSocket client.
 |---|---|---|
 | *(default)* | nothing | ✅ |
 | `self-update` | `--update` / `--check-update` | ✅ |
-| `tls` | `--tls-cert` / `--tls-key` (serve HTTPS in-process) | ✅ |
+| `tls` | `--tls-cert` / `--tls-key` — a relay serving HTTPS in-process (§6) | ✅ |
 | `relay-client` | `--relay` (device side; TLS + WS client) | ✅ |
 
 ```bash

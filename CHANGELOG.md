@@ -3,6 +3,144 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.15.1 — 2026-08-03
+
+### Fixed
+
+- **A `denied` audit entry now names the path that was refused.** A request to a
+  path the router does not match carries no route template, and the entry
+  recorded the method alone — `{"route": "GET "}`. Scanning the API surface
+  unauthenticated therefore left a run of byte-identical lines, and the trail
+  that exists to answer "what was probed?" could not. An unmatched path is now
+  recorded as the caller sent it; a matched route is still recorded as its
+  template (`/api/v1/sessions/{id}`), so entries keep grouping instead of
+  splitting one bucket per id.
+
+  Because the raw path is caller-controlled, it is truncated past 256 bytes with
+  ` (truncated)` appended. The marker starts with a space, which a request path
+  cannot contain, so it cannot be forged.
+
+- **A quote in `command` now reaches the shell as a quote (Windows).** The
+  command line was passed with an API that applies the C runtime's
+  argument-encoding rules, and `cmd.exe` does not parse its command line that
+  way — so `"` arrived as a literal `\"`. Every command that needed quoting
+  failed: `dir /b "C:\Program Files"` was a syntax error, `powershell -c "a | b"`
+  ran only `a`, and a path containing a space had no working form at all. A
+  caller who applied ordinary shell quoting was worse off than one who did not,
+  which is the opposite of what an API taking a command line should do.
+
+  Nothing new is granted by this. `/execute` hands its string to a shell by
+  definition, so a token holding `exec` could already run anything the account
+  can; what changed is that quoting means what it says. Unquoted commands are
+  byte-identical, shell operators (`&`, `|`, `&&`) behave as before, and Unix
+  was never affected.
+
+- **A startup that could not take its port no longer announces success first.**
+  The relay logged and printed `listening on <addr>` — plus a ready-to-paste
+  join command — *before* attempting the bind. Against a port already in use,
+  those lines were false by the time the failure appeared, and the operator was
+  left with a join command for a relay that does not exist; pasting it into a
+  device produced a dial timeout with nothing pointing back at the cause. The
+  same shape existed on the tunnelled path, where the server was spawned as a
+  task and the banner published a public URL, a generated API key, and a `curl`
+  example without ever learning whether the port was taken.
+
+  Both now bind first. The gateway already had this split (`api::bind`); the
+  relay gained the matching `bind_relay` / `serve_relay_on` pair, and
+  `serve_relay` is unchanged for callers with nothing to print in between.
+
+- **A port already in use is reported in words.** Both the gateway and the relay
+  ended a failed startup with the `Debug` form of an `io::Error` — `Error:
+  Io(Os { code: 10048, kind: AddrInUse, ... })` — the one place in this binary a
+  Rust internal reached an operator. The message now names the address, keeps
+  the OS text, and gives the platform's command for finding what holds the port.
+
+- **A device that cannot reach its relay now says what happened.** The only
+  advice this path carried was for two certificate problems; every network
+  failure fell through to a raw OS error, repeated forever with backoff. It did
+  not even name the host and port being dialled — the relay URL appears in the
+  startup banner and nowhere else.
+
+  A timed-out dial and a refused one now read differently, because they mean
+  different things: refused says the relay is not serving there, timed out says
+  something between the two machines is dropping the connection. The timeout
+  advice states outright that no flag of this program changes it — an operator
+  looking at a failure suspects their own arguments first, because those are the
+  only variable on screen, and in the incident behind this the host could not
+  open *any* outbound connection. If a proxy environment variable is set, that is
+  reported too, along with the fact that this client dials directly and does not
+  use it.
+
+  Classification comes from `io::ErrorKind`, never from the message text: an OS
+  error is written in the machine's own language, and the incident's console was
+  in Korean. A unit test pins that, so a regression to string matching fails.
+
+- **A gateway refused a TLS flag by naming flags the caller had not passed.**
+  `--tls-self-signed` fills in `--tls-cert`/`--tls-key` while arguments are
+  parsed, and the refusal reported those instead — sending the operator looking
+  for two flags they never wrote. It now names what was given.
+
+### Documentation
+
+- **A session was described as running a different shell than `/execute`. It
+  does not.** Both run `cmd /c` on Windows and `sh -c` on Unix, and a session
+  runs each command in a fresh one — `set FOO=bar` is not visible to the next
+  call and a `cd` does not persist. The `shell` field on `POST /sessions` is
+  accepted and has no effect. USAGE §3 and §3.2 and the OpenAPI schema now say
+  all three, and a test pins them so the sentence cannot go stale unnoticed.
+  What a session actually offers — an id the audit trail records against,
+  per-session `working_dir` and `env`, a place for streaming to attach — is
+  stated in its place.
+
+- **`--help` said a gateway serves HTTPS with no reverse proxy needed. Both
+  halves were false.** A gateway refuses the TLS flags at startup, and its own
+  refusal says to put a reverse proxy in front. The section is now scoped
+  ``TLS OPTIONS (with `relay`)`` — matching the scope the relay's other section
+  already carried — and states that a gateway's socket is plaintext. The two
+  dial-trust flags that were filed under it, `--relay-fingerprint` and
+  `--relay-ca`, moved next to `--relay`, which is what they belong to.
+  `USAGE.md` §6 listed the same two TLS rows in the gateway table, directly
+  above a line introducing the relay's flags as what it "additionally accepts";
+  they have moved to the relay table. The prose section on TLS was already
+  correct — only the reference tables were wrong.
+
+- **`--help` filed five mode-independent flags under the relay's section.**
+  `--check-update`, `--update`, `--no-update-check`, `-h` and `-V` trailed the
+  end of ``RELAY OPTIONS (with `relay`)``, having simply been left where the
+  list ran out. None of them concerns the relay — one flat parser reads every
+  flag, and the update trio exits before a server of either kind starts — and
+  the help contradicted itself further down, where the examples show
+  `shell-tunnel --check-update` with no subcommand. They now sit under their own
+  unscoped `OTHER OPTIONS`. Scoping the TLS header above (previous entry) is
+  what sharpened this: once every named section carries a mode, whatever trails
+  the last one inherits a scope nobody wrote.
+
+- `USAGE.md` §4 named one gap in the audit trail — requests refused for carrying
+  an unrecognised field. Four more refusals reach the same place and were left
+  unnamed: a malformed JSON body, a query string that fails to parse, a path
+  parameter that fails to parse, and a body over the size limit. The section now
+  lists them, and separately states that successful reads (`list`, `stat`,
+  `download`) are not recorded at all — previously discoverable only by noticing
+  no such kind in the event table.
+
+- **A server that generates its own API key now prints it on stdout, at every
+  log level.** `--require-auth` (and `--preset`/`--capabilities`, which also
+  switch authentication on) generate a key when none was supplied. On a
+  loopback bind that key was created inside the server and reported only as an
+  `INFO` log line, so `-l warn` or quieter started a server that enforced
+  authentication and told nobody the key — no copy of it existed anywhere, and
+  the only symptom was every request answering `401`. The key is now issued
+  before the banner and printed there, which is not something a log level can
+  silence.
+
+  A reachable server (tunnel, relay, or non-loopback bind) already printed its
+  key on the banner and is unchanged.
+
+  Because the key now exists before the server starts, it is no longer written
+  to the application log at all. That closes a smaller gap in the same place:
+  the audit trail deliberately records no tokens, while the log was carrying
+  one in plaintext.
+
 ## 0.15.0 — 2026-08-01
 
 ### Fixed

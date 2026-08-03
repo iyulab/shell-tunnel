@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shell_tunnel::config::{Posture, PublicExposure};
-use shell_tunnel::relay::{serve_relay, RelayConfig};
+use shell_tunnel::relay::{serve_relay_on, RelayConfig};
 use shell_tunnel::security::CapabilitySet;
 use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
@@ -119,7 +119,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // LAN is other people's machines too, and host checking (the DNS rebinding
     // defence) is a different axis that does not fill this gap.
     let posture = config.posture(provider.is_some(), args.relay_url.is_some());
-    let exposure = if posture == Posture::Exposed {
+    let mut exposure = if posture == Posture::Exposed {
         match config.harden_for_public_exposure(&args) {
             Ok(exposure) => exposure,
             Err(e) => {
@@ -130,6 +130,19 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     } else {
         PublicExposure::default()
     };
+    // Authentication is not only switched on by exposure: `--require-auth`,
+    // `--api-key`, a preset and a capability list each turn it on, and a
+    // loopback bind never reaches the hardening above. Whichever way it was
+    // asked for, the key has to exist *here* — before `to_server_config`
+    // below, and while there is still a banner to print it on. Left to the
+    // server (`serve_on`) the key was created after the banner, reported only
+    // as an `INFO` line, and at `-l warn` a `--require-auth` server started,
+    // enforced authentication, and told nobody the key: confirmed by running
+    // it, not inferred. `ensure_api_key` returns `None` when the hardening
+    // already issued one, so the exposed path is untouched.
+    if exposure.generated_key.is_none() {
+        exposure.generated_key = config.ensure_api_key();
+    }
 
     if args.relay_url.is_some() && args.enroll_token.is_none() {
         eprintln!("Configuration error: --relay requires --enroll-token");
@@ -140,7 +153,17 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // a plaintext server for someone who asked for an encrypted one — the exact
     // silent failure every other path in this binary refuses to make.
     if args.tls_cert.is_some() {
-        eprintln!("Configuration error: --tls-cert/--tls-key apply to `shell-tunnel relay`.");
+        // Names what was actually passed. `--tls-self-signed` fills in
+        // `tls_cert`/`tls_key` with defaults during parsing, so reporting the
+        // field rather than the flag sent an operator looking for two flags
+        // they never wrote.
+        // Carries its own verb: one flag applies, two apply.
+        let given = if args.tls_self_signed {
+            "--tls-self-signed applies"
+        } else {
+            "--tls-cert/--tls-key apply"
+        };
+        eprintln!("Configuration error: {given} to `shell-tunnel relay`.");
         eprintln!("A gateway is reached through a tunnel or a relay, which carry their own TLS;");
         eprintln!("to expose one directly, put a reverse proxy in front.");
         std::process::exit(1);
@@ -356,6 +379,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // its own banner once the URL exists (`print_banner`), and a relay prints
     // one beside its attach output (`run_with_relay`), so printing here too
     // would report the same key twice.
+    //
+    // A loopback bind reaches this line too, and now has something to print:
+    // the block above is empty for `Posture::Local` (nothing was narrowed, so
+    // there is nothing to report), but a key issued for `--require-auth` is
+    // not reachability information — it is the one value the operator cannot
+    // start without, whoever can reach the port. stdout, unconditionally, is
+    // the only place that survives `-l warn`.
     if provider.is_none() && args.relay_url.is_none() {
         if let Some(key) = &exposure.generated_key {
             println!("API key:     {key}   (generated)");
@@ -474,14 +504,16 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         for warning in &exposure.warnings {
             warn!("{}", warning);
         }
-        return shell_tunnel::api::serve_with_state(server_config, state).await;
+        let listener = bind_or_exit(&server_config).await;
+        return shell_tunnel::api::serve_on(listener, server_config, state).await;
     };
 
     let local: SocketAddr = server_config
         .bind_address()
         .parse()
         .expect("bind address is built from a parsed IpAddr and a u16 port");
-    let server = tokio::spawn(shell_tunnel::api::serve_with_state(server_config, state));
+    let listener = bind_or_exit(&server_config).await;
+    let server = tokio::spawn(shell_tunnel::api::serve_on(listener, server_config, state));
 
     // Open the tunnel only once the port actually accepts, so the provider is
     // not racing the listener and reporting connection failures.
@@ -517,6 +549,29 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         result = server => result.expect("server task panicked"),
         () = tunnel_died(&mut tunnel) => {
             eprintln!("Tunnel closed: the public URL is no longer reachable. Shutting down.");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Take the gateway's listening socket, or report why not and exit.
+///
+/// The `?` this replaces ended a failed startup with the `Debug` form of an
+/// `io::Error` — `Error: Io(Os { code: 10048, kind: AddrInUse, ... })`. Every
+/// other refusal in this binary is written for an operator; a taken port, which
+/// is the most common one, was the exception.
+async fn bind_or_exit(config: &shell_tunnel::ServerConfig) -> tokio::net::TcpListener {
+    match shell_tunnel::api::bind(config).await {
+        Ok(listener) => listener,
+        Err(shell_tunnel::ShellTunnelError::Io(e)) => {
+            eprintln!(
+                "{}",
+                shell_tunnel::error::explain_bind_failure("server", &config.bind_address(), &e)
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
     }
@@ -596,6 +651,26 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         Some(format!("{scheme}://{bind}"))
     } else {
         None
+    };
+
+    // Bound before anything is announced. The banner below says where the relay
+    // can be reached and hands out a join command; printing that and *then*
+    // discovering the port is taken made both lines false, and sent the operator
+    // to a device that could only report a timeout with no hint the relay was
+    // the cause. `serve_relay_on` takes the listener from here.
+    let listener = match shell_tunnel::relay::bind_relay(&config).await {
+        Ok(listener) => listener,
+        Err(shell_tunnel::ShellTunnelError::Io(e)) => {
+            eprintln!(
+                "{}",
+                shell_tunnel::error::explain_bind_failure("relay", &bind.to_string(), &e)
+            );
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
     };
 
     match &reachable {
@@ -683,7 +758,7 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         }
     }
 
-    serve_relay(config).await
+    serve_relay_on(listener, config).await
 }
 
 /// Serve locally while attached to a self-hosted relay.

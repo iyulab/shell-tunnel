@@ -20,6 +20,15 @@ Thumbs.db
 # Test artifacts
 *.log
 
+# Runtime files the binary creates in its working directory. A maintainer who
+# runs a reachable server from the repo root gets an audit trail whether or not
+# they asked for one, and a relay started with --tls-self-signed writes a
+# certificate and its private key. One of these was staged by accident.
+shell-tunnel-audit.jsonl
+shell-tunnel-audit.jsonl.1
+shell-tunnel-cert.pem
+shell-tunnel-key.pem
+
 # Local
 local-docs/
 CLAUDE.md

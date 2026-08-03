@@ -208,3 +208,111 @@ async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
     assert_eq!(result.total_bytes, produced as u64);
     assert!(result.truncated, "the collected result is still capped");
 }
+
+/// A session's execute uses the same shell as `/execute`, and keeps nothing
+/// between calls.
+///
+/// USAGE §3.2 now says so outright, after an upstream report and this
+/// repository's own handover notes both stated the opposite — that a session
+/// runs `powershell.exe` on Windows and `$SHELL` on Unix. It does not: sessions
+/// carry an id, a working directory and an environment, and every command runs
+/// in a fresh shell exactly as a one-shot does. The `shell` field on create is
+/// accepted and ignored.
+///
+/// Pinned as a test rather than left to the prose because a doc sentence about
+/// behaviour is the thing this repository has repeatedly shipped stale, and
+/// because the day sessions *do* get a persistent shell, this failing is how
+/// the sentence gets rewritten instead of quietly becoming false again.
+#[tokio::test]
+async fn a_session_runs_each_command_in_a_fresh_shell() {
+    use shell_tunnel::session::SessionConfig;
+
+    let store = Arc::new(SessionStore::new());
+    let exec = CommandExecutor::new(store.clone());
+    let id = store
+        .create(SessionConfig {
+            // Named explicitly, so this fails the day it starts being honoured.
+            shell: Some(
+                if cfg!(windows) {
+                    "powershell.exe"
+                } else {
+                    "/bin/bash"
+                }
+                .to_string(),
+            ),
+            ..Default::default()
+        })
+        .expect("create session");
+    store
+        .update(&id, |s| {
+            let _ = s
+                .state
+                .transition_to(shell_tunnel::session::SessionState::Idle);
+        })
+        .expect("session becomes idle");
+
+    // The two platforms need different probes, for the reason that makes this
+    // test worth having: `/bin/sh` is not one program. On Linux it is dash,
+    // which rejects a bash builtin; on macOS it is bash in POSIX mode, which
+    // accepts one. "A foreign builtin must fail" is therefore not portable —
+    // asserted anyway, it passed on Linux and Windows and failed only on macOS,
+    // where it claimed the `shell` field was being honoured when it was not.
+    #[cfg(windows)]
+    {
+        // `Get-Location` is a PowerShell cmdlet and `cmd.exe` has no command by
+        // that name, so the exit code separates the two outright here.
+        let result = exec
+            .execute_in_session(&id, &Command::new("Get-Location"))
+            .await
+            .expect("execute failed");
+        assert_ne!(
+            result.exit_code,
+            Some(0),
+            "the `shell` field is documented as ignored, but a PowerShell \
+             cmdlet ran: {:?}",
+            result.text_output
+        );
+    }
+    #[cfg(unix)]
+    {
+        // `$0` is what a shell calls itself, so it names whichever one actually
+        // ran regardless of which program `/bin/sh` happens to be — `/bin/sh`
+        // under either, and `/bin/bash` on the day the field starts being
+        // honoured.
+        let result = exec
+            .execute_in_session(&id, &Command::new("echo $0"))
+            .await
+            .expect("execute failed");
+        let named = result.text_output.trim().to_string();
+        assert!(
+            !named.contains("bash"),
+            "the `shell` field is documented as ignored, but the session ran \
+             {named:?}"
+        );
+        // Without this the probe passes on empty output, which would say
+        // nothing about which shell ran.
+        assert!(
+            named.ends_with("sh"),
+            "expected the shell to name itself, so the check above means \
+             something; got {named:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    let (set, read) = ("set FOO=bar", "echo %FOO%");
+    #[cfg(unix)]
+    let (set, read) = ("FOO=bar", "echo $FOO");
+
+    exec.execute_in_session(&id, &Command::new(set))
+        .await
+        .expect("execute failed");
+    let after = exec
+        .execute_in_session(&id, &Command::new(read))
+        .await
+        .expect("execute failed");
+    assert!(
+        !after.text_output.contains("bar"),
+        "a session is documented as keeping no state between calls: {:?}",
+        after.text_output
+    );
+}
