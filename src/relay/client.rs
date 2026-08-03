@@ -66,6 +66,20 @@ pub struct RelayClientConfig {
     /// correctly, since the alternative is trusting whatever answers. Naming the
     /// authority keeps that check intact instead of disabling it.
     pub ca_file: Option<PathBuf>,
+    /// Receives this device's public URL each time it enrolls, including after
+    /// a reconnect.
+    ///
+    /// The client used to `println!` the URL itself, which put a piece of the
+    /// binary's startup banner inside the library — so a consumer embedding
+    /// this client got writes to stdout it never asked for, and the phrasing of
+    /// a user-facing line lived somewhere no banner test looks. Reporting the
+    /// event and leaving the wording to the caller keeps both where they
+    /// belong; a `None` here attaches silently.
+    ///
+    /// Every enrolment is reported, not only the first: distinguishing "first
+    /// attach" from "re-attached after a drop" is the caller's decision, and
+    /// the client cannot make it without also deciding how each should read.
+    pub enrolled: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl RelayClientConfig {
@@ -233,7 +247,12 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
             device_id,
             public_url,
         } => {
-            println!("\nPublic URL:  {public_url}   (via relay)");
+            if let Some(enrolled) = &config.enrolled {
+                // A closed receiver means the caller stopped listening, which
+                // is not this connection's problem: the device is enrolled and
+                // has work to do either way.
+                let _ = enrolled.send(public_url.clone());
+            }
             device_id
         }
         RelayMessage::Rejected { code, message } => {
@@ -956,6 +975,7 @@ mod tests {
             device_name: None,
             fingerprint: None,
             ca_file: None,
+            enrolled: None,
         }
     }
 

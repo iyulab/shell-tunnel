@@ -1,4 +1,35 @@
 //! Logging initialization and configuration.
+//!
+//! # Why colour is off
+//!
+//! Both initializers below pass `with_ansi(false)`, and that is not a style
+//! choice. The `fmt` layer colours its output whenever `tracing-subscriber`'s
+//! `ansi` feature is compiled in, and that default asks nothing about what is
+//! downstream: it does not test whether stderr is a terminal, and on Windows
+//! it does not enable the console's virtual-terminal mode either. Escapes
+//! therefore reached every consumer of the logs — the file a service
+//! definition redirects to, an agent reading the pipe, and consoles that
+//! print them literally as `←[2m` in front of every line.
+//!
+//! Colour is switched off rather than made conditional, because the condition
+//! cannot be answered honestly here. `IsTerminal` alone does not settle it on
+//! Windows, where a console handle reports as a terminal whether or not it
+//! will interpret an escape; answering it properly means enabling
+//! virtual-terminal mode through the Win32 console API and falling back when
+//! that fails — a direct platform dependency and a block of `unsafe` FFI,
+//! bought for decoration on a headless gateway whose output is read by service
+//! managers, log files and agents far more often than by a person. The one
+//! surface an operator actually reads, the startup banner, is `println!` on
+//! stdout and was never coloured.
+//!
+//! This also holds the program's own logs to the rule its command output
+//! already follows: piped output is escape-free, because that is what makes it
+//! usable as structured data.
+//!
+//! `tests/main_startup_e2e.rs::the_log_stream_carries_no_ansi_escapes` is what
+//! keeps this true. A record's *text* is identical either way, so only a real
+//! process writing to a real pipe can tell the two apart — no unit test in
+//! this module can.
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -24,6 +55,7 @@ pub fn init() {
         .with(
             tracing_subscriber::fmt::layer()
                 .compact()
+                .with_ansi(false)
                 .with_writer(std::io::stderr),
         )
         .init();
@@ -42,6 +74,7 @@ pub fn try_init() -> Result<(), tracing_subscriber::util::TryInitError> {
         .with(
             tracing_subscriber::fmt::layer()
                 .compact()
+                .with_ansi(false)
                 .with_writer(std::io::stderr),
         )
         .try_init()
