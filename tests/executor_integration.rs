@@ -251,24 +251,57 @@ async fn a_session_runs_each_command_in_a_fresh_shell() {
         })
         .expect("session becomes idle");
 
-    // A command only the *other* shell understands. If the `shell` field were
-    // honoured this would succeed, which is the point.
+    // The two platforms need different probes, for the reason that makes this
+    // test worth having: `/bin/sh` is not one program. On Linux it is dash,
+    // which rejects a bash builtin; on macOS it is bash in POSIX mode, which
+    // accepts one. "A foreign builtin must fail" is therefore not portable —
+    // asserted anyway, it passed on Linux and Windows and failed only on macOS,
+    // where it claimed the `shell` field was being honoured when it was not.
     #[cfg(windows)]
-    let (foreign, set, read) = ("Get-Location", "set FOO=bar", "echo %FOO%");
+    {
+        // `Get-Location` is a PowerShell cmdlet and `cmd.exe` has no command by
+        // that name, so the exit code separates the two outright here.
+        let result = exec
+            .execute_in_session(&id, &Command::new("Get-Location"))
+            .await
+            .expect("execute failed");
+        assert_ne!(
+            result.exit_code,
+            Some(0),
+            "the `shell` field is documented as ignored, but a PowerShell \
+             cmdlet ran: {:?}",
+            result.text_output
+        );
+    }
     #[cfg(unix)]
-    let (foreign, set, read) = ("shopt -s nullglob", "FOO=bar", "echo $FOO");
+    {
+        // `$0` is what a shell calls itself, so it names whichever one actually
+        // ran regardless of which program `/bin/sh` happens to be — `/bin/sh`
+        // under either, and `/bin/bash` on the day the field starts being
+        // honoured.
+        let result = exec
+            .execute_in_session(&id, &Command::new("echo $0"))
+            .await
+            .expect("execute failed");
+        let named = result.text_output.trim().to_string();
+        assert!(
+            !named.contains("bash"),
+            "the `shell` field is documented as ignored, but the session ran \
+             {named:?}"
+        );
+        // Without this the probe passes on empty output, which would say
+        // nothing about which shell ran.
+        assert!(
+            named.ends_with("sh"),
+            "expected the shell to name itself, so the check above means \
+             something; got {named:?}"
+        );
+    }
 
-    let result = exec
-        .execute_in_session(&id, &Command::new(foreign))
-        .await
-        .expect("execute failed");
-    assert_ne!(
-        result.exit_code,
-        Some(0),
-        "the `shell` field is documented as ignored; a shell-specific builtin \
-         must not work: {:?}",
-        result.text_output
-    );
+    #[cfg(windows)]
+    let (set, read) = ("set FOO=bar", "echo %FOO%");
+    #[cfg(unix)]
+    let (set, read) = ("FOO=bar", "echo $FOO");
 
     exec.execute_in_session(&id, &Command::new(set))
         .await
