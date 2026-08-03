@@ -329,6 +329,123 @@ fn the_tls_flags_are_refused_by_a_gateway_and_scoped_to_the_relay_in_help() {
     );
 }
 
+/// A relay whose port is taken must not have announced itself first.
+///
+/// The announcement used to come before the bind, so a taken port produced a
+/// banner saying `listening on`, a join command for a relay that does not
+/// exist, an `INFO relay listening on` line, and only then the failure. An
+/// operator pasted that join command into a device and got a dial timeout with
+/// nothing pointing back at the relay as the cause.
+///
+/// This asserts on what was **not** printed, which is the only thing that
+/// catches an ordering bug: the return value was always `Err`, and every
+/// assertion about it stayed green while three lines lied. It also pins the
+/// failure text, which was the `Debug` form of an `io::Error` — the one place
+/// in the binary a Rust internal reached an operator.
+#[test]
+fn a_relay_on_a_taken_port_says_nothing_about_listening() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = holder.local_addr().expect("addr").port().to_string();
+
+    let mut command = Command::new(BIN);
+    command.current_dir(dir.path()).args([
+        "relay",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port,
+        "--enroll-token",
+        "st_test",
+    ]);
+    let (code, stdout, stderr) = run_command_with_timeout(command, Duration::from_secs(15));
+
+    assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        !stdout.contains("listening on"),
+        "a relay that never bound must not claim to be listening: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Devices join with"),
+        "a join command for a relay that does not exist is worse than no \
+         output at all: {stdout}"
+    );
+    assert!(
+        !stderr.contains("relay listening on"),
+        "the log line moved below the bind for the same reason: {stderr}"
+    );
+
+    assert!(
+        stderr.contains("already in use"),
+        "the failure must be readable, not a Debug dump: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Io(Os {"),
+        "the raw io::Error Debug form must not reach an operator: {stderr}"
+    );
+    drop(holder);
+}
+
+/// The gateway shares the translation, because it had the identical screen.
+///
+/// Fixing only the relay would have left `Error: Io(Os { code: 10048, ... })`
+/// on the other path — measured on both before the change, which is why the
+/// helper is shared rather than local to the relay.
+///
+/// The tunnelled case is the relay's own defect wearing different clothes, and
+/// it turned up while checking this one. A tunnel spawned the server as a task
+/// and then published its banner without ever learning whether the port had
+/// been taken: against a held port the old binary printed a public URL, a
+/// generated API key, and a ready-to-paste `curl` — then exited 1. Every line
+/// of that was false, and the URL and key were for a server that does not
+/// exist. Binding before the spawn is what makes the banner conditional on the
+/// port, so the two are asserted together.
+#[test]
+fn a_gateway_on_a_taken_port_reports_it_in_words() {
+    for tunnelled in [false, true] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let port = holder.local_addr().expect("addr").port().to_string();
+
+        let mut command = Command::new(BIN);
+        command
+            .current_dir(dir.path())
+            .args(["--host", "127.0.0.1", "--port", &port]);
+        if tunnelled {
+            // A stand-in tunnel client: prints a URL and exits, which is all
+            // the supervisor reads. Nothing here should be reached, and that
+            // is the point.
+            command.args(["--tunnel-command", "cmd /c echo https://taken.example"]);
+        }
+        let (code, stdout, stderr) = run_command_with_timeout(command, Duration::from_secs(20));
+
+        assert_eq!(
+            code,
+            Some(1),
+            "tunnelled={tunnelled} stdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("already in use"),
+            "tunnelled={tunnelled}: the failure must be readable, not a Debug \
+             dump: {stderr}"
+        );
+        assert!(
+            !stderr.contains("Io(Os {"),
+            "tunnelled={tunnelled}: the raw io::Error Debug form must not reach \
+             an operator: {stderr}"
+        );
+        assert!(
+            !stdout.contains("Public URL"),
+            "a server that never bound must not publish a URL: {stdout}"
+        );
+        assert!(
+            !stdout.contains("API key:"),
+            "nor a credential for a server that does not exist: {stdout}"
+        );
+        drop(holder);
+    }
+}
+
 /// `GET /api/v1` over a bare socket, with an optional bearer token, returning
 /// the status code.
 ///

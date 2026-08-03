@@ -78,6 +78,48 @@ pub enum ShellTunnelError {
 /// Convenience Result type for shell-tunnel operations.
 pub type Result<T> = std::result::Result<T, ShellTunnelError>;
 
+/// Report a failure to take a listening socket, in the words this program uses
+/// everywhere else.
+///
+/// Without this the gateway and the relay both ended a failed startup with the
+/// `Debug` form of an `io::Error` — `Error: Io(Os { code: 10048, kind:
+/// AddrInUse, ... })` — which is the one place in the binary a Rust internal
+/// leaks out. Shared because both do it: fixing one leaves the identical screen
+/// on the other, confirmed by running both against a taken port.
+///
+/// `AddrInUse` gets the case worth naming, because "the port is taken" is by
+/// far the most common way this fails and has an obvious next step. Classified
+/// from [`std::io::ErrorKind`] rather than from the message, which the OS
+/// writes in its own language.
+pub fn explain_bind_failure(what: &str, addr: &str, error: &std::io::Error) -> String {
+    let mut message = match error.kind() {
+        std::io::ErrorKind::AddrInUse => {
+            format!("cannot start the {what}: {addr} is already in use by another program.")
+        }
+        std::io::ErrorKind::PermissionDenied => {
+            format!("cannot start the {what}: not allowed to bind {addr}.")
+        }
+        std::io::ErrorKind::AddrNotAvailable => {
+            format!("cannot start the {what}: {addr} is not an address on this machine.")
+        }
+        _ => format!("cannot start the {what}: {addr} could not be bound."),
+    };
+    // The OS text is kept: it is the truth about that machine, and it is what
+    // an operator searches for.
+    message.push_str(&format!("\n  {error}"));
+    if error.kind() == std::io::ErrorKind::AddrInUse {
+        message.push_str("\n  Choose another port with -p, or stop whatever holds this one.");
+        if cfg!(windows) {
+            message.push_str(
+                "\n  To find it: Get-NetTCPConnection -LocalPort <port> | Select OwningProcess",
+            );
+        } else {
+            message.push_str("\n  To find it: ss -ltnp | grep :<port>");
+        }
+    }
+    message
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

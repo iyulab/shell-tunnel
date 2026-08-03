@@ -20,6 +20,26 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   ` (truncated)` appended. The marker starts with a space, which a request path
   cannot contain, so it cannot be forged.
 
+- **A startup that could not take its port no longer announces success first.**
+  The relay logged and printed `listening on <addr>` — plus a ready-to-paste
+  join command — *before* attempting the bind. Against a port already in use,
+  those lines were false by the time the failure appeared, and the operator was
+  left with a join command for a relay that does not exist; pasting it into a
+  device produced a dial timeout with nothing pointing back at the cause. The
+  same shape existed on the tunnelled path, where the server was spawned as a
+  task and the banner published a public URL, a generated API key, and a `curl`
+  example without ever learning whether the port was taken.
+
+  Both now bind first. The gateway already had this split (`api::bind`); the
+  relay gained the matching `bind_relay` / `serve_relay_on` pair, and
+  `serve_relay` is unchanged for callers with nothing to print in between.
+
+- **A port already in use is reported in words.** Both the gateway and the relay
+  ended a failed startup with the `Debug` form of an `io::Error` — `Error:
+  Io(Os { code: 10048, kind: AddrInUse, ... })` — the one place in this binary a
+  Rust internal reached an operator. The message now names the address, keeps
+  the OS text, and gives the platform's command for finding what holds the port.
+
 - **A device that cannot reach its relay now says what happened.** The only
   advice this path carried was for two certificate problems; every network
   failure fell through to a raw OS error, repeated forever with backoff. It did
