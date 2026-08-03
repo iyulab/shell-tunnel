@@ -3,6 +3,43 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.17.0 — 2026-08-03
+
+### Fixed
+
+- **The relay banner no longer announces certificate names the certificate does
+  not have.** `--tls-self-signed` generates a certificate on first run and
+  reuses it afterwards, so the names it carries are fixed at generation. The
+  banner reported the names it had *requested* rather than the ones on disk: a
+  relay restarted with a `--public-base` its certificate predates printed
+  `Certificate covers: relay.example.com` for a certificate that did not name
+  it, then offered `--relay-ca` as an alternative that could not verify that
+  name. Devices joining with `--relay-fingerprint` were unaffected — that path
+  pins the certificate and never checks the name — which is why this stayed
+  hidden. The banner now asks the certificate on disk, lists only what it
+  genuinely covers, names anything asked for and absent, and says how to
+  reissue. Found by running a relay, not by reading it.
+
+### Added
+
+- `TlsFiles::covered_names`, reporting which of a set of names the certificate
+  on disk is valid for. No new dependency — the check is `rustls`'s own name
+  verification.
+
+### Documentation
+
+- The relay TLS section said `--public-base` gives the certificate that name.
+  It does so only when the certificate is generated; a reused one is unchanged.
+  Both cases are stated now, in place of the one sentence that covered neither.
+- The troubleshooting row for a name mismatch quoted an error string the client
+  no longer emits, so searching for what the screen said did not find it. (The
+  neighbouring `BadSignature` row was re-checked against a running client and
+  is unchanged.)
+- `--help` presented `--relay-ca` as how devices trust a self-signed relay. The
+  fingerprint printed in the banner is that path, and the caveat about which
+  names a generated certificate carries belongs beside the flag that generates
+  it.
+
 ## 0.16.0 — 2026-08-03
 
 Everything below is startup output — what the program says about itself in the
