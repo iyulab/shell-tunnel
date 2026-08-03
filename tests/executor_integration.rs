@@ -208,3 +208,78 @@ async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
     assert_eq!(result.total_bytes, produced as u64);
     assert!(result.truncated, "the collected result is still capped");
 }
+
+/// A session's execute uses the same shell as `/execute`, and keeps nothing
+/// between calls.
+///
+/// USAGE §3.2 now says so outright, after an upstream report and this
+/// repository's own handover notes both stated the opposite — that a session
+/// runs `powershell.exe` on Windows and `$SHELL` on Unix. It does not: sessions
+/// carry an id, a working directory and an environment, and every command runs
+/// in a fresh shell exactly as a one-shot does. The `shell` field on create is
+/// accepted and ignored.
+///
+/// Pinned as a test rather than left to the prose because a doc sentence about
+/// behaviour is the thing this repository has repeatedly shipped stale, and
+/// because the day sessions *do* get a persistent shell, this failing is how
+/// the sentence gets rewritten instead of quietly becoming false again.
+#[tokio::test]
+async fn a_session_runs_each_command_in_a_fresh_shell() {
+    use shell_tunnel::session::SessionConfig;
+
+    let store = Arc::new(SessionStore::new());
+    let exec = CommandExecutor::new(store.clone());
+    let id = store
+        .create(SessionConfig {
+            // Named explicitly, so this fails the day it starts being honoured.
+            shell: Some(
+                if cfg!(windows) {
+                    "powershell.exe"
+                } else {
+                    "/bin/bash"
+                }
+                .to_string(),
+            ),
+            ..Default::default()
+        })
+        .expect("create session");
+    store
+        .update(&id, |s| {
+            let _ = s
+                .state
+                .transition_to(shell_tunnel::session::SessionState::Idle);
+        })
+        .expect("session becomes idle");
+
+    // A command only the *other* shell understands. If the `shell` field were
+    // honoured this would succeed, which is the point.
+    #[cfg(windows)]
+    let (foreign, set, read) = ("Get-Location", "set FOO=bar", "echo %FOO%");
+    #[cfg(unix)]
+    let (foreign, set, read) = ("shopt -s nullglob", "FOO=bar", "echo $FOO");
+
+    let result = exec
+        .execute_in_session(&id, &Command::new(foreign))
+        .await
+        .expect("execute failed");
+    assert_ne!(
+        result.exit_code,
+        Some(0),
+        "the `shell` field is documented as ignored; a shell-specific builtin \
+         must not work: {:?}",
+        result.text_output
+    );
+
+    exec.execute_in_session(&id, &Command::new(set))
+        .await
+        .expect("execute failed");
+    let after = exec
+        .execute_in_session(&id, &Command::new(read))
+        .await
+        .expect("execute failed");
+    assert!(
+        !after.text_output.contains("bar"),
+        "a session is documented as keeping no state between calls: {:?}",
+        after.text_output
+    );
+}

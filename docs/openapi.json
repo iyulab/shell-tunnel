@@ -1301,7 +1301,7 @@
         "properties": {
           "shell": {
             "type": "string",
-            "description": "Shell command to use (e.g., bash, powershell.exe)",
+            "description": "Accepted and currently ignored: every execute runs in cmd /c (Windows) or sh -c (Unix) whatever this says.",
             "example": "bash"
           },
           "working_dir": {

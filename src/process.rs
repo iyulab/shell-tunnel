@@ -57,11 +57,32 @@ pub(crate) fn detach_process_group(cmd: &mut OsCommand) {
 }
 
 /// Build the platform shell command that runs `command_line` non-interactively.
+///
+/// On Windows the command line is passed with [`CommandExt::raw_arg`] rather
+/// than `arg`. `arg` applies the argument-encoding rules of the C runtime —
+/// among them, escaping `"` as `\"` — and `cmd.exe` does not parse its command
+/// line that way. The result was that a quote written by the caller arrived at
+/// the shell as a literal backslash-quote, so every command needing quoting
+/// failed: `dir /b "D:\some\path"` was a syntax error, `powershell -c "a | b"`
+/// ran only `a`, and a path containing a space had no working form at all.
+/// Measured both ways before choosing; `raw_arg` fixes each of those and leaves
+/// unquoted commands byte-identical.
+///
+/// This grants the caller nothing new. `/execute` hands its string to a shell
+/// by definition, so a token holding `exec` could already run anything the
+/// account can; what changed is that quoting now means what it says.
+///
+/// Unix needs no equivalent: `arg` there places the string into `argv` with no
+/// encoding step, which is already what `sh -c` expects.
 pub(crate) fn shell_command(command_line: &str) -> OsCommand {
     #[cfg(windows)]
     {
+        use std::os::windows::process::CommandExt;
         let mut c = OsCommand::new("cmd.exe");
-        c.arg("/c").arg(command_line);
+        // Two `raw_arg` calls, and the trailing space in the first, are load
+        // bearing: raw arguments are concatenated verbatim, so `/c` and the
+        // command must be separated here or they arrive as one token.
+        c.raw_arg("/c ").raw_arg(command_line);
         c
     }
     #[cfg(unix)]
@@ -85,6 +106,55 @@ mod tests {
             .expect("shell should be available");
         assert!(output.status.success());
         assert!(String::from_utf8_lossy(&output.stdout).contains("shell-tunnel"));
+    }
+
+    /// A quote written by the caller must reach the shell as a quote.
+    ///
+    /// `arg` encodes for the C runtime's parser and turns `"` into `\"`, which
+    /// `cmd.exe` does not undo — so the shell saw a literal backslash. Three
+    /// separate consequences, each checked here rather than only the visible
+    /// one: the quotes survive round-trip, a quoted path is understood as one
+    /// argument, and an inner command line reaches the program it was meant for
+    /// instead of being cut at the first quote.
+    #[test]
+    fn a_quoted_command_reaches_the_shell_intact() {
+        let output = shell_command(r#"echo ["quoted"]"#)
+            .stdin(Stdio::null())
+            .output()
+            .expect("shell should be available");
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains(r#"["quoted"]"#),
+            "the quotes must survive; got {text:?}"
+        );
+        assert!(
+            !text.contains(r#"\""#),
+            "a backslash the caller never wrote must not appear: {text:?}"
+        );
+    }
+
+    /// A path in quotes is what quoting exists for, and it is the case with no
+    /// workaround: an unquoted path containing a space cannot be expressed at
+    /// all. `Cargo.toml` at the crate root is the fixture because it is present
+    /// wherever the tests run.
+    #[test]
+    fn a_quoted_path_is_one_argument() {
+        let root = env!("CARGO_MANIFEST_DIR");
+        #[cfg(windows)]
+        let line = format!(r#"dir /b "{root}\Cargo.toml""#);
+        #[cfg(unix)]
+        let line = format!(r#"ls "{root}/Cargo.toml""#);
+
+        let output = shell_command(&line)
+            .stdin(Stdio::null())
+            .output()
+            .expect("shell should be available");
+        assert!(
+            output.status.success(),
+            "a quoted path must be understood: {:?} / {:?}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

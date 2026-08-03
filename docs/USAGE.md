@@ -238,6 +238,27 @@ one is refused (see below), which it was not before 0.15.0: `{"command":"cmd",
 "args":["/c","echo","hi"]}` used to drop the `args`, start a bare shell, and
 answer `success: true, exit_code: 0` without running the command.
 
+**The string is handed to a shell as written**, so quoting, redirection, pipes
+and `&&` are the shell's to interpret, and quoting a path with spaces works the
+way it does at a prompt:
+
+```bash
+curl -X POST http://127.0.0.1:3000/api/v1/execute \
+  -H "Content-Type: application/json" \
+  -d '{"command":"dir /b \"C:\\Program Files\\Common Files\""}'
+```
+
+That shell is `cmd /c` on Windows and `/bin/sh -c` on Unix, on **both**
+`/execute` and a session's execute (§3.2) — a session runs each command in a
+fresh shell of its own, not in a persistent one. `POST /api/v1/sessions` accepts
+a `shell` field and it currently has no effect; nothing but `cmd`/`sh` is
+spawned either way. Neither does a session carry state between calls: `set
+FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
+
+Before 0.15.1 a quote in `command` reached the Windows shell as `\"`, so
+`dir /b "C:\Program Files"` was a syntax error and `powershell -c "a | b"` ran
+only `a`. A path containing a space had no working form at all.
+
 **A field this server does not recognise is refused, not ignored.** Misspell one
 — `workingDir` for `working_dir`, `timeoutSecs` for `timeout_secs` — and the
 request fails naming the field and listing the accepted ones, rather than
@@ -293,6 +314,14 @@ curl -X DELETE "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
 
 Create accepts `shell`, `working_dir`, `env`. Sessions are ready to execute the
 moment they are created.
+
+**A session groups commands; it does not keep a shell alive.** Each execute runs
+in its own `cmd /c` (Windows) or `sh -c` (Unix), the same as `/execute` — so
+`set FOO=bar` is not visible to the next call, a `cd` does not persist, and the
+`shell` field above currently changes nothing. What a session does give you is
+an id the audit trail records against, per-session `working_dir` and `env`, and
+a place for streaming to attach. Use `working_dir` rather than a leading `cd`,
+and pass what you need in `env`.
 
 ### Streaming over WebSocket
 

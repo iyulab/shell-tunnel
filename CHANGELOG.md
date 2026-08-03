@@ -20,6 +20,21 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   ` (truncated)` appended. The marker starts with a space, which a request path
   cannot contain, so it cannot be forged.
 
+- **A quote in `command` now reaches the shell as a quote (Windows).** The
+  command line was passed with an API that applies the C runtime's
+  argument-encoding rules, and `cmd.exe` does not parse its command line that
+  way — so `"` arrived as a literal `\"`. Every command that needed quoting
+  failed: `dir /b "C:\Program Files"` was a syntax error, `powershell -c "a | b"`
+  ran only `a`, and a path containing a space had no working form at all. A
+  caller who applied ordinary shell quoting was worse off than one who did not,
+  which is the opposite of what an API taking a command line should do.
+
+  Nothing new is granted by this. `/execute` hands its string to a shell by
+  definition, so a token holding `exec` could already run anything the account
+  can; what changed is that quoting means what it says. Unquoted commands are
+  byte-identical, shell operators (`&`, `|`, `&&`) behave as before, and Unix
+  was never affected.
+
 - **A startup that could not take its port no longer announces success first.**
   The relay logged and printed `listening on <addr>` — plus a ready-to-paste
   join command — *before* attempting the bind. Against a port already in use,
@@ -66,6 +81,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   for two flags they never wrote. It now names what was given.
 
 ### Documentation
+
+- **A session was described as running a different shell than `/execute`. It
+  does not.** Both run `cmd /c` on Windows and `sh -c` on Unix, and a session
+  runs each command in a fresh one — `set FOO=bar` is not visible to the next
+  call and a `cd` does not persist. The `shell` field on `POST /sessions` is
+  accepted and has no effect. USAGE §3 and §3.2 and the OpenAPI schema now say
+  all three, and a test pins them so the sentence cannot go stale unnoticed.
+  What a session actually offers — an id the audit trail records against,
+  per-session `working_dir` and `env`, a place for streaming to attach — is
+  stated in its place.
 
 - **`--help` said a gateway serves HTTPS with no reverse proxy needed. Both
   halves were false.** A gateway refuses the TLS flags at startup, and its own
