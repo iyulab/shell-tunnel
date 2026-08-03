@@ -842,8 +842,26 @@ shell-tunnel --relay https://relay.internal:8443 --enroll-token <t> --relay-ca c
 
 `--relay-ca` *adds* to the public trust anchors, so a mixed fleet does not become
 an all-or-nothing choice. Unlike a fingerprint, it requires the certificate to
-name the address being dialled — start the relay with `--public-base` for that
-name.
+name the address being dialled.
+
+Which names a generated certificate carries is decided **when it is generated**,
+and only then. On first run it takes the `--public-base` host, this machine's
+hostname, the bind address, and the local names. On every run after that the
+existing pair is reused as it is — adding `--public-base` to a relay that already
+has a certificate does not add the name to it. The startup banner reports what
+the certificate on disk actually covers, and names anything it was asked for and
+does not have:
+
+```
+Certificate covers: relay-host, localhost, 127.0.0.1
+             but not relay.example.com — an existing certificate is reused rather than reissued, …
+```
+
+To put a new name in, stop the relay, delete `shell-tunnel-cert.pem` and
+`shell-tunnel-key.pem`, and start it again — which mints a new fingerprint, so
+every device joining by fingerprint has to be given the new one. Devices already
+joining with `--relay-fingerprint` are unaffected by the missing name itself:
+that path pins the certificate and never checks the name.
 
 There is deliberately no option to skip verification. Encryption without
 authentication stops passive eavesdropping but not an active intermediary, who
@@ -988,7 +1006,7 @@ tunnel or a relay, which carry their own TLS, or put a reverse proxy in front �
 |---|---|---|
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
-| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
+| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts — its names are fixed when it is generated ([§5](#tls-without-a-proxy)) | `false` |
 | `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS on the relay (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
@@ -1072,7 +1090,7 @@ startup rather than serving local-only.
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
 | **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
-| `invalid peer certificate: NotValidForName` | certificate does not cover the dialled name | restart the relay with `--public-base <name>` after deleting the certificate and key |
+| `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
 | **502** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay |

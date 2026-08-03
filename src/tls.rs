@@ -80,6 +80,36 @@ impl TlsFiles {
         Ok(true)
     }
 
+    /// Which of `candidates` the certificate on disk is actually valid for.
+    ///
+    /// Asked of the file rather than of the names handed to
+    /// `ensure_self_signed`: the two agree only on the run that generated the
+    /// pair. Every later run reuses it, so a name added to `--public-base`
+    /// afterwards is not in the certificate, however plainly it was asked for.
+    ///
+    /// This checks names one at a time instead of listing the certificate's
+    /// subject alternative names, because listing them needs an X.509 parser
+    /// and checking one is already in `rustls`. The cost is that a name this
+    /// run did not ask about goes unmentioned even when the certificate carries
+    /// it — an understatement, which is the safe direction for a banner.
+    pub fn covered_names(&self, candidates: &[String]) -> Result<Vec<String>> {
+        let certs = read_certs(&self.cert)?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| ShellTunnelError::Tls("certificate file is empty".to_string()))?;
+        let parsed = rustls::server::ParsedCertificate::try_from(leaf)
+            .map_err(|e| ShellTunnelError::Tls(format!("cannot read the certificate: {e}")))?;
+
+        Ok(candidates
+            .iter()
+            .filter(|candidate| {
+                rustls::pki_types::ServerName::try_from((*candidate).clone())
+                    .is_ok_and(|name| rustls::client::verify_server_name(&parsed, &name).is_ok())
+            })
+            .cloned()
+            .collect())
+    }
+
     /// The SHA-256 fingerprint of the certificate on disk.
     pub fn fingerprint(&self) -> Result<String> {
         let certs = read_certs(&self.cert)?;
@@ -301,6 +331,46 @@ mod tests {
         // Generating something that then fails to load would be worse than not
         // generating at all.
         assert!(files.load().is_ok());
+    }
+
+    /// The banner has to describe the certificate that will actually be served.
+    /// On every run after the first that is not the certificate these names were
+    /// chosen for — `ensure_self_signed` reuses an existing pair without adding
+    /// to it — and the caller used to report the names it had asked for.
+    #[test]
+    fn covered_names_describes_the_certificate_on_disk_not_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = TlsFiles::new(dir.path().join("c.pem"), dir.path().join("k.pem"));
+        files
+            .ensure_self_signed(&["first.example".to_string(), "127.0.0.1".to_string()])
+            .unwrap();
+
+        // A later run names something else in --public-base. The pair is reused.
+        let asked = vec![
+            "second.example".to_string(),
+            "first.example".to_string(),
+            "127.0.0.1".to_string(),
+        ];
+        assert!(
+            !files.ensure_self_signed(&asked).unwrap(),
+            "the existing pair must be reused for this test to mean anything"
+        );
+
+        assert_eq!(
+            files.covered_names(&asked).unwrap(),
+            vec!["first.example".to_string(), "127.0.0.1".to_string()],
+            "a name the certificate does not carry must not be reported as covered"
+        );
+    }
+
+    /// Saying nothing beats guessing: a certificate that cannot be read cannot
+    /// be described, and the caller prints no coverage line at all.
+    #[test]
+    fn covered_names_fails_rather_than_guessing_when_there_is_no_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = TlsFiles::new(dir.path().join("absent.pem"), dir.path().join("k.pem"));
+
+        assert!(files.covered_names(&["localhost".to_string()]).is_err());
     }
 
     #[test]
