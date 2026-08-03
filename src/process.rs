@@ -111,11 +111,9 @@ mod tests {
     /// A quote written by the caller must reach the shell as a quote.
     ///
     /// `arg` encodes for the C runtime's parser and turns `"` into `\"`, which
-    /// `cmd.exe` does not undo — so the shell saw a literal backslash. Three
-    /// separate consequences, each checked here rather than only the visible
-    /// one: the quotes survive round-trip, a quoted path is understood as one
-    /// argument, and an inner command line reaches the program it was meant for
-    /// instead of being cut at the first quote.
+    /// `cmd.exe` does not undo — so the shell saw a literal backslash. This
+    /// covers the round trip; `a_quoted_path_is_one_argument` below covers the
+    /// case with no workaround.
     #[test]
     fn a_quoted_command_reaches_the_shell_intact() {
         let output = shell_command(r#"echo ["quoted"]"#)
@@ -123,9 +121,24 @@ mod tests {
             .output()
             .expect("shell should be available");
         let text = String::from_utf8_lossy(&output.stdout);
+
+        // The two shells disagree about what `echo` does with a quote, and the
+        // disagreement is what makes each output proof. `cmd.exe` echoes its
+        // line verbatim, quotes included. `sh` consumes them as syntax, so the
+        // quotes are gone from its output precisely *because* they arrived as
+        // quotes — a mangled `\"` would make `sh` print the quote literally,
+        // which is the Windows-correct string. Asserting one expectation on
+        // both platforms therefore fails on whichever one it was not written
+        // for; this test asserted the Windows string and had only ever run on
+        // Windows.
+        #[cfg(windows)]
+        let expected = r#"["quoted"]"#;
+        #[cfg(unix)]
+        let expected = "[quoted]";
+
         assert!(
-            text.contains(r#"["quoted"]"#),
-            "the quotes must survive; got {text:?}"
+            text.contains(expected),
+            "the quote must reach the shell as a quote; wanted {expected:?}, got {text:?}"
         );
         assert!(
             !text.contains(r#"\""#),
