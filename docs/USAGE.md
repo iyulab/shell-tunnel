@@ -581,20 +581,44 @@ publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 `--audit-log <file>` appends one JSON object per line for every execution, for
 every request the authentication layer refuses, and for the file operations
 listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry. Two gaps are worth naming rather than leaving to
-be discovered.
+absent from it leaves no entry. Three gaps are worth naming rather than leaving
+to be discovered.
+
+**Reading is not recorded.** `list`, `stat` and `download` write nothing when
+they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.
+This is the gap with the widest operational reach — on a server started without
+`--fs-root`, a token holding `fs.read` can read every file the process can
+reach, and the trail stays empty throughout. Three successful reads, zero
+entries, measured against a running server rather than read off the table.
 
 A request whose *path* does not resolve — missing, malformed, or escaping
 `--fs-root` — is turned away by machinery shared with `list`, `stat`, and
 `download`, and writes nothing on any of those routes.
 
-A request refused for carrying a field this server does not recognise (§3) is
-turned away while the body or query string is still being parsed, before any
-handler runs, so it writes nothing either. A caller probing `?dryRun=true`
-against `DELETE .../fs/file` leaves no trace of having tried — though it also
-changes nothing, which is the point of the refusal. Requests the
-authentication layer turns away first are unaffected: those are recorded as
-`denied`, including when the request would also have failed to parse.
+A request turned away **before any handler runs** writes nothing either, and
+that is more than the one case this paragraph used to name. Each of these was
+sent to a running server with a valid token and left the trail empty:
+
+| Refusal | Status |
+|---|---|
+| a body carrying a field this server does not recognise (§3) | `422` |
+| a query string carrying one | `400` |
+| a malformed JSON body | `400` |
+| a path parameter that does not parse | `400` |
+| a body over the size limit | `413` |
+
+A caller probing `?dryRun=true` against `DELETE .../fs/file` therefore leaves no
+trace of having tried — though it also changes nothing, which is the point of
+the refusal. Requests the authentication layer turns away first are unaffected:
+those are recorded as `denied`, including when the request would also have
+failed to parse.
+
+A `denied` entry names the path that was refused, and an unmatched path is
+recorded as the caller sent it rather than as a router template — that is the
+only description of a probe that exists. Such a path is truncated past 256
+bytes, with ` (truncated)` appended; the marker starts with a space, which a
+request path cannot contain, so it cannot be forged by a caller who ends a short
+path with the same text.
 
 Off on a loopback bind with no tunnel or relay — creating a file
 nobody asked for is its own kind of surprise there. A server reachable from

@@ -176,6 +176,131 @@ async fn an_insufficient_capability_names_what_was_missing() {
     assert!(event.identity.is_some());
 }
 
+/// Minimal HTTP GET, for the paths that carry no body.
+///
+/// Takes the target as bytes rather than `&str` so a test can send a request
+/// line no `format!` would produce.
+async fn get_raw(addr: SocketAddr, target: &[u8]) -> u16 {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = b"GET ".to_vec();
+    request.extend_from_slice(target);
+    request.extend_from_slice(
+        format!(" HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+    );
+    stream.write_all(&request).await.unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut raw))
+        .await
+        .expect("server should answer")
+        .unwrap();
+    String::from_utf8_lossy(&raw)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Two probes at different paths must leave two distinguishable entries.
+///
+/// They did not. A path the router does not match carries no `MatchedPath`, and
+/// the entry recorded the method alone — so scanning the whole API surface
+/// unauthenticated produced N byte-identical lines, and the trail asked about
+/// afterwards could not say what had been probed. Measured against a running
+/// server: five different requests, five identical lines.
+///
+/// Asserting merely that each entry *names its own path* would not catch a
+/// regression that recorded, say, the method and a constant; the entries have
+/// to differ from **each other**, which is the property that was lost.
+#[tokio::test]
+async fn two_unmatched_paths_leave_two_distinguishable_entries() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    assert_eq!(get_raw(addr, b"/nope/deep/path").await, 401);
+    assert_eq!(get_raw(addr, b"/other/deep/path").await, 401);
+
+    let recorded = events(&trail, 2).await;
+    let routes: Vec<&str> = recorded
+        .iter()
+        .map(|e| e.route.as_deref().expect("a denial names a route"))
+        .collect();
+    assert_ne!(
+        routes[0], routes[1],
+        "two different probes must not be indistinguishable: {routes:?}"
+    );
+    assert_eq!(routes[0], "GET /nope/deep/path", "{routes:?}");
+    assert_eq!(routes[1], "GET /other/deep/path", "{routes:?}");
+}
+
+/// The raw path is caller-controlled, so the entry it lands in is bounded.
+///
+/// Four kilobytes of path reaches this layer — hyper accepts it — and without a
+/// bound each probe would write as much of the trail as the prober chose. The
+/// `tracing` line beside the audit call was already lowered to `debug` over the
+/// same worry; a log level cannot silence the trail, so the bound is where the
+/// equivalent has to live.
+#[tokio::test]
+async fn a_long_unmatched_path_is_truncated_in_the_trail() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    let mut target = vec![b'/'];
+    target.extend(std::iter::repeat(b'a').take(4000));
+    assert_eq!(get_raw(addr, &target).await, 401);
+
+    let event = events(&trail, 1).await.remove(0);
+    let route = event.route.expect("a denial names a route");
+    assert!(
+        route.len() < 300,
+        "a 4000-byte path must not land in the trail whole: {} bytes",
+        route.len()
+    );
+    assert!(
+        route.ends_with(" (truncated)"),
+        "a shortened path must say it was shortened: {route}"
+    );
+    // The marker starts with a space, and a space cannot appear in a request
+    // path — hyper answers 400 to one. So a caller cannot end a short path with
+    // the marker and pass a truncated entry off as a whole one: percent-encoding
+    // is what survives to this layer, and it does not decode on the way.
+    assert_eq!(get_raw(addr, b"/x%20(truncated)").await, 401);
+    let forged = events(&trail, 2).await.remove(1);
+    assert_eq!(
+        forged.route.as_deref(),
+        Some("GET /x%20(truncated)"),
+        "the escape must survive verbatim, or the marker is forgeable"
+    );
+}
+
+/// A matched route stays a template, so entries group instead of exploding into
+/// one bucket per session id. Only the unmatched case falls back to a raw path.
+#[tokio::test]
+async fn a_matched_route_is_recorded_as_its_template() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "ro-key", &["session.read"]).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "DELETE /api/v1/sessions/abc123 HTTP/1.1\r\nHost: {addr}\r\n\
+         Authorization: Bearer ro-key\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut raw))
+        .await
+        .expect("server should answer")
+        .unwrap();
+
+    let event = events(&trail, 1).await.remove(0);
+    assert_eq!(event.status, Some(403));
+    assert_eq!(
+        event.route.as_deref(),
+        Some("DELETE /api/v1/sessions/{id}"),
+        "the id must not reach the trail as part of the route"
+    );
+}
+
 #[tokio::test]
 async fn the_token_never_reaches_the_file() {
     let dir = tempfile::tempdir().unwrap();

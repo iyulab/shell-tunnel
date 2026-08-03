@@ -7,6 +7,29 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A `denied` audit entry now names the path that was refused.** A request to a
+  path the router does not match carries no route template, and the entry
+  recorded the method alone — `{"route": "GET "}`. Scanning the API surface
+  unauthenticated therefore left a run of byte-identical lines, and the trail
+  that exists to answer "what was probed?" could not. An unmatched path is now
+  recorded as the caller sent it; a matched route is still recorded as its
+  template (`/api/v1/sessions/{id}`), so entries keep grouping instead of
+  splitting one bucket per id.
+
+  Because the raw path is caller-controlled, it is truncated past 256 bytes with
+  ` (truncated)` appended. The marker starts with a space, which a request path
+  cannot contain, so it cannot be forged.
+
+### Documentation
+
+- `USAGE.md` §4 named one gap in the audit trail — requests refused for carrying
+  an unrecognised field. Four more refusals reach the same place and were left
+  unnamed: a malformed JSON body, a query string that fails to parse, a path
+  parameter that fails to parse, and a body over the size limit. The section now
+  lists them, and separately states that successful reads (`list`, `stat`,
+  `download`) are not recorded at all — previously discoverable only by noticing
+  no such kind in the event table.
+
 - **A server that generates its own API key now prints it on stdout, at every
   log level.** `--require-auth` (and `--preset`/`--capabilities`, which also
   switch authentication on) generate a key when none was supplied. On a
