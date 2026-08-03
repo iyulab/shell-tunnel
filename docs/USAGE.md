@@ -678,9 +678,9 @@ shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
 ```
 
 Logs go to stderr and this banner-style output to stdout, so
-`shell-tunnel --tunnel | grep "Public URL"` works. Neither stream is coloured:
-log lines carry no ANSI escapes whether they land on a terminal, in the file a
-service unit redirects to, or in a pipe.
+`shell-tunnel --tunnel | grep "Public URL"` works. Log lines carry no ANSI
+escapes: colour is off unconditionally rather than detected, so nothing depends
+on where the stream ends up.
 
 Read it with `tail -f` or `jq`; entries are appended and never rewritten, and
 each is flushed as it happens so a crash does not take the last ones with it.
