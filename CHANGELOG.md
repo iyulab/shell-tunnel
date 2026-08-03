@@ -3,6 +3,67 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.16.0 — 2026-08-03
+
+Everything below is startup output — what the program says about itself in the
+first second, which is the one surface no test was watching and every operator
+reads. Each item was found by running the binary, not by reading it.
+
+### Fixed
+
+- **Logs no longer carry ANSI escapes.** Colour was switched on whenever the
+  logging crate was compiled with its `ansi` feature, and that default asks
+  nothing about what is downstream: it does not test whether stderr is a
+  terminal, and on Windows it does not enable the console's virtual-terminal
+  mode. So escapes went wherever the logs went — into the file a service unit
+  redirects to, into a pipe, and onto consoles that print them literally as
+  `←[2m` in front of every line. Colour is now off unconditionally rather than
+  guessed at: answering "can this terminal render an escape?" honestly on
+  Windows needs the Win32 console API, which is a platform dependency and a
+  block of `unsafe` bought for decoration on a headless gateway. The banner an
+  operator actually reads was never coloured.
+
+- **A generated API key now says it is not saved.** The key exists only in
+  memory, so a restart issues a different one and every caller configured with
+  the old value is refused — exactly the failure the relay's generated
+  enrolment token already warned about, on a credential that said nothing.
+  Behind a relay it is the quieter of the two: `--device-name` keeps the public
+  URL stable across restarts by design, so the address you handed out goes on
+  answering, with `401` to everyone. The banner now names `--api-key` and
+  `SHELL_TUNNEL_API_KEY` as the way to pin it.
+
+- **A relay's join line is the command, not a template.** It carried a literal
+  `--enroll-token <token>` while the URL and certificate fingerprint on the
+  same line were filled in, so the one line printed to be copied was the one
+  line that could not be. A token the relay generated is already on screen
+  three lines above, so the placeholder protected nothing. It is now
+  interpolated when the relay generated it; a token you supplied stays a
+  placeholder, since you have it already.
+
+- **The audit trail's path is announced once.** An exposed server named it both
+  in the posture banner and in a log line, two lines apart. The log line
+  remains where it is the only announcement — a local server has no posture
+  banner and can still be given `--audit-log`.
+
+### Added
+
+- **A device attached to a relay now prints the same `Try:` command a tunnel
+  does.** The relay path announced a public URL and stopped there, so the one
+  path that reaches a machine behind NAT was the one that never showed what to
+  do with the result. A reconnect does not reprint the block — the URL has not
+  changed — and is logged instead, on the stream that reported the drop.
+
+### Changed
+
+- **`relay::client::RelayClientConfig` gains an `enrolled` field** (breaking for
+  code that constructs it as a struct literal; `None` restores the previous
+  behaviour minus the stdout write). The client used to `println!` the device's
+  public URL from inside the library: an embedding consumer got a write to
+  stdout it never asked for, and one line of the binary's banner lived where no
+  banner test looks — which is why the `Try:` block above could not be added
+  until now. The client reports enrolment; the caller decides the wording, and
+  whether a reconnect deserves any.
+
 ## 0.15.1 — 2026-08-03
 
 ### Fixed

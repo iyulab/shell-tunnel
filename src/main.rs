@@ -347,7 +347,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         }
         None => std::sync::Arc::new(shell_tunnel::audit::AuditSink::Disabled),
     };
-    if audit.is_enabled() {
+    // The posture banner names the trail on stdout, so logging it here as well
+    // printed the same path twice, two lines apart, on every exposed run. The
+    // log line cannot simply be deleted: a local server gets no banner at all
+    // (nothing was narrowed, so `posture_banner` reports nothing) and can still
+    // be handed `--audit-log` explicitly, and this is the only place that says
+    // so. So it stays exactly where the banner is silent.
+    if audit.is_enabled() && posture == Posture::Local {
         info!("audit trail: {}", audit_log.as_ref().unwrap().display());
     }
     // The banner is the whole mitigation for a file API that no longer needs a
@@ -388,7 +394,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // the only place that survives `-l warn`.
     if provider.is_none() && args.relay_url.is_none() {
         if let Some(key) = &exposure.generated_key {
-            println!("API key:     {key}   (generated)");
+            println!("{}", generated_api_key_lines(key));
         }
     }
     println!("File API:    {}", fs_root.describe());
@@ -698,8 +704,23 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     #[cfg(not(feature = "tls"))]
     let ca_flag = String::new();
 
+    // A token this process generated is already three lines above in plain
+    // text, so a placeholder here withholds nothing — it only costs the line
+    // the one thing it exists for, being copied whole. Every other value on it
+    // is interpolated, so an operator ends up splicing a single field by hand
+    // into an otherwise complete command.
+    //
+    // A token the operator supplied stays a placeholder, for the reason
+    // `print_banner` keeps `(the key you configured)` rather than echoing a
+    // configured API key: they have it already, and printing a secret they
+    // handed in buys nothing that could not be lost.
+    let token_arg = if generated {
+        enroll_token.to_string()
+    } else {
+        "<token>".to_string()
+    };
     println!(
-        "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token <token>{ca_flag}\n"
+        "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token {token_arg}{ca_flag}\n"
     );
 
     // A port-less --public-base now inherits this relay's listen port (see
@@ -791,6 +812,7 @@ async fn run_with_relay(
         .map_err(shell_tunnel::ShellTunnelError::Io)?;
     let server = tokio::spawn(shell_tunnel::api::serve_on(listener, server_config, state));
 
+    let (enrolled_tx, mut enrolled_rx) = tokio::sync::mpsc::unbounded_channel();
     let client_config = RelayClientConfig {
         relay_url,
         enroll_token: args
@@ -807,14 +829,33 @@ async fn run_with_relay(
             .or_else(shell_tunnel::relay::client::default_device_name),
         fingerprint: args.relay_fingerprint.clone(),
         ca_file: args.relay_ca.clone(),
+        enrolled: Some(enrolled_tx),
     };
 
     for warning in &exposure.warnings {
         warn!("{}", warning);
     }
     if let Some(key) = &exposure.generated_key {
-        println!("API key:     {key}   (generated)");
+        println!("{}", generated_api_key_lines(key));
     }
+
+    // The first enrolment is the one worth a banner; the ones after it are
+    // recoveries from a drop, and the URL they report is the same URL. Saying
+    // so on stdout each time would push the block an operator is still reading
+    // off the top of the screen, so a reconnect is a log line — which is also
+    // the stream the drop it recovers from was reported on.
+    let generated_key = exposure.generated_key.clone();
+    tokio::spawn(async move {
+        let mut announced = false;
+        while let Some(url) = enrolled_rx.recv().await {
+            if announced {
+                info!("re-attached to relay as {url}");
+            } else {
+                print_relay_banner(&url, generated_key.as_deref());
+                announced = true;
+            }
+        }
+    });
 
     tokio::select! {
         result = server => result.expect("server task panicked"),
@@ -851,19 +892,48 @@ async fn tunnel_died(tunnel: &mut TunnelHandle) {
 fn print_banner(tunnel: &TunnelHandle, generated_key: Option<&str>) {
     let url = tunnel.public_url();
     let key_line = match generated_key {
-        Some(key) => format!("API key:     {key}   (generated)"),
+        Some(key) => generated_api_key_lines(key),
         None => "API key:     (the key you configured)".to_string(),
     };
     let key_value = generated_key.unwrap_or("$SHELL_TUNNEL_API_KEY");
 
     println!(
-        "\nPublic URL:  {url}   (via {provider})\n\
-         {key_line}\n\
-         Try:         curl -X POST {url}/api/v1/execute \\\n\
-         \x20              -H \"Authorization: Bearer {key_value}\" \\\n\
-         \x20              -H \"Content-Type: application/json\" \\\n\
-         \x20              -d '{{\"command\":\"echo hi\"}}'\n",
+        "\nPublic URL:  {url}   (via {provider})\n{key_line}\n{}\n",
+        try_curl_block(url, key_value),
         provider = tunnel.provider(),
+    );
+}
+
+/// The `Try:` block — one command that exercises the URL just announced.
+///
+/// Written as a single literal rather than continued across source lines with
+/// `\`: `cargo fmt` folds such a continuation into a run of spaces, which has
+/// shipped broken user-facing text here four times.
+fn try_curl_block(url: &str, key_value: &str) -> String {
+    format!("Try:         curl -X POST {url}/api/v1/execute \\\n               -H \"Authorization: Bearer {key_value}\" \\\n               -H \"Content-Type: application/json\" \\\n               -d '{{\"command\":\"echo hi\"}}'")
+}
+
+/// The banner for a device that has just attached to a relay.
+///
+/// Announced here rather than by the relay client, which used to `println!` the
+/// URL from inside the library — a consumer embedding that client got writes to
+/// stdout it never asked for, and one line of this binary's banner lived where
+/// no banner test looks.
+///
+/// It carries no `API key:` line, and that asymmetry with the tunnel's banner
+/// is deliberate. A tunnel's URL exists before anything is served, so its
+/// banner can announce both at once. A device's URL is not known until the
+/// relay accepts it, and a relay that never accepts it leaves the client
+/// retrying in backoff forever — so the key is printed before any of that, and
+/// repeating it here as a labelled line would report the same value twice.
+/// It still appears in the command below, which is what makes that command
+/// runnable as printed.
+#[cfg(feature = "relay-client")]
+fn print_relay_banner(url: &str, generated_key: Option<&str>) {
+    let key_value = generated_key.unwrap_or("$SHELL_TUNNEL_API_KEY");
+    println!(
+        "\nPublic URL:  {url}   (via relay)\n{}\n",
+        try_curl_block(url, key_value)
     );
 }
 
@@ -977,6 +1047,32 @@ fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&Capab
 /// continuation of the line it qualifies rather than a new fact.
 fn generated_enroll_token_note() -> &'static str {
     "              not saved: a restart generates a new one and every attached device's join line stops working. Pass --enroll-token to keep it across restarts."
+}
+
+/// The `API key:` banner line for a key this process generated, with the note
+/// that it does not survive a restart.
+///
+/// One function because there are three places that announce a generated key —
+/// a bare bind, a relay attach, and a tunnel's banner — and each used to build
+/// the line itself. That is how the note came to be missing here in the first
+/// place: the same warning was written once, for the enrolment token, and the
+/// key's three sites were not one place to add it to.
+///
+/// The two credentials fail identically. `Config::ensure_api_key` pushes the
+/// key into the in-memory list and writes it nowhere, exactly as the enrolment
+/// token is generated and kept nowhere, so a restart issues a different one and
+/// every caller configured with the old value is refused.
+///
+/// Behind a relay it is the harder of the two to read. A device names itself
+/// after the machine, so its public URL is *deliberately* stable across
+/// restarts — the address an operator handed out goes on working while the key
+/// behind it rotates. The enrolment token at least fails visibly, as devices
+/// that cannot attach; this one leaves a live URL refusing everyone.
+///
+/// The note is indented to the column the values above it start at, so it reads
+/// as a qualifier of the line it follows rather than as a new fact.
+fn generated_api_key_lines(key: &str) -> String {
+    format!("API key:     {key}   (generated)\n             not saved: a restart generates a new one and every existing caller is refused. Pass --api-key (or SHELL_TUNNEL_API_KEY) to keep it across restarts.")
 }
 
 /// The banner lines announcing the posture. Local is an empty list — with

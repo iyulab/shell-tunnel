@@ -147,13 +147,58 @@ fn wait_for_line(
     timeout: Duration,
     predicate: impl Fn(&str) -> bool,
 ) -> String {
+    let mut seen = wait_for_stdout_lines(server, timeout, predicate);
+    seen.pop().expect("the matching line is the last one read")
+}
+
+/// As `wait_for_line`, returning every line read rather than only the match.
+///
+/// Callers that assert on what the stream does *not* carry, or on a line's
+/// neighbour, need the lines that arrived before the match as much as the
+/// match itself.
+fn wait_for_stdout_lines(
+    server: &mut Killed,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let stdout = server.0.stdout.take().expect("stdout is piped");
+    read_lines_until(stdout, timeout, predicate)
+}
+
+/// As `wait_for_stdout_lines`, for the diagnostics stream.
+fn wait_for_stderr_lines(
+    server: &mut Killed,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let stderr = server.0.stderr.take().expect("stderr is piped");
+    read_lines_until(stderr, timeout, predicate)
+}
+
+/// Read `stream` until a line matches `predicate`, returning everything read
+/// with the match last. Panics if the deadline passes first, quoting what did
+/// arrive — a silent empty result would let an absence assertion pass on a
+/// stream that never produced anything.
+///
+/// The reader thread goes on draining after its receiver is gone, and that is
+/// load-bearing rather than tidy-up. Stopping at the first failed send drops
+/// the `BufReader`, which closes this end of the child's pipe — and the child
+/// is still writing its banner. Its next `println!` then fails on a broken
+/// pipe and panics the process, so a test that had already found the line it
+/// wanted would go on to find nothing listening on the port. That is a race,
+/// not a certainty: it depends on how much of the banner the child had flushed
+/// before the match arrived, which is why it stayed hidden until a line was
+/// added to the banner and shifted the timing. Draining until EOF keeps the
+/// pipe open for as long as the child holds the other end; `Killed` ends both.
+fn read_lines_until(
+    stream: impl Read + Send + 'static,
+    timeout: Duration,
+    predicate: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if tx.send(line).is_err() {
-                break;
-            }
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
         }
     });
 
@@ -162,10 +207,11 @@ fn wait_for_line(
     while std::time::Instant::now() < deadline {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
-                if predicate(&line) {
-                    return line;
-                }
+                let matched = predicate(&line);
                 seen.push(line);
+                if matched {
+                    return seen;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -618,4 +664,219 @@ fn a_generated_key_reaches_stdout_at_every_log_level() {
             "at -l {level} the printed key must be the one the server accepts"
         );
     }
+}
+
+/// The diagnostics stream must carry no ANSI escapes.
+///
+/// `tracing-subscriber`'s `fmt` layer colours its output whenever the crate's
+/// `ansi` feature is compiled in — it never asks whether anything downstream
+/// can render an escape, and on Windows it never enables the console's
+/// virtual-terminal mode either. So the escapes went wherever the logs went:
+/// into the file a service definition redirects to, into an agent's pipe, and
+/// onto consoles that print them literally as `←[2m` in front of every line.
+///
+/// Nothing inside the crate could have caught it. `logging.rs`'s unit tests
+/// emit records and assert they do not panic, and a record's *text* is
+/// identical either way — only the bytes on the pipe differ, and only a real
+/// process writing to a real pipe has those. This test is that process.
+///
+/// It reads until the version line rather than asserting on an empty stream:
+/// an absence assertion over nothing passes vacuously. The predicate matches
+/// with escapes present too (they wrap the fields, not the message), so a
+/// regression fails on the assertion below rather than timing out — confirmed
+/// by running it against the unfixed binary.
+#[test]
+fn the_log_stream_carries_no_ansi_escapes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39886"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let seen = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("shell-tunnel v")
+    });
+
+    for line in &seen {
+        assert!(
+            !line.contains('\u{1b}'),
+            "a log line reaching a pipe must be plain text, got {line:?}"
+        );
+    }
+}
+
+/// A key this server generated must say, on the next line, that it is gone on
+/// restart — the same thing the relay's generated enrolment token already says.
+///
+/// `Config::ensure_api_key` pushes the key into the in-memory key list and
+/// writes it nowhere, so the two credentials fail identically: restart, and
+/// the old value stops working. Only the enrolment token said so. The gap is
+/// worst behind a relay, where a device names itself after the machine and its
+/// public URL is *deliberately* stable across restarts — the address an
+/// operator handed out keeps answering while the key behind it rotates, so the
+/// symptom is "the URL is fine and everything 401s" rather than anything that
+/// points at a key.
+///
+/// The assertion is on adjacency, not mere presence. A note printed somewhere
+/// else in the banner would satisfy "the text appears" and still not read as a
+/// qualifier of the line it belongs to, which is the whole of its job.
+#[test]
+fn a_generated_key_is_printed_with_the_warning_that_it_is_not_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39887", "--require-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let seen = wait_for_stdout_lines(&mut server, Duration::from_secs(30), |l| {
+        l.trim_start().starts_with("not saved:")
+    });
+
+    let note = seen.last().expect("the match is the last line");
+    let above = seen
+        .get(seen.len().wrapping_sub(2))
+        .unwrap_or_else(|| panic!("the note has no line above it: {seen:?}"));
+    assert!(
+        above.starts_with("API key:") && above.contains("(generated)"),
+        "the note must qualify the generated-key line directly above it, got {above:?}"
+    );
+
+    // Naming the flag is what makes the note actionable rather than a lament;
+    // the enrolment token's note names `--enroll-token` for the same reason.
+    assert!(
+        note.contains("--api-key"),
+        "the note must name the flag that pins the key, got {note:?}"
+    );
+    // Alignment is what makes it read as a continuation of the line above
+    // rather than a new fact, so it is pinned to the column that line's value
+    // actually starts at — not to a hardcoded width that would drift silently
+    // if the labels were ever re-padded.
+    let column = above.find("st_").expect("the key line carries the key");
+    assert!(
+        note.starts_with(&" ".repeat(column)) && !note[column..].starts_with(' '),
+        "the note must start at the value column ({column}) of the line above, got {note:?}"
+    );
+}
+
+/// The join line a relay prints must be the command, not a template.
+///
+/// Every other value on it is interpolated — the URL, and the fingerprint when
+/// there is one — so a placeholder in the token position leaves an operator
+/// splicing one field by hand into an otherwise complete line. Nothing is
+/// protected by it either: a token this process generated is printed in full
+/// three lines above, on the same screen.
+#[test]
+fn a_generated_enrolment_token_reaches_the_join_line() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["relay", "--host", "127.0.0.1", "--port", "39888"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut relay = Killed(child);
+
+    let seen = wait_for_stdout_lines(&mut relay, Duration::from_secs(30), |l| {
+        l.trim_start().starts_with("shell-tunnel --relay")
+    });
+    let join = seen.last().expect("the match is the last line").clone();
+
+    let token = seen
+        .iter()
+        .find_map(|l| l.strip_prefix("Enroll token:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no generated token was announced: {seen:?}"));
+    assert!(
+        token.starts_with("st_"),
+        "expected a generated token above the join line, got {token:?}"
+    );
+
+    assert!(
+        join.contains(&format!("--enroll-token {token}")),
+        "the join line must carry the token that was generated, got {join:?}"
+    );
+    assert!(
+        !join.contains("<token>"),
+        "a line presented as the command to run must not be a template: {join:?}"
+    );
+}
+
+/// The audit trail's path is announced once, by whichever of the two outputs
+/// is speaking for the posture in force.
+///
+/// An exposed server's posture banner names it on stdout, so logging it as
+/// well printed the same path twice, two lines apart. A local server has no
+/// banner at all — `posture_banner` reports nothing when nothing was narrowed
+/// — and can still be handed `--audit-log`, so there the log line is the only
+/// thing that says where the trail went. Deleting it outright would have
+/// traded a duplicate for a silence, which is why both halves are asserted
+/// here rather than just the one that changed.
+#[test]
+fn the_audit_trail_path_is_announced_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "0.0.0.0", "--port", "39889"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut exposed = Killed(child);
+
+    let out = wait_for_stdout_lines(&mut exposed, Duration::from_secs(30), |l| {
+        l.starts_with("File API:")
+    });
+    assert_eq!(
+        out.iter().filter(|l| l.starts_with("Audit trail:")).count(),
+        1,
+        "the exposed banner names the trail exactly once: {out:?}"
+    );
+
+    // Read past the line that proves startup logging happened, so "no audit
+    // line on stderr" is an assertion about a stream that spoke, not silence.
+    let err = wait_for_stderr_lines(&mut exposed, Duration::from_secs(30), |l| {
+        l.contains("Starting shell-tunnel API server")
+    });
+    assert!(
+        !err.iter().any(|l| l.contains("audit trail:")),
+        "the banner already said it; the log must not repeat it: {err:?}"
+    );
+    drop(exposed);
+
+    // The other half: with no banner to carry it, the log line must.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let audit_log = dir.path().join("local-audit.jsonl");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            "39890",
+            "--audit-log",
+            audit_log.to_str().expect("utf-8 path"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut local = Killed(child);
+
+    let err = wait_for_stderr_lines(&mut local, Duration::from_secs(30), |l| {
+        l.contains("audit trail:")
+    });
+    let line = err.last().expect("the match is the last line");
+    assert!(
+        line.contains("local-audit.jsonl"),
+        "a local server's only announcement must name the path it was given: {line:?}"
+    );
 }

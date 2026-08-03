@@ -85,6 +85,7 @@ on `PATH`; shell-tunnel neither bundles nor downloads it. Prints:
 ```
 Public URL:  https://<random>.trycloudflare.com   (via cloudflared)
 API key:     st_18c432ca0b988868_1376c761ea5f8453   (generated)
+             not saved: a restart generates a new one and every existing caller is refused. Pass --api-key (or SHELL_TUNNEL_API_KEY) to keep it across restarts.
 Try:         curl -X POST https://<random>.trycloudflare.com/api/v1/execute ...
 ```
 
@@ -149,7 +150,7 @@ break is silent from the server's side:**
 
 | Leave it out | What breaks on restart |
 |---|---|
-| `-k <key>` | a new key is generated, and every existing caller gets `401`. The new key is only on the console. |
+| `-k <key>` | a new key is generated, and every existing caller gets `401`. The new key is only on the console, and the banner warns when it generated one. Behind a relay this is the quietest of the three: `--device-name` keeps the URL alive, so the address you handed out goes on answering — with `401` to everyone. |
 | `--device-name <n>` | defaults to the machine's name, which is stable — but if you set one, keep setting it, or the device URL moves |
 | `--enroll-token <t>` **on the relay** | a new one is generated and stored nowhere, so every attached device's join line stops working. The devices retry quietly in backoff; nothing says why. The relay's own banner warns when it generated one. |
 
@@ -677,7 +678,9 @@ shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
 ```
 
 Logs go to stderr and this banner-style output to stdout, so
-`shell-tunnel --tunnel | grep "Public URL"` works.
+`shell-tunnel --tunnel | grep "Public URL"` works. Log lines carry no ANSI
+escapes: colour is off unconditionally rather than detected, so nothing depends
+on where the stream ends up.
 
 Read it with `tail -f` or `jq`; entries are appended and never rewritten, and
 each is flushed as it happens so a crash does not take the last ones with it.
@@ -858,7 +861,18 @@ shell-tunnel --port 3000 --preset operator \
 
 ```
 Public URL:  https://relay.example.com/d/build-box   (via relay)
+Try:         curl -X POST https://relay.example.com/d/build-box/api/v1/execute ...
 ```
+
+Printed when the relay accepts the device, so it lands after the startup log
+lines rather than with them. A key this server generated is announced before
+that — it has to be, because a relay that never accepts the device leaves the
+client retrying in backoff and the key would never be printed at all — so it is
+not repeated here; the command above carries it.
+
+A reconnect does not reprint this block. The URL is the same URL, and repeating
+it would push the block you are reading off the screen; re-attaching is an
+`INFO` line instead, on the same stream that reported the drop.
 
 The device is named after the machine it runs on, so its URL survives restarts
 without anyone naming hosts by hand. `--device-name` overrides that. Names accept

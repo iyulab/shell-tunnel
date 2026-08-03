@@ -307,3 +307,48 @@ async fn an_unnamed_device_still_gets_a_random_id() {
     };
     assert!(device_id.starts_with("st_"), "{device_id}");
 }
+
+/// The client hands its public URL to whoever started it, rather than printing
+/// it.
+///
+/// It used to `println!` the line itself. That put one line of the binary's
+/// startup banner inside the library — a consumer embedding the client got a
+/// write to stdout it never asked for — and it left the wording somewhere no
+/// banner test looks, which is how the relay path ended up as the only public
+/// URL announced without the `Try:` command that follows it everywhere else.
+///
+/// This is the seam that replaced it, and it is the half that only a real
+/// client against a real relay can prove: the binary's side is ordinary
+/// formatting, but nothing else shows that the URL ever arrives.
+#[cfg(feature = "relay-client")]
+#[tokio::test]
+async fn a_device_reports_its_public_url_to_whoever_started_it() {
+    use shell_tunnel::relay::client::{run, RelayClientConfig};
+
+    let (relay_addr, _state) = start_relay("secret").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+    let config = RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: "secret".to_string(),
+        // Enrolment happens on the control channel before anything is proxied,
+        // so this address is never dialled and need not answer.
+        local: "127.0.0.1:1".parse().unwrap(),
+        label: None,
+        device_name: Some("probe".to_string()),
+        fingerprint: None,
+        ca_file: None,
+        enrolled: Some(tx),
+    };
+    tokio::spawn(run(config));
+
+    let url = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the client must report its enrolment, not just perform it")
+        .expect("the sending half is held by the running client");
+
+    assert!(
+        url.contains("/d/probe"),
+        "the reported URL must address the device by the name it asked for: {url:?}"
+    );
+}

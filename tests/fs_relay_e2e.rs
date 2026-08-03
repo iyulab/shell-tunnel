@@ -79,6 +79,7 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         device_name: Some(device_name.to_string()),
         fingerprint: None,
         ca_file: None,
+        enrolled: None,
     };
     tokio::spawn(run(config));
 }
