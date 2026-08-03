@@ -165,7 +165,10 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         };
         eprintln!("Configuration error: {given} to `shell-tunnel relay`.");
         eprintln!("A gateway is reached through a tunnel or a relay, which carry their own TLS;");
-        eprintln!("to expose one directly, put a reverse proxy in front.");
+        eprintln!("to expose one directly, put a reverse proxy in front — and pass --require-auth");
+        eprintln!("with it. A proxy does not change the bind address, so a loopback-bound gateway");
+        eprintln!("goes on treating itself as local, with authentication off, while the proxy");
+        eprintln!("publishes it to whoever can reach the proxy.");
         std::process::exit(1);
     }
     #[cfg(not(feature = "relay-client"))]

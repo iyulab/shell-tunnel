@@ -44,6 +44,10 @@ jobs:
       # (`tls`) arrived, the sentence stayed true-sounding, and the TLS relay
       # suite went unrun on all three platforms until someone counted again.
       # Whatever gates exist, list their features; do not enumerate the files.
+      #
+      # `tests/ci_feature_gates.rs` now checks this line against the gates it
+      # finds, so a fourth gate fails a test instead of relying on this comment
+      # being reread. It carries no feature gate of its own, deliberately.
       - name: Run tests
         run: cargo test --all --features relay-client,tls --verbose
 

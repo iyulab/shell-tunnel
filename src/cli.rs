@@ -419,6 +419,10 @@ TLS OPTIONS (with `relay`):
                             flags at startup: reach it through a tunnel or a
                             relay, which carry their own TLS, or put a reverse
                             proxy in front. Its own socket is plaintext.
+                            With a proxy, pass --require-auth: the proxy does
+                            not change the bind address, so a loopback-bound
+                            gateway still counts itself local and leaves
+                            authentication off while the proxy publishes it
 
 RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay
