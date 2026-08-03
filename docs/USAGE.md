@@ -1000,6 +1000,15 @@ The gateway's own socket is plaintext, and `--tls-cert`/`--tls-key`/
 tunnel or a relay, which carry their own TLS, or put a reverse proxy in front —
 [§5](#tls-without-a-proxy) covers terminating TLS on the relay instead.
 
+**A proxy in front changes what the bind address means.** Whether authentication
+is enforced is read from the bind address: a loopback bind is treated as local,
+so authentication is off and no audit trail is written unless one is asked for.
+A proxy does not change the bind address. It changes who can reach it — and
+every request then arrives from `127.0.0.1`, so the gateway goes on treating
+itself as local while being as reachable as the proxy is. Pass `--require-auth`
+and `--audit-log` when a proxy is in front; in that posture neither is applied
+for you.
+
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
 | Option | Description | Default |
