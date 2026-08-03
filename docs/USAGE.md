@@ -925,8 +925,6 @@ still sees the real address.
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
-| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
-| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS directly (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 | `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
@@ -936,12 +934,19 @@ still sees the real address.
 | `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
+The gateway's own socket is plaintext, and `--tls-cert`/`--tls-key`/
+`--tls-self-signed` are refused at startup if given to one. Reach it through a
+tunnel or a relay, which carry their own TLS, or put a reverse proxy in front —
+[§5](#tls-without-a-proxy) covers terminating TLS on the relay instead.
+
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
 | Option | Description | Default |
 |---|---|---|
 | `--enroll-token <T>` | Secret devices present to attach (not `--api-key`) | generated |
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
+| `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts | `false` |
+| `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS on the relay (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
 
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
@@ -1065,7 +1070,7 @@ The default build links no TLS stack, HTTP client, or WebSocket client.
 |---|---|---|
 | *(default)* | nothing | ✅ |
 | `self-update` | `--update` / `--check-update` | ✅ |
-| `tls` | `--tls-cert` / `--tls-key` (serve HTTPS in-process) | ✅ |
+| `tls` | `--tls-cert` / `--tls-key` — a relay serving HTTPS in-process (§6) | ✅ |
 | `relay-client` | `--relay` (device side; TLS + WS client) | ✅ |
 
 ```bash

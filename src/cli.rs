@@ -380,6 +380,13 @@ OPTIONS:
                             unless -p says otherwise
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
+        --relay-fingerprint <FP>
+                            Expect exactly this certificate from the relay, as
+                            printed by `shell-tunnel relay --tls-self-signed`.
+                            Nothing to copy but the string, and the certificate
+                            need not name the address being dialled
+        --relay-ca <FILE>   Also trust this PEM authority when dialling a relay
+                            (the alternative to a fingerprint, for a private CA)
         --allow-host <HOST> Also answer to this host name. A loopback-bound
                             server that is not published otherwise answers only
                             to localhost, which is what stops DNS rebinding.
@@ -396,20 +403,18 @@ OPTIONS:
                             the API reaches everything this account can
         --fs-chunk-size <N> Upload chunk size in bytes (default 4194304)
 
-TLS OPTIONS (serve HTTPS directly, no reverse proxy needed):
+TLS OPTIONS (with `relay`):
         --tls-self-signed   Serve HTTPS with a self-signed certificate,
                             generating one on first run and reusing it after.
                             Needs no paths; devices trust it with --relay-ca
         --tls-cert <FILE>   PEM certificate chain [default with --tls-self-signed:
                             shell-tunnel-cert.pem]
         --tls-key <FILE>    PEM private key matching the certificate
-        --relay-fingerprint <FP>
-                            Expect exactly this certificate from the relay, as
-                            printed by `shell-tunnel relay --tls-self-signed`.
-                            Nothing to copy but the string, and the certificate
-                            need not name the address being dialled
-        --relay-ca <FILE>   Also trust this PEM authority when dialling a relay
-                            (the alternative to a fingerprint, for a private CA)
+
+                            A gateway does not serve HTTPS and refuses these
+                            flags at startup: reach it through a tunnel or a
+                            relay, which carry their own TLS, or put a reverse
+                            proxy in front. Its own socket is plaintext.
 
 RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay

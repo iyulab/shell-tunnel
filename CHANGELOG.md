@@ -20,7 +20,24 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   ` (truncated)` appended. The marker starts with a space, which a request path
   cannot contain, so it cannot be forged.
 
+- **A gateway refused a TLS flag by naming flags the caller had not passed.**
+  `--tls-self-signed` fills in `--tls-cert`/`--tls-key` while arguments are
+  parsed, and the refusal reported those instead — sending the operator looking
+  for two flags they never wrote. It now names what was given.
+
 ### Documentation
+
+- **`--help` said a gateway serves HTTPS with no reverse proxy needed. Both
+  halves were false.** A gateway refuses the TLS flags at startup, and its own
+  refusal says to put a reverse proxy in front. The section is now scoped
+  ``TLS OPTIONS (with `relay`)`` — matching the scope the relay's other section
+  already carried — and states that a gateway's socket is plaintext. The two
+  dial-trust flags that were filed under it, `--relay-fingerprint` and
+  `--relay-ca`, moved next to `--relay`, which is what they belong to.
+  `USAGE.md` §6 listed the same two TLS rows in the gateway table, directly
+  above a line introducing the relay's flags as what it "additionally accepts";
+  they have moved to the relay table. The prose section on TLS was already
+  correct — only the reference tables were wrong.
 
 - `USAGE.md` §4 named one gap in the audit trail — requests refused for carrying
   an unrecognised field. Four more refusals reach the same place and were left

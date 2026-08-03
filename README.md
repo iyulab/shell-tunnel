@@ -34,8 +34,8 @@ curl -X POST http://127.0.0.1:3000/api/v1/execute \
 ```
 
 That's the whole loop: run the binary, POST a command, get structured output. No config, no
-account, no daemon. When you want auth, a public URL, or TLS, add one flag at a time — the
-next section shows each.
+account, no daemon. When you want auth or a public URL, add one flag at a time — the next
+section shows each, including TLS on a relay you host. The gateway's own socket is plaintext.
 
 ## Install
 
@@ -167,8 +167,8 @@ authenticated, not just encrypted. The startup banner states what is actually in
 ## Status
 
 Implemented: sessions, one-shot and streaming execution, WebSocket, capability-scoped auth,
-rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS with
-self-signed generation and fingerprint pinning, host-header checking, an append-only audit
+rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS on the
+relay with self-signed generation and fingerprint pinning, host-header checking, an append-only audit
 trail, and filesystem operations (list, read, write, delete, optionally confined by `--fs-root`). On the
 roadmap: native MCP tools.
 

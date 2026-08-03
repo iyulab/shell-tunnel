@@ -264,6 +264,71 @@ fn an_exposed_bind_deriving_an_audit_log_inside_the_fs_root_refuses_to_start() {
     );
 }
 
+/// The TLS flags belong to the relay, and `--help` must say so — because for a
+/// while it said the opposite.
+///
+/// The header read `TLS OPTIONS (serve HTTPS directly, no reverse proxy
+/// needed)`, in a help text where the relay's own section *is* scoped
+/// (`RELAY OPTIONS (with `relay`)`). A scope marker on one section and not the
+/// other reads as "the unmarked one is common to both modes", which is exactly
+/// backwards: a gateway refuses these flags at startup, and its refusal tells
+/// the operator to put a reverse proxy in front — the thing the header said was
+/// not needed. Both halves of that parenthetical were false.
+///
+/// The two assertions cover different regressions. Behaviour: each way of
+/// asking for TLS is refused, and refused *for being a relay flag* rather than
+/// for some incidental parse error. Text: the help scopes the section and does
+/// not carry the old claim back. Neither alone would have caught the defect —
+/// the behaviour was always correct, and it was the text that lied.
+#[test]
+fn the_tls_flags_are_refused_by_a_gateway_and_scoped_to_the_relay_in_help() {
+    for (label, args) in [
+        ("--tls-self-signed", vec!["--tls-self-signed"]),
+        (
+            "--tls-cert/--tls-key",
+            vec!["--tls-cert", "cert.pem", "--tls-key", "key.pem"],
+        ),
+    ] {
+        let mut with_bind = vec!["--host", "127.0.0.1", "--port", "39885"];
+        with_bind.extend(args);
+        let (code, _stdout, stderr) = run_with_timeout(&with_bind, Duration::from_secs(10));
+
+        assert_eq!(
+            code,
+            Some(1),
+            "{label} must refuse startup; stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("shell-tunnel relay"),
+            "{label} must be refused as a relay flag, not for an unrelated \
+             reason: {stderr}"
+        );
+        // The refusal names what was passed. `--tls-self-signed` fills in
+        // `--tls-cert`/`--tls-key` during parsing, so reporting the fields
+        // instead sent an operator looking for two flags they never wrote.
+        assert!(
+            stderr.contains(label),
+            "the refusal must name the flag that was given: {stderr}"
+        );
+    }
+
+    let (code, help, _stderr) = run_with_timeout(&["--help"], Duration::from_secs(10));
+    assert_eq!(code, Some(0));
+    let tls_header = help
+        .lines()
+        .find(|l| l.starts_with("TLS OPTIONS"))
+        .expect("the help has a TLS section");
+    assert!(
+        tls_header.contains("relay"),
+        "the TLS section must name the mode that accepts it: {tls_header}"
+    );
+    assert!(
+        !help.contains("no reverse proxy needed"),
+        "the help claimed a gateway needs no reverse proxy while its own \
+         refusal tells the operator to add one"
+    );
+}
+
 /// `GET /api/v1` over a bare socket, with an optional bearer token, returning
 /// the status code.
 ///

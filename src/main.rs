@@ -153,7 +153,17 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // a plaintext server for someone who asked for an encrypted one — the exact
     // silent failure every other path in this binary refuses to make.
     if args.tls_cert.is_some() {
-        eprintln!("Configuration error: --tls-cert/--tls-key apply to `shell-tunnel relay`.");
+        // Names what was actually passed. `--tls-self-signed` fills in
+        // `tls_cert`/`tls_key` with defaults during parsing, so reporting the
+        // field rather than the flag sent an operator looking for two flags
+        // they never wrote.
+        // Carries its own verb: one flag applies, two apply.
+        let given = if args.tls_self_signed {
+            "--tls-self-signed applies"
+        } else {
+            "--tls-cert/--tls-key apply"
+        };
+        eprintln!("Configuration error: {given} to `shell-tunnel relay`.");
         eprintln!("A gateway is reached through a tunnel or a relay, which carry their own TLS;");
         eprintln!("to expose one directly, put a reverse proxy in front.");
         std::process::exit(1);
