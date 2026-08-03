@@ -1021,6 +1021,9 @@ startup rather than serving local-only.
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
+| `cannot reach relay: … Nothing answered at <host:port>` | the connection was neither answered nor refused — something between the device and the relay is dropping it | not a flag problem. Check whether the device can open *any* outbound connection to that port; a relay on a port the network already allows out is the usual fix |
+| `cannot reach relay: … <host:port> was reached, and nothing is listening on it` | the address and route are fine; the relay is not serving there | check the relay is running and bound to that port |
+| `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
 | **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |

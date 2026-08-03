@@ -20,6 +20,26 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   ` (truncated)` appended. The marker starts with a space, which a request path
   cannot contain, so it cannot be forged.
 
+- **A device that cannot reach its relay now says what happened.** The only
+  advice this path carried was for two certificate problems; every network
+  failure fell through to a raw OS error, repeated forever with backoff. It did
+  not even name the host and port being dialled — the relay URL appears in the
+  startup banner and nowhere else.
+
+  A timed-out dial and a refused one now read differently, because they mean
+  different things: refused says the relay is not serving there, timed out says
+  something between the two machines is dropping the connection. The timeout
+  advice states outright that no flag of this program changes it — an operator
+  looking at a failure suspects their own arguments first, because those are the
+  only variable on screen, and in the incident behind this the host could not
+  open *any* outbound connection. If a proxy environment variable is set, that is
+  reported too, along with the fact that this client dials directly and does not
+  use it.
+
+  Classification comes from `io::ErrorKind`, never from the message text: an OS
+  error is written in the machine's own language, and the incident's console was
+  in Korean. A unit test pins that, so a regression to string matching fails.
+
 - **A gateway refused a TLS flag by naming flags the caller had not passed.**
   `--tls-self-signed` fills in `--tls-cert`/`--tls-key` while arguments are
   parsed, and the refusal reported those instead — sending the operator looking
