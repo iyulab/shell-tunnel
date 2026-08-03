@@ -104,6 +104,17 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   they have moved to the relay table. The prose section on TLS was already
   correct — only the reference tables were wrong.
 
+- **`--help` filed five mode-independent flags under the relay's section.**
+  `--check-update`, `--update`, `--no-update-check`, `-h` and `-V` trailed the
+  end of ``RELAY OPTIONS (with `relay`)``, having simply been left where the
+  list ran out. None of them concerns the relay — one flat parser reads every
+  flag, and the update trio exits before a server of either kind starts — and
+  the help contradicted itself further down, where the examples show
+  `shell-tunnel --check-update` with no subcommand. They now sit under their own
+  unscoped `OTHER OPTIONS`. Scoping the TLS header above (previous entry) is
+  what sharpened this: once every named section carries a mode, whatever trails
+  the last one inherits a scope nobody wrote.
+
 - `USAGE.md` §4 named one gap in the audit trail — requests refused for carrying
   an unrecognised field. Four more refusals reach the same place and were left
   unnamed: a malformed JSON body, a query string that fails to parse, a path

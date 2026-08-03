@@ -329,6 +329,68 @@ fn the_tls_flags_are_refused_by_a_gateway_and_scoped_to_the_relay_in_help() {
     );
 }
 
+/// A flag accepted in either mode must not be filed under a section header that
+/// names one.
+///
+/// `--check-update`, `--update`, `--no-update-check`, `-h` and `-V` were listed
+/// under `RELAY OPTIONS (with `relay`)`, having simply been left at the bottom
+/// of the last section. None of them has anything to do with the relay: one
+/// flat parser reads every flag, and the update trio exits before a server of
+/// either kind starts. The help contradicted itself two screens later, where
+/// EXAMPLES shows `shell-tunnel --check-update` with no subcommand.
+///
+/// This is the TLS header's defect one section further down, and scoping that
+/// header is what sharpened it: once every *named* section carries a mode, the
+/// flags trailing the last one inherit a scope nobody wrote. So the guard is
+/// written as a rule over sections rather than an assertion about these five
+/// flags — a sixth added to the end of the file must not quietly acquire the
+/// relay's scope either.
+#[test]
+fn a_flag_accepted_in_either_mode_is_not_filed_under_a_mode_scoped_section() {
+    let (code, help, _stderr) = run_with_timeout(&["--help"], Duration::from_secs(10));
+    assert_eq!(code, Some(0));
+
+    // The update trio is compiled in only with the `self-update` feature, so it
+    // is checked where present rather than required to be present: a build
+    // without it must still not misfile `-h`/`-V`.
+    const MODE_INDEPENDENT: &[&str] = &[
+        "-h, --help",
+        "-V, --version",
+        "--check-update",
+        "--update ",
+        "--no-update-check",
+    ];
+
+    // Section headers are the only unindented lines ending in a colon.
+    let mut header = "";
+    let mut checked = 0;
+    for line in help.lines() {
+        if !line.starts_with(' ') && line.ends_with(':') {
+            header = line;
+            continue;
+        }
+        let flags = line.trim_start();
+        for flag in MODE_INDEPENDENT {
+            if flags.starts_with(flag) {
+                checked += 1;
+                assert!(
+                    !header.contains("with `relay`"),
+                    "`{}` is accepted in either mode, but the help files it \
+                     under `{header}`",
+                    flag.trim()
+                );
+            }
+        }
+    }
+
+    // Without this the test passes on a help text that stopped listing the
+    // flags at all, which is not the property being pinned.
+    assert!(
+        checked >= 2,
+        "expected at least `-h` and `-V` to be found in the help, saw {checked}"
+    );
+}
+
 /// A relay whose port is taken must not have announced itself first.
 ///
 /// The announcement used to come before the bind, so a taken port produced a

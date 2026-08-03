@@ -423,6 +423,8 @@ RELAY OPTIONS (with `relay`):
         --public-base <URL> Public base URL of this relay. A URL with no port
                             uses this relay's listen port; name a port only when
                             a proxy remaps it [default: http://<bind address>]
+
+OTHER OPTIONS:
 {update_opts}    -h, --help              Print help
     -V, --version           Print version
 
