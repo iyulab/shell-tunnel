@@ -367,7 +367,8 @@ OPTIONS:
                             operator when the server is reachable
         --preset <NAME>     Scope issued token(s) by role preset
                             (operator | file-write | file-read | full-control)
-        --no-rate-limit     Disable rate limiting
+        --no-rate-limit     Disable rate limiting. No X-RateLimit-* headers are
+                            then sent — there is no budget to report
         --tunnel            Expose publicly via a Cloudflare quick tunnel
                             (requires `cloudflared`; implies authentication)
         --tunnel-command <C>
@@ -425,7 +426,10 @@ TLS OPTIONS (with `relay`):
                             With a proxy, pass --require-auth: the proxy does
                             not change the bind address, so a loopback-bound
                             gateway still counts itself local and leaves
-                            authentication off while the proxy publishes it
+                            authentication off while the proxy publishes it.
+                            Forget it and the server warns once, on the first
+                            request carrying a proxy header — but a proxy that
+                            forwards none of them leaves nothing to warn about
 
 RELAY OPTIONS (with `relay`):
         --enroll-token <T>  Secret devices present to attach to this relay
