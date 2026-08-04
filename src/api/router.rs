@@ -13,6 +13,7 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -379,11 +380,13 @@ async fn capability_auth_middleware(
             // record nothing, so the trail is not a complete list of every
             // refusal the server issued. `USAGE.md` §4 names that gap and lists
             // the measured cases; keep the two in step as the layer grows.
-            audit.record(
-                crate::audit::AuditEvent::new("denied")
-                    .with_route(route)
-                    .with_denial(401, reason),
-            );
+            audit
+                .record_async(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_route(route)
+                        .with_denial(401, reason),
+                )
+                .await;
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
@@ -403,12 +406,14 @@ async fn capability_auth_middleware(
             if capabilities.satisfies(cap) {
                 Ok(next.run(request).await)
             } else {
-                audit.record(
-                    crate::audit::AuditEvent::new("denied")
-                        .with_identity(identity)
-                        .with_route(route.clone())
-                        .with_denial(403, format!("missing-capability:{cap}")),
-                );
+                audit
+                    .record_async(
+                        crate::audit::AuditEvent::new("denied")
+                            .with_identity(identity)
+                            .with_route(route.clone())
+                            .with_denial(403, format!("missing-capability:{cap}")),
+                    )
+                    .await;
                 tracing::debug!(
                     %method,
                     path = %route,
@@ -478,6 +483,77 @@ async fn host_check_middleware(
     ))
 }
 
+/// Headers a reverse proxy adds, in the order operators are likeliest to meet.
+///
+/// `Forwarded` is the standardised one; the two `X-` names predate it and are
+/// what nginx, Apache, IIS and every cloud load balancer actually send.
+const PROXY_HEADERS: [&str; 3] = ["x-forwarded-for", "x-real-ip", "forwarded"];
+
+/// Say so, once, if a request arrives through a proxy while auth is off.
+///
+/// The posture this server picks is decided by its bind address: loopback is
+/// read as "not reachable", and authentication, the `operator` scope and
+/// automatic audit are all released on that reading. A reverse proxy breaks the
+/// premise without changing the bind address — every request then appears to
+/// come from `127.0.0.1` — so the server goes on believing it is private while
+/// being as reachable as the proxy is. This product *recommends* that
+/// arrangement: putting a reverse proxy in front is what its own error message
+/// tells an operator to do when they ask a gateway for TLS.
+///
+/// Documentation already says this at each place the arrangement is suggested,
+/// but documentation only protects whoever reads it. This is the observation
+/// that needs no reading: a request carrying `X-Forwarded-For` is evidence,
+/// arriving on the very path that matters, that something is in front.
+///
+/// Only ever a warning, which is what makes the forgeability of these headers
+/// irrelevant: anyone who can reach an unauthenticated exec API has no use for
+/// making it warn about itself. And only where auth is off — a server that
+/// authenticates is behind a proxy on purpose and needs no telling.
+///
+/// The default is deliberately not changed. Loopback-means-no-auth is the
+/// local-development experience, and trading it away is a product decision, not
+/// one to slip in beside a warning.
+async fn proxy_evidence_middleware(
+    State((warned, audited)): State<(Arc<std::sync::atomic::AtomicBool>, bool)>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use std::sync::atomic::Ordering;
+
+    // The common case is the already-warned one; keep it to a single load.
+    if !warned.load(Ordering::Relaxed) {
+        if let Some(header) = PROXY_HEADERS
+            .iter()
+            .find(|name| request.headers().contains_key(**name))
+        {
+            // Whoever loses the race warned; the other stays quiet.
+            if !warned.swap(true, Ordering::Relaxed) {
+                // Written as separate calls, never one literal split with a
+                // backslash: `cargo fmt` folds that into a line with a gap in
+                // the middle, and it has shipped that way here four times.
+                //
+                // Each line asserts only what was checked. Whether the bind
+                // address is loopback is not checked — a library consumer can
+                // disable auth on any address — and whether a trail is being
+                // written is read rather than assumed, because an operator who
+                // passed --audit-log has one.
+                tracing::warn!("A request arrived carrying {header}, which a reverse proxy adds.");
+                tracing::warn!("Authentication is off on this server, so whatever reaches it can run commands — and something in front means that is wherever the proxy is reachable, not just this machine.");
+                if !audited {
+                    tracing::warn!(
+                        "No audit trail is configured either, so none of it is being recorded."
+                    );
+                    tracing::warn!("Restart with --require-auth, and --audit-log <FILE> to keep a record. This warning is printed once.");
+                } else {
+                    tracing::warn!("Restart with --require-auth. This warning is printed once.");
+                }
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
 /// Create the API router with security enabled.
 pub fn create_secure_router(
     state: AppState,
@@ -523,6 +599,18 @@ pub fn create_secure_router(
         ))
         .layer(TraceLayer::new_for_http());
 
+    // Only where there is something to warn about: a server that authenticates
+    // is behind whatever is in front of it on purpose.
+    if !auth_store.is_enabled() {
+        router = router.layer(middleware::from_fn_with_state(
+            (
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                state.audit.is_enabled(),
+            ),
+            proxy_evidence_middleware,
+        ));
+    }
+
     // Outermost, so a rebound request is refused before it reaches the token
     // store or the rate limiter's bookkeeping.
     if let Some(hosts) = allowed_hosts {
@@ -553,6 +641,24 @@ pub struct ServerConfig {
     pub security: SecurityConfig,
     /// Enable graceful shutdown on SIGTERM/SIGINT.
     pub graceful_shutdown: bool,
+    /// Where to report an API key this server generated for itself.
+    ///
+    /// [`serve_on`] generates one when authentication is on and no key was
+    /// registered. It used to write that key to the log, which handed an
+    /// embedding consumer a plaintext secret in whatever its logs go to. It now
+    /// sends the key here instead: the library reports the fact, the caller
+    /// decides where it goes — the arrangement
+    /// [`crate::relay::client::RelayClientConfig`]'s `enrolled` already uses.
+    ///
+    /// `None` leaves the key unreported, and [`serve_on`] warns when it lands
+    /// there — a key nobody can read authenticates nobody. Register a key with
+    /// [`SecurityConfig::with_api_key`] if you have one; set this if you want
+    /// the generated one.
+    ///
+    /// The send happens before the listener starts accepting, and the channel
+    /// is unbounded, so the key waits in it: spawn [`serve_on`] and receive
+    /// afterwards. Nothing needs to be draining it first.
+    pub generated_key: Option<UnboundedSender<String>>,
 }
 
 impl ServerConfig {
@@ -562,6 +668,7 @@ impl ServerConfig {
             port,
             security: SecurityConfig::default(),
             graceful_shutdown: true,
+            generated_key: None,
         }
     }
 
@@ -580,6 +687,15 @@ impl ServerConfig {
         self.graceful_shutdown = false;
         self
     }
+
+    /// Report a key this server generates for itself on `tx`.
+    ///
+    /// See [`ServerConfig::generated_key`] for when that happens and what
+    /// leaving it unset costs.
+    pub fn report_generated_key_to(mut self, tx: UnboundedSender<String>) -> Self {
+        self.generated_key = Some(tx);
+        self
+    }
 }
 
 impl Default for ServerConfig {
@@ -589,6 +705,7 @@ impl Default for ServerConfig {
             port: 3000,
             security: SecurityConfig::default(),
             graceful_shutdown: true,
+            generated_key: None,
         }
     }
 }
@@ -635,7 +752,16 @@ pub async fn serve_on(
             // configured capabilities (full-control when unset).
             let key = crate::security::generate_api_key();
             register_key(&auth_store, &key, &config.security.capabilities);
-            tracing::info!("Generated API key: {}", key);
+            match &config.generated_key {
+                Some(tx) => {
+                    let _ = tx.send(key);
+                }
+                // Reported nowhere, and deliberately not logged: this used to
+                // put a plaintext secret in the consumer's log. Saying so is
+                // the difference between "the caller chose not to collect it"
+                // and "the server is now holding a key nobody can present".
+                None => tracing::warn!("authentication is on with no API key registered, so one was generated — but ServerConfig::generated_key is unset and the key is not logged, so nothing can read it. Register a key with SecurityConfig::with_api_key, or set that channel."),
+            }
         }
         tracing::info!(
             "Authentication enabled with {} API key(s)",

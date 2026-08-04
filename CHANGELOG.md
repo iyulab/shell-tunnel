@@ -3,6 +3,152 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.19.0 — 2026-08-04
+
+> ⚠ **A minor bump rather than a patch, because of the breaking library changes**
+> listed under *Changed*. HTTP callers need no change.
+
+### Added
+
+- **`GET /relay/v1/devices` reports how long each device has been taking to answer.**
+  Four fields per device — `exchanges`, `last_exchange_ms`, `mean_exchange_ms`,
+  `slowest_exchange_ms` — so a slow relayed request can be attributed without guessing.
+  They appear only once a device has answered something; a device nothing has called
+  reports none of them rather than zero, which would read as answering instantly. What one
+  measurement covers is stated rather than implied: transfer *and* the device's own
+  processing together, which the relay cannot separate, with the wait for a free
+  connection excluded and failures counted. Reached with the enrol token, as the rest of
+  that endpoint is. This replaces a request for an endpoint echoing arbitrary bytes, which
+  was declined — it would have been an unauthenticated bandwidth amplifier.
+
+### Fixed
+
+- **A `429` that crossed a relay no longer claims the caller has requests to spare.**
+  Two rate limiters sit in series on the proxied path, and the middleware overwrote
+  whatever the response already carried — so a refusal from a device with an empty
+  bucket arrived stamped with the *relay's* spare budget, up to `X-RateLimit-Remaining: 92`
+  beside a `429`. A consumer pacing itself by that header reads a refusal as room to
+  continue. The device's headers are now kept where it sent them, and the relay fills
+  them in only where the device sent none. Nor is a count added to a `429` that is not a
+  rate limit at all — `too-many-uploads` carries no limiter headers, and the limiter that
+  *allowed* the request has no spare capacity to claim on somebody else's refusal.
+  `Retry-After` was correct all along and is unchanged. §5 of the operating guide states
+  which set of headers arrives in each case.
+- **A mismatched `--relay-fingerprint` now names the fingerprint.** Pinning worked; the
+  diagnostic said nothing. A wrong value produced `cannot reach relay: IO error: invalid
+  peer certificate: ApplicationVerificationFailure` — four wrappings ending in a library's
+  enum name, never once saying `fingerprint`, and opening with a phrase that sends an
+  operator to firewalls and DNS for a relay that answered and offered its certificate. The
+  failure now names the flag, prints the pinned value beside the one the relay actually
+  sent, says where to copy the current one from, and says that retrying does not help until
+  the pin or that certificate changes. §8 of the operating guide gained the row: it listed
+  both `--relay-ca` failures and neither of the fingerprint path's, which is the one the
+  banner recommends. A dial failure is explained in full once and then referred to by its
+  first line: these explanations are paragraphs, a device that cannot attach retries
+  forever, and the first live run of the new one produced 47 log lines in six seconds.
+
+- **The `Reachable:` banner no longer presents `operator` as a boundary it is not.** It
+  read `tokens are scoped to \`operator\`, not wildcard` under the reachability label, which
+  says *reachable now, but narrowed in exchange*. Nothing was narrowed: `operator` holds
+  all five capabilities this version defines, so a token scoped to it meets no `403` on any
+  route that exists — confirmed by issuing one and walking them. The banner now names the
+  capabilities a token actually holds, and where they cover everything, says outright that
+  nothing is withheld today. A scope that genuinely narrows, such as `file-read`, does not
+  carry that line.
+
+- **An unauthenticated gateway now says so when it can see it is behind a proxy.** Which
+  posture a gateway takes is read from its bind address, so a reverse proxy — the
+  arrangement its own TLS error message tells an operator to set up — leaves it treating
+  itself as local, with authentication off and no audit trail, while being reachable from
+  wherever the proxy is. Every request arrives from `127.0.0.1`, so nothing in the bind
+  address can reveal it. The first request carrying `X-Forwarded-For`, `X-Real-IP` or
+  `Forwarded` now draws a one-time warning naming what is at stake and what to restart
+  with. It remains a warning and refuses nothing: the headers are forgeable, and forging
+  them only makes the server warn about itself. A proxy that passes none of them leaves no
+  evidence and draws no warning — the documented `--require-auth` is still the thing to do,
+  not something this replaces. **The default is unchanged**: loopback still means no auth,
+  because trading that away is a product decision rather than a bug fix.
+
+- **Public traffic can no longer starve a device off the relay it shares an address with.**
+  The relay's per-address limit exists to stop an enrolment token being guessed at line
+  speed, but the same bucket also counted the data connections an already-enrolled device
+  opens — and since the relay has a device open a fresh one for every proxied request, the
+  device's share of that budget was set by whoever called it. Load on an address could
+  therefore refuse the enrolments of a device on that address, which is the ordinary case
+  when a relay and its devices sit behind one outbound address; it happened, and the device
+  backed off in silence. A device's connections are now charged and then **refunded once it
+  has proven the enrol token**, so only failed and abandoned attempts accumulate. A guess is
+  still charged, so the defence the limit was written for is unchanged.
+- **A device refused with `429` says so, and says it will recover.** It reported
+  `cannot reach relay: … HTTP error: 429`, which sends an operator to firewalls and DNS for
+  a relay that is up and answering. A refusal carrying an HTTP status now reads as a
+  refusal rather than a failure to connect, and the `429` case additionally names rate
+  limiting as the cause and says the retry recovers on its own.
+- **A server started with `--no-rate-limit` no longer advertises a rate limit.**
+  It answered `X-RateLimit-Limit: 100 / X-RateLimit-Remaining: 100` on every response —
+  a budget nothing was counting, with the remaining count frozen at full forever. A
+  client that throttles itself by the header held itself to a limit that did not exist.
+  No `X-RateLimit-*` header is sent when limiting is off.
+- **Writing the audit trail no longer runs on a runtime worker.** `AuditSink::record`
+  opens, writes and flushes a file. The filesystem handlers already threaded that into the
+  `spawn_blocking` bodies they were running in, so a slow disk could not starve the pool
+  that also serves `/health` and the accept loop — but the execute, WebSocket and
+  denial paths have no blocking body of their own and called it from the runtime thread,
+  which is the case a trail on a network share or a busy disk turns into stalled unrelated
+  requests. Those six call sites now go through a new `AuditSink::record_async`, which is
+  awaited rather than detached: the entry still lands before the response, because a trail
+  that drops its last entries under load is untrustworthy exactly where it is load-bearing.
+  With no trail configured the hop is skipped entirely. What is recorded, and in what
+  order, is unchanged.
+- **An upload stopped by a Windows disk quota now answers `507`, not `500`.** A quota is
+  exhausted with the volume itself far from full, and that case had a counterpart on Unix
+  (`EDQUOT`) and none on Windows — so the one answer a client can act on, "free something
+  up and retry", arrived as "the server has a bug, file a report". `ERROR_DISK_QUOTA_EXCEEDED`
+  now reads as out-of-space alongside the two full-volume codes. `ERROR_NOT_ENOUGH_QUOTA`
+  deliberately does not: despite the name it reports a process memory quota, which freeing
+  disk space does not resolve. §8 of the operating guide and `docs/openapi.json` both said
+  Windows quotas were uncovered; both now state what each platform reports.
+- **A server no longer dies because whatever was reading its stdout went away first.**
+  `println!` panics on a failed write — the right answer for a command whose output *is*
+  the job, and the wrong one for a process that serves afterwards. A banner written into a
+  pipe with no reader left is a failed write, so the process exited mid-banner with
+  `failed printing to stdout: The pipe is being closed. (os error 232)`, taking the server
+  with it. A log shipper restarting, a wrapper's `| head` exiting, a supervisor rotating a
+  pipe — the operating guide's own service recipes put a long-lived consumer there, and
+  none of this is defensible from outside the process. The banner and the notes a running
+  process writes now go through a locked handle and drop a line that cannot be written.
+  The startup refusals are unchanged: they write and exit on the next line, so there is
+  nothing left running for a panic there to take down.
+- **A key the server generates for itself no longer goes to the log.** `serve_on`
+  generates an API key when authentication is on and no key was registered, and wrote it
+  with `tracing::info!` — a plaintext secret landing in whatever an embedding consumer's
+  logs go to, at the level normal operation already runs at. The binary's key stopped
+  going there when key issuing moved up to the configuration layer, and appears on the
+  startup banner instead; this branch is the one a library consumer reaches, and it kept
+  the old line. The key is now sent to `ServerConfig::generated_key`, and where that
+  channel is unset the server says it is holding a key nothing can read — the key is
+  neither logged nor silently kept, because a generated key nobody has authenticates
+  nobody.
+
+### Changed
+
+- **Breaking (library):** `RateLimiter::check` returns `RateLimitDecision` instead of
+  `Result<u32, Duration>`. The three variants are `Unlimited`,
+  `Allowed { remaining, charge }` and `Limited { retry_after }`; the old signature had no
+  way to say "no limit applies" except by reporting a full bucket, which is the defect
+  above. Callers matching on `Ok`/`Err` need the two allowed cases separated.
+- **Breaking (library):** `relay::registry::DeviceSummary` gained four fields, and
+  `RateLimiter::refund` is new — it takes the `RateLimitCharge` from an `Allowed`
+  decision, which the rate-limit middleware puts in the request's extensions. Naming the
+  slot is what keeps a refund from returning a different caller's; an opaque "give one
+  back" cannot tell the difference once the charge it meant has aged out of the window.
+- **Breaking (library):** `api::ServerConfig` gained a `generated_key` field — breaking
+  for code that constructs it as a struct literal, and `None` (what the builders set)
+  restores the previous behaviour minus the log line. `ServerConfig::report_generated_key_to`
+  sets it. This is the arrangement `relay::client::RelayClientConfig`'s `enrolled` already
+  uses: the library reports the fact and the caller decides where it goes, rather than the
+  library choosing a stream on its behalf.
+
 ## 0.18.0 — 2026-08-04
 
 > ⚠ **A minor bump rather than a patch, because of one breaking library change**

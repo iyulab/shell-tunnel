@@ -165,13 +165,24 @@ pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::i
 /// platform-correct value for each target, so naming it is also more
 /// correct than hardcoding one.
 ///
-/// Windows has two counterparts, not one: `ERROR_DISK_FULL` (112) and
+/// Windows has three counterparts, not one: `ERROR_DISK_FULL` (112),
 /// `ERROR_HANDLE_DISK_FULL` (39/`0x27`) — the latter is what a handle-based
 /// write (exactly the path `UploadStore::append`'s `Write` impl takes)
-/// reports for a full volume, per `winerror.h`. Both are documented literals
-/// rather than named constants: there is no crate in this tree's dependency
-/// graph that names them (no `windows-sys`, and this task adds no new
-/// dependencies).
+/// reports for a full volume — and `ERROR_DISK_QUOTA_EXCEEDED` (1295), which
+/// is `EDQUOT`'s counterpart and was missing while the Unix side had it: a
+/// per-user quota on an NTFS volume is exhausted with the volume itself far
+/// from full, and answering `500` there tells a client to file a bug about a
+/// condition it could have fixed by freeing space. All three are documented
+/// literals rather than named constants: there is no crate in this tree's
+/// dependency graph that names them (no `windows-sys`, and this task adds no
+/// new dependencies). 1295's identity was confirmed on Windows by rendering
+/// it — "The requested file operation failed because the storage quota was
+/// exceeded" — rather than read off a table.
+///
+/// `ERROR_NOT_ENOUGH_QUOTA` (1816) is deliberately *not* here despite the
+/// name: it renders as "Not enough quota is available to process this
+/// command" and reports a process memory quota, which is not a condition
+/// freeing disk space resolves.
 #[cfg(unix)]
 pub fn is_out_of_space(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(code) if code == libc::ENOSPC || code == libc::EDQUOT)
@@ -184,12 +195,18 @@ pub fn is_out_of_space(err: &std::io::Error) -> bool {
     /// `ERROR_HANDLE_DISK_FULL` (`0x27`), from `winerror.h` — reported for a
     /// full volume on a handle-based write, which is the path uploads take.
     const ERROR_HANDLE_DISK_FULL: i32 = 39;
+    /// `ERROR_DISK_QUOTA_EXCEEDED`, from `winerror.h` — a quota exhausted on a
+    /// volume with space left, which is `EDQUOT`'s counterpart.
+    const ERROR_DISK_QUOTA_EXCEEDED: i32 = 1295;
     // `io::Error::raw_os_error()` reports the raw Win32 error code, not an
-    // `errno` — neither of these is to be confused with any POSIX `ENOSPC`
+    // `errno` — none of these is to be confused with any POSIX `ENOSPC`
     // or `EDQUOT` numbering.
     matches!(
         err.raw_os_error(),
-        Some(code) if code == ERROR_DISK_FULL || code == ERROR_HANDLE_DISK_FULL
+        Some(code)
+            if code == ERROR_DISK_FULL
+                || code == ERROR_HANDLE_DISK_FULL
+                || code == ERROR_DISK_QUOTA_EXCEEDED
     )
 }
 
@@ -274,6 +291,8 @@ mod tests {
     fn is_out_of_space_matches_disk_full_codes_only() {
         const ERROR_DISK_FULL: i32 = 112;
         const ERROR_HANDLE_DISK_FULL: i32 = 39;
+        const ERROR_DISK_QUOTA_EXCEEDED: i32 = 1295;
+        const ERROR_NOT_ENOUGH_QUOTA: i32 = 1816;
 
         let disk_full = std::io::Error::from_raw_os_error(ERROR_DISK_FULL);
         assert!(is_out_of_space(&disk_full));
@@ -283,8 +302,19 @@ mod tests {
         let handle_disk_full = std::io::Error::from_raw_os_error(ERROR_HANDLE_DISK_FULL);
         assert!(is_out_of_space(&handle_disk_full));
 
+        // A quota exhausted on a volume with space left is the same
+        // instruction to the client, and is what the Unix side's `EDQUOT`
+        // already covered.
+        let quota = std::io::Error::from_raw_os_error(ERROR_DISK_QUOTA_EXCEEDED);
+        assert!(is_out_of_space(&quota));
+
+        // Named like a quota and is not one: 1816 is a process memory quota,
+        // which freeing disk space does not resolve.
+        let memory_quota = std::io::Error::from_raw_os_error(ERROR_NOT_ENOUGH_QUOTA);
+        assert!(!is_out_of_space(&memory_quota));
+
         // A different Win32 code — e.g. ERROR_FILE_NOT_FOUND (2) — must not
-        // be mistaken for either.
+        // be mistaken for any of them.
         let not_found = std::io::Error::from_raw_os_error(2);
         assert!(!is_out_of_space(&not_found));
 

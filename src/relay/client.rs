@@ -202,14 +202,33 @@ fn install_crypto_provider() {
 pub async fn run(config: RelayClientConfig) -> Result<()> {
     install_crypto_provider();
     let mut backoff = BACKOFF_MIN;
+    // The reason a dial failed is explained in full once, then referred to.
+    //
+    // Some of these explanations are long — the fingerprint mismatch prints
+    // both values and where to copy from — and a device that cannot attach
+    // retries forever. Repeating the whole thing every backoff turns the one
+    // configuration that most needs reading into a wall of it. The condition
+    // still repeats, so it is still visible; what stops repeating is the
+    // paragraph explaining it.
+    let mut explained: Option<String> = None;
     loop {
         match attach(&config).await {
             Ok(()) => {
                 tracing::warn!(target: "relay-client", "relay connection closed; reconnecting");
                 backoff = BACKOFF_MIN;
+                explained = None;
             }
             Err(e) => {
-                tracing::warn!(target: "relay-client", "relay connection failed: {e}");
+                let reason = e.to_string();
+                let repeat = explained.as_deref() == Some(reason.as_str());
+                tracing::warn!(
+                    target: "relay-client",
+                    "{}",
+                    dial_failure_line(&reason, repeat, backoff)
+                );
+                if !repeat {
+                    explained = Some(reason);
+                }
             }
         }
         tokio::time::sleep(backoff).await;
@@ -217,11 +236,37 @@ pub async fn run(config: RelayClientConfig) -> Result<()> {
     }
 }
 
+/// What to log about a dial failure, given whether it has been explained once.
+///
+/// `explain_dial_failure` writes paragraphs — the fingerprint mismatch prints
+/// both values and where to copy from — and a device that cannot attach retries
+/// forever. Repeating the whole thing every backoff buries the one explanation
+/// that most needs reading. Live-verified: a wrong fingerprint produced 47 lines
+/// in six seconds before this, and 22 after, with the gap widening as the
+/// backoff grows.
+///
+/// The repeat still names the condition and says when the next attempt is, so
+/// the failure stays visible in a log tail; only the explanation stops.
+fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -> String {
+    if !already_explained {
+        return format!("relay connection failed: {reason}");
+    }
+    let headline = reason.lines().next().unwrap_or(reason);
+    format!(
+        "relay connection failed again: {headline} (unchanged; retrying in {}s)",
+        backoff.as_secs()
+    )
+}
+
 /// One attachment: enroll, then serve pool requests until the channel drops.
 ///
 /// Returns `Ok(())` when the relay closed the channel cleanly.
 pub async fn attach(config: &RelayClientConfig) -> Result<()> {
     install_crypto_provider();
+    // Built before the dial so the failure path can read what the verifier
+    // recorded: a rejected certificate's fingerprint is the one thing an
+    // operator needs and the one thing rustls cannot carry out in its error.
+    let (tls, seen) = connector(config)?;
     let (mut control, _) = tokio_tungstenite::connect_async_tls_with_config(
         config
             .control_url()
@@ -229,10 +274,13 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
         None,
         false,
-        connector(config)?,
+        tls,
     )
     .await
-    .map_err(|e| ShellTunnelError::Tunnel(explain_dial_failure(&e, config)))?;
+    .map_err(|e| {
+        let presented = seen.lock().ok().and_then(|s| s.clone());
+        ShellTunnelError::Tunnel(explain_dial_failure(&e, config, presented.as_deref()))
+    })?;
 
     let enroll = DeviceMessage::Enroll {
         enroll_token: config.enroll_token.clone(),
@@ -310,7 +358,11 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
         None,
         false,
-        connector(config)?,
+        // The recorded certificate is not read here: a data connection only
+        // opens after the control channel enrolled over the same TLS
+        // configuration, so a pin that failed has already been reported once
+        // by `attach` with both fingerprints in it.
+        connector(config)?.0,
     )
     .await
     .map_err(|e| ShellTunnelError::Tunnel(format!("data connection refused: {e}")))?;
@@ -424,6 +476,10 @@ fn proxy_env_set() -> Vec<&'static str> {
 /// failing to reach the relay happens every time a device is placed on a
 /// constrained network, which is what this product is for.
 ///
+/// An HTTP refusal is separated from both: the relay answered, so neither the
+/// certificate advice nor the reachability advice applies, and the prefix says
+/// refused rather than unreachable.
+///
 /// Reachability is classified from [`std::io::ErrorKind`], never from the
 /// message: an OS error string is translated into the machine's own language,
 /// so matching on its text works on the machine it was written on and nowhere
@@ -432,10 +488,82 @@ fn proxy_env_set() -> Vec<&'static str> {
 fn explain_dial_failure(
     error: &tokio_tungstenite::tungstenite::Error,
     config: &RelayClientConfig,
+    presented: Option<&str>,
 ) -> String {
     let text = error.to_string();
-    let mut message = format!("cannot reach relay: {text}");
     let target = config.dial_target();
+
+    // A refusal is not a failure to reach: the relay answered, and saying
+    // "cannot reach relay" here sends an operator to firewalls and DNS for a
+    // relay that is up and talking. Rate limiting is the case that matters,
+    // because the device then retries in backoff and, without this, says
+    // nothing about why or whether it will recover — four enrolments were
+    // refused this way in the field and the console showed only the retries.
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
+        let status = response.status();
+        let mut message = format!("relay refused this connection: HTTP {status}");
+        if status == 429 {
+            advise(
+                &mut message,
+                &format!("{target} is rate limiting this address, not rejecting this device."),
+            );
+            advise(
+                &mut message,
+                "This is transient and the device keeps retrying in backoff; it attaches",
+            );
+            advise(&mut message, "once the address is under the limit again.");
+            advise(
+                &mut message,
+                "If it persists, something else is sharing this machine's outbound address",
+            );
+            advise(
+                &mut message,
+                "and spending the relay's per-address budget. Raise the relay's limit, or",
+            );
+            advise(&mut message, "give the device an address of its own.");
+        } else {
+            advise(&mut message, &format!("Dialling {target}."));
+        }
+        return message;
+    }
+
+    // A pin that did not match is neither a failure to reach nor a certificate
+    // problem in the ordinary sense: the relay answered and the handshake got
+    // as far as its certificate. Left to the branches below it surfaced as
+    // `cannot reach relay: IO error: invalid peer certificate:
+    // ApplicationVerificationFailure` — four wrappings ending in a rustls enum
+    // name, never once saying `fingerprint`, and opening with a phrase that
+    // sends an operator to firewalls and DNS. The value they typed is the
+    // cause; both values belong in the message.
+    if let Some(expected) = &config.fingerprint {
+        if text.contains("ApplicationVerificationFailure") {
+            let mut message = "relay certificate does not match --relay-fingerprint".to_string();
+            advise(&mut message, &format!("pinned:      {expected}"));
+            match presented {
+                Some(actual) => advise(&mut message, &format!("relay sent:  {actual}")),
+                None => advise(
+                    &mut message,
+                    "The certificate the relay sent could not be fingerprinted here.",
+                ),
+            }
+            advise(
+                &mut message,
+                "The relay prints its own on the `Devices join with:` line of its banner.",
+            );
+            advise(
+                &mut message,
+                "A relay that regenerated its certificate has a new one, so a value copied",
+            );
+            advise(
+                &mut message,
+                "before that no longer matches. Retrying changes nothing until the pin or",
+            );
+            advise(&mut message, "that certificate does.");
+            return message;
+        }
+    }
+
+    let mut message = format!("cannot reach relay: {text}");
 
     if text.contains("BadSignature") || text.contains("UnknownIssuer") {
         let ca = config
@@ -559,7 +687,19 @@ fn explain_dial_failure(
 struct PinnedCertificate {
     expected: Vec<u8>,
     provider: std::sync::Arc<rustls::crypto::CryptoProvider>,
+    /// The fingerprint of whatever was presented, when it was not the pinned
+    /// one.
+    ///
+    /// rustls answers a rejected certificate with one of its own enum variants
+    /// and gives a custom verifier nowhere to attach a reason, so the value an
+    /// operator needs — the one to copy if the relay is the one that changed —
+    /// would otherwise be computed here and thrown away. Recording it beside
+    /// the connector is what lets the dial failure name both numbers.
+    seen: SeenCertificate,
 }
+
+/// Where a rejected certificate's fingerprint is left for the error message.
+type SeenCertificate = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
     fn verify_server_cert(
@@ -572,12 +712,15 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
     ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
         let presented = ring::digest::digest(&ring::digest::SHA256, end_entity.as_ref());
         if presented.as_ref() == self.expected.as_slice() {
-            Ok(rustls::client::danger::ServerCertVerified::assertion())
-        } else {
-            Err(rustls::Error::InvalidCertificate(
-                rustls::CertificateError::ApplicationVerificationFailure,
-            ))
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
         }
+
+        if let Ok(mut seen) = self.seen.lock() {
+            *seen = Some(crate::fingerprint::of_certificate(end_entity.as_ref()));
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
     }
 
     fn verify_tls12_signature(
@@ -619,7 +762,10 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
 ///
 /// Returning `None` means "use the defaults", which is what a relay with a
 /// publicly-signed certificate needs.
-fn connector(config: &RelayClientConfig) -> Result<Option<tokio_tungstenite::Connector>> {
+fn connector(
+    config: &RelayClientConfig,
+) -> Result<(Option<tokio_tungstenite::Connector>, SeenCertificate)> {
+    let seen: SeenCertificate = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some(fingerprint) = &config.fingerprint {
         let expected = crate::fingerprint::parse(fingerprint)
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad --relay-fingerprint: {e}")))?;
@@ -632,15 +778,19 @@ fn connector(config: &RelayClientConfig) -> Result<Option<tokio_tungstenite::Con
             .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertificate {
                 expected,
                 provider,
+                seen: std::sync::Arc::clone(&seen),
             }))
             .with_no_client_auth();
-        return Ok(Some(tokio_tungstenite::Connector::Rustls(
-            std::sync::Arc::new(tls),
-        )));
+        return Ok((
+            Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+                tls,
+            ))),
+            seen,
+        ));
     }
 
     let Some(path) = &config.ca_file else {
-        return Ok(None);
+        return Ok((None, seen));
     };
 
     let pem = std::fs::read(path)
@@ -666,9 +816,12 @@ fn connector(config: &RelayClientConfig) -> Result<Option<tokio_tungstenite::Con
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok(Some(tokio_tungstenite::Connector::Rustls(
-        std::sync::Arc::new(tls),
-    )))
+    Ok((
+        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
+            tls,
+        ))),
+        seen,
+    ))
 }
 
 /// Parse every certificate in a PEM blob, ignoring anything that is not one.
@@ -989,7 +1142,7 @@ mod tests {
             ..config("wss://relay.example.com")
         };
         // The CA file does not exist; reaching for it would fail here.
-        assert!(matches!(connector(&config), Ok(Some(_))));
+        assert!(matches!(connector(&config), Ok((Some(_), _))));
     }
 
     #[test]
@@ -1017,7 +1170,7 @@ mod tests {
             "invalid peer certificate: BadSignature",
         ));
 
-        let message = explain_dial_failure(&error, &config);
+        let message = explain_dial_failure(&error, &config, None);
         // "BadSignature" alone sends an operator looking at the wrong thing.
         assert!(message.contains("copied-cert.pem"), "{message}");
         assert!(message.contains("--relay-ca"), "{message}");
@@ -1030,7 +1183,7 @@ mod tests {
         let error = Error::Io(std::io::Error::other(
             "invalid peer certificate: NotValidForName",
         ));
-        let message = explain_dial_failure(&error, &config("wss://relay.example.com"));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com"), None);
 
         assert!(message.contains("--public-base"), "{message}");
     }
@@ -1055,7 +1208,7 @@ mod tests {
             std::io::ErrorKind::TimedOut,
             localised.to_string(),
         ));
-        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"), None);
 
         // Where it was going. The URL was only ever in the startup banner.
         assert!(message.contains("relay.example.com:8443"), "{message}");
@@ -1078,8 +1231,136 @@ mod tests {
         use tokio_tungstenite::tungstenite::Error;
 
         let error = Error::Io(std::io::Error::from_raw_os_error(10060));
-        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"), None);
         assert!(message.contains("Nothing answered at"), "{message}");
+    }
+
+    /// A repeated failure keeps the condition and drops the paragraph.
+    ///
+    /// Found by running it: the fingerprint explanation is eight lines, a
+    /// device that cannot attach retries forever, and the first live run of
+    /// that message produced 47 log lines in six seconds. Both halves are
+    /// asserted — a repeat that dropped the reason entirely would be as bad in
+    /// the other direction, leaving a log tail showing retries with no cause.
+    #[test]
+    fn a_repeated_dial_failure_stops_repeating_its_explanation() {
+        let reason = "relay certificate does not match --relay-fingerprint\n  pinned:      sha256:aa\n  relay sent:  sha256:bb\n  The relay prints its own on its banner.";
+
+        let first = dial_failure_line(reason, false, Duration::from_secs(1));
+        assert!(
+            first.contains("sha256:bb"),
+            "the first says everything: {first}"
+        );
+
+        let again = dial_failure_line(reason, true, Duration::from_secs(8));
+        assert!(
+            !again.contains("sha256:bb"),
+            "the repeat must not reprint the explanation: {again}"
+        );
+        assert!(
+            again.contains("--relay-fingerprint"),
+            "but it must still name the condition, or a log tail shows retries with no cause: {again}"
+        );
+        assert!(
+            again.contains("8s"),
+            "and when the next attempt is: {again}"
+        );
+    }
+
+    /// A pin that did not match must say `--relay-fingerprint`, and both values.
+    ///
+    /// Pinning works — a wrong value is refused and the right one attaches,
+    /// verified with a live relay either way. The diagnostic was the part that
+    /// said nothing: `cannot reach relay: IO error: invalid peer certificate:
+    /// ApplicationVerificationFailure`, four wrappings ending in a rustls enum
+    /// name, never once naming the flag whose value caused it — and opening
+    /// with a phrase that sends an operator to firewalls and DNS for a relay
+    /// that answered and offered its certificate.
+    #[test]
+    fn a_mismatched_fingerprint_names_the_flag_and_both_values() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let pinned = crate::fingerprint::of_certificate(b"the one that was pinned");
+        let served = crate::fingerprint::of_certificate(b"the one the relay sent");
+        let config = RelayClientConfig {
+            fingerprint: Some(pinned.clone()),
+            ..config("wss://relay.example.com:8443")
+        };
+        let error = Error::Io(std::io::Error::other(
+            "invalid peer certificate: ApplicationVerificationFailure",
+        ));
+
+        let message = explain_dial_failure(&error, &config, Some(&served));
+
+        assert!(
+            message.contains("--relay-fingerprint"),
+            "the value an operator typed is the cause and must be named: {message}"
+        );
+        assert!(
+            !message.contains("cannot reach relay"),
+            "the relay was reached and offered a certificate: {message}"
+        );
+        assert!(message.contains(&pinned), "the pinned value: {message}");
+        assert!(
+            message.contains(&served),
+            "the value to copy if the relay is what changed: {message}"
+        );
+        assert!(
+            message.contains("Retrying changes nothing"),
+            "the retry loop is silent, so the line has to say the wait is not the fix: {message}"
+        );
+    }
+
+    /// The same rustls variant without a pin in force is somebody else's error.
+    ///
+    /// `--relay-ca` can produce it too, and blaming `--relay-fingerprint` for a
+    /// flag the operator never passed would be its own wrong turn.
+    #[test]
+    fn a_verification_failure_without_a_pin_is_not_blamed_on_the_pin() {
+        use tokio_tungstenite::tungstenite::Error;
+
+        let error = Error::Io(std::io::Error::other(
+            "invalid peer certificate: ApplicationVerificationFailure",
+        ));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"), None);
+
+        assert!(
+            !message.contains("--relay-fingerprint"),
+            "no fingerprint was pinned, so it cannot be the cause: {message}"
+        );
+    }
+
+    /// Being rate limited is not being unreachable, and must not read like it.
+    ///
+    /// The relay answered — it answered `429`. The device then retries in
+    /// backoff and recovers on its own, so the console line has to say both
+    /// that this is the relay's doing and that it is temporary. It used to say
+    /// `cannot reach relay`, which sends an operator to firewalls and DNS for
+    /// a relay that is up and talking to them.
+    #[test]
+    fn being_rate_limited_does_not_read_as_being_unreachable() {
+        use tokio_tungstenite::tungstenite::{http::Response, Error};
+
+        let response = Response::builder().status(429).body(None).unwrap();
+        let message = explain_dial_failure(
+            &Error::Http(response),
+            &config("wss://relay.example.com:8443"),
+            None,
+        );
+
+        assert!(
+            !message.contains("cannot reach relay"),
+            "the relay was reached: {message}"
+        );
+        assert!(message.contains("rate limiting"), "{message}");
+        assert!(
+            message.contains("transient") || message.contains("retrying"),
+            "an operator must learn this recovers on its own: {message}"
+        );
+        assert!(
+            message.contains("relay.example.com:8443"),
+            "the target belongs in every dial failure: {message}"
+        );
     }
 
     /// Refused and timed out mean different things and must not read the same.
@@ -1090,9 +1371,10 @@ mod tests {
         use tokio_tungstenite::tungstenite::Error;
 
         let refused = Error::Io(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
-        let refused = explain_dial_failure(&refused, &config("wss://relay.example.com:8443"));
+        let refused = explain_dial_failure(&refused, &config("wss://relay.example.com:8443"), None);
         let timed_out = Error::Io(std::io::Error::from(std::io::ErrorKind::TimedOut));
-        let timed_out = explain_dial_failure(&timed_out, &config("wss://relay.example.com:8443"));
+        let timed_out =
+            explain_dial_failure(&timed_out, &config("wss://relay.example.com:8443"), None);
 
         assert!(refused.contains("nothing is listening"), "{refused}");
         assert!(timed_out.contains("swallowed"), "{timed_out}");
@@ -1129,7 +1411,7 @@ mod tests {
         use tokio_tungstenite::tungstenite::Error;
 
         let error = Error::Io(std::io::Error::other("connection refused"));
-        let message = explain_dial_failure(&error, &config("wss://relay.example.com"));
+        let message = explain_dial_failure(&error, &config("wss://relay.example.com"), None);
 
         assert!(message.contains("connection refused"), "{message}");
         assert!(!message.contains("--relay-ca"), "{message}");

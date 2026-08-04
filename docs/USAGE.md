@@ -968,8 +968,33 @@ curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com/relay/v
 
 ```json
 {"devices":[{"id":"build-box","label":null,"attached_secs":42,"last_seen_secs":3,
+             "exchanges":17,"last_exchange_ms":38,"mean_exchange_ms":44,
+             "slowest_exchange_ms":210,
              "public_url":"https://relay.example.com/d/build-box"}]}
 ```
+
+**The four `exchange` fields are how long this device has been taking to
+answer**, and they are the way to tell a slow device from a slow relay without
+guessing. They appear once the device has answered at least one proxied request
+— a device nothing has called yet reports none of them rather than reporting
+zero, because zero reads as answering instantly.
+
+Read them for what they measure, which is narrower than "network latency":
+
+- One measurement runs from the relay handing the request to the device's socket
+  to the relay having read the whole answer. That is **transfer time and the
+  device's own processing added together**, and the relay cannot separate them:
+  its send returns as soon as the socket buffer accepts the frame. A request that
+  runs a slow command shows up here as a slow exchange.
+- Waiting for a free connection from the device's pool is *not* included. That
+  wait is the relay's queueing, and counting it would blame the device for it.
+- Failed and timed-out exchanges are counted too. A device that stops answering
+  is the slowest case there is, and leaving those out would make these numbers
+  improve as things got worse.
+- `slowest_exchange_ms` is there because the mean hides the case usually being
+  looked for: one occasional very slow answer among fast ones.
+- Everything resets when the device re-attaches — the counters live with the
+  attachment, not with the name.
 
 ### Calling a device
 
@@ -978,6 +1003,38 @@ curl -X POST "https://relay.example.com/d/build-box/api/v1/execute" \
   -H "Authorization: Bearer <api-key>" \
   -H "Content-Type: application/json" -d '{"command":"echo hello"}'
 ```
+
+### What decides how fast a relayed request is
+
+Not a number this document can give you, and that is the useful thing to know
+about it. What it can give you is the shape, which is what tells you where to
+look when a transfer is slower than you expected.
+
+The relay does not stream. It reads a request body **whole**, forwards it as one
+frame down one of the device's data connections, and buffers the whole response
+before answering the caller — one data connection taken from the device's pool
+per request, and refilled afterwards. Two consequences follow:
+
+- **Effective throughput is roughly the slower of the two hops**: caller→relay
+  and relay→device. Nothing overlaps them.
+- **The relay's own cost is small.** Measured over loopback, with the network
+  taken out of the question, the forwarding path moved an 8 MiB download at
+  78–98 MB/s and added 15–20 ms to an `/execute` round trip. That is the code
+  path, not a promise about any deployment: on a real relay the two hops
+  dominate and this measurement says nothing about them.
+
+So when a relayed transfer is slow, the question is which hop, and the answer is
+usually the relay host's own uplink — the one thing only whoever runs the relay
+can measure. Sequential requests do not pay a handshake each time (each device
+keeps a small pool of connections open and refills it as they are consumed), but
+more than a handful of *concurrent* requests to one device will outrun that pool
+and start paying for new connections.
+
+Chunk size is not a tuning knob for this. There is no per-chunk
+acknowledgement and no window: a bigger chunk is one bigger frame. `chunk_size`
+exists for the relay's body ceiling and its per-request deadline (§3.2), and the
+server tells you the value it will accept — do not derive a throughput
+expectation from it.
 
 ### Trust model
 
@@ -999,14 +1056,44 @@ own; it does not isolate tenants from each other.
 ### Rate limiting on the relay
 
 Every relay route except `/health` is limited per client IP (100/minute by
-default, `--no-rate-limit` to disable). This is not decoration: enrolment
-attempts land on `/relay/v1/control`, so without a limit a weak enrolment token
-can be guessed at line speed.
+default, `--no-rate-limit` to disable). This is not decoration, and it holds two
+things back rather than one: enrolment attempts land on `/relay/v1/control`, so
+without a limit a weak enrolment token can be guessed at line speed — and it is
+also the only thing bounding the device-name lookup described below.
+
+**A device's own connections are charged and then refunded once it has proven
+the enrol token**, so what accumulates against an address is failed and
+abandoned attempts — which is what the limit is for. Before 0.19.0 they were
+simply charged, and because the relay has a device open a fresh data connection
+for every proxied request, the device's share of the budget was set by whoever
+called it: public load on an address could spend the budget a device on that
+address needed to stay attached. That is not a corner case where a relay and its
+devices sit on one network behind one outbound address. A device turned away by
+the limit — a `429` on the connection itself — now says so and says it will
+recover (§8); it used to retry in silence. Refusals that come *after* the
+connection is established, a rejected enrol token among them, are a separate
+message and were always reported.
 
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
 limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
 still sees the real address.
+
+Two limiters therefore sit in series on the proxied path, and a response can
+only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
+
+- **The device's limiter refused** — its headers arrive untouched, `Remaining: 0`.
+  Before 0.19.0 the relay overwrote them with its own, so the refusal could
+  claim most of a budget was still free.
+- **The relay's limiter refused** — the device is never reached and the headers
+  are the relay's, `Remaining: 0`.
+- **Neither refused** — the device's numbers if it sent any, otherwise the
+  relay's. A device started with `--no-rate-limit` sends none, and the relay's
+  budget is a real constraint on the caller, so filling the gap is honest.
+- **The device refused for some other reason** — `too-many-uploads`, say, which
+  is also a `429` but carries no limiter headers. No count is added: the relay
+  allowed this request, so it has no spare capacity to claim on a refusal that
+  is not its own.
 
 ### Relay endpoints
 
@@ -1017,6 +1104,23 @@ still sees the real address.
 | `WS` | `/relay/v1/control` | enrol frame (device only) |
 | `WS` | `/relay/v1/data` | attach frame (device only) |
 | `ANY` | `/d/<device-id>/…` | forwarded to the device unchanged |
+
+**Device names are discoverable without credentials.** The last row and the
+`/health` row combine into something neither states on its own: `/d/<id>/…` is
+forwarded as-is, so a device's own unauthenticated route is unauthenticated
+through the relay too. `GET /d/<name>/health` answers `200` for an attached
+device and `502 device is not connected` for a name that is not there, and
+neither needs a token — so anyone who can reach the relay can ask whether a
+given name is attached to it. Names are guessable: `--device-name` defaults to
+the machine's own name.
+
+What this does and does not give away: the *existence* of a name, and nothing
+else. Reaching the device behind it still needs that device's API key, and a
+request without one is refused by the device with `401`. The rate limit is the
+only thing bounding the lookup itself, which is the second reason
+`--no-rate-limit` is a bigger decision on a relay than it looks — and note that
+a probe for a name that is *not* attached is the cheap case, because no device
+is involved to spend anything further.
 
 ---
 
@@ -1033,7 +1137,7 @@ still sees the real address.
 | `--require-auth` | Enable auth, generating a key if none given and printing it on stdout | `false` |
 | `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
 | `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
-| `--no-rate-limit` | Disable rate limiting | `false` |
+| `--no-rate-limit` | Disable rate limiting. Responses then carry no `X-RateLimit-*` headers — there is no budget to report | `false` |
 | `--cors-allow-any` | Allow any CORS origin | `false` |
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
@@ -1061,6 +1165,15 @@ every request then arrives from `127.0.0.1`, so the gateway goes on treating
 itself as local while being as reachable as the proxy is. Pass `--require-auth`
 and `--audit-log` when a proxy is in front; in that posture neither is applied
 for you.
+
+If you miss it, the server says so once it has evidence. From 0.19.0 an
+unauthenticated gateway warns — once, on the first request that carries
+`X-Forwarded-For`, `X-Real-IP` or `Forwarded` — that something is proxying to
+it while authentication is off. It stays a warning and nothing is refused: the
+headers can be forged, and forging them only makes the server complain about
+itself. Note what it cannot see: a proxy configured to pass none of those
+headers leaves no evidence, and no warning appears. The paragraph above is
+still the thing to follow.
 
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
@@ -1142,6 +1255,7 @@ startup rather than serving local-only.
 | `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
+| `relay refused this connection: HTTP 429` | the relay is rate limiting this device's **address**, not rejecting the device | transient — the device keeps retrying and attaches once the address is under the limit. If it persists, something else on this outbound address is spending the relay's per-address budget: raise the relay's limit, or give the device an address of its own |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
@@ -1150,7 +1264,8 @@ startup rather than serving local-only.
 | `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
-| **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
+| **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead |
+| `relay certificate does not match --relay-fingerprint` | the pinned value is not the certificate the relay is serving — a relay that regenerated its certificate has a new one | the message prints both fingerprints; copy the relay's current one from the `Devices join with:` line of its banner ([§5](#tls-without-a-proxy)). Retrying does not help until the pin or that certificate changes |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
@@ -1162,7 +1277,7 @@ startup rather than serving local-only.
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body. This is also the cheapest way to recover from a `504` — resending the lost chunk unchanged answers with the true offset (§3.2) |
 | **409** `destination-busy` on `POST .../fs/uploads` | a live session already targets this path | the body names it in `upload_id`. Resume it (`GET .../uploads/{upload_id}` for its offset) or abandon it (`DELETE`). An idle session is swept after an hour, but do not wait for that |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
-| **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
+| **507** on an upload | destination's filesystem is out of space, or a quota on it is exhausted | free space and retry. A quota counts on both platforms — `EDQUOT` on Unix, `ERROR_DISK_QUOTA_EXCEEDED` on Windows — so a volume with space left can still answer this |
 | **422** `unknown field \`…\`, expected one of …` | a JSON body carries a field this server does not recognise — usually a misspelling such as `workingDir` for `working_dir`, or an `args` array, which `/execute` does not take (§3) | use the name the message lists. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |

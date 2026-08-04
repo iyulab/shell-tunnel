@@ -526,6 +526,241 @@ async fn enrolment_attempts_are_throttled() {
     );
 }
 
+/// Infrastructure a device opens after proving the token is not public traffic.
+///
+/// The limit exists to slow enrolment guessing, and a device that has proven
+/// the token is not guessing. Charging it anyway put two unlike things in one
+/// budget — and the device's share of that budget is set by whoever calls the
+/// device, because the relay has it open a fresh data connection for every
+/// proxied request. Public load on an address could therefore starve a device
+/// sharing it, which is not hypothetical: four enrolments were refused that way
+/// in the field while the device retried in silence.
+///
+/// Deliberately no sleeps. Each step's refund is already done by the time its
+/// observable result arrives — the `Enrolled` frame is sent after enrolment
+/// refunds, and a proxied request can only be answered by a connection that
+/// reached the pool, which happens after that connection refunds.
+#[tokio::test]
+async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
+    let addr = start_throttled_relay(4).await;
+
+    // Charged and refunded: enrolment (1) and one data connection (1).
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    // Public traffic, charged and kept: this is also what proves the data
+    // connection joined the pool, so its refund has certainly run.
+    let (status, _) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_eq!(status, 200);
+    served.await.unwrap();
+
+    // Three left of four. Without the refunds only one would be.
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+    for attempt in 1..=3 {
+        let (status, _) = http_get(&url, auth).await;
+        assert_eq!(
+            status, 200,
+            "request {attempt} should be allowed: the device's own connections \
+             must not have spent the caller's budget"
+        );
+    }
+
+    // And the budget is a budget still — the refunds did not remove the limit.
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(status, 429, "four public requests is the whole budget");
+}
+
+/// When the relay is the one refusing, the numbers are the relay's and are `0`.
+///
+/// The other tests here cover a device's refusal crossing the relay and a
+/// non-rate-limit `429` passing through it. This is the third case in that set
+/// and the only one previously argued rather than run: the relay's own bucket
+/// empties, the device is never reached, and the caller has to be told about
+/// the budget that actually stopped them. Nothing else can tell them — a device
+/// that was never asked has no headers to send.
+#[tokio::test]
+async fn a_refusal_the_relay_itself_made_reports_the_relays_budget() {
+    let addr = start_throttled_relay(2).await;
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    // Enrolment and the data connection are refunded, so the budget is intact:
+    // two proxied requests, then the refusal.
+    let url = format!("http://{addr}/d/{device_id}/health");
+    let (status, _) = http_get(&url, None).await;
+    assert_eq!(status, 200, "the first is within budget");
+    served.await.unwrap();
+    let (status, _) = http_get(&url, None).await;
+    assert_eq!(
+        status, 503,
+        "the second is within budget too — 503 is the empty pool, not the limiter"
+    );
+
+    let (status, head) = http_head_and_status(&url).await;
+    assert_eq!(status, 429, "the third exceeds the relay's own budget");
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains("x-ratelimit-remaining: 0"),
+        "the relay refused, so the relay's remaining is what the caller needs: {head}"
+    );
+    assert!(
+        head.contains("x-ratelimit-limit: 2"),
+        "and the limit is the relay's own, not a device's: {head}"
+    );
+    assert!(head.contains("retry-after:"), "{head}");
+}
+
+/// The device list reports how long a device took to answer — after it has.
+///
+/// A consumer asked for a way to measure the relay↔device leg, having spent a
+/// long time unable to tell a slow device from a slow relay. An endpoint that
+/// echoes arbitrary bytes was refused (it would be an unauthenticated bandwidth
+/// amplifier on a relay that already answers unauthenticated questions); this is
+/// what was offered instead, and it costs nothing new — `proxy_handler` is
+/// already holding both ends of the timing.
+///
+/// The absence half is the load-bearing one. A device nothing has called yet
+/// must report no timing at all rather than zero, which reads as answering
+/// instantly, and is exactly what a consumer diagnosing slowness would misread.
+#[tokio::test]
+async fn the_device_list_reports_answer_times_only_once_there_are_any() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+
+    let (status, body) = http_get(&url, auth).await;
+    assert_eq!(status, 200);
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let before = &listed["devices"][0];
+    assert!(
+        before["exchanges"].is_null() && before["mean_exchange_ms"].is_null(),
+        "a device nothing has called has no answer time, and 0 would read as instant: {before}"
+    );
+
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+    let (status, _) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_eq!(status, 200);
+    served.await.unwrap();
+
+    let (_, body) = http_get(&url, auth).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let after = &listed["devices"][0];
+    assert_eq!(
+        after["exchanges"], 1,
+        "one proxied request is one exchange: {after}"
+    );
+    for field in [
+        "last_exchange_ms",
+        "mean_exchange_ms",
+        "slowest_exchange_ms",
+    ] {
+        assert!(
+            after[field].is_u64(),
+            "{field} must be reported once there is a measurement: {after}"
+        );
+    }
+}
+
+/// A `429` the relay merely carried gets no spare count stamped on it.
+///
+/// Not every `429` is a rate limit — a device answers one when its upload table
+/// is full, and that response carries no limiter headers to preserve. Filling
+/// them in from the relay's limiter, which *allowed* this request, rebuilds the
+/// contradiction the header pass removed: refused, with room to continue. A
+/// caller pacing itself by the header keeps going straight into the refusal.
+#[tokio::test]
+async fn a_429_from_elsewhere_is_not_given_a_spare_count() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 429, "too-many-uploads").await;
+
+    let (status, headers) =
+        http_head_and_status(&format!("http://{addr}/d/{device_id}/api/v1/fs/uploads")).await;
+    served.await.unwrap();
+
+    assert_eq!(status, 429, "the device's refusal reached the caller");
+    assert!(
+        !headers
+            .to_ascii_lowercase()
+            .contains("x-ratelimit-remaining"),
+        "the relay allowed this request, so it has no remaining count to \
+         attach to somebody else's refusal: {headers}"
+    );
+}
+
+/// `http_get`, keeping the response head instead of the body.
+async fn http_head_and_status(url: &str) -> (u16, String) {
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("relay should answer")
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
+    (status, head)
+}
+
+/// The other side of the refund: a guess is still charged.
+///
+/// This is the assertion that keeps the refund from becoming an exemption. If
+/// a wrong token were refunded too, the route the limit exists for would have
+/// no limit at all, and the change would have quietly removed the defence it
+/// was written to preserve.
+#[tokio::test]
+async fn a_refused_enrolment_still_spends_its_slot() {
+    let addr = start_throttled_relay(2).await;
+
+    let (mut control, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/control"))
+            .await
+            .expect("the upgrade itself is not the authentication step");
+    let guess = DeviceMessage::Enroll {
+        enroll_token: "wrong".to_string(),
+        version: PROTOCOL_VERSION,
+        label: None,
+        device_name: None,
+    };
+    control
+        .send(Message::Text(serde_json::to_string(&guess).unwrap()))
+        .await
+        .unwrap();
+
+    // Waiting for the refusal is what orders this against the budget check.
+    let RelayMessage::Rejected { code, .. } = recv(&mut control).await else {
+        panic!("expected a rejection");
+    };
+    assert_eq!(code, "bad-token");
+
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(status, 200, "one of two slots is left");
+
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(
+        status, 429,
+        "the guess kept its slot, so the budget is spent"
+    );
+}
+
 #[tokio::test]
 async fn health_is_never_throttled() {
     // Monitoring must not be the thing that trips the limit.

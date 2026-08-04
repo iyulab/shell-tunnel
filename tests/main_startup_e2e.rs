@@ -922,3 +922,130 @@ fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
         "the banner must name the relay-path size the server will actually advertise: {line}"
     );
 }
+
+/// A loopback server that is actually behind a proxy says so, on the first
+/// request that proves it.
+///
+/// The posture is decided by the bind address, so a reverse proxy — the
+/// arrangement this product's own TLS error tells an operator to set up —
+/// leaves the server reading itself as private while it is reachable from
+/// wherever the proxy is. Documentation says this at every place the
+/// arrangement is suggested, and documentation protects whoever reads it. The
+/// warning is the part that needs no reading.
+///
+/// Only the real binary can prove it. The middleware is added conditionally,
+/// and a unit test of the message could be green while nothing ever mounted
+/// the layer — which is the whole failure mode: a check nobody runs.
+#[test]
+fn a_proxied_request_to_an_unauthenticated_server_is_warned_about() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39881"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    assert_eq!(
+        get_status_with_headers(39881, &["X-Forwarded-For: 203.0.113.9"]),
+        200,
+        "the warning must not change what the request gets"
+    );
+
+    let lines = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("--require-auth")
+    });
+    let text = lines.join("\n");
+
+    assert!(
+        text.contains("X-Forwarded-For") || text.contains("x-forwarded-for"),
+        "the warning must name the evidence it saw: {text}"
+    );
+    assert!(
+        text.contains("run commands"),
+        "an operator has to be told what is at stake, not only that a header arrived: {text}"
+    );
+}
+
+/// `GET /api/v1` with extra request headers, returning the status code.
+///
+/// `get_status` takes only a bearer token; this takes whole header lines,
+/// which is what a test about a proxy-added header needs.
+fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
+    use std::io::Write;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+        }
+    };
+
+    let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+    let request =
+        format!("GET /api/v1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{extra}\r\n");
+    stream.write_all(request.as_bytes()).expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next().expect("a response status line");
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("status code in {status_line:?} is not a number: {e}"))
+}
+
+/// A server whose stdout reader goes away must keep serving.
+///
+/// `println!` panics on a failed write, and a banner written into a pipe with
+/// no reader left is a failed write — so the process used to die mid-banner
+/// with `failed printing to stdout: The pipe is being closed. (os error 232)`.
+/// That was first seen as a *test* harness closing the read end early
+/// (cycle-60), but nothing about it is peculiar to a test: the operating
+/// guide's service recipes put a long-lived consumer on this pipe, and a log
+/// shipper restarting or a wrapper's `| head` exiting closes it the same way.
+/// An operator cannot defend against it from outside the process.
+///
+/// The read end is closed *before* the banner is written rather than after one
+/// line, which is what makes this deterministic. Reading a line first
+/// reproduces the panic only when the child happens to still be writing —
+/// cycle-60 saw it two runs in three that way, and `shell-tunnel | head -1`
+/// never reproduced it at all, because `head` holds the pipe open until it
+/// exits. Closing outright puts every banner write on the far side of a closed
+/// pipe, so this fails every time if the tolerance is removed.
+#[test]
+fn a_server_outlives_the_reader_of_its_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39891", "--require-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+
+    drop(child.stdout.take().expect("stdout is piped"));
+    let mut server = Killed(child);
+
+    // `401`, not `200`: the key was announced on the stdout just closed, and
+    // what is being asked here is whether anything is answering at all. A dead
+    // process fails this by never accepting the connection.
+    assert_eq!(
+        get_status(39891, None),
+        401,
+        "the server must outlive the reader of its stdout"
+    );
+
+    // Touch `server` after the request so the child is not killed before it.
+    let _ = &mut server;
+}

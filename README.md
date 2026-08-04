@@ -159,8 +159,11 @@ non-loopback address, turns authentication on, generates a key if you gave none,
 refuses `--no-auth`, scopes the issued token to `operator` instead of the
 wildcard, and appends an audit trail to `shell-tunnel-audit.jsonl` in the working
 directory (`--audit-log` puts it elsewhere). Naming a scope yourself still wins —
-`--preset full-control` keeps the wildcard. Keep rate limiting on, and treat the URL
-and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
+`--preset full-control` keeps the wildcard. Note what `operator` is and is not:
+it holds every capability this version defines, so it withholds nothing today
+and the difference from the wildcard is only that it will not automatically
+carry capabilities added later. The narrowing presets are `file-read` and
+`file-write`. Keep rate limiting on, and treat the URL and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
 on the relay is one flag, and the fingerprint it prints keeps the connection
 authenticated, not just encrypted. The startup banner states what is actually in force.
 
