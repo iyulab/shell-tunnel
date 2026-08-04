@@ -16,8 +16,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   bucket arrived stamped with the *relay's* spare budget, up to `X-RateLimit-Remaining: 92`
   beside a `429`. A consumer pacing itself by that header reads a refusal as room to
   continue. The device's headers are now kept where it sent them, and the relay fills
-  them in only where the device sent none. `Retry-After` was correct all along and is
-  unchanged.
+  them in only where the device sent none. Nor is a count added to a `429` that is not a
+  rate limit at all — `too-many-uploads` carries no limiter headers, and the limiter that
+  *allowed* the request has no spare capacity to claim on somebody else's refusal.
+  `Retry-After` was correct all along and is unchanged. §5 of the operating guide states
+  which set of headers arrives in each case.
 - **Public traffic can no longer starve a device off the relay it shares an address with.**
   The relay's per-address limit exists to stop an enrolment token being guessed at line
   speed, but the same bucket also counted the data connections an already-enrolled device
@@ -30,8 +33,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   still charged, so the defence the limit was written for is unchanged.
 - **A device refused with `429` says so, and says it will recover.** It reported
   `cannot reach relay: … HTTP error: 429`, which sends an operator to firewalls and DNS for
-  a relay that is up and answering. An HTTP refusal now reads as a refusal, names rate
-  limiting as the cause, and says the retry recovers on its own.
+  a relay that is up and answering. A refusal carrying an HTTP status now reads as a
+  refusal rather than a failure to connect, and the `429` case additionally names rate
+  limiting as the cause and says the retry recovers on its own.
 - **A server started with `--no-rate-limit` no longer advertises a rate limit.**
   It answered `X-RateLimit-Limit: 100 / X-RateLimit-Remaining: 100` on every response —
   a budget nothing was counting, with the remaining count frozen at full forever. A

@@ -571,6 +571,61 @@ async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
     assert_eq!(status, 429, "four public requests is the whole budget");
 }
 
+/// A `429` the relay merely carried gets no spare count stamped on it.
+///
+/// Not every `429` is a rate limit — a device answers one when its upload table
+/// is full, and that response carries no limiter headers to preserve. Filling
+/// them in from the relay's limiter, which *allowed* this request, rebuilds the
+/// contradiction the header pass removed: refused, with room to continue. A
+/// caller pacing itself by the header keeps going straight into the refusal.
+#[tokio::test]
+async fn a_429_from_elsewhere_is_not_given_a_spare_count() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 429, "too-many-uploads").await;
+
+    let (status, headers) =
+        http_head_and_status(&format!("http://{addr}/d/{device_id}/api/v1/fs/uploads")).await;
+    served.await.unwrap();
+
+    assert_eq!(status, 429, "the device's refusal reached the caller");
+    assert!(
+        !headers
+            .to_ascii_lowercase()
+            .contains("x-ratelimit-remaining"),
+        "the relay allowed this request, so it has no remaining count to \
+         attach to somebody else's refusal: {headers}"
+    );
+}
+
+/// `http_get`, keeping the response head instead of the body.
+async fn http_head_and_status(url: &str) -> (u16, String) {
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let request = format!("GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.unwrap();
+
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("relay should answer")
+        .unwrap();
+
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let head = text.split("\r\n\r\n").next().unwrap_or("").to_string();
+    (status, head)
+}
+
 /// The other side of the refund: a guess is still charged.
 ///
 /// This is the assertion that keeps the refund from becoming an exemption. If

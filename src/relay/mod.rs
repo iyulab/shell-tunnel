@@ -31,12 +31,14 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{any, get},
-    Router,
+    Extension, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 
 use crate::error::ShellTunnelError;
-use crate::security::{generate_api_key, rate_limit_middleware, RateLimitConfig, RateLimiter};
+use crate::security::{
+    generate_api_key, rate_limit_middleware, RateLimitCharge, RateLimitConfig, RateLimiter,
+};
 use protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
@@ -378,10 +380,12 @@ async fn control_handler(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    charge: Option<Extension<RateLimitCharge>>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let observed = observed_base(&headers, serves_tls(&state));
-    ws.on_upgrade(move |socket| control_session(socket, state, observed, peer))
+    let charge = charge.map(|Extension(charge)| charge);
+    ws.on_upgrade(move |socket| control_session(socket, state, observed, peer, charge))
 }
 
 /// Enroll a device, then serve its heartbeats until the connection ends.
@@ -390,6 +394,7 @@ async fn control_session(
     state: RelayState,
     observed: Option<String>,
     peer: SocketAddr,
+    charge: Option<RateLimitCharge>,
 ) {
     let (mut sink, mut stream) = socket.split();
 
@@ -439,7 +444,9 @@ async fn control_session(
     }
 
     // Proven. Give the slot back — see `relay_router`.
-    state.limiter.refund(peer.ip());
+    if let Some(charge) = charge {
+        state.limiter.refund(peer.ip(), charge);
+    }
 
     // A named device keeps one URL across reconnects, which is what makes the
     // relay usable when whoever calls the device cannot read its console. An
@@ -578,12 +585,19 @@ async fn data_handler(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    charge: Option<Extension<RateLimitCharge>>,
 ) -> Response {
-    ws.on_upgrade(move |socket| attach_data_connection(socket, state, peer))
+    let charge = charge.map(|Extension(charge)| charge);
+    ws.on_upgrade(move |socket| attach_data_connection(socket, state, peer, charge))
 }
 
 /// Read the attach frame, verify it, and hand the socket to the device's pool.
-async fn attach_data_connection(mut socket: WebSocket, state: RelayState, peer: SocketAddr) {
+async fn attach_data_connection(
+    mut socket: WebSocket,
+    state: RelayState,
+    peer: SocketAddr,
+    charge: Option<RateLimitCharge>,
+) {
     let first = tokio::time::timeout(ENROLL_TIMEOUT, socket.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
         let _ = socket.close().await;
@@ -609,7 +623,9 @@ async fn attach_data_connection(mut socket: WebSocket, state: RelayState, peer: 
     // made the shared bucket a starvation risk rather than a curiosity: a
     // device opens one of these per proxied request, so its volume is set by
     // the public caller, not by the device.
-    state.limiter.refund(peer.ip());
+    if let Some(charge) = charge {
+        state.limiter.refund(peer.ip(), charge);
+    }
 
     let Some(device) = state.devices.get(&device_id) else {
         let _ = socket.close().await;

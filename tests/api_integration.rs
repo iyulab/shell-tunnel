@@ -793,6 +793,34 @@ async fn a_disabled_limiter_advertises_no_budget() {
     );
 }
 
+/// A refusal the limiter *did* make says zero, and says it as its own.
+///
+/// The companion to `a_429_from_elsewhere_is_not_given_a_spare_count` in
+/// `tests/relay_data_e2e.rs`, which covers the other half — a `429` this
+/// limiter merely allowed through.
+#[tokio::test]
+async fn a_refusal_this_limiter_made_reports_zero() {
+    use shell_tunnel::security::RateLimitConfig;
+
+    let mut config = SecurityConfig::development();
+    config.rate_limit = RateLimitConfig::custom(1, 60);
+    let app = secure_app_from(config);
+
+    let _ = app
+        .clone()
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+    let refused = app
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(refused.headers().get("X-RateLimit-Remaining").unwrap(), "0");
+    assert_eq!(refused.headers().get("X-RateLimit-Limit").unwrap(), "1");
+}
+
 /// The other side of the same rule: an *enabled* limiter still reports itself.
 ///
 /// Paired with the test above deliberately. The fix for the disabled case is a

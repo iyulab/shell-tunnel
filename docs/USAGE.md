@@ -1010,8 +1010,11 @@ simply charged, and because the relay has a device open a fresh data connection
 for every proxied request, the device's share of the budget was set by whoever
 called it: public load on an address could spend the budget a device on that
 address needed to stay attached. That is not a corner case where a relay and its
-devices sit on one network behind one outbound address. A device refused this
-way now says so and that it will recover (§8); it used to retry in silence.
+devices sit on one network behind one outbound address. A device turned away by
+the limit — a `429` on the connection itself — now says so and says it will
+recover (§8); it used to retry in silence. Refusals that come *after* the
+connection is established, a rejected enrol token among them, are a separate
+message and were always reported.
 
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
@@ -1019,12 +1022,20 @@ limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
 still sees the real address.
 
 Two limiters therefore sit in series on the proxied path, and a response can
-only carry one set of `X-RateLimit-*` headers. The device's are kept where it
-sent them; the relay fills them in only where the device sent none (which is
-what a device started with `--no-rate-limit` does). So a `429` reports the
-bucket that actually refused the request — before 0.19.0 the relay overwrote
-the device's numbers with its own, and a refusal could arrive claiming most of
-a budget was still free.
+only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
+
+- **The device's limiter refused** — its headers arrive untouched, `Remaining: 0`.
+  Before 0.19.0 the relay overwrote them with its own, so the refusal could
+  claim most of a budget was still free.
+- **The relay's limiter refused** — the device is never reached and the headers
+  are the relay's, `Remaining: 0`.
+- **Neither refused** — the device's numbers if it sent any, otherwise the
+  relay's. A device started with `--no-rate-limit` sends none, and the relay's
+  budget is a real constraint on the caller, so filling the gap is honest.
+- **The device refused for some other reason** — `too-many-uploads`, say, which
+  is also a `429` but carries no limiter headers. No count is added: the relay
+  allowed this request, so it has no spare capacity to claim on a refusal that
+  is not its own.
 
 ### Relay endpoints
 
