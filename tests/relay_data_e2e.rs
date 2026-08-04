@@ -571,6 +571,46 @@ async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
     assert_eq!(status, 429, "four public requests is the whole budget");
 }
 
+/// When the relay is the one refusing, the numbers are the relay's and are `0`.
+///
+/// The other tests here cover a device's refusal crossing the relay and a
+/// non-rate-limit `429` passing through it. This is the third case in that set
+/// and the only one previously argued rather than run: the relay's own bucket
+/// empties, the device is never reached, and the caller has to be told about
+/// the budget that actually stopped them. Nothing else can tell them — a device
+/// that was never asked has no headers to send.
+#[tokio::test]
+async fn a_refusal_the_relay_itself_made_reports_the_relays_budget() {
+    let addr = start_throttled_relay(2).await;
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    // Enrolment and the data connection are refunded, so the budget is intact:
+    // two proxied requests, then the refusal.
+    let url = format!("http://{addr}/d/{device_id}/health");
+    let (status, _) = http_get(&url, None).await;
+    assert_eq!(status, 200, "the first is within budget");
+    served.await.unwrap();
+    let (status, _) = http_get(&url, None).await;
+    assert_eq!(
+        status, 503,
+        "the second is within budget too — 503 is the empty pool, not the limiter"
+    );
+
+    let (status, head) = http_head_and_status(&url).await;
+    assert_eq!(status, 429, "the third exceeds the relay's own budget");
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains("x-ratelimit-remaining: 0"),
+        "the relay refused, so the relay's remaining is what the caller needs: {head}"
+    );
+    assert!(
+        head.contains("x-ratelimit-limit: 2"),
+        "and the limit is the relay's own, not a device's: {head}"
+    );
+    assert!(head.contains("retry-after:"), "{head}");
+}
+
 /// The device list reports how long a device took to answer — after it has.
 ///
 /// A consumer asked for a way to measure the relay↔device leg, having spent a

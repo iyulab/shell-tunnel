@@ -43,7 +43,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   sent, says where to copy the current one from, and says that retrying does not help until
   the pin or that certificate changes. §8 of the operating guide gained the row: it listed
   both `--relay-ca` failures and neither of the fingerprint path's, which is the one the
-  banner recommends.
+  banner recommends. A dial failure is explained in full once and then referred to by its
+  first line: these explanations are paragraphs, a device that cannot attach retries
+  forever, and the first live run of the new one produced 47 log lines in six seconds.
 
 - **The `Reachable:` banner no longer presents `operator` as a boundary it is not.** It
   read `tokens are scoped to \`operator\`, not wildcard` under the reachability label, which

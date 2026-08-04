@@ -202,19 +202,60 @@ fn install_crypto_provider() {
 pub async fn run(config: RelayClientConfig) -> Result<()> {
     install_crypto_provider();
     let mut backoff = BACKOFF_MIN;
+    // The reason a dial failed is explained in full once, then referred to.
+    //
+    // Some of these explanations are long — the fingerprint mismatch prints
+    // both values and where to copy from — and a device that cannot attach
+    // retries forever. Repeating the whole thing every backoff turns the one
+    // configuration that most needs reading into a wall of it. The condition
+    // still repeats, so it is still visible; what stops repeating is the
+    // paragraph explaining it.
+    let mut explained: Option<String> = None;
     loop {
         match attach(&config).await {
             Ok(()) => {
                 tracing::warn!(target: "relay-client", "relay connection closed; reconnecting");
                 backoff = BACKOFF_MIN;
+                explained = None;
             }
             Err(e) => {
-                tracing::warn!(target: "relay-client", "relay connection failed: {e}");
+                let reason = e.to_string();
+                let repeat = explained.as_deref() == Some(reason.as_str());
+                tracing::warn!(
+                    target: "relay-client",
+                    "{}",
+                    dial_failure_line(&reason, repeat, backoff)
+                );
+                if !repeat {
+                    explained = Some(reason);
+                }
             }
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(BACKOFF_MAX);
     }
+}
+
+/// What to log about a dial failure, given whether it has been explained once.
+///
+/// `explain_dial_failure` writes paragraphs — the fingerprint mismatch prints
+/// both values and where to copy from — and a device that cannot attach retries
+/// forever. Repeating the whole thing every backoff buries the one explanation
+/// that most needs reading. Live-verified: a wrong fingerprint produced 47 lines
+/// in six seconds before this, and 22 after, with the gap widening as the
+/// backoff grows.
+///
+/// The repeat still names the condition and says when the next attempt is, so
+/// the failure stays visible in a log tail; only the explanation stops.
+fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -> String {
+    if !already_explained {
+        return format!("relay connection failed: {reason}");
+    }
+    let headline = reason.lines().next().unwrap_or(reason);
+    format!(
+        "relay connection failed again: {headline} (unchanged; retrying in {}s)",
+        backoff.as_secs()
+    )
 }
 
 /// One attachment: enroll, then serve pool requests until the channel drops.
@@ -1192,6 +1233,38 @@ mod tests {
         let error = Error::Io(std::io::Error::from_raw_os_error(10060));
         let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"), None);
         assert!(message.contains("Nothing answered at"), "{message}");
+    }
+
+    /// A repeated failure keeps the condition and drops the paragraph.
+    ///
+    /// Found by running it: the fingerprint explanation is eight lines, a
+    /// device that cannot attach retries forever, and the first live run of
+    /// that message produced 47 log lines in six seconds. Both halves are
+    /// asserted — a repeat that dropped the reason entirely would be as bad in
+    /// the other direction, leaving a log tail showing retries with no cause.
+    #[test]
+    fn a_repeated_dial_failure_stops_repeating_its_explanation() {
+        let reason = "relay certificate does not match --relay-fingerprint\n  pinned:      sha256:aa\n  relay sent:  sha256:bb\n  The relay prints its own on its banner.";
+
+        let first = dial_failure_line(reason, false, Duration::from_secs(1));
+        assert!(
+            first.contains("sha256:bb"),
+            "the first says everything: {first}"
+        );
+
+        let again = dial_failure_line(reason, true, Duration::from_secs(8));
+        assert!(
+            !again.contains("sha256:bb"),
+            "the repeat must not reprint the explanation: {again}"
+        );
+        assert!(
+            again.contains("--relay-fingerprint"),
+            "but it must still name the condition, or a log tail shows retries with no cause: {again}"
+        );
+        assert!(
+            again.contains("8s"),
+            "and when the next attempt is: {again}"
+        );
     }
 
     /// A pin that did not match must say `--relay-fingerprint`, and both values.
