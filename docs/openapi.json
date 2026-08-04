@@ -1308,12 +1308,12 @@
           },
           "working_dir": {
             "type": "string",
-            "description": "Initial working directory",
+            "description": "Accepted and currently ignored: it is echoed back by GET /api/v1/sessions/{id} but never reaches a command. Pass working_dir on each execute instead.",
             "example": "/home/user"
           },
           "env": {
             "type": "object",
-            "description": "Environment variables to set",
+            "description": "Accepted and currently ignored: no execute in this session inherits it. Pass env on each execute instead.",
             "additionalProperties": {
               "type": "string"
             },
@@ -1370,7 +1370,7 @@
           },
           "working_dir": {
             "type": "string",
-            "description": "Current working directory",
+            "description": "The working_dir passed at creation, echoed back unchanged. It is not tracked (a cd cannot persist across executes) and it does not affect where commands run.",
             "example": "/home/user"
           },
           "last_exit_code": {

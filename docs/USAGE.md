@@ -318,11 +318,16 @@ moment they are created.
 
 **A session groups commands; it does not keep a shell alive.** Each execute runs
 in its own `cmd /c` (Windows) or `sh -c` (Unix), the same as `/execute` — so
-`set FOO=bar` is not visible to the next call, a `cd` does not persist, and the
-`shell` field above currently changes nothing. What a session does give you is
-an id the audit trail records against, per-session `working_dir` and `env`, and
-a place for streaming to attach. Use `working_dir` rather than a leading `cd`,
-and pass what you need in `env`.
+`set FOO=bar` is not visible to the next call and a `cd` does not persist.
+
+**None of the three create fields currently changes what runs.** `shell` is
+ignored; `working_dir` is echoed back by `GET /api/v1/sessions/{id}` but never
+reaches a command; `env` is not read at all. Set the directory and the
+environment **on each execute** — `working_dir` and `env` on
+`POST /api/v1/sessions/{id}/execute` do take effect (same request fields as
+*One-shot execution* above), and using them beats a leading `cd`. What a session
+gives you today is an id the audit trail records against and a place for
+streaming to attach.
 
 ### Streaming over WebSocket
 
