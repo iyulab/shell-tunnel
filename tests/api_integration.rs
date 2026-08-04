@@ -761,3 +761,65 @@ async fn test_rate_limit_exempts_health() {
         .unwrap();
     assert_eq!(health.status(), StatusCode::OK);
 }
+
+/// A server started without a rate limit does not advertise one.
+///
+/// It used to answer `X-RateLimit-Limit: 100 / X-RateLimit-Remaining: 100` on
+/// every response, a budget that nothing was counting and nothing would ever
+/// enforce — the counter simply sat at 100 forever. A client pacing itself by
+/// the header would throttle to a limit that does not exist. Saying nothing is
+/// the honest answer; the header is optional, the assurance was not true.
+#[tokio::test]
+async fn a_disabled_limiter_advertises_no_budget() {
+    use shell_tunnel::security::RateLimitConfig;
+
+    let mut config = SecurityConfig::development();
+    config.rate_limit = RateLimitConfig::disabled();
+    let app = secure_app_from(config);
+
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response.headers().get("X-RateLimit-Limit").is_none(),
+        "a disabled limiter must not advertise a limit"
+    );
+    assert!(
+        response.headers().get("X-RateLimit-Remaining").is_none(),
+        "a disabled limiter must not advertise a remaining count"
+    );
+}
+
+/// The other side of the same rule: an *enabled* limiter still reports itself.
+///
+/// Paired with the test above deliberately. The fix for the disabled case is a
+/// suppression, and a suppression that goes one step too far would silently
+/// remove the headers §8 of the operating guide tells callers to read.
+#[tokio::test]
+async fn an_enabled_limiter_reports_its_budget() {
+    use shell_tunnel::security::RateLimitConfig;
+
+    let mut config = SecurityConfig::development();
+    config.rate_limit = RateLimitConfig::custom(5, 60);
+    let app = secure_app_from(config);
+
+    let response = app
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("X-RateLimit-Limit").unwrap(),
+        "5",
+        "the limit is the configured budget"
+    );
+    assert_eq!(
+        response.headers().get("X-RateLimit-Remaining").unwrap(),
+        "4",
+        "one of five requests has been spent"
+    );
+}

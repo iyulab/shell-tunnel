@@ -104,6 +104,23 @@ impl RequestRecord {
     }
 }
 
+/// What the limiter decided about one request.
+///
+/// Three variants rather than `Result<remaining, retry_after>` because a
+/// limiter that is switched off has no remaining count to report, and folding
+/// that case into `Ok(max_requests)` is what put `X-RateLimit-Remaining: 100`
+/// on every response of a server started with `--no-rate-limit`. A limit that
+/// does not exist cannot be advertised if it cannot be represented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitDecision {
+    /// No limit was applied — the limiter is disabled.
+    Unlimited,
+    /// Allowed, with this many requests left in the current window.
+    Allowed { remaining: u32 },
+    /// Refused; the window frees up after this long.
+    Limited { retry_after: Duration },
+}
+
 /// Thread-safe rate limiter.
 #[derive(Debug)]
 pub struct RateLimiter {
@@ -133,11 +150,9 @@ impl RateLimiter {
     }
 
     /// Check if a request from the given IP should be allowed.
-    ///
-    /// Returns `Ok(remaining)` if allowed, `Err(retry_after)` if rate limited.
-    pub fn check(&self, ip: IpAddr) -> Result<u32, Duration> {
+    pub fn check(&self, ip: IpAddr) -> RateLimitDecision {
         if !self.config.enabled {
-            return Ok(self.config.max_requests);
+            return RateLimitDecision::Unlimited;
         }
 
         // Periodic cleanup
@@ -145,7 +160,10 @@ impl RateLimiter {
 
         let mut records = match self.records.write() {
             Ok(r) => r,
-            Err(_) => return Ok(self.config.max_requests), // Fail open on lock error
+            // Fail open on lock error. `Unlimited` rather than a remaining
+            // count, because no limit was applied to this request and saying
+            // otherwise would put a number on the wire that nothing counted.
+            Err(_) => return RateLimitDecision::Unlimited,
         };
 
         let record = records.entry(ip).or_insert_with(RequestRecord::new);
@@ -157,14 +175,14 @@ impl RateLimiter {
             let retry_after = oldest
                 .map(|t| self.config.window.saturating_sub(t.elapsed()))
                 .unwrap_or(self.config.window);
-            return Err(retry_after);
+            return RateLimitDecision::Limited { retry_after };
         }
 
         // Record this request
         record.record();
         let remaining = self.config.max_requests - current_count - 1;
 
-        Ok(remaining)
+        RateLimitDecision::Allowed { remaining }
     }
 
     /// Perform cleanup of old records if needed.
@@ -258,23 +276,37 @@ pub async fn rate_limit_middleware(
     }
 
     match limiter.check(addr.ip()) {
-        Ok(remaining) => {
+        // Nothing counted this request, so nothing is advertised about it.
+        RateLimitDecision::Unlimited => next.run(request).await,
+        RateLimitDecision::Allowed { remaining } => {
             let mut response = next.run(request).await;
 
-            // Add rate limit headers
+            // Only where nobody upstream already answered the question. The
+            // relay wraps this middleware around `/d/*` too, so a proxied
+            // response arrives carrying the *device's* headers — and `insert`
+            // replaced them, which is how a `429` from a device with an empty
+            // bucket reached its caller saying 92 requests remained. Whoever
+            // refused is the one whose budget the caller has to wait on.
+            //
+            // The pair moves together: a `Limit` from one limiter beside a
+            // `Remaining` from another describes no budget that exists.
             let headers = response.headers_mut();
-            headers.insert(
-                "X-RateLimit-Limit",
-                limiter.config.max_requests.to_string().parse().unwrap(),
-            );
-            headers.insert(
-                "X-RateLimit-Remaining",
-                remaining.to_string().parse().unwrap(),
-            );
+            if !headers.contains_key("X-RateLimit-Limit")
+                && !headers.contains_key("X-RateLimit-Remaining")
+            {
+                headers.insert(
+                    "X-RateLimit-Limit",
+                    limiter.config.max_requests.to_string().parse().unwrap(),
+                );
+                headers.insert(
+                    "X-RateLimit-Remaining",
+                    remaining.to_string().parse().unwrap(),
+                );
+            }
 
             response
         }
-        Err(retry_after) => {
+        RateLimitDecision::Limited { retry_after } => {
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded. Please try again later.",
@@ -324,6 +356,14 @@ mod tests {
         assert_eq!(config.window, Duration::from_secs(30));
     }
 
+    fn allowed(decision: RateLimitDecision) -> bool {
+        matches!(decision, RateLimitDecision::Allowed { .. })
+    }
+
+    fn limited(decision: RateLimitDecision) -> bool {
+        matches!(decision, RateLimitDecision::Limited { .. })
+    }
+
     #[test]
     fn test_rate_limiter_allows_requests() {
         let limiter = RateLimiter::new(RateLimitConfig::custom(5, 60));
@@ -332,7 +372,7 @@ mod tests {
         // First 5 requests should be allowed
         for i in 0..5 {
             let result = limiter.check(ip);
-            assert!(result.is_ok(), "Request {} should be allowed", i);
+            assert!(allowed(result), "Request {} should be allowed", i);
         }
     }
 
@@ -342,13 +382,12 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
 
         // First 3 requests allowed
-        assert!(limiter.check(ip).is_ok());
-        assert!(limiter.check(ip).is_ok());
-        assert!(limiter.check(ip).is_ok());
+        assert!(allowed(limiter.check(ip)));
+        assert!(allowed(limiter.check(ip)));
+        assert!(allowed(limiter.check(ip)));
 
         // 4th request should be blocked
-        let result = limiter.check(ip);
-        assert!(result.is_err());
+        assert!(limited(limiter.check(ip)));
     }
 
     #[test]
@@ -358,23 +397,29 @@ mod tests {
         let ip2 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 
         // Each IP gets its own quota
-        assert!(limiter.check(ip1).is_ok());
-        assert!(limiter.check(ip1).is_ok());
-        assert!(limiter.check(ip1).is_err()); // ip1 blocked
+        assert!(allowed(limiter.check(ip1)));
+        assert!(allowed(limiter.check(ip1)));
+        assert!(limited(limiter.check(ip1))); // ip1 blocked
 
-        assert!(limiter.check(ip2).is_ok()); // ip2 still allowed
-        assert!(limiter.check(ip2).is_ok());
-        assert!(limiter.check(ip2).is_err()); // ip2 now blocked
+        assert!(allowed(limiter.check(ip2))); // ip2 still allowed
+        assert!(allowed(limiter.check(ip2)));
+        assert!(limited(limiter.check(ip2))); // ip2 now blocked
     }
 
+    /// A disabled limiter reports *no limit*, never a full bucket.
+    ///
+    /// The distinction is the whole reason this is an enum: the middleware
+    /// prints whatever count it is handed, so `Allowed { remaining: 100 }`
+    /// here would advertise a 100-request budget on a server started with
+    /// `--no-rate-limit`, and a client that paces itself by the header would
+    /// throttle to a limit that does not exist.
     #[test]
     fn test_rate_limiter_disabled() {
         let limiter = RateLimiter::disabled();
         let ip = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-        // Should always allow when disabled
         for _ in 0..100 {
-            assert!(limiter.check(ip).is_ok());
+            assert_eq!(limiter.check(ip), RateLimitDecision::Unlimited);
         }
     }
 
@@ -383,9 +428,9 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::custom(2, 60));
         let ip = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1));
 
-        assert!(limiter.check(ip).is_ok());
-        assert!(limiter.check(ip).is_ok());
-        assert!(limiter.check(ip).is_err());
+        assert!(allowed(limiter.check(ip)));
+        assert!(allowed(limiter.check(ip)));
+        assert!(limited(limiter.check(ip)));
     }
 
     #[test]
@@ -393,7 +438,7 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::custom(10, 30));
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
 
-        limiter.check(ip).ok();
+        limiter.check(ip);
 
         let stats = limiter.stats();
         assert_eq!(stats.tracked_ips, 1);
@@ -407,11 +452,14 @@ mod tests {
         let limiter = RateLimiter::new(RateLimitConfig::custom(5, 60));
         let ip = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
 
-        assert_eq!(limiter.check(ip).unwrap(), 4); // 5-1 = 4 remaining
-        assert_eq!(limiter.check(ip).unwrap(), 3);
-        assert_eq!(limiter.check(ip).unwrap(), 2);
-        assert_eq!(limiter.check(ip).unwrap(), 1);
-        assert_eq!(limiter.check(ip).unwrap(), 0);
-        assert!(limiter.check(ip).is_err()); // Now blocked
+        for expected in [4, 3, 2, 1, 0] {
+            assert_eq!(
+                limiter.check(ip),
+                RateLimitDecision::Allowed {
+                    remaining: expected
+                }
+            );
+        }
+        assert!(limited(limiter.check(ip))); // Now blocked
     }
 }

@@ -1008,6 +1008,14 @@ device replays each request to its own loopback listener, so the device's own
 limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
 still sees the real address.
 
+Two limiters therefore sit in series on the proxied path, and a response can
+only carry one set of `X-RateLimit-*` headers. The device's are kept where it
+sent them; the relay fills them in only where the device sent none (which is
+what a device started with `--no-rate-limit` does). So a `429` reports the
+bucket that actually refused the request — before 0.19.0 the relay overwrote
+the device's numbers with its own, and a refusal could arrive claiming most of
+a budget was still free.
+
 ### Relay endpoints
 
 | Method | Path | Auth |
@@ -1033,7 +1041,7 @@ still sees the real address.
 | `--require-auth` | Enable auth, generating a key if none given and printing it on stdout | `false` |
 | `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
 | `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
-| `--no-rate-limit` | Disable rate limiting | `false` |
+| `--no-rate-limit` | Disable rate limiting. Responses then carry no `X-RateLimit-*` headers — there is no budget to report | `false` |
 | `--cors-allow-any` | Allow any CORS origin | `false` |
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
@@ -1150,7 +1158,7 @@ startup rather than serving local-only.
 | `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
-| **429** | rate limit | see `Retry-After`, `X-RateLimit-Remaining` |
+| **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |

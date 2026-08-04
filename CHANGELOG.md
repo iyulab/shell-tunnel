@@ -3,6 +3,35 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.19.0 — 2026-08-04
+
+> ⚠ **A minor bump rather than a patch, because of one breaking library change**
+> (`RateLimiter::check`, below). HTTP callers need no change.
+
+### Fixed
+
+- **A `429` that crossed a relay no longer claims the caller has requests to spare.**
+  Two rate limiters sit in series on the proxied path, and the middleware overwrote
+  whatever the response already carried — so a refusal from a device with an empty
+  bucket arrived stamped with the *relay's* spare budget, up to `X-RateLimit-Remaining: 92`
+  beside a `429`. A consumer pacing itself by that header reads a refusal as room to
+  continue. The device's headers are now kept where it sent them, and the relay fills
+  them in only where the device sent none. `Retry-After` was correct all along and is
+  unchanged.
+- **A server started with `--no-rate-limit` no longer advertises a rate limit.**
+  It answered `X-RateLimit-Limit: 100 / X-RateLimit-Remaining: 100` on every response —
+  a budget nothing was counting, with the remaining count frozen at full forever. A
+  client that throttles itself by the header held itself to a limit that did not exist.
+  No `X-RateLimit-*` header is sent when limiting is off.
+
+### Changed
+
+- **Breaking (library):** `RateLimiter::check` returns `RateLimitDecision` instead of
+  `Result<u32, Duration>`. The three variants are `Unlimited`, `Allowed { remaining }`
+  and `Limited { retry_after }`; the old signature had no way to say "no limit applies"
+  except by reporting a full bucket, which is the defect above. Callers matching on
+  `Ok`/`Err` need the two allowed cases separated.
+
 ## 0.18.0 — 2026-08-04
 
 > ⚠ **A minor bump rather than a patch, because of one breaking library change**
