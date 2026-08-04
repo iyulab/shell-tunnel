@@ -8,6 +8,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 > ⚠ **A minor bump rather than a patch, because of one breaking library change**
 > (`RateLimiter::check`, below). HTTP callers need no change.
 
+### Added
+
+- **`GET /relay/v1/devices` reports how long each device has been taking to answer.**
+  Four fields per device — `exchanges`, `last_exchange_ms`, `mean_exchange_ms`,
+  `slowest_exchange_ms` — so a slow relayed request can be attributed without guessing.
+  They appear only once a device has answered something; a device nothing has called
+  reports none of them rather than zero, which would read as answering instantly. What one
+  measurement covers is stated rather than implied: transfer *and* the device's own
+  processing together, which the relay cannot separate, with the wait for a free
+  connection excluded and failures counted. Reached with the enrol token, as the rest of
+  that endpoint is. This replaces a request for an endpoint echoing arbitrary bytes, which
+  was declined — it would have been an unauthenticated bandwidth amplifier.
+
 ### Fixed
 
 - **A `429` that crossed a relay no longer claims the caller has requests to spare.**

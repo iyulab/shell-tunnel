@@ -562,13 +562,15 @@ async fn devices_handler(State(state): State<RelayState>, headers: HeaderMap) ->
         .into_iter()
         .map(|device| {
             let url = format!("{}/d/{}", base, device.id);
-            serde_json::json!({
-                "id": device.id,
-                "label": device.label,
-                "attached_secs": device.attached_secs,
-                "last_seen_secs": device.last_seen_secs,
-                "public_url": url,
-            })
+            // Serialised from the summary rather than field by field, so a
+            // field added there cannot be silently missing here. The timing
+            // fields are absent until a device has answered something.
+            let mut entry = serde_json::to_value(&device)
+                .unwrap_or_else(|_| serde_json::json!({ "id": device.id, "label": device.label }));
+            if let Some(object) = entry.as_object_mut() {
+                object.insert("public_url".to_string(), serde_json::Value::String(url));
+            }
+            entry
         })
         .collect();
 
@@ -706,7 +708,13 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
             .into_response();
     };
 
-    match tokio::time::timeout(
+    // Timed from here, after the pool wait: what an operator asking "is this
+    // device slow?" needs is the device's answer time, and queueing for a free
+    // connection is the relay's own doing. Failures are recorded too — a device
+    // that times out is the slowest kind, and leaving those out would make the
+    // reported numbers look better the worse things got.
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
         REQUEST_TIMEOUT,
         forward(
             conn,
@@ -719,8 +727,10 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
             body,
         ),
     )
-    .await
-    {
+    .await;
+    device.record_exchange(started.elapsed());
+
+    match outcome {
         Ok(Ok(response)) => response,
         Ok(Err(reason)) => {
             tracing::debug!(target: "relay", device_id = %device.id, reason, "proxy failed");

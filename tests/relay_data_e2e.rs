@@ -571,6 +571,58 @@ async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
     assert_eq!(status, 429, "four public requests is the whole budget");
 }
 
+/// The device list reports how long a device took to answer — after it has.
+///
+/// A consumer asked for a way to measure the relay↔device leg, having spent a
+/// long time unable to tell a slow device from a slow relay. An endpoint that
+/// echoes arbitrary bytes was refused (it would be an unauthenticated bandwidth
+/// amplifier on a relay that already answers unauthenticated questions); this is
+/// what was offered instead, and it costs nothing new — `proxy_handler` is
+/// already holding both ends of the timing.
+///
+/// The absence half is the load-bearing one. A device nothing has called yet
+/// must report no timing at all rather than zero, which reads as answering
+/// instantly, and is exactly what a consumer diagnosing slowness would misread.
+#[tokio::test]
+async fn the_device_list_reports_answer_times_only_once_there_are_any() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+
+    let (status, body) = http_get(&url, auth).await;
+    assert_eq!(status, 200);
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let before = &listed["devices"][0];
+    assert!(
+        before["exchanges"].is_null() && before["mean_exchange_ms"].is_null(),
+        "a device nothing has called has no answer time, and 0 would read as instant: {before}"
+    );
+
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+    let (status, _) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_eq!(status, 200);
+    served.await.unwrap();
+
+    let (_, body) = http_get(&url, auth).await;
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let after = &listed["devices"][0];
+    assert_eq!(
+        after["exchanges"], 1,
+        "one proxied request is one exchange: {after}"
+    );
+    for field in [
+        "last_exchange_ms",
+        "mean_exchange_ms",
+        "slowest_exchange_ms",
+    ] {
+        assert!(
+            after[field].is_u64(),
+            "{field} must be reported once there is a measurement: {after}"
+        );
+    }
+}
+
 /// A `429` the relay merely carried gets no spare count stamped on it.
 ///
 /// Not every `429` is a rate limit — a device answers one when its upload table

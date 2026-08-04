@@ -26,12 +26,44 @@ pub struct Device {
     pub label: Option<String>,
     attached_at: Instant,
     last_seen: Mutex<Instant>,
+    exchanges: Mutex<Exchanges>,
     pool_tx: mpsc::Sender<WebSocket>,
     pool_rx: tokio::sync::Mutex<mpsc::Receiver<WebSocket>>,
     refill_tx: mpsc::Sender<()>,
 }
 
+/// How long this device has been taking to answer proxied requests.
+///
+/// **What one measurement covers, exactly**: from the moment the relay hands a
+/// request to the device's socket to the moment it has finished reading the
+/// answer. That is transfer time and the device's own processing *added
+/// together*, and it does not come apart here — `send` returns as soon as the
+/// socket buffer accepts the frame, so the relay never observes the two
+/// separately. A number from this says how long the device took to answer, not
+/// how fast the link to it is.
+///
+/// Waiting for a free connection from the pool is deliberately outside it: that
+/// is the relay's own queueing, not the device's.
+#[derive(Debug, Default, Clone, Copy)]
+struct Exchanges {
+    count: u64,
+    total_ms: u64,
+    last_ms: u64,
+    slowest_ms: u64,
+}
+
 impl Device {
+    /// Record how long one proxied exchange with this device took.
+    pub fn record_exchange(&self, elapsed: Duration) {
+        let ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
+        if let Ok(mut exchanges) = self.exchanges.lock() {
+            exchanges.count = exchanges.count.saturating_add(1);
+            exchanges.total_ms = exchanges.total_ms.saturating_add(ms);
+            exchanges.last_ms = ms;
+            exchanges.slowest_ms = exchanges.slowest_ms.max(ms);
+        }
+    }
+
     /// Whether the device has missed heartbeats for longer than `timeout`.
     pub fn is_stale(&self, timeout: Duration) -> bool {
         self.last_seen
@@ -88,6 +120,27 @@ pub struct DeviceSummary {
     pub attached_secs: u64,
     /// Seconds since its last heartbeat.
     pub last_seen_secs: u64,
+    /// Proxied exchanges measured so far, absent until there has been one.
+    ///
+    /// Absent rather than zero: a device nothing has called yet has no timing,
+    /// and a `0` there reads as "answers instantly".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchanges: Option<u64>,
+    /// How long the most recent exchange took, in milliseconds.
+    ///
+    /// Transfer *and* the device's own processing together — see [`Exchanges`].
+    /// Splitting them is not possible from the relay's side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exchange_ms: Option<u64>,
+    /// Mean over every exchange since this device attached, in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mean_exchange_ms: Option<u64>,
+    /// The slowest single exchange since this device attached, in milliseconds.
+    ///
+    /// Kept alongside the mean because the mean hides exactly the case an
+    /// operator is looking for: an occasional very slow answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slowest_exchange_ms: Option<u64>,
 }
 
 /// Handles handed to the control session that owns a device.
@@ -125,6 +178,7 @@ impl DeviceRegistry {
             label,
             attached_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
+            exchanges: Mutex::new(Exchanges::default()),
             pool_tx,
             pool_rx: tokio::sync::Mutex::new(pool_rx),
             refill_tx,
@@ -165,15 +219,27 @@ impl DeviceRegistry {
         let mut devices: Vec<DeviceSummary> = match self.devices.read() {
             Ok(devices) => devices
                 .values()
-                .map(|device| DeviceSummary {
-                    id: device.id.clone(),
-                    label: device.label.clone(),
-                    attached_secs: device.attached_at.elapsed().as_secs(),
-                    last_seen_secs: device
-                        .last_seen
+                .map(|device| {
+                    let measured = device
+                        .exchanges
                         .lock()
-                        .map(|seen| seen.elapsed().as_secs())
-                        .unwrap_or_default(),
+                        .ok()
+                        .map(|exchanges| *exchanges)
+                        .filter(|exchanges| exchanges.count > 0);
+                    DeviceSummary {
+                        id: device.id.clone(),
+                        label: device.label.clone(),
+                        attached_secs: device.attached_at.elapsed().as_secs(),
+                        last_seen_secs: device
+                            .last_seen
+                            .lock()
+                            .map(|seen| seen.elapsed().as_secs())
+                            .unwrap_or_default(),
+                        exchanges: measured.map(|e| e.count),
+                        last_exchange_ms: measured.map(|e| e.last_ms),
+                        mean_exchange_ms: measured.map(|e| e.total_ms / e.count),
+                        slowest_exchange_ms: measured.map(|e| e.slowest_ms),
+                    }
                 })
                 .collect(),
             Err(_) => Vec::new(),

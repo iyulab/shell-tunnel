@@ -968,8 +968,33 @@ curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com/relay/v
 
 ```json
 {"devices":[{"id":"build-box","label":null,"attached_secs":42,"last_seen_secs":3,
+             "exchanges":17,"last_exchange_ms":38,"mean_exchange_ms":44,
+             "slowest_exchange_ms":210,
              "public_url":"https://relay.example.com/d/build-box"}]}
 ```
+
+**The four `exchange` fields are how long this device has been taking to
+answer**, and they are the way to tell a slow device from a slow relay without
+guessing. They appear once the device has answered at least one proxied request
+— a device nothing has called yet reports none of them rather than reporting
+zero, because zero reads as answering instantly.
+
+Read them for what they measure, which is narrower than "network latency":
+
+- One measurement runs from the relay handing the request to the device's socket
+  to the relay having read the whole answer. That is **transfer time and the
+  device's own processing added together**, and the relay cannot separate them:
+  its send returns as soon as the socket buffer accepts the frame. A request that
+  runs a slow command shows up here as a slow exchange.
+- Waiting for a free connection from the device's pool is *not* included. That
+  wait is the relay's queueing, and counting it would blame the device for it.
+- Failed and timed-out exchanges are counted too. A device that stops answering
+  is the slowest case there is, and leaving those out would make these numbers
+  improve as things got worse.
+- `slowest_exchange_ms` is there because the mean hides the case usually being
+  looked for: one occasional very slow answer among fast ones.
+- Everything resets when the device re-attaches — the counters live with the
+  attachment, not with the name.
 
 ### Calling a device
 
