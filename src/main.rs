@@ -400,7 +400,26 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             println!("{}", generated_api_key_lines(key));
         }
     }
+    // Resolved before the banner so the banner can report it, and so an
+    // out-of-range value exits without first printing a banner for a server
+    // that is about to die. It was decided after the banner until the banner
+    // needed to name it.
+    let chunk_size = resolve_chunk_size(&args);
+
     println!("File API:    {}", fs_root.describe());
+    // Only when it is not the plain default. A device joined to a relay
+    // advertises a smaller chunk than a directly-reached one, and cycle-64
+    // made that substitution *silently* — an operator comparing two
+    // deployments would have found no line explaining why one hands out
+    // 262144 and the other 4194304. Printing it unconditionally would put a
+    // constant on every run instead; the deviation is the signal, which is
+    // the same rule the generated-key line already follows.
+    if chunk_size != shell_tunnel::fs::DEFAULT_CHUNK_SIZE {
+        println!("             upload chunk size: {chunk_size} bytes");
+        if args.fs_chunk_size.is_none() {
+            println!("             (a relayed chunk must finish inside the relay's request deadline; pass --fs-chunk-size to override)");
+        }
+    }
     // The one combination the lines above describe truthfully and still leave
     // an operator to assemble for themselves. For `operator` or `full-control`
     // a machine-wide file API withholds nothing that `exec` did not already
@@ -432,18 +451,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         .with_audit(audit)
         .with_fs_root(fs_root);
 
-    // Rejected at startup rather than clamped silently: a chunk size at or
-    // above the ceiling would make every relayed transfer 413, and the
-    // symptom would look like a server bug rather than a misconfiguration.
-    let state = match args.fs_chunk_size {
-        Some(size) if size == 0 || size >= shell_tunnel::fs::MAX_CHUNK_SIZE => {
-            eprintln!("--fs-chunk-size {size} is out of range.");
-            eprintln!("It must be between 1 and 8388607 bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
-            std::process::exit(2);
-        }
-        Some(size) => state.with_chunk_size(size),
-        None => state,
-    };
+    let state = state.with_chunk_size(chunk_size);
 
     // Sessions never survive a restart, so any `.part` staging file still
     // present is unreachable — nothing can resume it and nothing will
@@ -1033,6 +1041,53 @@ fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> To
 /// and with `auth.enabled: false` alongside a preset in a config file; an
 /// exposed server cannot reach it, since the posture turns authentication on
 /// and refuses `--no-auth`.
+/// The upload chunk size this server will advertise.
+///
+/// Three inputs, in precedence order: an explicit `--fs-chunk-size`, then
+/// whether this device joined a relay, then the direct default. Gathered into
+/// one function rather than left inline because two places now need the
+/// answer — the banner reports it and `AppState` is built from it — and a
+/// second copy of this decision is a second place for the two to disagree
+/// about what the server is actually advertising.
+///
+/// Exits the process for an out-of-range explicit value rather than clamping:
+/// a chunk at or above the relay's body ceiling makes every relayed transfer
+/// answer 413, and that symptom reads as a server bug rather than as the
+/// misconfiguration it is.
+fn resolve_chunk_size(args: &shell_tunnel::cli::Args) -> usize {
+    let Some(size) = args.fs_chunk_size else {
+        // Nothing explicit: a relay-joined device advertises the relay-safe
+        // size instead of the direct default, because the relay's fixed
+        // request deadline — not its body-size ceiling — is what bounds a
+        // chunk once a relay is in the path. See `fs::RELAY_CHUNK_SIZE`.
+        return match args.relay_url.is_some() {
+            true => shell_tunnel::fs::RELAY_CHUNK_SIZE,
+            false => shell_tunnel::fs::DEFAULT_CHUNK_SIZE,
+        };
+    };
+
+    if size == 0 || size >= shell_tunnel::fs::MAX_CHUNK_SIZE {
+        eprintln!("--fs-chunk-size {size} is out of range.");
+        eprintln!("It must be between 1 and 8388607 bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
+        eprintln!("Size is not the only relay constraint — a relayed chunk must also finish inside the relay's 120s request deadline, which is why a relay-joined device advertises a smaller size than this ceiling allows.");
+        std::process::exit(2);
+    }
+
+    // An explicit value wins — the operator may know their link is fast — but
+    // on a relay-joined device a value above the relay-safe size is the exact
+    // configuration that fails at zero bytes with a `504`, so it is worth
+    // saying out loud rather than leaving the operator to rediscover it from
+    // a stalled upload. A warning, not a refusal: the size is only unsafe if
+    // the relay->device leg is slow, and this process cannot see that leg.
+    if args.relay_url.is_some() && size > shell_tunnel::fs::RELAY_CHUNK_SIZE {
+        let safe = shell_tunnel::fs::RELAY_CHUNK_SIZE;
+        eprintln!("warning: --fs-chunk-size {size} is larger than the {safe} bytes this device would advertise over a relay.");
+        eprintln!("         A relayed request body is forwarded whole and must complete inside the relay's 120s deadline, so an oversized chunk fails at 0 bytes with 504 on a slow link rather than transferring slowly.");
+        eprintln!("         Drop the flag to use the relay-safe size.");
+    }
+    size
+}
+
 fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&CapabilitySet>) -> bool {
     let Some(set) = capabilities.filter(|_| auth_enabled) else {
         return false;

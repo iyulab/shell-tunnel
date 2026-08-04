@@ -401,7 +401,10 @@ OPTIONS:
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
         --fs-root <PATH>    Confine the file API to this directory. Without it
                             the API reaches everything this account can
-        --fs-chunk-size <N> Upload chunk size in bytes (default 4194304)
+        --fs-chunk-size <N> Upload chunk size advertised to callers, in bytes.
+                            Default 4194304; 262144 when --relay is given,
+                            because a relayed chunk must also finish inside the
+                            relay's 120s request deadline
 
 TLS OPTIONS (with `relay`):
         --tls-self-signed   Serve HTTPS with a self-signed certificate,

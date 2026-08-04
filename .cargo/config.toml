@@ -1,0 +1,30 @@
+# Local convenience commands.
+#
+# `cargo test --all` builds this crate with `default = []`, which is the right
+# default for a zero-dependency library and the wrong default for finding out
+# whether your change works: seven integration suites sit behind
+# `relay-client`/`tls`, so they compile to *zero tests*, report `ok`, and are
+# simply absent. Locally that is 9 test binaries instead of 16, and 382 unit
+# tests instead of 419 — all green, with every relay and TLS path unbuilt.
+#
+# CI already runs the full set, and `tests/ci_feature_gates.rs` proves CI's
+# command line covers every gate. What that check could not fix is the command
+# a person types before pushing. This alias is that command.
+#
+#     cargo test-all      # what CI runs — use this before pushing
+#     cargo test --all    # default features only; still worth running, since
+#                         # CI checks the zero-dependency build too
+#
+# `tests/ci_feature_gates.rs` holds this alias to the same rule it holds CI to,
+# so a third gate cannot appear without turning up here.
+[alias]
+test-all = ["test", "--all", "--features", "relay-client,tls"]
+clippy-all = [
+    "clippy",
+    "--all-targets",
+    "--features",
+    "relay-client,tls",
+    "--",
+    "-D",
+    "warnings",
+]

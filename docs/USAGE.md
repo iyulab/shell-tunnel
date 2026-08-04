@@ -517,6 +517,44 @@ one to open. `DELETE .../uploads/{id}` abandons a session early, freeing its sta
 bytes; an idle session is swept automatically after an hour either way, so an abandoned
 transfer never accumulates forever.
 
+**Session ids are lowercase hexadecimal** — `up-` followed by 16 hex digits, so
+`up-000000000000000a` is serial 10: read the digits as hex, not decimal. They are
+also not a dense sequence — a refused `POST /uploads` consumes a serial — so a serial
+is not a count of sessions opened either. Read the id from the response that gives it
+to you; do not generate or enumerate ids.
+
+#### 3.2 Resuming after a timeout — a `504` does not mean the chunk was lost
+
+**A timeout says the outcome is unknown, not that it failed.** The relay forwards a
+whole chunk to the device and waits 120s for the answer; if the answer is late, the
+caller gets `504` — but the device may already have received the chunk and written it.
+Treating that as failure discards a transfer that actually succeeded, and a consumer
+who did exactly that lost 12 MB of a 16 MB upload before resuming instead.
+
+The session is the authority on what it holds. Two ways to ask, both fine:
+
+```bash
+# (a) Just resend the chunk you were sending. If it already landed, the refusal
+#     carries the true offset — one round trip, no extra call.
+curl -s -X PATCH "$BASE/api/v1/fs/uploads/up-0000000000000000" \
+  -H 'content-range: bytes 1572864-2097151/16583118' --data-binary @chunk-003
+# {"error":"offset-mismatch","message":"chunk does not continue from the session offset","offset":2097152}
+#                                                                          ^ it did land — continue from here
+
+# (b) Or ask outright, without sending bytes.
+curl -s "$BASE/api/v1/fs/uploads/up-0000000000000000"
+# {"upload_id":"up-0000000000000000","offset":2097152,"chunk_size":262144}
+```
+
+Either way, continue from the offset the server reports. Writing the same chunk twice
+is not a risk the client has to manage: a chunk that does not start exactly at the
+session's offset is refused before a single byte is written, so a duplicate cannot
+corrupt the running digest.
+
+**Retry on progress, not forever.** Recovering and hanging are different things: if the
+offset has not moved after several attempts, the transfer is stuck and should fail
+loudly rather than retry indefinitely.
+
 **While a transfer is in flight the bytes live in a `.shell-tunnel-uploads`
 directory**, beside the destination when the file API reaches the whole machine and at
 the root of `--fs-root` when one is given. It is removed once the last transfer staging
@@ -718,6 +756,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `fs.delete.refused` | a removal the server turned away before touching the disk | `file`, `status`, `reason` (`recursive-required`, `staging-in-tree`, or `reserved-path` — the same code the HTTP body carries) |
 | `fs.delete.failed` | a removal that was attempted and the filesystem refused | `file`, `status`, `reason` (the underlying error) |
 | `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
+| `upload.refused` | a session the server declined to open | `file`, `status`, `reason` (`destination-busy`, `destination-is-directory`, `reserved-path`, `bad-digest`, `too-many-uploads`, `io-error` — the same code the HTTP body carries). No `upload_id`: no session was opened to name |
 | `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
 | `upload.rejected` | the digest did not match at `complete` | `file`, `digest_ok: false`, `upload_id` |
 | `upload.failed` | `complete` failed for a reason other than the digest | `file`, `bytes`, `status`, `reason`, `upload_id` |
@@ -732,6 +771,20 @@ everything — so a truncated result stays distinguishable from a command that s
 printed little, which is a question the response itself cannot answer once it is gone.
 Streaming (`WS …/ws`) executions never carry it: a WebSocket consumer receives every
 chunk regardless of the cap, so there is nothing about that delivery to flag.
+
+`upload.refused` covers every refusal `POST .../fs/uploads` returns **once the
+destination has resolved**. One case is deliberately outside it: a path that does not
+resolve at all leaves no entry, because there is no destination to name and the raw
+string the caller spelled is not the canonical `file` every other `upload.*` entry
+carries. `DELETE .../fs/file` draws the same line. Stated as those two cases rather
+than as "every refusal is recorded" — a universal about this trail has been wrong here
+before, and the cost of an omission is smaller than the cost of a false assurance.
+
+The refusal worth watching for is `too-many-uploads`. The concurrent-session cap is a
+capability boundary, not a disk-quota convenience: it stops a token holding nothing but
+`fs.write` from exhausting the process's file descriptors and degrading `execute` and
+session routes that token has no capability over at all. Before this kind existed that
+boundary fired in complete silence.
 
 The `fs.delete*` kinds carry the outcome in the kind itself rather than in a field
 on one shared kind — the same convention the `upload.*` kinds already use. It is what
@@ -992,7 +1045,7 @@ still sees the real address.
 | `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
-| `--fs-chunk-size <N>` | Upload chunk size in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB) |
+| `--fs-chunk-size <N>` | Upload chunk size advertised to callers, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB); `262144` (256 KiB) when `--relay` is given |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
 The gateway's own socket is plaintext, and `--tls-cert`/`--tls-key`/
@@ -1104,9 +1157,10 @@ startup rather than serving local-only.
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
 | **502** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
-| **504** from a relay URL | device did not answer in 120s | check the device. The command may still be running there |
+| **504** from a relay URL | device did not answer in 120s | **the outcome is unknown, not failed** — the request may have been carried out in full and only the answer lost. Never treat it as "did not happen". For an upload chunk, ask the session where it is (§3.2) and continue from there; for `/execute`, the command may still be running on the device |
 | **413** | request body over 8 MiB (refused by the relay), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), or an upload chunk over `chunk_size` | split the request. Bulk bytes belong in an upload session, not in a JSON body |
-| **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body |
+| **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body. This is also the cheapest way to recover from a `504` — resending the lost chunk unchanged answers with the true offset (§3.2) |
+| **409** `destination-busy` on `POST .../fs/uploads` | a live session already targets this path | the body names it in `upload_id`. Resume it (`GET .../uploads/{upload_id}` for its offset) or abandon it (`DELETE`). An idle session is swept after an hour, but do not wait for that |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space or quota | free space and retry (Windows quota reporting is not covered, only `EDQUOT` on Unix) |
 | **422** `unknown field \`…\`, expected one of …` | a JSON body carries a field this server does not recognise — usually a misspelling such as `workingDir` for `working_dir`, or an `args` array, which `/execute` does not take (§3) | use the name the message lists. Nothing ran |
@@ -1178,8 +1232,18 @@ documented here.
   briefly for a refill and get **503** after 5 seconds.
 - **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a
   value one byte under the ceiling (`8388607`) is accepted and sits directly against the
-  relay's own body limit, leaving no margin. The default (4 MiB) is the one to keep for
-  anything that will ever run behind a relay.
+  relay's own body limit, leaving no margin.
+- **Behind a relay, size is not the binding constraint — the deadline is.** The relay
+  buffers a request body whole and forwards it as one frame, and gives the device 120s
+  for the whole round trip. So the time a chunk needs grows with its size while the
+  budget does not, and a chunk too large for the link fails **at zero bytes** with `504`
+  rather than transferring slowly. A device started with `--relay` therefore advertises
+  **256 KiB** instead of 4 MiB; that size clears the deadline on a link sustaining about
+  2 KB/s. Passing `--fs-chunk-size` explicitly overrides this and warns if the value is
+  larger — the override is honoured because only the operator can know the relay↔device
+  link is fast. **The startup banner names the size whenever it is not the plain
+  default**, under `File API:`, so a deployment that hands out a different number says
+  so rather than leaving it to be discovered from a response body.
 - Quick tunnels change URL on every restart and are documented by Cloudflare as
   testing-only.
 - Command content is not filtered; capability scoping is the control.

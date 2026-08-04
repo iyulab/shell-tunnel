@@ -880,3 +880,45 @@ fn the_audit_trail_path_is_announced_once() {
         "a local server's only announcement must name the path it was given: {line:?}"
     );
 }
+
+/// A relay-joined device advertises a smaller upload chunk than a directly
+/// reached one, and it does so *silently* unless the banner says otherwise —
+/// an operator comparing two deployments would find no line explaining why
+/// one hands out 262144 and the other 4194304.
+///
+/// Only the real binary can prove this. `resolve_chunk_size` is a pure
+/// function and could be unit-tested green while `async_main` printed the
+/// banner from a second, stale copy of the same decision — which is exactly
+/// the shape the resolution was factored out to prevent. The line has to be
+/// read off the process that also serves the value.
+#[test]
+fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "--relay",
+            // Deliberately unreachable: the relay client retries in the
+            // background, and the local server (and its banner) come up
+            // regardless. Nothing here needs a relay to actually answer.
+            "wss://127.0.0.1:59999",
+            "--enroll-token",
+            "t",
+            "--port",
+            "39884",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let line = wait_for_line(&mut server, Duration::from_secs(30), |l| {
+        l.contains("upload chunk size")
+    });
+
+    assert!(
+        line.contains("262144"),
+        "the banner must name the relay-path size the server will actually advertise: {line}"
+    );
+}

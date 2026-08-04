@@ -4855,3 +4855,101 @@ async fn a_single_entry_preview_carries_staging_in_tree_too() {
         "a preview removes nothing"
     );
 }
+
+/// A refused `POST /uploads` used to leave nothing in the trail at all: the
+/// `upload.*` family had seven kinds and every one of them described a session
+/// that had already opened. An operator reading the log saw successes and
+/// silence.
+///
+/// `destination-busy` is the refusal a consumer actually hit — a transfer lost
+/// to a relay timeout leaves a live session holding the path, and every retry
+/// bounces off it. Whether that is happening is exactly the question the trail
+/// should answer.
+#[tokio::test]
+async fn a_refused_upload_is_audited_rather_than_silent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (state, log) = audited_state(&dir);
+
+    let first = create_test_upload(state.clone(), "app.bin", b"hello world").await;
+
+    let refused = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app.bin",
+                        "size": 11,
+                        "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+    let events = audit_lines(&log);
+    let entry = events
+        .iter()
+        .find(|e| e["kind"] == "upload.refused")
+        .expect("a refused session must leave an entry, not silence");
+    assert_eq!(entry["file"], "app.bin");
+    assert_eq!(entry["status"], 409);
+    assert_eq!(entry["reason"], "destination-busy");
+    assert_eq!(entry["route"], "POST /api/v1/fs/uploads");
+    // The session that caused the refusal is still the one in the trail's
+    // `upload.start`, so the two correlate through `file`.
+    assert!(
+        events
+            .iter()
+            .any(|e| e["kind"] == "upload.start" && e["upload_id"] == first.as_str()),
+        "the holder's own start event must still be there to correlate against"
+    );
+}
+
+/// `destination-is-directory` answers `409` just as `destination-busy` does.
+/// Deriving the recorded `reason` from the status — which reads as the tidier
+/// implementation — would file this refusal under `destination-busy`, and an
+/// operator grepping the trail for destination contention would find
+/// directory collisions mixed in. This pins the two apart at the same status.
+#[tokio::test]
+async fn two_refusals_sharing_a_status_are_recorded_under_different_reasons() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir(dir.path().join("adir")).expect("mkdir");
+    let (state, log) = audited_state(&dir);
+
+    let refused = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "adir",
+                        "size": 11,
+                        "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(refused.status(), StatusCode::CONFLICT);
+
+    let events = audit_lines(&log);
+    let entry = events
+        .iter()
+        .find(|e| e["kind"] == "upload.refused")
+        .expect("a refused session must leave an entry");
+    assert_eq!(entry["status"], 409);
+    assert_eq!(
+        entry["reason"], "destination-is-directory",
+        "a 409 that is not destination-busy must not be recorded as one"
+    );
+}

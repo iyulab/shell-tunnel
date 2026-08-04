@@ -3,6 +3,65 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+> ⚠ **This carries a breaking library change** (`UploadError::Conflict`, below), so
+> the next release is a minor bump rather than a patch.
+
+### Fixed
+
+- **A device reached through a relay no longer advertises an upload chunk size that
+  cannot get through.** The relay buffers a request body whole and forwards it as one
+  frame, and gives the device a *fixed* 120s for the round trip — so the time a chunk
+  needs grows with its size while the budget does not. The advertised default was
+  chosen against the relay's body-size ceiling and never against that deadline, which
+  left it silently requiring roughly 35 KB/s on the relay↔device leg. Below that a
+  transfer did not run slowly, it failed at **zero bytes**, every time, with a `504`
+  the caller could not tell apart from a broken link. A relay-joined device now
+  advertises 256 KiB, derived from the deadline and a declared floor throughput rather
+  than picked, with the relationship held by compile-time assertions.
+- **`409 destination-busy` now names the session holding the destination.** A transfer
+  lost to a timeout leaves a live session on the path, and every retry bounced off a
+  refusal that identified nothing — the destination could be neither resumed nor
+  cancelled, because every session route is keyed by an id the refusal declined to
+  give. The body now carries `upload_id`.
+- **A refused upload session is recorded in the audit trail.** The `upload.*` kinds all
+  described sessions that had already opened, so a refusal left silence. This mattered
+  most for the concurrent-session cap, which is a capability boundary — it stops a token
+  holding only `fs.write` from exhausting process file descriptors and degrading routes
+  that token has no capability over — and which fired with no trace at all.
+- The startup banner names the effective upload chunk size whenever it is not the
+  default, so a deployment that hands out a different number says so.
+
+### Changed
+
+- **Breaking (library):** `UploadError::Conflict` is now `Conflict { upload_id: String }`
+  rather than a unit variant. Code matching it needs the field added. HTTP callers are
+  unaffected except that the `409` body gained a key.
+- Upload session ids are no longer a dense sequence — a refused create consumes one.
+  They were never documented as contiguous, and nothing in this crate depends on it.
+
+### Added
+
+- `fs::RELAY_CHUNK_SIZE`, the chunk size advertised over a relay.
+- `upload.refused` audit event, carrying `file`, `status`, and `reason`.
+- `.cargo/config.toml` with `test-all` and `clippy-all` aliases. With `default = []`,
+  a plain `cargo test --all` builds 9 test binaries instead of 16 and reports `ok` —
+  the feature-gated suites compile to zero tests rather than failing. The existing
+  CI feature-gate check now holds these aliases to the same rule it holds CI to.
+
+### Documentation
+
+- `USAGE.md` §3.2: **a timeout means the outcome is unknown, not that it failed.** A
+  chunk that answered `504` may well have been written. The protocol already tolerated
+  this — resending the chunk unchanged answers `409 offset-mismatch` with the true
+  offset, no extra round trip — but nothing said so, and a consumer discarded 12 MB of
+  a completed transfer as a result. No code changed for this; the contract existed and
+  the documentation did not.
+- `upload_id` format is documented (`^up-[0-9a-f]{16}$`) in `openapi.json`. It is
+  lowercase hex, which every worked example had hidden by using session zero.
+- `USAGE.md` §8 gains rows for `409 destination-busy` and a corrected `504`.
+
 ## 0.17.0 — 2026-08-03
 
 ### Fixed
