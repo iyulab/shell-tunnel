@@ -93,10 +93,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 ### Changed
 
 - **Breaking (library):** `RateLimiter::check` returns `RateLimitDecision` instead of
-  `Result<u32, Duration>`. The three variants are `Unlimited`, `Allowed { remaining }`
-  and `Limited { retry_after }`; the old signature had no way to say "no limit applies"
-  except by reporting a full bucket, which is the defect above. Callers matching on
-  `Ok`/`Err` need the two allowed cases separated.
+  `Result<u32, Duration>`. The three variants are `Unlimited`,
+  `Allowed { remaining, charge }` and `Limited { retry_after }`; the old signature had no
+  way to say "no limit applies" except by reporting a full bucket, which is the defect
+  above. Callers matching on `Ok`/`Err` need the two allowed cases separated.
+- **Breaking (library):** `relay::registry::DeviceSummary` gained four fields, and
+  `RateLimiter::refund` is new — it takes the `RateLimitCharge` from an `Allowed`
+  decision, which the rate-limit middleware puts in the request's extensions. Naming the
+  slot is what keeps a refund from returning a different caller's; an opaque "give one
+  back" cannot tell the difference once the charge it meant has aged out of the window.
 
 ## 0.18.0 — 2026-08-04
 
