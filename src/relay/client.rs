@@ -424,6 +424,10 @@ fn proxy_env_set() -> Vec<&'static str> {
 /// failing to reach the relay happens every time a device is placed on a
 /// constrained network, which is what this product is for.
 ///
+/// An HTTP refusal is separated from both: the relay answered, so neither the
+/// certificate advice nor the reachability advice applies, and the prefix says
+/// refused rather than unreachable.
+///
 /// Reachability is classified from [`std::io::ErrorKind`], never from the
 /// message: an OS error string is translated into the machine's own language,
 /// so matching on its text works on the machine it was written on and nowhere
@@ -434,8 +438,43 @@ fn explain_dial_failure(
     config: &RelayClientConfig,
 ) -> String {
     let text = error.to_string();
-    let mut message = format!("cannot reach relay: {text}");
     let target = config.dial_target();
+
+    // A refusal is not a failure to reach: the relay answered, and saying
+    // "cannot reach relay" here sends an operator to firewalls and DNS for a
+    // relay that is up and talking. Rate limiting is the case that matters,
+    // because the device then retries in backoff and, without this, says
+    // nothing about why or whether it will recover — four enrolments were
+    // refused this way in the field and the console showed only the retries.
+    if let tokio_tungstenite::tungstenite::Error::Http(response) = error {
+        let status = response.status();
+        let mut message = format!("relay refused this connection: HTTP {status}");
+        if status == 429 {
+            advise(
+                &mut message,
+                &format!("{target} is rate limiting this address, not rejecting this device."),
+            );
+            advise(
+                &mut message,
+                "This is transient and the device keeps retrying in backoff; it attaches",
+            );
+            advise(&mut message, "once the address is under the limit again.");
+            advise(
+                &mut message,
+                "If it persists, something else is sharing this machine's outbound address",
+            );
+            advise(
+                &mut message,
+                "and spending the relay's per-address budget. Raise the relay's limit, or",
+            );
+            advise(&mut message, "give the device an address of its own.");
+        } else {
+            advise(&mut message, &format!("Dialling {target}."));
+        }
+        return message;
+    }
+
+    let mut message = format!("cannot reach relay: {text}");
 
     if text.contains("BadSignature") || text.contains("UnknownIssuer") {
         let ca = config
@@ -1080,6 +1119,38 @@ mod tests {
         let error = Error::Io(std::io::Error::from_raw_os_error(10060));
         let message = explain_dial_failure(&error, &config("wss://relay.example.com:8443"));
         assert!(message.contains("Nothing answered at"), "{message}");
+    }
+
+    /// Being rate limited is not being unreachable, and must not read like it.
+    ///
+    /// The relay answered — it answered `429`. The device then retries in
+    /// backoff and recovers on its own, so the console line has to say both
+    /// that this is the relay's doing and that it is temporary. It used to say
+    /// `cannot reach relay`, which sends an operator to firewalls and DNS for
+    /// a relay that is up and talking to them.
+    #[test]
+    fn being_rate_limited_does_not_read_as_being_unreachable() {
+        use tokio_tungstenite::tungstenite::{http::Response, Error};
+
+        let response = Response::builder().status(429).body(None).unwrap();
+        let message = explain_dial_failure(
+            &Error::Http(response),
+            &config("wss://relay.example.com:8443"),
+        );
+
+        assert!(
+            !message.contains("cannot reach relay"),
+            "the relay was reached: {message}"
+        );
+        assert!(message.contains("rate limiting"), "{message}");
+        assert!(
+            message.contains("transient") || message.contains("retrying"),
+            "an operator must learn this recovers on its own: {message}"
+        );
+        assert!(
+            message.contains("relay.example.com:8443"),
+            "the target belongs in every dial failure: {message}"
+        );
     }
 
     /// Refused and timed out mean different things and must not read the same.

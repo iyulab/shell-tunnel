@@ -26,7 +26,7 @@ use axum::{
     body::Bytes,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Request, State,
+        ConnectInfo, FromRequestParts, Request, State,
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -182,14 +182,23 @@ pub fn public_base_port_hint(base: &str, listen_port: u16) -> Option<String> {
 pub struct RelayState {
     config: RelayConfig,
     devices: DeviceRegistry,
+    /// The same limiter the middleware runs, reachable from the handlers.
+    ///
+    /// Not duplication: a device's routes are charged by the middleware and
+    /// refunded by the handler once the enrolment token has been proven, and
+    /// both have to be talking about one set of counters for that to mean
+    /// anything.
+    limiter: Arc<RateLimiter>,
 }
 
 impl RelayState {
     /// Create state for `config`.
     pub fn new(config: RelayConfig) -> Self {
+        let limiter = Arc::new(RateLimiter::new(config.rate_limit.clone()));
         Self {
             config,
             devices: DeviceRegistry::new(),
+            limiter,
         }
     }
 
@@ -204,8 +213,26 @@ impl RelayState {
 /// Every route but `/health` is rate limited per client IP. Enrolment is the
 /// reason: without a limit, a weak enrolment token can be guessed at line speed,
 /// and the relay is the only place that sees who is asking.
+///
+/// A device's own routes are charged like anything else and then **refunded
+/// once the enrolment token has been proven**, so the bucket accumulates only
+/// attempts that failed or were abandoned. Without that refund the two kinds of
+/// traffic share a budget, and the amount of device traffic is set by whoever
+/// calls the device: the relay's one-data-connection-per-request model has the
+/// device open a replacement socket for every proxied request, so public load
+/// on an address could spend the budget a device on that address needs to stay
+/// attached — and it did, refusing four enrolments in the field while the
+/// device backed off in silence.
+///
+/// What the refund gives up, stated rather than left implicit: a holder of the
+/// enrol token can now open connections without a per-address ceiling. That is
+/// a trade this relay can afford because the token already grants attaching
+/// connections for *any* device on it — the relay is single-tenant by design —
+/// so a limit was never what stood between a token holder and the relay. The
+/// pool bounds what those connections cost: a full pool closes the extra
+/// socket rather than keeping it.
 pub fn relay_router(state: RelayState) -> Router {
-    let limiter = Arc::new(RateLimiter::new(state.config.rate_limit.clone()));
+    let limiter = Arc::clone(&state.limiter);
 
     Router::new()
         .route("/health", get(|| async { "OK" }))
@@ -350,14 +377,20 @@ fn serves_tls(_state: &RelayState) -> bool {
 async fn control_handler(
     ws: WebSocketUpgrade,
     State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let observed = observed_base(&headers, serves_tls(&state));
-    ws.on_upgrade(move |socket| control_session(socket, state, observed))
+    ws.on_upgrade(move |socket| control_session(socket, state, observed, peer))
 }
 
 /// Enroll a device, then serve its heartbeats until the connection ends.
-async fn control_session(socket: WebSocket, state: RelayState, observed: Option<String>) {
+async fn control_session(
+    socket: WebSocket,
+    state: RelayState,
+    observed: Option<String>,
+    peer: SocketAddr,
+) {
     let (mut sink, mut stream) = socket.split();
 
     // An unauthenticated peer must not be able to hold a connection open
@@ -398,10 +431,15 @@ async fn control_session(socket: WebSocket, state: RelayState, observed: Option<
 
     if !constant_time_eq(&enroll_token, &state.config.enroll_token) {
         // No detail about *why*: a device that guessed wrong learns nothing.
+        // The slot stays spent, which is the whole point of charging first:
+        // guesses are what the limit exists to slow down.
         tracing::debug!(target: "relay", "enrollment rejected: bad token");
         reject_and_close(&mut sink, reject::BAD_TOKEN, "enrollment refused").await;
         return;
     }
+
+    // Proven. Give the slot back — see `relay_router`.
+    state.limiter.refund(peer.ip());
 
     // A named device keeps one URL across reconnects, which is what makes the
     // relay usable when whoever calls the device cannot read its console. An
@@ -536,12 +574,16 @@ async fn devices_handler(State(state): State<RelayState>, headers: HeaderMap) ->
 /// URL: query strings land in the access logs of the reverse proxies this relay
 /// is meant to sit behind, so a token there would be written to disk in
 /// plaintext on exactly the deployments that follow our own TLS advice.
-async fn data_handler(ws: WebSocketUpgrade, State(state): State<RelayState>) -> Response {
-    ws.on_upgrade(move |socket| attach_data_connection(socket, state))
+async fn data_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    ws.on_upgrade(move |socket| attach_data_connection(socket, state, peer))
 }
 
 /// Read the attach frame, verify it, and hand the socket to the device's pool.
-async fn attach_data_connection(mut socket: WebSocket, state: RelayState) {
+async fn attach_data_connection(mut socket: WebSocket, state: RelayState, peer: SocketAddr) {
     let first = tokio::time::timeout(ENROLL_TIMEOUT, socket.recv()).await;
     let Ok(Some(Ok(Message::Text(text)))) = first else {
         let _ = socket.close().await;
@@ -562,6 +604,12 @@ async fn attach_data_connection(mut socket: WebSocket, state: RelayState) {
         let _ = socket.close().await;
         return;
     }
+
+    // Proven. Give the slot back — see `relay_router`. This is the route that
+    // made the shared bucket a starvation risk rather than a curiosity: a
+    // device opens one of these per proxied request, so its volume is set by
+    // the public caller, not by the device.
+    state.limiter.refund(peer.ip());
 
     let Some(device) = state.devices.get(&device_id) else {
         let _ = socket.close().await;

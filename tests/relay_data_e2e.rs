@@ -526,6 +526,94 @@ async fn enrolment_attempts_are_throttled() {
     );
 }
 
+/// Infrastructure a device opens after proving the token is not public traffic.
+///
+/// The limit exists to slow enrolment guessing, and a device that has proven
+/// the token is not guessing. Charging it anyway put two unlike things in one
+/// budget — and the device's share of that budget is set by whoever calls the
+/// device, because the relay has it open a fresh data connection for every
+/// proxied request. Public load on an address could therefore starve a device
+/// sharing it, which is not hypothetical: four enrolments were refused that way
+/// in the field while the device retried in silence.
+///
+/// Deliberately no sleeps. Each step's refund is already done by the time its
+/// observable result arrives — the `Enrolled` frame is sent after enrolment
+/// refunds, and a proxied request can only be answered by a connection that
+/// reached the pool, which happens after that connection refunds.
+#[tokio::test]
+async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
+    let addr = start_throttled_relay(4).await;
+
+    // Charged and refunded: enrolment (1) and one data connection (1).
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    // Public traffic, charged and kept: this is also what proves the data
+    // connection joined the pool, so its refund has certainly run.
+    let (status, _) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
+    assert_eq!(status, 200);
+    served.await.unwrap();
+
+    // Three left of four. Without the refunds only one would be.
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+    for attempt in 1..=3 {
+        let (status, _) = http_get(&url, auth).await;
+        assert_eq!(
+            status, 200,
+            "request {attempt} should be allowed: the device's own connections \
+             must not have spent the caller's budget"
+        );
+    }
+
+    // And the budget is a budget still — the refunds did not remove the limit.
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(status, 429, "four public requests is the whole budget");
+}
+
+/// The other side of the refund: a guess is still charged.
+///
+/// This is the assertion that keeps the refund from becoming an exemption. If
+/// a wrong token were refunded too, the route the limit exists for would have
+/// no limit at all, and the change would have quietly removed the defence it
+/// was written to preserve.
+#[tokio::test]
+async fn a_refused_enrolment_still_spends_its_slot() {
+    let addr = start_throttled_relay(2).await;
+
+    let (mut control, _) =
+        tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/control"))
+            .await
+            .expect("the upgrade itself is not the authentication step");
+    let guess = DeviceMessage::Enroll {
+        enroll_token: "wrong".to_string(),
+        version: PROTOCOL_VERSION,
+        label: None,
+        device_name: None,
+    };
+    control
+        .send(Message::Text(serde_json::to_string(&guess).unwrap()))
+        .await
+        .unwrap();
+
+    // Waiting for the refusal is what orders this against the budget check.
+    let RelayMessage::Rejected { code, .. } = recv(&mut control).await else {
+        panic!("expected a rejection");
+    };
+    assert_eq!(code, "bad-token");
+
+    let url = format!("http://{addr}/relay/v1/devices");
+    let auth = Some(("authorization", "Bearer secret"));
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(status, 200, "one of two slots is left");
+
+    let (status, _) = http_get(&url, auth).await;
+    assert_eq!(
+        status, 429,
+        "the guess kept its slot, so the budget is spent"
+    );
+}
+
 #[tokio::test]
 async fn health_is_never_throttled() {
     // Monitoring must not be the thing that trips the limit.

@@ -185,6 +185,36 @@ impl RateLimiter {
         RateLimitDecision::Allowed { remaining }
     }
 
+    /// Give back a slot this IP was charged for.
+    ///
+    /// For a request whose legitimacy is only established *after* the limiter
+    /// has already had to decide. A device proves its enrolment token in the
+    /// first WebSocket frame, long after the middleware ran on the upgrade
+    /// request, so the choice is between not limiting those routes at all —
+    /// which is where an enrolment token could be guessed at line speed — and
+    /// charging every attempt and refunding the ones that turn out to be
+    /// authenticated. This is the second: what accumulates in the bucket is
+    /// failed and abandoned attempts, which is exactly what the limit is for.
+    ///
+    /// Drops the *newest* timestamp rather than hunting for the one this
+    /// caller was charged. Concurrent requests from one address are
+    /// interchangeable as far as the count goes, and dropping the newest can
+    /// only make the window expire sooner — dropping the oldest would extend
+    /// it, which is the direction that must not be got wrong.
+    pub fn refund(&self, ip: IpAddr) {
+        if !self.config.enabled {
+            return;
+        }
+
+        let Ok(mut records) = self.records.write() else {
+            return;
+        };
+
+        if let Some(record) = records.get_mut(&ip) {
+            record.timestamps.pop();
+        }
+    }
+
     /// Perform cleanup of old records if needed.
     fn maybe_cleanup(&self) {
         let should_cleanup = self
@@ -421,6 +451,53 @@ mod tests {
         for _ in 0..100 {
             assert_eq!(limiter.check(ip), RateLimitDecision::Unlimited);
         }
+    }
+
+    /// A refunded slot goes back into the same window it came out of.
+    #[test]
+    fn a_refund_returns_the_slot_it_was_charged() {
+        let limiter = RateLimiter::new(RateLimitConfig::custom(2, 60));
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+
+        assert_eq!(
+            limiter.check(ip),
+            RateLimitDecision::Allowed { remaining: 1 }
+        );
+        limiter.refund(ip);
+        assert_eq!(
+            limiter.check(ip),
+            RateLimitDecision::Allowed { remaining: 1 },
+            "the refunded slot is available again"
+        );
+
+        // And the limit still exists: two spent, no more refunds.
+        assert!(allowed(limiter.check(ip)));
+        assert!(limited(limiter.check(ip)));
+    }
+
+    /// Refunding what was never charged must not create credit.
+    ///
+    /// An address with no record at all, and one whose window has already been
+    /// emptied, both reach this — a handler refunds without knowing whether the
+    /// middleware charged, and a limiter that went negative would be a way to
+    /// bank slots.
+    #[test]
+    fn a_refund_without_a_charge_creates_nothing() {
+        let limiter = RateLimiter::new(RateLimitConfig::custom(1, 60));
+        let unseen = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8));
+
+        for _ in 0..5 {
+            limiter.refund(unseen);
+        }
+
+        assert!(allowed(limiter.check(unseen)), "one request is the budget");
+        limiter.refund(unseen);
+        limiter.refund(unseen);
+        assert!(allowed(limiter.check(unseen)), "the one refund applies");
+        assert!(
+            limited(limiter.check(unseen)),
+            "the extra refunds banked nothing"
+        );
     }
 
     #[test]

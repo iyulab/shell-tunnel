@@ -18,6 +18,20 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   continue. The device's headers are now kept where it sent them, and the relay fills
   them in only where the device sent none. `Retry-After` was correct all along and is
   unchanged.
+- **Public traffic can no longer starve a device off the relay it shares an address with.**
+  The relay's per-address limit exists to stop an enrolment token being guessed at line
+  speed, but the same bucket also counted the data connections an already-enrolled device
+  opens — and since the relay has a device open a fresh one for every proxied request, the
+  device's share of that budget was set by whoever called it. Load on an address could
+  therefore refuse the enrolments of a device on that address, which is the ordinary case
+  when a relay and its devices sit behind one outbound address; it happened, and the device
+  backed off in silence. A device's connections are now charged and then **refunded once it
+  has proven the enrol token**, so only failed and abandoned attempts accumulate. A guess is
+  still charged, so the defence the limit was written for is unchanged.
+- **A device refused with `429` says so, and says it will recover.** It reported
+  `cannot reach relay: … HTTP error: 429`, which sends an operator to firewalls and DNS for
+  a relay that is up and answering. An HTTP refusal now reads as a refusal, names rate
+  limiting as the cause, and says the retry recovers on its own.
 - **A server started with `--no-rate-limit` no longer advertises a rate limit.**
   It answered `X-RateLimit-Limit: 100 / X-RateLimit-Remaining: 100` on every response —
   a budget nothing was counting, with the remaining count frozen at full forever. A

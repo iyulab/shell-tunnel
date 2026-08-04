@@ -1003,6 +1003,16 @@ default, `--no-rate-limit` to disable). This is not decoration: enrolment
 attempts land on `/relay/v1/control`, so without a limit a weak enrolment token
 can be guessed at line speed.
 
+**A device's own connections are charged and then refunded once it has proven
+the enrol token**, so what accumulates against an address is failed and
+abandoned attempts — which is what the limit is for. Before 0.19.0 they were
+simply charged, and because the relay has a device open a fresh data connection
+for every proxied request, the device's share of the budget was set by whoever
+called it: public load on an address could spend the budget a device on that
+address needed to stay attached. That is not a corner case where a relay and its
+devices sit on one network behind one outbound address. A device refused this
+way now says so and that it will recover (§8); it used to retry in silence.
+
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
 limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
@@ -1150,6 +1160,7 @@ startup rather than serving local-only.
 | `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
+| `relay refused this connection: HTTP 429` | the relay is rate limiting this device's **address**, not rejecting the device | transient — the device keeps retrying and attaches once the address is under the limit. If it persists, something else on this outbound address is spending the relay's per-address budget: raise the relay's limit, or give the device an address of its own |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
