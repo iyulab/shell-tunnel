@@ -922,3 +922,85 @@ fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
         "the banner must name the relay-path size the server will actually advertise: {line}"
     );
 }
+
+/// A loopback server that is actually behind a proxy says so, on the first
+/// request that proves it.
+///
+/// The posture is decided by the bind address, so a reverse proxy — the
+/// arrangement this product's own TLS error tells an operator to set up —
+/// leaves the server reading itself as private while it is reachable from
+/// wherever the proxy is. Documentation says this at every place the
+/// arrangement is suggested, and documentation protects whoever reads it. The
+/// warning is the part that needs no reading.
+///
+/// Only the real binary can prove it. The middleware is added conditionally,
+/// and a unit test of the message could be green while nothing ever mounted
+/// the layer — which is the whole failure mode: a check nobody runs.
+#[test]
+fn a_proxied_request_to_an_unauthenticated_server_is_warned_about() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39881"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    assert_eq!(
+        get_status_with_headers(39881, &["X-Forwarded-For: 203.0.113.9"]),
+        200,
+        "the warning must not change what the request gets"
+    );
+
+    let lines = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("--require-auth")
+    });
+    let text = lines.join("\n");
+
+    assert!(
+        text.contains("X-Forwarded-For") || text.contains("x-forwarded-for"),
+        "the warning must name the evidence it saw: {text}"
+    );
+    assert!(
+        text.contains("run commands"),
+        "an operator has to be told what is at stake, not only that a header arrived: {text}"
+    );
+}
+
+/// `GET /api/v1` with extra request headers, returning the status code.
+///
+/// `get_status` takes only a bearer token; this takes whole header lines,
+/// which is what a test about a proxy-added header needs.
+fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
+    use std::io::Write;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(e) if std::time::Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+        }
+    };
+
+    let extra: String = headers.iter().map(|h| format!("{h}\r\n")).collect();
+    let request =
+        format!("GET /api/v1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n{extra}\r\n");
+    stream.write_all(request.as_bytes()).expect("write request");
+
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    let text = String::from_utf8_lossy(&raw);
+    let status_line = text.lines().next().expect("a response status line");
+    status_line
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("no status code in {status_line:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("status code in {status_line:?} is not a number: {e}"))
+}

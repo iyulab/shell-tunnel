@@ -1091,6 +1091,15 @@ itself as local while being as reachable as the proxy is. Pass `--require-auth`
 and `--audit-log` when a proxy is in front; in that posture neither is applied
 for you.
 
+If you miss it, the server says so once it has evidence. From 0.19.0 an
+unauthenticated gateway warns — once, on the first request that carries
+`X-Forwarded-For`, `X-Real-IP` or `Forwarded` — that something is proxying to
+it while authentication is off. It stays a warning and nothing is refused: the
+headers can be forged, and forging them only makes the server complain about
+itself. Note what it cannot see: a proxy configured to pass none of those
+headers leaves no evidence, and no warning appears. The paragraph above is
+still the thing to follow.
+
 `shell-tunnel relay [OPTIONS]` additionally accepts:
 
 | Option | Description | Default |

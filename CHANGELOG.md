@@ -21,6 +21,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   *allowed* the request has no spare capacity to claim on somebody else's refusal.
   `Retry-After` was correct all along and is unchanged. §5 of the operating guide states
   which set of headers arrives in each case.
+- **An unauthenticated gateway now says so when it can see it is behind a proxy.** Which
+  posture a gateway takes is read from its bind address, so a reverse proxy — the
+  arrangement its own TLS error message tells an operator to set up — leaves it treating
+  itself as local, with authentication off and no audit trail, while being reachable from
+  wherever the proxy is. Every request arrives from `127.0.0.1`, so nothing in the bind
+  address can reveal it. The first request carrying `X-Forwarded-For`, `X-Real-IP` or
+  `Forwarded` now draws a one-time warning naming what is at stake and what to restart
+  with. It remains a warning and refuses nothing: the headers are forgeable, and forging
+  them only makes the server warn about itself. A proxy that passes none of them leaves no
+  evidence and draws no warning — the documented `--require-auth` is still the thing to do,
+  not something this replaces. **The default is unchanged**: loopback still means no auth,
+  because trading that away is a product decision rather than a bug fix.
+
 - **Public traffic can no longer starve a device off the relay it shares an address with.**
   The relay's per-address limit exists to stop an enrolment token being guessed at line
   speed, but the same bucket also counted the data connections an already-enrolled device
