@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.17.0",
+    "version": "0.18.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -933,7 +933,7 @@
             }
           },
           "409": {
-            "description": "`destination-busy` (another session already targets this path) or `destination-is-directory` (the destination already exists as a directory).",
+            "description": "`destination-busy` (another session already targets this path — the body carries that session in `upload_id`, so the caller can resume it with `GET /api/v1/fs/uploads/{id}` or abandon it with `DELETE`) or `destination-is-directory` (the destination already exists as a directory).",
             "content": {
               "application/json": {
                 "schema": {
@@ -1271,9 +1271,11 @@
         "name": "id",
         "in": "path",
         "required": true,
-        "description": "Upload session identifier, returned as `upload_id` by `POST /api/v1/fs/uploads`.",
+        "description": "Upload session identifier, returned as `upload_id` by `POST /api/v1/fs/uploads`. Format is `up-` followed by 16 lowercase hexadecimal digits, so `up-000000000000000a` is serial 10 — read the digits as hex, not decimal. Ids are also not a dense sequence: a refused create consumes a serial, so a serial is not a count of sessions opened either. Read the id from the response that supplies it; do not generate or enumerate ids.",
         "schema": {
-          "type": "string"
+          "type": "string",
+          "pattern": "^up-[0-9a-f]{16}$",
+          "example": "up-000000000000000a"
         }
       }
     },
@@ -1722,7 +1724,10 @@
         ],
         "properties": {
           "upload_id": {
-            "type": "string"
+            "type": "string",
+            "pattern": "^up-[0-9a-f]{16}$",
+            "description": "Session identifier: `up-` plus 16 lowercase hexadecimal digits.",
+            "example": "up-0000000000000000"
           },
           "offset": {
             "type": "integer",
@@ -1731,7 +1736,7 @@
           },
           "chunk_size": {
             "type": "integer",
-            "description": "Largest chunk the caller may send, in bytes. Advertised rather than assumed, and always below the relay's 8 MiB body ceiling.",
+            "description": "Largest chunk the caller may send, in bytes. Advertised rather than assumed: read it from this response instead of hard-coding one. A device started with --relay advertises 262144, because a relayed chunk must also finish inside the relay's 120s request deadline; otherwise 4194304. Always below the relay's 8 MiB body ceiling, and overridable with --fs-chunk-size.",
             "example": 4194304
           }
         }

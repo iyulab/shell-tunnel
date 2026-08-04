@@ -126,6 +126,13 @@ and SHA-256, send chunks, and the file appears at its destination only once the 
 thing verifies. That is the point of these endpoints: a large transfer that resumes and
 verifies, rather than bytes piped through a command.
 
+Resuming an upload is worth reading before you need it. A timeout on a chunk means the
+outcome is **unknown**, not that the chunk was lost — the server may well have written
+it — so asking the session where it is beats assuming the worst and starting over.
+[USAGE §3.2](docs/USAGE.md) gives the two ways to ask, and the chunk size to use comes
+from the server rather than from a constant in your client: it is smaller when the
+device is reached through a relay.
+
 Directory removal is opt-in (`recursive=true`) and can be previewed (`dry_run=true`) —
 a guard against a caller's mistake, not against a caller, since a token that can already
 remove one file this way can remove anything the server can reach.

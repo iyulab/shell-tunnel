@@ -25,6 +25,104 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// every relayed transfer would 413, and the symptom looks like a server bug.
 pub const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Chunk size advertised instead of [`DEFAULT_CHUNK_SIZE`] when this device
+/// reached its operator through a relay.
+///
+/// **`DEFAULT_CHUNK_SIZE` was chosen against the wrong constraint.** Its
+/// reasoning (above) weighs the relay's *size* ceiling, `relay::MAX_BODY`, and
+/// mentions the 120s request deadline only as "tight for 8 MiB". But the relay
+/// buffers a whole request body and forwards it as one WebSocket frame
+/// (`relay::forward`), while `relay::proxy::REQUEST_TIMEOUT` is a **fixed
+/// total** — so the time a chunk needs scales with its size and the budget it
+/// must fit into does not. That makes the deadline, not the size ceiling, the
+/// binding constraint, and 4 MiB silently requires the relay→device leg to
+/// sustain roughly 35 KB/s. Below that the transfer does not merely run slow:
+/// it fails at zero bytes, every time, with no partial progress — a `504` the
+/// caller cannot distinguish from a broken link. Live report: 4 MiB failed at
+/// 0 bytes on eight consecutive attempts across two unrelated links, while
+/// smaller chunks over the same links progressed.
+///
+/// So this value is derived from the deadline rather than picked from a
+/// measurement:
+///
+/// * `RELAY_FLOOR_THROUGHPUT` — the slowest relay→device leg a relayed upload
+///   is expected to work over at all.
+/// * `REQUEST_TIMEOUT` (120s) — the whole budget one chunk's round trip has.
+/// * `RELAY_DEADLINE_FRACTION` — how much of that budget one chunk may spend.
+///   Not 1: the budget also covers the response leg and the device's own write
+///   and hash, and observed transfer times vary by more than 3x on a poor
+///   link, so a chunk sized to *just* fit the deadline fails intermittently.
+///
+/// The result is rounded down to a power of two. At 256 KiB a chunk fits the
+/// deadline on any link sustaining ~2.2 KB/s, which is far below the slowest
+/// link anyone has reported this failing on.
+///
+/// Deliberately *not* applied per request. The relay injects no marker header
+/// and replays the caller's own headers verbatim, so a handler cannot tell a
+/// relayed request from a direct one; what the device does know is whether it
+/// joined a relay at all. A directly-reached caller on a relay-joined device
+/// is therefore told a smaller size than it strictly needs — an extra round
+/// trip, in the fail-safe direction — which is the honest trade for not
+/// inventing a signal that does not exist.
+pub const RELAY_CHUNK_SIZE: usize = {
+    let ceiling = RELAY_FLOOR_THROUGHPUT * REQUEST_TIMEOUT_SECS / RELAY_DEADLINE_FRACTION;
+    // Round down to a power of two, so the advertised number is one a client
+    // can align buffers to. `ceiling` is 480 KiB today, which rounds to 256.
+    let mut size = 1;
+    while size * 2 <= ceiling {
+        size *= 2;
+    }
+    size
+};
+
+/// Slowest relay→device leg a relayed upload is expected to work over.
+const RELAY_FLOOR_THROUGHPUT: usize = 16 * 1024;
+
+/// The relay's own request deadline, read rather than copied.
+///
+/// This module reaching into `relay` for one constant is a dependency worth
+/// paying: the number it needs *is* the relay's deadline, and the alternative
+/// — a hand-copied `120` guarded by a test asserting the two agree — keeps a
+/// second source of truth alive for no gain. (That copy was written here
+/// first, on the belief that `Duration::as_secs` was not callable in a
+/// `const`. It is, and has been since well before this crate's MSRV; the
+/// belief was never checked before it was acted on.)
+const REQUEST_TIMEOUT_SECS: usize = crate::relay::proxy::REQUEST_TIMEOUT.as_secs() as usize;
+
+/// Share of the relay's request deadline one chunk may consume.
+const RELAY_DEADLINE_FRACTION: usize = 4;
+
+/// The three properties [`RELAY_CHUNK_SIZE`] exists to hold, asserted at
+/// compile time rather than in a test.
+///
+/// Every input is a `const`, so a test asserting these could only ever fail
+/// on a build that already compiled — which is the wrong moment. As
+/// `const _`, an edit that breaks one of them fails the build at the line
+/// that broke it. (Clippy points this out as `assertions_on_constants`; it is
+/// right, and the stronger form is also the clearer one.)
+///
+/// The relay's deadline needs no assertion of its own: it is read from
+/// `relay::proxy::REQUEST_TIMEOUT` directly, so there is no copy to drift.
+const _: () = {
+    // 1. A chunk clears the deadline on the slowest link claimed to be
+    //    supported, within the share of the budget a chunk may spend.
+    assert!(
+        RELAY_CHUNK_SIZE / RELAY_FLOOR_THROUGHPUT <= REQUEST_TIMEOUT_SECS / RELAY_DEADLINE_FRACTION,
+        "a relay-path chunk must fit its share of the relay's deadline at the floor throughput"
+    );
+    // 2. A size a client can align buffers to.
+    assert!(RELAY_CHUNK_SIZE.is_power_of_two());
+    // 3. The defect, stated as an invariant: the direct default does *not*
+    //    fit that deadline at the floor throughput, which is the entire
+    //    reason a separate relay-path value exists. If a future edit ever
+    //    makes it fit, delete this constant rather than keeping two sizes
+    //    that mean the same thing.
+    assert!(
+        DEFAULT_CHUNK_SIZE / RELAY_FLOOR_THROUGHPUT > REQUEST_TIMEOUT_SECS,
+        "the direct default now fits the relay deadline — RELAY_CHUNK_SIZE is obsolete"
+    );
+};
+
 /// How long a session may sit idle before it is swept.
 pub const SESSION_TTL: Duration = Duration::from_secs(3600);
 
@@ -54,7 +152,15 @@ pub enum UploadError {
     /// The chunk did not start where the session expects.
     OffsetMismatch { expected: u64 },
     /// Another live session already targets this destination.
-    Conflict,
+    ///
+    /// Carries the id of the session holding the claim. Without it a caller
+    /// that lost a transfer to a timeout is told the destination is busy and
+    /// given no way to reach the session that is busy with it — it can
+    /// neither resume that session nor cancel it, because every route to a
+    /// session is keyed by an id this refusal declined to name. A live report
+    /// had a consumer enumerating `up-%016d` from zero to find it, which is
+    /// both not a contract and the wrong number base (ids are hex).
+    Conflict { upload_id: String },
     /// The chunk exceeds the advertised chunk size.
     TooLarge,
     /// This chunk would push the session past the size declared at creation.
@@ -156,17 +262,26 @@ struct Session {
 pub struct UploadStore {
     sessions: RwLock<HashMap<String, Mutex<Session>>>,
     /// Destinations currently claimed, so two sessions cannot race to one path,
-    /// each mapped to the staging directory that destination stages through.
+    /// each mapped to the staging directory it stages through and the session
+    /// that holds it.
     ///
     /// A map, not a set. It was a set for as long as nothing read a value out
     /// of it (an earlier version stored the claiming session's id, which
     /// nothing looked up — `sessions` is the source of truth for which id owns
-    /// which destination). `release` now does read one: it reclaims an empty
+    /// which destination). `release` then read one: it reclaims an empty
     /// staging directory once no remaining claim stages through it, and "which
     /// directory, and is anyone else using it" is a question only this map can
     /// answer under a single lock. Machine-wide, staging follows each
     /// destination, so two claims routinely name two different directories and
     /// a set could not tell them apart.
+    ///
+    /// The owning id is back, and this time something *does* look it up:
+    /// `create` reports it in `UploadError::Conflict` so a refused caller can
+    /// reach the session that refused it. `sessions` remains the source of
+    /// truth for what a session *is* — this is a back-reference, and the two
+    /// cannot be consulted together without breaking the lock invariant
+    /// below, which is exactly why the id has to live here rather than be
+    /// looked up from `sessions` at refusal time.
     ///
     /// Its length still doubles as the live-session count for
     /// `MAX_CONCURRENT_UPLOADS`: every live session claims exactly one
@@ -175,9 +290,16 @@ pub struct UploadStore {
     /// admission check — two concurrent callers cannot both read a count under
     /// the cap and then both insert, because the check and the insert share
     /// one critical section.
-    claimed: Mutex<HashMap<String, PathBuf>>,
+    claimed: Mutex<HashMap<String, Claim>>,
     chunk_size: usize,
     counter: std::sync::atomic::AtomicU64,
+}
+
+/// What a claimed destination records: where it stages, and who holds it.
+#[derive(Debug, Clone)]
+struct Claim {
+    staging: PathBuf,
+    upload_id: String,
 }
 
 impl UploadStore {
@@ -291,24 +413,13 @@ impl UploadStore {
         // under the `create_dir_all` and `create_new` below.
         let staging = Self::staging_dir(root, dest_abs);
 
-        // Claim the destination first: a second session for the same path is a
-        // silent-overwrite race, and last-writer-wins loses data quietly.
-        {
-            let mut claimed = self.claimed.lock().map_err(|_| poisoned())?;
-            if claimed.contains_key(&dest_rel) {
-                return Err(UploadError::Conflict);
-            }
-            if claimed.len() >= MAX_CONCURRENT_UPLOADS {
-                return Err(UploadError::TooManySessions);
-            }
-            claimed.insert(dest_rel.clone(), staging.clone());
-        }
-
-        if let Err(e) = std::fs::create_dir_all(&staging) {
-            self.release(&dest_rel);
-            return Err(e.into());
-        }
-
+        // Minted before the claim rather than after it, because the claim now
+        // records who holds it and a claim cannot name an id that does not
+        // exist yet. The cost is that a refused `create` still consumes a
+        // serial, so ids are not contiguous — which was never a property
+        // anything could rely on (`sweep_orphan_parts` parses a stem, it does
+        // not enumerate), and the one caller who *did* try to enumerate them
+        // is the reason `Conflict` carries an id at all.
         let serial = self
             .counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -318,6 +429,33 @@ impl UploadStore {
         // component. The postcondition `delete_file_blocking` needs for a
         // caller-supplied name (`src/api/fs.rs`) has nothing to check here.
         let id = format!("up-{serial:016x}");
+
+        // Claim the destination first: a second session for the same path is a
+        // silent-overwrite race, and last-writer-wins loses data quietly.
+        {
+            let mut claimed = self.claimed.lock().map_err(|_| poisoned())?;
+            if let Some(holder) = claimed.get(&dest_rel) {
+                return Err(UploadError::Conflict {
+                    upload_id: holder.upload_id.clone(),
+                });
+            }
+            if claimed.len() >= MAX_CONCURRENT_UPLOADS {
+                return Err(UploadError::TooManySessions);
+            }
+            claimed.insert(
+                dest_rel.clone(),
+                Claim {
+                    staging: staging.clone(),
+                    upload_id: id.clone(),
+                },
+            );
+        }
+
+        if let Err(e) = std::fs::create_dir_all(&staging) {
+            self.release(&dest_rel);
+            return Err(e.into());
+        }
+
         let part_path = staging.join(format!("{id}.part"));
 
         // `create_new` (`O_EXCL` on Unix, `CREATE_NEW` on Windows), not
@@ -664,10 +802,13 @@ impl UploadStore {
     /// crash is instead reclaimed the next time an upload through it finishes.
     fn release(&self, dest_rel: &str) {
         if let Ok(mut claimed) = self.claimed.lock() {
-            let Some(staging) = claimed.remove(dest_rel) else {
+            let Some(Claim { staging, .. }) = claimed.remove(dest_rel) else {
                 return;
             };
-            if !claimed.values().any(|other| *other == staging) {
+            // Compares staging directories, not whole claims: two claims are
+            // never equal (their ids differ by construction), and the question
+            // here is whether anyone else still stages through this directory.
+            if !claimed.values().any(|other| other.staging == staging) {
                 std::fs::remove_dir(&staging).ok();
             }
         }
@@ -870,6 +1011,30 @@ mod tests {
     /// SHA-256 of b"hello world".
     const HELLO_DIGEST: &str = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
 
+    /// A store built with the relay size must actually refuse a chunk above
+    /// it. The constant is only worth anything if `append` enforces it — the
+    /// advertised number and the enforced ceiling are the same field, and a
+    /// change that advertised one while enforcing the other would leave the
+    /// caller obeying a limit that does nothing.
+    #[test]
+    fn a_store_at_the_relay_size_enforces_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = FsRoot::new(dir.path()).expect("root");
+        let store = UploadStore::new(RELAY_CHUNK_SIZE);
+        assert_eq!(store.chunk_size(), RELAY_CHUNK_SIZE);
+
+        let id = store
+            .create_rel(
+                &root,
+                "out.bin",
+                DEFAULT_CHUNK_SIZE as u64,
+                HELLO_DIGEST.into(),
+            )
+            .expect("create");
+        let oversized = vec![0_u8; RELAY_CHUNK_SIZE + 1];
+        assert_eq!(store.append(&id, 0, &oversized), Err(UploadError::TooLarge));
+    }
+
     /// 트리 삭제가 진행 중인 업로드를 지우지 않으려면, 어떤 디렉터리 아래에
     /// 살아있는 세션의 스테이징 파일이 있는지 물을 수 있어야 한다. 고아
     /// `.part`는 "살아있음"이 아니다 — 그것까지 살아있다고 답하면 스윕이 늦은
@@ -1014,12 +1179,68 @@ mod tests {
     #[test]
     fn two_sessions_may_not_target_the_same_path() {
         let (_dir, root, store) = store();
-        store
+        let first = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("first");
+        // The refusal must name the session that caused it — that id is the
+        // only route back to the in-flight transfer, and a refusal without it
+        // leaves the destination unreachable until the TTL expires.
         assert_eq!(
             store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into()),
-            Err(UploadError::Conflict)
+            Err(UploadError::Conflict { upload_id: first })
+        );
+    }
+
+    /// The id in a `Conflict` has to be the *live holder's*, not the id the
+    /// refused attempt minted for itself. Those are different values (the
+    /// counter advances before the claim is checked), and reporting the
+    /// caller's own id back to it would be worse than reporting nothing: it
+    /// names a session that does not exist, so `GET` answers 404 and the
+    /// caller concludes the destination is stuck.
+    #[test]
+    fn a_conflict_names_the_holder_not_the_refused_caller() {
+        let (_dir, root, store) = store();
+        let holder = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("first");
+
+        match store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into()) {
+            Err(UploadError::Conflict { upload_id }) => {
+                assert_eq!(upload_id, holder);
+                // And it is a *live* session: the id the refusal handed back
+                // must actually resolve, or it is not a route to anything.
+                assert_eq!(store.offset(&upload_id), Some(0));
+            }
+            other => panic!("expected a conflict naming the holder, got {other:?}"),
+        }
+    }
+
+    /// Ids are minted before the claim is taken, so a refused `create`
+    /// consumes a serial and ids are not contiguous. Pinned deliberately: a
+    /// consumer already tried to enumerate ids to find a live session, and
+    /// this is half of why that could never work (the other half being that
+    /// they are hex). Nothing in this crate depends on contiguity — this test
+    /// exists so that a future change assuming it fails here rather than in
+    /// somebody's deploy script.
+    #[test]
+    fn a_refused_create_still_consumes_a_serial() {
+        let (_dir, root, store) = store();
+        let first = store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .expect("first");
+        assert_eq!(first, "up-0000000000000000");
+
+        // Refused: consumes serial 1.
+        assert!(store
+            .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
+            .is_err());
+
+        let next = store
+            .create_rel(&root, "other.bin", 11, HELLO_DIGEST.into())
+            .expect("second destination");
+        assert_eq!(
+            next, "up-0000000000000002",
+            "the refused attempt's serial is not reused — ids are not a dense sequence"
         );
     }
 
@@ -1254,9 +1475,18 @@ mod tests {
         // called `release_destination`), so the destination must still be
         // refused to a second session — otherwise two sessions could both be
         // mid-publication to the same path.
+        //
+        // The claim still names the completed session's id. That is the
+        // honest answer even though `sessions` no longer holds it: the id
+        // identifies what is mid-publication to this path, and a caller
+        // retrying here is meant to back off, not to resume — `GET` on that
+        // id answers 404, which says "not resumable" rather than "unknown
+        // destination".
         assert_eq!(
             store.create_rel(&root, "out.bin", 11, HELLO_DIGEST.into()),
-            Err(UploadError::Conflict)
+            Err(UploadError::Conflict {
+                upload_id: id.clone()
+            })
         );
 
         store.release_destination(&finished.dest_rel);

@@ -1366,9 +1366,20 @@ pub struct UploadState {
     pub offset: u64,
     /// Largest chunk the caller may send.
     ///
-    /// Advertised rather than assumed: the ceiling depends on the path the
-    /// request travelled, and a client that guesses will guess wrong on one of
-    /// them.
+    /// Advertised rather than assumed: the ceiling depends on how this device
+    /// is reachable, and a client that guesses will guess wrong on one of
+    /// them. A relay-joined device advertises `fs::RELAY_CHUNK_SIZE`, which
+    /// fits the relay's fixed request deadline; otherwise
+    /// `fs::DEFAULT_CHUNK_SIZE`. `--fs-chunk-size` overrides both.
+    ///
+    /// **This is a property of the device, not of the request.** An earlier
+    /// version of this comment said the ceiling "depends on the path the
+    /// request travelled", which was never true and could not have been: the
+    /// relay injects no marker and replays the caller's headers verbatim
+    /// (`relay::client::serve_one`), so a handler cannot tell a relayed
+    /// request from a direct one. The value is chosen once, at startup, from
+    /// whether `--relay` was given — which means a direct caller on a
+    /// relay-joined device is told the smaller number too. Say what it does.
     pub chunk_size: usize,
 }
 
@@ -1390,11 +1401,21 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
             })),
         )
             .into_response(),
-        UploadError::Conflict => error_response(
+        // The id is the point of this refusal, not decoration. A caller that
+        // lost a chunk to a relay timeout retries `POST /uploads` and lands
+        // here; without the id it can neither resume the live session (every
+        // session route is keyed by id) nor cancel it, so a destination stays
+        // refused until the session's own TTL expires an hour later. With it,
+        // `GET .../{upload_id}` gives the offset and the transfer continues.
+        UploadError::Conflict { upload_id } => (
             StatusCode::CONFLICT,
-            "destination-busy",
-            "another upload session is already targeting this path",
-        ),
+            Json(serde_json::json!({
+                "error": "destination-busy",
+                "message": "another upload session is already targeting this path; resume or cancel it by upload_id",
+                "upload_id": upload_id,
+            })),
+        )
+            .into_response(),
         UploadError::TooLarge => error_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "chunk-too-large",
@@ -1555,7 +1576,9 @@ fn create_upload_blocking(
     // staging file, making that session's `create_new` fail for a reason
     // that has nothing to do with it.
     if is_reserved_path(&dest_rel) {
-        return reserved_path_response();
+        let response = reserved_path_response();
+        audit_upload_refusal(audit, identity, &dest_rel, &response, "reserved-path");
+        return response;
     }
 
     // Checked before the digest/size validation below, and before claiming
@@ -1568,20 +1591,30 @@ fn create_upload_blocking(
     // comment), so it simply replaces the link rather than failing.
     if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
         if meta.is_dir() {
-            return error_response(
+            let response = error_response(
                 StatusCode::CONFLICT,
                 "destination-is-directory",
                 "the destination path already exists as a directory",
             );
+            audit_upload_refusal(
+                audit,
+                identity,
+                &dest_rel,
+                &response,
+                "destination-is-directory",
+            );
+            return response;
         }
     }
 
     if body.sha256.len() != 64 || !body.sha256.chars().all(|c| c.is_ascii_hexdigit()) {
-        return error_response(
+        let response = error_response(
             StatusCode::BAD_REQUEST,
             "bad-digest",
             "sha256 must be 64 hexadecimal characters",
         );
+        audit_upload_refusal(audit, identity, &dest_rel, &response, "bad-digest");
+        return response;
     }
 
     // Cloned before the move below: `dest_rel` is canonical (see the comment
@@ -1643,7 +1676,84 @@ fn create_upload_blocking(
             )
                 .into_response()
         }
-        Err(error) => upload_error_response(error),
+        Err(error) => {
+            let reason = upload_error_code(&error);
+            let response = upload_error_response(error);
+            audit_upload_refusal(audit, identity, &dest_for_audit, &response, reason);
+            response
+        }
+    }
+}
+
+/// Record a session the server declined to open.
+///
+/// `upload.*` had seven kinds and none of them covered a refusal, while the
+/// delete family has carried `fs.delete.refused` since it grew a guard worth
+/// recording. The asymmetry mattered most for one refusal in particular:
+/// `MAX_CONCURRENT_UPLOADS` exists as a *capability boundary* — the cap stops
+/// a token holding nothing but `fs.write` from exhausting the process's file
+/// descriptors and degrading routes that token has no capability over at all
+/// (see `UploadStore`'s own doc). A defence that fires silently gives an
+/// operator no way to see it firing, which is the one thing an audit trail is
+/// for.
+///
+/// **What is recorded, and the one case that is not.** Every refusal this
+/// route returns *after the destination has resolved* leaves an entry:
+/// `reserved-path`, `destination-is-directory`, `bad-digest`,
+/// `destination-busy`, `too-many-uploads`, and the filesystem's own refusals.
+/// A path that does not resolve at all is **not** recorded — there is no
+/// destination to name, and naming the caller's raw spelling would put an
+/// unresolved string in the `file` field every other upload event fills with
+/// a canonical one. That is the same line the delete route draws, and it is
+/// stated here as two specific cases rather than as a universal, because a
+/// universal about this trail has already been wrong once.
+///
+/// `status` is read off the response, so the recorded status cannot disagree
+/// with what the caller was told. `reason` is **passed in, not derived from
+/// that status** — deriving it looks tidier and is wrong here: two different
+/// refusals on this route both answer `409` (`destination-busy` from the
+/// store, `destination-is-directory` from the lstat above), so a status-keyed
+/// lookup would file every directory collision under `destination-busy` and
+/// an operator grepping for contention would find refusals that had nothing
+/// to do with it. Each call site names its own code, which is also the code
+/// its own response body carries one line away.
+fn audit_upload_refusal(
+    audit: &crate::audit::AuditSink,
+    identity: Option<crate::audit::Identity>,
+    dest_rel: &str,
+    response: &Response,
+    reason: &'static str,
+) {
+    audit.record(
+        crate::audit::AuditEvent::new("upload.refused")
+            .with_identity(identity)
+            .with_route("POST /api/v1/fs/uploads")
+            .with_file(dest_rel.to_string(), None)
+            .with_denial(response.status().as_u16(), reason),
+    );
+}
+
+/// The `error` code `upload_error_response` will put in the body for this
+/// refusal.
+///
+/// Kept beside that function deliberately: the two must agree, and a reader
+/// changing one sees the other. Taken by reference so the caller can record
+/// the code and *then* hand the error over to be rendered.
+fn upload_error_code(error: &crate::fs::UploadError) -> &'static str {
+    use crate::fs::UploadError;
+    match error {
+        UploadError::NotFound => "no-such-upload",
+        UploadError::OffsetMismatch { .. } => "offset-mismatch",
+        UploadError::Conflict { .. } => "destination-busy",
+        UploadError::TooLarge => "chunk-too-large",
+        UploadError::SizeExceeded => "size-exceeded",
+        UploadError::TooManySessions => "too-many-uploads",
+        UploadError::Checksum { .. } => "checksum-mismatch",
+        // One code for both, matching the body: an out-of-space `Io` and any
+        // other `Io` differ in *status* (507 vs 500) but carry the same
+        // `error` code. The recorded `status` already tells them apart, so a
+        // second code here would say the same thing in a second vocabulary.
+        UploadError::Io { .. } => "io-error",
     }
 }
 

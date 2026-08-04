@@ -179,6 +179,103 @@ fn ci_passes_every_feature_the_test_suites_are_gated_behind() {
     }
 }
 
+/// Each alias in `.cargo/config.toml`, flattened into something
+/// [`features_on`] can read.
+///
+/// An alias is a TOML array (`["test", "--all", "--features", "relay-client,tls"]`)
+/// which `cargo fmt`-style wrapping may spread over several lines, so neither
+/// "one line is one command" nor a raw whitespace split works on its own. Each
+/// alias is gathered from its `name = ` up to the next one, then the array
+/// punctuation is stripped so the same reader serves both this and CI's
+/// command lines — which is the whole point of checking them against one rule.
+///
+/// **Commas are stripped per token, not globally.** A blanket replace also eats
+/// the separator inside `relay-client,tls`, which leaves the feature list
+/// looking like two arguments and the check reporting `tls` as missing when it
+/// is right there. Found by running it.
+fn alias_commands(config: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut current: Option<String> = None;
+    for line in config.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        // A new alias starts at `name = ` outside any array. `[alias]` itself
+        // has no `=`, so the section header does not start one.
+        let starts_alias = trimmed.contains('=') && !trimmed.starts_with('[');
+        if starts_alias {
+            if let Some(done) = current.take() {
+                commands.push(done);
+            }
+            current = Some(String::new());
+        }
+        if let Some(buffer) = current.as_mut() {
+            let bare = trimmed.replace(['[', ']', '"'], " ");
+            for token in bare.split_whitespace() {
+                buffer.push(' ');
+                buffer.push_str(token.trim_end_matches(','));
+            }
+        }
+    }
+    commands.extend(current);
+    commands
+}
+
+/// The same rule, applied to the command a person types before pushing.
+///
+/// CI being right does not stop a contributor from running `cargo test --all`,
+/// getting `ok` from nine binaries instead of sixteen, and concluding their
+/// relay change is fine. `.cargo/config.toml` exists to give that person a
+/// complete command — and an alias is only worth having if it stays complete,
+/// which is the same drift this file already guards CI against. One rule, two
+/// consumers.
+///
+/// A missing `.cargo/config.toml` fails rather than skips: the alias is the
+/// only thing standing between a local run and a false green, so its absence
+/// is the condition worth reporting, not a reason to pass quietly.
+#[test]
+fn the_local_alias_passes_every_feature_the_test_suites_are_gated_behind() {
+    let config_path = repo_root().join(".cargo/config.toml");
+    let config = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+        panic!(
+            "{} could not be read ({e}). It carries the alias that runs the full \
+             suite locally; without it `cargo test --all` silently skips every \
+             feature-gated suite and still reports ok.",
+            config_path.display()
+        )
+    });
+
+    let commands = alias_commands(&config);
+    assert!(
+        !commands.is_empty(),
+        "no aliases were found in {}. An alias that does not exist cannot be the \
+         complete command anyone runs.",
+        config_path.display()
+    );
+
+    let gates = gates_across_tests();
+    for command in &commands {
+        let enabled = features_on(command);
+        let missing: Vec<&(String, String)> = gates
+            .iter()
+            .filter(|(feature, _)| !enabled.contains(feature))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "the local alias in {} does not enable every feature the test suites are \
+             gated behind.\nenables: {enabled:?}\nmissing:\n{}\n\
+             Somebody running that alias would get a green run with those suites absent.",
+            config_path.display(),
+            missing
+                .iter()
+                .map(|(feature, file)| format!("  - `{feature}` (gates tests/{file})"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// The scan is the part most likely to rot in silence: if it quietly stopped
 /// matching anything, the check above would pass for the wrong reason.
 #[test]
