@@ -979,6 +979,38 @@ curl -X POST "https://relay.example.com/d/build-box/api/v1/execute" \
   -H "Content-Type: application/json" -d '{"command":"echo hello"}'
 ```
 
+### What decides how fast a relayed request is
+
+Not a number this document can give you, and that is the useful thing to know
+about it. What it can give you is the shape, which is what tells you where to
+look when a transfer is slower than you expected.
+
+The relay does not stream. It reads a request body **whole**, forwards it as one
+frame down one of the device's data connections, and buffers the whole response
+before answering the caller — one data connection taken from the device's pool
+per request, and refilled afterwards. Two consequences follow:
+
+- **Effective throughput is roughly the slower of the two hops**: caller→relay
+  and relay→device. Nothing overlaps them.
+- **The relay's own cost is small.** Measured over loopback, with the network
+  taken out of the question, the forwarding path moved an 8 MiB download at
+  78–98 MB/s and added 15–20 ms to an `/execute` round trip. That is the code
+  path, not a promise about any deployment: on a real relay the two hops
+  dominate and this measurement says nothing about them.
+
+So when a relayed transfer is slow, the question is which hop, and the answer is
+usually the relay host's own uplink — the one thing only whoever runs the relay
+can measure. Sequential requests do not pay a handshake each time (each device
+keeps a small pool of connections open and refills it as they are consumed), but
+more than a handful of *concurrent* requests to one device will outrun that pool
+and start paying for new connections.
+
+Chunk size is not a tuning knob for this. There is no per-chunk
+acknowledgement and no window: a bigger chunk is one bigger frame. `chunk_size`
+exists for the relay's body ceiling and its per-request deadline (§3.2), and the
+server tells you the value it will accept — do not derive a throughput
+expectation from it.
+
 ### Trust model
 
 Two secrets, deliberately separate — they are not interchangeable:
@@ -999,9 +1031,10 @@ own; it does not isolate tenants from each other.
 ### Rate limiting on the relay
 
 Every relay route except `/health` is limited per client IP (100/minute by
-default, `--no-rate-limit` to disable). This is not decoration: enrolment
-attempts land on `/relay/v1/control`, so without a limit a weak enrolment token
-can be guessed at line speed.
+default, `--no-rate-limit` to disable). This is not decoration, and it holds two
+things back rather than one: enrolment attempts land on `/relay/v1/control`, so
+without a limit a weak enrolment token can be guessed at line speed — and it is
+also the only thing bounding the device-name lookup described below.
 
 **A device's own connections are charged and then refunded once it has proven
 the enrol token**, so what accumulates against an address is failed and
@@ -1046,6 +1079,23 @@ only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
 | `WS` | `/relay/v1/control` | enrol frame (device only) |
 | `WS` | `/relay/v1/data` | attach frame (device only) |
 | `ANY` | `/d/<device-id>/…` | forwarded to the device unchanged |
+
+**Device names are discoverable without credentials.** The last row and the
+`/health` row combine into something neither states on its own: `/d/<id>/…` is
+forwarded as-is, so a device's own unauthenticated route is unauthenticated
+through the relay too. `GET /d/<name>/health` answers `200` for an attached
+device and `502 device is not connected` for a name that is not there, and
+neither needs a token — so anyone who can reach the relay can ask whether a
+given name is attached to it. Names are guessable: `--device-name` defaults to
+the machine's own name.
+
+What this does and does not give away: the *existence* of a name, and nothing
+else. Reaching the device behind it still needs that device's API key, and a
+request without one is refused by the device with `401`. The rate limit is the
+only thing bounding the lookup itself, which is the second reason
+`--no-rate-limit` is a bigger decision on a relay than it looks — and note that
+a probe for a name that is *not* attached is the cheap case, because no device
+is involved to spend anything further.
 
 ---
 
