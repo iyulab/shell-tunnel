@@ -1079,6 +1079,15 @@ device replays each request to its own loopback listener, so the device's own
 limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
 still sees the real address.
 
+That has a consequence worth stating outright, because it is the opposite of
+what "per client IP" suggests: **a device's own limit is one budget shared by
+everyone reaching it through the relay**, so a single busy caller can spend it
+and the next caller is refused for something it did not do. Measured on a live
+relay: 140 requests from two different callers inside four seconds produced
+exactly 100 answered and 40 refused, with no distinction between them. Per-caller
+fairness for relayed traffic lives on the relay, which is why the relay's limit
+is the one to size against the number of callers.
+
 Two limiters therefore sit in series on the proxied path, and a response can
 only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
 
