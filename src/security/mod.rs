@@ -33,7 +33,7 @@ pub mod validation;
 
 // Re-export commonly used types
 pub use auth::{auth_middleware, generate_api_key, ApiKeyStore, AuthConfig, TokenRecord};
-pub use capability::{preset, CapabilitySet, WILDCARD};
+pub use capability::{preset, CapabilitySet, KNOWN_CAPABILITIES, WILDCARD};
 pub use rate_limit::{
     rate_limit_middleware, RateLimitCharge, RateLimitConfig, RateLimitDecision, RateLimitStats,
     RateLimiter,

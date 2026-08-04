@@ -1190,6 +1190,7 @@ startup rather than serving local-only.
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
 | **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead |
+| `relay certificate does not match --relay-fingerprint` | the pinned value is not the certificate the relay is serving — a relay that regenerated its certificate has a new one | the message prints both fingerprints; copy the relay's current one from the `Devices join with:` line of its banner ([§5](#tls-without-a-proxy)). Retrying does not help until the pin or that certificate changes |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |

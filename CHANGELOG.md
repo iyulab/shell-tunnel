@@ -21,6 +21,26 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   *allowed* the request has no spare capacity to claim on somebody else's refusal.
   `Retry-After` was correct all along and is unchanged. §5 of the operating guide states
   which set of headers arrives in each case.
+- **A mismatched `--relay-fingerprint` now names the fingerprint.** Pinning worked; the
+  diagnostic said nothing. A wrong value produced `cannot reach relay: IO error: invalid
+  peer certificate: ApplicationVerificationFailure` — four wrappings ending in a library's
+  enum name, never once saying `fingerprint`, and opening with a phrase that sends an
+  operator to firewalls and DNS for a relay that answered and offered its certificate. The
+  failure now names the flag, prints the pinned value beside the one the relay actually
+  sent, says where to copy the current one from, and says that retrying does not help until
+  the pin or that certificate changes. §8 of the operating guide gained the row: it listed
+  both `--relay-ca` failures and neither of the fingerprint path's, which is the one the
+  banner recommends.
+
+- **The `Reachable:` banner no longer presents `operator` as a boundary it is not.** It
+  read `tokens are scoped to \`operator\`, not wildcard` under the reachability label, which
+  says *reachable now, but narrowed in exchange*. Nothing was narrowed: `operator` holds
+  all five capabilities this version defines, so a token scoped to it meets no `403` on any
+  route that exists — confirmed by issuing one and walking them. The banner now names the
+  capabilities a token actually holds, and where they cover everything, says outright that
+  nothing is withheld today. A scope that genuinely narrows, such as `file-read`, does not
+  carry that line.
+
 - **An unauthenticated gateway now says so when it can see it is behind a proxy.** Which
   posture a gateway takes is read from its bind address, so a reverse proxy — the
   arrangement its own TLS error message tells an operator to set up — leaves it treating

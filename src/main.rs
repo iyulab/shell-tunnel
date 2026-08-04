@@ -982,7 +982,12 @@ enum TokenScope {
     /// Every capability, including any added in later versions.
     Wildcard,
     /// A named preset, holding exactly what that name grants.
-    Preset(String),
+    ///
+    /// The capabilities travel with the name because the name alone cannot say
+    /// whether anything was narrowed — `operator` holds every capability this
+    /// version defines, and a banner that only printed the name presented that
+    /// as a boundary.
+    Preset { name: String, listed: Vec<String> },
     /// An explicit set of capability strings, in a stable order.
     Explicit(Vec<String>),
 }
@@ -1003,18 +1008,55 @@ fn token_scope(preset: Option<&str>, capabilities: Option<&CapabilitySet>) -> To
     if set.is_wildcard() {
         return TokenScope::Wildcard;
     }
+    // Sorted because the set is a `HashSet`: unsorted, the same configuration
+    // would print a different banner on every run.
+    let mut listed: Vec<String> = set.iter().cloned().collect();
+    listed.sort();
+
     match preset {
         Some(name) if shell_tunnel::security::preset(name).as_ref() == Some(set) => {
-            TokenScope::Preset(name.to_string())
+            TokenScope::Preset {
+                name: name.to_string(),
+                listed,
+            }
         }
-        _ => {
-            // Sorted because the set is a `HashSet`: unsorted, the same
-            // configuration would print a different banner on every run.
-            let mut listed: Vec<String> = set.iter().cloned().collect();
-            listed.sort();
-            TokenScope::Explicit(listed)
-        }
+        _ => TokenScope::Explicit(listed),
     }
+}
+
+/// The `Reachable:` line for a non-wildcard scope, plus the qualifier a scope
+/// that withholds nothing needs.
+///
+/// `prefix` names the preset where there is one. The second line exists only
+/// for the case that would otherwise mislead: it says outright that the grant
+/// covers everything this version defines, so nobody reads a preset name as a
+/// boundary. Indented to the column the values start at, matching the other
+/// qualifier lines in this banner.
+fn scope_lines(prefix: &str, listed: &[String]) -> Vec<String> {
+    let quoted: Vec<String> = listed.iter().map(|c| format!("`{c}`")).collect();
+    let mut lines = vec![format!(
+        "Reachable:   from other machines — tokens are scoped to {prefix}{}",
+        quoted.join(", ")
+    )];
+    if !narrows_something(listed) {
+        lines.push(
+            "             that is every capability this version defines, so nothing is withheld today; the wildcard differs only for capabilities added later".to_string(),
+        );
+    }
+    lines
+}
+
+/// Whether a scope withholds any capability that exists today.
+///
+/// `operator` does not: it holds all five of `KNOWN_CAPABILITIES`, so a token
+/// scoped to it reaches every route a wildcard token does and there is no
+/// `403` anywhere behind it. That was verified by issuing one and walking the
+/// routes, not by reading the table. The only difference from the wildcard is
+/// forward-compatible — a capability added in a later version.
+fn narrows_something(listed: &[String]) -> bool {
+    !shell_tunnel::security::KNOWN_CAPABILITIES
+        .iter()
+        .all(|known| listed.iter().any(|held| held == known))
 }
 
 /// Whether the file API is the whole of what a token this server issues holds.
@@ -1156,23 +1198,21 @@ fn posture_banner(
     // The wildcard line deliberately avoids the word "scoped": the wildcard is
     // the absence of scoping, and this line is the only place a consumer
     // confirms which of the two they have.
-    let reach = match scope {
-        TokenScope::Wildcard => "Reachable:   from other machines — tokens hold the wildcard `*`: every capability, including any added in later versions".to_string(),
-        TokenScope::Preset(name) => {
-            format!("Reachable:   from other machines — tokens are scoped to `{name}`, not wildcard")
-        }
+    //
+    // A scope is also never described as narrowing when it does not. `operator`
+    // — the preset a promoted server picks for itself — holds all five of
+    // `KNOWN_CAPABILITIES`, so "scoped to `operator`, not wildcard" sat under
+    // the `Reachable:` label reading as *and in exchange this much was taken
+    // away*, when nothing was: an `operator` token meets no `403` on any route
+    // that exists. The capabilities are named instead, which lets a reader see
+    // the grant rather than be told a word for it.
+    let mut lines = match scope {
+        TokenScope::Wildcard => vec!["Reachable:   from other machines — tokens hold the wildcard `*`: every capability, including any added in later versions".to_string()],
+        TokenScope::Preset { name, listed } => scope_lines(&format!("`{name}`: "), listed),
         // Each capability is backticked, as the `Preset` arm backticks its
-        // name: unquoted, "scoped to exec, fs.read, not wildcard" reads as if
-        // `not wildcard` were a third item in the list.
-        TokenScope::Explicit(listed) => {
-            let quoted: Vec<String> = listed.iter().map(|c| format!("`{c}`")).collect();
-            format!(
-                "Reachable:   from other machines — tokens are scoped to {}, not wildcard",
-                quoted.join(", ")
-            )
-        }
+        // name: unquoted, a bare list reads as running into the prose after it.
+        TokenScope::Explicit(listed) => scope_lines("", listed),
     };
-    let mut lines = vec![reach];
     // `--allow-host` is read only on a loopback bind with no public path, and
     // that is exactly the posture this function returns early for — so on
     // every line below it the flag did nothing at all. Turning the check off
@@ -1445,6 +1485,54 @@ mod tests {
         assert!(
             text.contains("wildcard"),
             "it must say plainly that the token holds the wildcard: {text}"
+        );
+    }
+
+    /// A scope that withholds nothing must not be presented as a boundary.
+    ///
+    /// `operator` is what a promoted server picks for itself, and it holds all
+    /// five capabilities this version defines — a token scoped to it meets no
+    /// `403` on any route that exists, confirmed by issuing one and walking
+    /// them. The banner used to say "scoped to `operator`, not wildcard" under
+    /// the `Reachable:` label, which reads as *reachable now, but narrowed in
+    /// exchange*. Nothing was narrowed. The reassuring direction is the one
+    /// this repository has been wrong in every time.
+    #[test]
+    fn a_scope_that_withholds_nothing_says_so() {
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+
+        for capability in shell_tunnel::security::KNOWN_CAPABILITIES {
+            assert!(
+                text.contains(capability),
+                "a reader has to see the grant, not a word standing in for it — {capability} is missing: {text}"
+            );
+        }
+        assert!(
+            text.contains("nothing is withheld today"),
+            "the banner must say outright that this scope takes nothing away: {text}"
+        );
+    }
+
+    /// And a scope that *does* narrow must not carry that qualifier.
+    ///
+    /// The pair matters: a fix that always printed "nothing is withheld" would
+    /// satisfy the test above while telling a `file-read` operator their
+    /// read-only token grants everything.
+    #[test]
+    fn a_scope_that_withholds_something_does_not_say_it_withholds_nothing() {
+        let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
+        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+
+        assert!(text.contains("fs.read"), "{text}");
+        assert!(
+            !text.contains("nothing is withheld"),
+            "file-read holds one capability of five; saying nothing is withheld would be \
+             false in the reassuring direction: {text}"
+        );
+        assert!(
+            !text.contains("exec"),
+            "a preset without exec must not name it: {text}"
         );
     }
 
