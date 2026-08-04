@@ -3,10 +3,10 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## Unreleased
+## 0.18.0 — 2026-08-04
 
-> ⚠ **This carries a breaking library change** (`UploadError::Conflict`, below), so
-> the next release is a minor bump rather than a patch.
+> ⚠ **A minor bump rather than a patch, because of one breaking library change**
+> (`UploadError::Conflict`, below). HTTP callers need no change.
 
 ### Fixed
 
