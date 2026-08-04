@@ -8,7 +8,7 @@ mod id;
 mod state;
 mod store;
 
-pub use context::{SessionContext, StateProbe};
+pub use context::SessionContext;
 pub use id::SessionId;
 pub use state::SessionState;
-pub use store::{Session, SessionConfig, SessionStore};
+pub use store::{Session, SessionStore};

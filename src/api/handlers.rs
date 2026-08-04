@@ -14,7 +14,7 @@ use super::types::{
     ExecuteCommandResponse, ListSessionsResponse, SessionStatusResponse, SessionSummary,
 };
 use crate::execution::{Command, CommandExecutor};
-use crate::session::{SessionConfig, SessionId, SessionState, SessionStore};
+use crate::session::{SessionId, SessionState, SessionStore};
 
 /// Shared application state.
 #[derive(Clone)]
@@ -133,7 +133,7 @@ pub async fn list_sessions(
         if let Ok(Some(session)) = state.store.get(&id) {
             sessions.push(SessionSummary {
                 session_id: session.id.as_u64(),
-                state: format!("{:?}", session.state),
+                running: session.state == SessionState::Active,
                 idle_seconds: session.idle_duration().as_secs_f64(),
             });
         }
@@ -146,17 +146,15 @@ pub async fn list_sessions(
 }
 
 /// Create a new session.
+/// The body is optional because the request carries no fields: `POST /sessions`
+/// with nothing at all is the natural call. A body that *is* sent still has to
+/// parse, so a caller who passes the old `shell`/`working_dir`/`env` is told so
+/// rather than having them dropped.
 pub async fn create_session(
     State(state): State<AppState>,
-    Json(req): Json<CreateSessionRequest>,
+    _req: Option<Json<CreateSessionRequest>>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let config = SessionConfig {
-        shell: req.shell,
-        working_dir: req.working_dir,
-        env: req.env,
-    };
-
-    let session_id = state.store.create(config).map_err(|e| {
+    let session_id = state.store.create().map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse::internal_error(e.to_string())),

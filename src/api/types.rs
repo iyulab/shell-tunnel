@@ -9,21 +9,19 @@ use crate::session::{SessionId, SessionState};
 
 /// Request to create a new session.
 ///
-/// Strict about field names — see `ExecuteCommandRequest` for why every request
-/// type here is.
+/// **It carries nothing.** A session is an id the audit trail records against
+/// and a place for streaming to attach; where a command runs and what it runs
+/// with are decided per execute, by `ExecuteCommandRequest`.
+///
+/// This type once held `shell`, `working_dir` and `env`, and none of the three
+/// ever reached a command — the execute path consults the session only for
+/// whether it may run. Two of them were documented as taking effect. The type
+/// stays (rather than the route dropping its body) so that sending them again
+/// is refused by name instead of dropped: see `ExecuteCommandRequest` for why
+/// every request type here is strict about field names.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
-pub struct CreateSessionRequest {
-    /// Shell command to use (e.g., "bash", "powershell.exe").
-    #[serde(default)]
-    pub shell: Option<String>,
-    /// Initial working directory.
-    #[serde(default)]
-    pub working_dir: Option<String>,
-    /// Environment variables to set.
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-}
+pub struct CreateSessionRequest {}
 
 /// Response for session creation.
 #[derive(Debug, Clone, Serialize)]
@@ -48,11 +46,15 @@ impl CreateSessionResponse {
 pub struct SessionStatusResponse {
     /// Session ID.
     pub session_id: u64,
-    /// Current state.
-    pub state: String,
-    /// Working directory (if known).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub working_dir: Option<String>,
+    /// Whether a command is running in this session right now.
+    ///
+    /// The one thing `idle_seconds` cannot say: the executor touches the
+    /// session when a command starts as well as when it ends, so a session two
+    /// seconds into a command and one idle for two seconds report the same
+    /// `idle_seconds`. The internal state machine is not published — it holds
+    /// two more values this API can never return, and keeping it out means a
+    /// state can be added without breaking a caller.
+    pub running: bool,
     /// Last exit code (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_exit_code: Option<i32>,
@@ -66,11 +68,7 @@ impl SessionStatusResponse {
     pub fn from_session(session: &crate::session::Session) -> Self {
         Self {
             session_id: session.id.as_u64(),
-            state: format!("{:?}", session.state),
-            working_dir: session
-                .context
-                .cwd()
-                .map(|p| p.to_string_lossy().to_string()),
+            running: session.state == SessionState::Active,
             last_exit_code: session.context.last_exit_code(),
             execution_count: session.context.execution_count(),
             idle_seconds: session.idle_duration().as_secs_f64(),
@@ -300,7 +298,9 @@ pub struct ListSessionsResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionSummary {
     pub session_id: u64,
-    pub state: String,
+    /// Whether a command is running in this session right now — see
+    /// [`SessionStatusResponse::running`].
+    pub running: bool,
     pub idle_seconds: f64,
 }
 
@@ -310,18 +310,7 @@ mod tests {
 
     #[test]
     fn test_create_session_request_default() {
-        let req: CreateSessionRequest = serde_json::from_str("{}").unwrap();
-        assert!(req.shell.is_none());
-        assert!(req.working_dir.is_none());
-        assert!(req.env.is_empty());
-    }
-
-    #[test]
-    fn test_create_session_request_with_fields() {
-        let json = r#"{"shell": "bash", "working_dir": "/tmp"}"#;
-        let req: CreateSessionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.shell, Some("bash".to_string()));
-        assert_eq!(req.working_dir, Some("/tmp".to_string()));
+        assert!(serde_json::from_str::<CreateSessionRequest>("{}").is_ok());
     }
 
     #[test]
@@ -392,11 +381,21 @@ mod tests {
         }
     }
 
+    /// Create carries no fields, so every field is an unknown one — including
+    /// the three this type used to accept and drop on the floor.
     #[test]
-    fn create_session_request_refuses_an_unknown_field() {
-        let req: CreateSessionRequest = serde_json::from_str(r#"{"working_dir":"/tmp"}"#).unwrap();
-        assert_eq!(req.working_dir.as_deref(), Some("/tmp"));
-        assert!(serde_json::from_str::<CreateSessionRequest>(r#"{"workingDir":"/tmp"}"#).is_err());
+    fn create_session_request_refuses_every_field() {
+        for body in [
+            r#"{"shell":"bash"}"#,
+            r#"{"working_dir":"/tmp"}"#,
+            r#"{"env":{"A":"b"}}"#,
+            r#"{"workingDir":"/tmp"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<CreateSessionRequest>(body).is_err(),
+                "{body} was accepted"
+            );
+        }
     }
 
     #[test]

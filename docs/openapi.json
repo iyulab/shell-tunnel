@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
-    "version": "0.19.0",
+    "version": "0.20.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -119,10 +119,11 @@
           "Sessions"
         ],
         "summary": "Create a new session",
-        "description": "Creates a new shell session with optional configuration.\n\nRequired capability: `session.manage`.",
+        "description": "Creates a new session. Takes no configuration: a session is an id the audit trail records against and a place for streaming to attach, and the request body may be omitted entirely. Where a command runs and what it runs with are decided per execute.\n\nRequired capability: `session.manage`.",
         "operationId": "createSession",
         "requestBody": {
-          "description": "Session configuration",
+          "description": "Optional, and empty when sent. May be omitted.",
+          "required": false,
           "content": {
             "application/json": {
               "schema": {
@@ -176,7 +177,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
+                "example": "Failed to deserialize the JSON body into the target type: shell: unknown field `shell`, there are no fields at line 1 column 8"
               }
             }
           }
@@ -1299,29 +1300,9 @@
       },
       "CreateSessionRequest": {
         "type": "object",
+        "description": "Carries nothing. The body may be omitted entirely; if one is sent it must be {} — any field is refused with 422. Until 0.20.0 this took shell, working_dir and env, none of which ever reached a command.",
         "additionalProperties": false,
-        "properties": {
-          "shell": {
-            "type": "string",
-            "description": "Accepted and currently ignored: every execute runs in cmd /c (Windows) or sh -c (Unix) whatever this says.",
-            "example": "bash"
-          },
-          "working_dir": {
-            "type": "string",
-            "description": "Accepted and currently ignored: it is echoed back by GET /api/v1/sessions/{id} but never reaches a command. Pass working_dir on each execute instead.",
-            "example": "/home/user"
-          },
-          "env": {
-            "type": "object",
-            "description": "Accepted and currently ignored: no execute in this session inherits it. Pass env on each execute instead.",
-            "additionalProperties": {
-              "type": "string"
-            },
-            "example": {
-              "MY_VAR": "my_value"
-            }
-          }
-        }
+        "properties": {}
       },
       "CreateSessionResponse": {
         "type": "object",
@@ -1347,7 +1328,7 @@
         "type": "object",
         "required": [
           "session_id",
-          "state",
+          "running",
           "execution_count",
           "idle_seconds"
         ],
@@ -1357,21 +1338,10 @@
             "format": "int64",
             "example": 1
           },
-          "state": {
-            "type": "string",
-            "description": "Current session state",
-            "enum": [
-              "Created",
-              "Active",
-              "Idle",
-              "Terminated"
-            ],
-            "example": "Idle"
-          },
-          "working_dir": {
-            "type": "string",
-            "description": "The working_dir passed at creation, echoed back unchanged. It is not tracked (a cd cannot persist across executes) and it does not affect where commands run.",
-            "example": "/home/user"
+          "running": {
+            "type": "boolean",
+            "description": "Whether a command is running in this session right now. The one thing idle_seconds cannot say: the executor touches the session when a command starts as well as when it ends, so a session two seconds into a command and one idle for two seconds report the same idle_seconds. Until 0.20.0 this was `state`, a four-value internal enum of which two values this API can never return, alongside a `working_dir` echoed from creation that governed nothing.",
+            "example": false
           },
           "last_exit_code": {
             "type": "integer",
@@ -1415,7 +1385,7 @@
         "type": "object",
         "required": [
           "session_id",
-          "state",
+          "running",
           "idle_seconds"
         ],
         "properties": {
@@ -1423,8 +1393,9 @@
             "type": "integer",
             "format": "int64"
           },
-          "state": {
-            "type": "string"
+          "running": {
+            "type": "boolean",
+            "description": "Whether a command is running in this session right now. See SessionStatusResponse.running."
           },
           "idle_seconds": {
             "type": "number",

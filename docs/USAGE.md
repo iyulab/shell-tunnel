@@ -250,11 +250,10 @@ curl -X POST http://127.0.0.1:3000/api/v1/execute \
 ```
 
 That shell is `cmd /c` on Windows and `/bin/sh -c` on Unix, on **both**
-`/execute` and a session's execute (§3.2) — a session runs each command in a
-fresh shell of its own, not in a persistent one. `POST /api/v1/sessions` accepts
-a `shell` field and it currently has no effect; nothing but `cmd`/`sh` is
-spawned either way. Neither does a session carry state between calls: `set
-FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
+`/execute` and a session's execute (*Sessions* below) — a session runs each
+command in a fresh shell of its own, not in a persistent one, and there is no
+way to ask for a different one. Neither does a session carry state between
+calls: `set FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
 
 Before 0.15.1 a quote in `command` reached the Windows shell as `\"`, so
 `dir /b "C:\Program Files"` was a syntax error and `powershell -c "a | b"` ran
@@ -303,31 +302,45 @@ consumer receives every chunk regardless, and its `result` message carries
 ### Sessions
 
 ```bash
-curl -X POST "$BASE/api/v1/sessions" -H "Authorization: Bearer $KEY" \
-     -H "Content-Type: application/json" -d '{}'
+curl -X POST "$BASE/api/v1/sessions" -H "Authorization: Bearer $KEY"
 # {"session_id":1,"session_id_str":"sess-00000001"}
 
 curl -X POST "$BASE/api/v1/sessions/1/execute" -H "Authorization: Bearer $KEY" \
-     -H "Content-Type: application/json" -d '{"command":"pwd"}'
+     -H "Content-Type: application/json" -d '{"command":"pwd","working_dir":"/srv"}'
+
+curl "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
+# {"session_id":1,"running":false,"last_exit_code":0,"execution_count":1,"idle_seconds":0.4}
 
 curl -X DELETE "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
 ```
 
-Create accepts `shell`, `working_dir`, `env`. Sessions are ready to execute the
-moment they are created.
+**Create takes no fields.** The body may be omitted; sending one means sending
+`{}`, and any field in it is refused with `422` naming the field. Sessions are
+ready to execute the moment they are created.
 
 **A session groups commands; it does not keep a shell alive.** Each execute runs
 in its own `cmd /c` (Windows) or `sh -c` (Unix), the same as `/execute` — so
 `set FOO=bar` is not visible to the next call and a `cd` does not persist.
 
-**None of the three create fields currently changes what runs.** `shell` is
-ignored; `working_dir` is echoed back by `GET /api/v1/sessions/{id}` but never
-reaches a command; `env` is not read at all. Set the directory and the
-environment **on each execute** — `working_dir` and `env` on
-`POST /api/v1/sessions/{id}/execute` do take effect (same request fields as
-*One-shot execution* above), and using them beats a leading `cd`. What a session
-gives you today is an id the audit trail records against and a place for
-streaming to attach.
+Set the directory and the environment **on each execute**: `working_dir` and
+`env` on `POST /api/v1/sessions/{id}/execute` do take effect (same request
+fields as *One-shot execution* above), and using them beats a leading `cd`.
+What a session gives you is an id the audit trail records against and a place
+for streaming to attach.
+
+Status reports `running` — whether a command is in flight right now. That is
+the one thing `idle_seconds` cannot tell you: the clock is touched when a
+command *starts* as well as when it ends, so a session thirty seconds into a
+build and one that has been idle for thirty seconds report the same
+`idle_seconds`.
+
+> **Changed in 0.20.0.** Create used to accept `shell`, `working_dir` and `env`;
+> none of the three ever reached a command, and two of them were documented here
+> as though they did. They are gone rather than wired up, because where a command
+> runs is a per-execute decision and the per-execute fields already carry it.
+> Status used to report `state` (a four-value internal enum, two of whose values
+> this API never returned) and a `working_dir` echoed from creation that governed
+> nothing; `running` replaces both.
 
 ### Streaming over WebSocket
 

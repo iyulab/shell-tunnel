@@ -212,37 +212,25 @@ async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
 /// A session's execute uses the same shell as `/execute`, and keeps nothing
 /// between calls.
 ///
-/// USAGE §3.2 now says so outright, after an upstream report and this
-/// repository's own handover notes both stated the opposite — that a session
-/// runs `powershell.exe` on Windows and `$SHELL` on Unix. It does not: sessions
-/// carry an id, a working directory and an environment, and every command runs
-/// in a fresh shell exactly as a one-shot does. The `shell` field on create is
-/// accepted and ignored.
+/// USAGE says so outright, after an upstream report and this repository's own
+/// handover notes both stated the opposite — that a session runs
+/// `powershell.exe` on Windows and `$SHELL` on Unix. It does not: every command
+/// runs in a fresh shell exactly as a one-shot does. `pty::default_shell()` does
+/// return those two, which is where the wrong sentence came from; nothing on
+/// this path calls it.
 ///
-/// Pinned as a test rather than left to the prose because a doc sentence about
-/// behaviour is the thing this repository has repeatedly shipped stale, and
-/// because the day sessions *do* get a persistent shell, this failing is how
-/// the sentence gets rewritten instead of quietly becoming false again.
+/// A session no longer has a `shell` field to ask with — create carries no
+/// fields at all since 0.20.0 — so this now pins the shell a session's execute
+/// actually uses. Pinned as a test rather than left to the prose because a doc
+/// sentence about behaviour is the thing this repository has repeatedly shipped
+/// stale, and because the day sessions *do* get a persistent shell, this
+/// failing is how the sentence gets rewritten instead of quietly becoming false
+/// again.
 #[tokio::test]
 async fn a_session_runs_each_command_in_a_fresh_shell() {
-    use shell_tunnel::session::SessionConfig;
-
     let store = Arc::new(SessionStore::new());
     let exec = CommandExecutor::new(store.clone());
-    let id = store
-        .create(SessionConfig {
-            // Named explicitly, so this fails the day it starts being honoured.
-            shell: Some(
-                if cfg!(windows) {
-                    "powershell.exe"
-                } else {
-                    "/bin/bash"
-                }
-                .to_string(),
-            ),
-            ..Default::default()
-        })
-        .expect("create session");
+    let id = store.create().expect("create session");
     store
         .update(&id, |s| {
             let _ = s

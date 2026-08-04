@@ -3,6 +3,54 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.20.0 — 2026-08-05
+
+> ⚠ **Breaking for HTTP callers**, not only for library consumers. Both changes are
+> to the session routes; `/execute`, streaming, and the filesystem API are untouched.
+
+### Changed
+
+- **`POST /api/v1/sessions` takes no fields.** It used to accept `shell`,
+  `working_dir` and `env`. None of the three ever reached a command: a session's
+  execute consults the session only for whether it may run, and builds the command
+  from the execute request alone. A session created with a `working_dir` ran `cd`
+  in the server's own directory; one created with an `env` ran with none of those
+  variables set. Sending any of them now answers `422` naming the field, rather
+  than accepting it and dropping it. The body may be omitted entirely.
+
+  They are removed rather than wired up because where a command runs is a
+  per-execute decision, and `working_dir` and `env` on the execute request already
+  carry it — those do take effect and always did.
+
+- **Session status reports `running` instead of `state` and `working_dir`.**
+  `state` published a four-value internal enum (`Created`/`Active`/`Idle`/
+  `Terminated`) of which two values this API can never return: a session is moved
+  past `Created` before the create response is written, and removed from the store
+  in the same request that marks it `Terminated`. `working_dir` echoed back what
+  creation was given, unchanged, for a directory nothing ran in.
+
+  `running` is the one fact neither `idle_seconds` nor the caller can derive: the
+  clock is touched when a command *starts* as well as when it ends, so a session
+  thirty seconds into a build and one idle for thirty seconds report the same
+  `idle_seconds`. Keeping the enum out of the contract also means a state can be
+  added without breaking a caller. `GET /api/v1/sessions` reports the same field
+  per entry.
+
+- **Library:** `SessionConfig` and `StateProbe` are gone, `SessionStore::create`
+  takes no argument, and `SessionContext` no longer carries a working directory or
+  an environment. `StateProbe` existed to recover shell state from a persistent
+  shell this product does not keep; nothing called it.
+
+### Fixed
+
+- **The documentation no longer tells callers to use session fields that do nothing.**
+  `docs/USAGE.md` named per-session `working_dir` and `env` as what a session gives
+  you and said to use `working_dir` rather than a leading `cd`; following that ran
+  the command in the server's directory with no variables set, and reported success.
+  `docs/openapi.json` described the same two as taking effect and called the echoed
+  `working_dir` the "current working directory". `shell` had been corrected earlier
+  and its neighbours had not, which made the rest of the paragraph read as checked.
+
 ## 0.19.0 — 2026-08-04
 
 > ⚠ **A minor bump rather than a patch, because of the breaking library changes**

@@ -18,7 +18,7 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use shell_tunnel::{NativePty, PtySize, SessionStore, SessionConfig};
+//! use shell_tunnel::{NativePty, PtySize, SessionStore};
 //!
 //! #[tokio::main]
 //! async fn main() -> shell_tunnel::Result<()> {
@@ -29,7 +29,7 @@
 //!     let store = SessionStore::new();
 //!
 //!     // Create a new session
-//!     let session_id = store.create(SessionConfig::default())?;
+//!     let session_id = store.create()?;
 //!
 //!     // Spawn a PTY
 //!     let pty = NativePty::new();
@@ -83,7 +83,7 @@ pub use fs::{FsError, FsRoot};
 pub use output::{OutputSanitizer, VirtualScreen};
 pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
 pub use session::{
-    Session, SessionConfig, SessionContext, SessionId, SessionState, SessionStore, StateProbe,
+    Session, SessionContext, SessionId, SessionState, SessionStore,
 };
 
 // Re-export API types
