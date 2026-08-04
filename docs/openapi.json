@@ -144,7 +144,7 @@
             }
           },
           "400": {
-            "description": "Invalid request",
+            "description": "A JSON body was declared with Content-Type and none was sent. This route wants no body at all — send neither, or send {}.",
             "content": {
               "application/json": {
                 "schema": {

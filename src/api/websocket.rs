@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use super::handlers::AppState;
 use super::types::{WsClientMessage, WsServerMessage};
 use crate::execution::Command;
-use crate::session::SessionId;
+use crate::session::{SessionId, SessionState};
 
 /// WebSocket upgrade handler.
 pub async fn ws_handler(
@@ -91,6 +91,20 @@ async fn handle_socket(
                 if let Some(secs) = timeout_secs {
                     cmd = cmd.timeout(Duration::from_secs(secs));
                 }
+
+                // Mark the session busy for the whole command, exactly as the
+                // REST path does. This handler streams through `execute_async`
+                // rather than `execute_in_session`, so nothing else here touches
+                // the session — without this a command driven over the socket
+                // left the session reporting `running: false` and its idle clock
+                // running while a build was under way.
+                state
+                    .store
+                    .update(&id, |s| {
+                        let _ = s.state.transition_to(SessionState::Active);
+                        s.touch();
+                    })
+                    .ok();
 
                 // Execute with streaming
                 match state.executor.execute_async(&cmd).await {
@@ -177,6 +191,17 @@ async fn handle_socket(
                         }
                     }
                 }
+
+                // Idle again on every way out, including the ones that never
+                // reached the executor: a session stuck at `Active` would report
+                // a command running forever.
+                state
+                    .store
+                    .update(&id, |s| {
+                        let _ = s.state.transition_to(SessionState::Idle);
+                        s.touch();
+                    })
+                    .ok();
             }
             WsClientMessage::Ping => {
                 let pong = WsServerMessage::Pong;

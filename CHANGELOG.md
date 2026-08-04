@@ -43,6 +43,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A command driven over a session's WebSocket now counts as running in that session.**
+  `/api/v1/sessions/{id}/ws` verifies the session at connect and then hands the command
+  straight to the executor, bypassing the one place session state is touched. So a
+  session streaming a build reported `running: false` for its whole duration, and its
+  idle clock kept running — which, with `running` newly documented as "whether a command
+  is running in this session right now", would have been a fresh way for that sentence to
+  be false. The socket path now marks the session busy and idle again on every way out,
+  including the ones that never reach the executor.
+
 - **The documentation no longer tells callers to use session fields that do nothing.**
   `docs/USAGE.md` named per-session `working_dir` and `env` as what a session gives
   you and said to use `working_dir` rather than a leading `cd`; following that ran
