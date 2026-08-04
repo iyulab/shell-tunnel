@@ -1004,3 +1004,48 @@ fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
         .parse()
         .unwrap_or_else(|e| panic!("status code in {status_line:?} is not a number: {e}"))
 }
+
+/// A server whose stdout reader goes away must keep serving.
+///
+/// `println!` panics on a failed write, and a banner written into a pipe with
+/// no reader left is a failed write — so the process used to die mid-banner
+/// with `failed printing to stdout: The pipe is being closed. (os error 232)`.
+/// That was first seen as a *test* harness closing the read end early
+/// (cycle-60), but nothing about it is peculiar to a test: the operating
+/// guide's service recipes put a long-lived consumer on this pipe, and a log
+/// shipper restarting or a wrapper's `| head` exiting closes it the same way.
+/// An operator cannot defend against it from outside the process.
+///
+/// The read end is closed *before* the banner is written rather than after one
+/// line, which is what makes this deterministic. Reading a line first
+/// reproduces the panic only when the child happens to still be writing —
+/// cycle-60 saw it two runs in three that way, and `shell-tunnel | head -1`
+/// never reproduced it at all, because `head` holds the pipe open until it
+/// exits. Closing outright puts every banner write on the far side of a closed
+/// pipe, so this fails every time if the tolerance is removed.
+#[test]
+fn a_server_outlives_the_reader_of_its_stdout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--host", "127.0.0.1", "--port", "39891", "--require-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+
+    drop(child.stdout.take().expect("stdout is piped"));
+    let mut server = Killed(child);
+
+    // `401`, not `200`: the key was announced on the stdout just closed, and
+    // what is being asked here is whether anything is answering at all. A dead
+    // process fails this by never accepting the connection.
+    assert_eq!(
+        get_status(39891, None),
+        401,
+        "the server must outlive the reader of its stdout"
+    );
+
+    // Touch `server` after the request so the child is not killed before it.
+    let _ = &mut server;
+}

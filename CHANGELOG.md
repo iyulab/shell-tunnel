@@ -5,8 +5,8 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## 0.19.0 — 2026-08-04
 
-> ⚠ **A minor bump rather than a patch, because of one breaking library change**
-> (`RateLimiter::check`, below). HTTP callers need no change.
+> ⚠ **A minor bump rather than a patch, because of the breaking library changes**
+> listed under *Changed*. HTTP callers need no change.
 
 ### Added
 
@@ -89,6 +89,46 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   a budget nothing was counting, with the remaining count frozen at full forever. A
   client that throttles itself by the header held itself to a limit that did not exist.
   No `X-RateLimit-*` header is sent when limiting is off.
+- **Writing the audit trail no longer runs on a runtime worker.** `AuditSink::record`
+  opens, writes and flushes a file. The filesystem handlers already threaded that into the
+  `spawn_blocking` bodies they were running in, so a slow disk could not starve the pool
+  that also serves `/health` and the accept loop — but the execute, WebSocket and
+  denial paths have no blocking body of their own and called it from the runtime thread,
+  which is the case a trail on a network share or a busy disk turns into stalled unrelated
+  requests. Those six call sites now go through a new `AuditSink::record_async`, which is
+  awaited rather than detached: the entry still lands before the response, because a trail
+  that drops its last entries under load is untrustworthy exactly where it is load-bearing.
+  With no trail configured the hop is skipped entirely. What is recorded, and in what
+  order, is unchanged.
+- **An upload stopped by a Windows disk quota now answers `507`, not `500`.** A quota is
+  exhausted with the volume itself far from full, and that case had a counterpart on Unix
+  (`EDQUOT`) and none on Windows — so the one answer a client can act on, "free something
+  up and retry", arrived as "the server has a bug, file a report". `ERROR_DISK_QUOTA_EXCEEDED`
+  now reads as out-of-space alongside the two full-volume codes. `ERROR_NOT_ENOUGH_QUOTA`
+  deliberately does not: despite the name it reports a process memory quota, which freeing
+  disk space does not resolve. §8 of the operating guide and `docs/openapi.json` both said
+  Windows quotas were uncovered; both now state what each platform reports.
+- **A server no longer dies because whatever was reading its stdout went away first.**
+  `println!` panics on a failed write — the right answer for a command whose output *is*
+  the job, and the wrong one for a process that serves afterwards. A banner written into a
+  pipe with no reader left is a failed write, so the process exited mid-banner with
+  `failed printing to stdout: The pipe is being closed. (os error 232)`, taking the server
+  with it. A log shipper restarting, a wrapper's `| head` exiting, a supervisor rotating a
+  pipe — the operating guide's own service recipes put a long-lived consumer there, and
+  none of this is defensible from outside the process. The banner and the notes a running
+  process writes now go through a locked handle and drop a line that cannot be written.
+  The startup refusals are unchanged: they write and exit on the next line, so there is
+  nothing left running for a panic there to take down.
+- **A key the server generates for itself no longer goes to the log.** `serve_on`
+  generates an API key when authentication is on and no key was registered, and wrote it
+  with `tracing::info!` — a plaintext secret landing in whatever an embedding consumer's
+  logs go to, at the level normal operation already runs at. The binary's key stopped
+  going there when key issuing moved up to the configuration layer, and appears on the
+  startup banner instead; this branch is the one a library consumer reaches, and it kept
+  the old line. The key is now sent to `ServerConfig::generated_key`, and where that
+  channel is unset the server says it is holding a key nothing can read — the key is
+  neither logged nor silently kept, because a generated key nobody has authenticates
+  nobody.
 
 ### Changed
 
@@ -102,6 +142,12 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   decision, which the rate-limit middleware puts in the request's extensions. Naming the
   slot is what keeps a refund from returning a different caller's; an opaque "give one
   back" cannot tell the difference once the charge it meant has aged out of the window.
+- **Breaking (library):** `api::ServerConfig` gained a `generated_key` field — breaking
+  for code that constructs it as a struct literal, and `None` (what the builders set)
+  restores the previous behaviour minus the log line. `ServerConfig::report_generated_key_to`
+  sets it. This is the arrangement `relay::client::RelayClientConfig`'s `enrolled` already
+  uses: the library reports the fact and the caller decides where it goes, rather than the
+  library choosing a stream on its behalf.
 
 ## 0.18.0 — 2026-08-04
 

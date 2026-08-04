@@ -284,11 +284,46 @@ impl AuditSink {
         matches!(self, Self::File { .. })
     }
 
+    /// Record one event from an async context, off the runtime's workers.
+    ///
+    /// [`record`](Self::record) opens, writes and flushes a file, which is
+    /// blocking work — the filesystem handlers already thread it into the
+    /// `spawn_blocking` bodies they are running in for that reason, so a slow
+    /// disk cannot starve the worker pool that also runs `/health` and the
+    /// accept loop. A handler that has no blocking body of its own has nowhere
+    /// to put it and used to call `record` straight from the runtime thread.
+    /// This is that missing half: same write, same ordering.
+    ///
+    /// Awaited rather than detached, deliberately. Spawning and walking away
+    /// would return the response first and leave the entry to land whenever —
+    /// or not at all, if the process stops in between. An audit trail that
+    /// drops its last entries under load is untrustworthy exactly where it is
+    /// load-bearing, which is the same reason `record` flushes per event.
+    ///
+    /// The hop is skipped entirely when nothing is being recorded: with no
+    /// trail configured `record` returns immediately, and paying for a task
+    /// dispatch to do nothing would be a cost on every request of the default
+    /// configuration.
+    pub async fn record_async(self: &std::sync::Arc<Self>, event: AuditEvent) {
+        if !self.is_enabled() {
+            return;
+        }
+        let sink = std::sync::Arc::clone(self);
+        // A panic inside the blocking task would already have aborted the
+        // process through the panic hook; the join error is not actionable
+        // here and dropping it keeps this from being a second failure mode.
+        let _ = tokio::task::spawn_blocking(move || sink.record(event)).await;
+    }
+
     /// Record one event.
     ///
     /// Flushed per event rather than buffered until convenient: a trail that
     /// loses its last entries when the process dies is least trustworthy exactly
     /// when it matters most.
+    ///
+    /// Blocking. From an async context use
+    /// [`record_async`](Self::record_async), or call this inside a
+    /// `spawn_blocking` body that is already running.
     pub fn record(&self, event: AuditEvent) {
         let Self::File {
             path,

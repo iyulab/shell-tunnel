@@ -11,6 +11,52 @@ use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
 
+/// A banner line, written to stdout without dying if nobody is reading it.
+///
+/// `println!` panics when the write fails, and that is the right answer for a
+/// command that prints its result and exits — the output *was* the job. This
+/// process serves afterwards, and the banner is only how it introduces itself,
+/// so the same panic takes down a running server because whoever was reading
+/// its stdout went away first: a log shipper restarting, a `| head` in a
+/// wrapper script, a supervisor rotating a pipe. The operating guide's own
+/// service recipes put a long-lived consumer on that pipe. An operator cannot
+/// defend against that from outside the process, so a failed banner line is
+/// dropped instead of raised — losing a line of introduction costs nothing
+/// beside losing the server.
+///
+/// Measured, not assumed: the panic is
+/// `failed printing to stdout: The pipe is being closed. (os error 232)`, and
+/// it killed the process mid-banner while a test harness closed the read end
+/// early (cycle-60). `shell-tunnel | head -1` does not reproduce it — `head`
+/// keeps the pipe open until it exits — which is why the guard below closes
+/// the read end outright.
+///
+/// Only the writes this process makes while it is serving, or about to serve,
+/// go through here. The startup refusals write to stderr and exit on the next
+/// line: nothing is left running for a panic there to take down.
+macro_rules! outln {
+    () => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout().lock());
+    }};
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout().lock(), $($arg)*);
+    }};
+}
+
+/// As [`outln!`], for the notes a running process writes to stderr.
+macro_rules! errln {
+    () => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock());
+    }};
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr().lock(), $($arg)*);
+    }};
+}
+
 fn main() -> shell_tunnel::Result<()> {
     // Parse command-line arguments
     let args = match parse_args() {
@@ -381,7 +427,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         audit_log.as_deref(),
         !args.allow_hosts.is_empty(),
     ) {
-        println!("{line}");
+        outln!("{line}");
     }
     // The generated key belongs with the reachability it unlocks, not after the
     // file-API block. Only the bare-bind path prints it here: a tunnel prints
@@ -397,7 +443,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // the only place that survives `-l warn`.
     if provider.is_none() && args.relay_url.is_none() {
         if let Some(key) = &exposure.generated_key {
-            println!("{}", generated_api_key_lines(key));
+            outln!("{}", generated_api_key_lines(key));
         }
     }
     // Resolved before the banner so the banner can report it, and so an
@@ -406,7 +452,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // needed to name it.
     let chunk_size = resolve_chunk_size(&args);
 
-    println!("File API:    {}", fs_root.describe());
+    outln!("File API:    {}", fs_root.describe());
     // Only when it is not the plain default. A device joined to a relay
     // advertises a smaller chunk than a directly-reached one, and cycle-64
     // made that substitution *silently* — an operator comparing two
@@ -415,9 +461,9 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // constant on every run instead; the deviation is the signal, which is
     // the same rule the generated-key line already follows.
     if chunk_size != shell_tunnel::fs::DEFAULT_CHUNK_SIZE {
-        println!("             upload chunk size: {chunk_size} bytes");
+        outln!("             upload chunk size: {chunk_size} bytes");
         if args.fs_chunk_size.is_none() {
-            println!("             (a relayed chunk must finish inside the relay's request deadline; pass --fs-chunk-size to override)");
+            outln!("             (a relayed chunk must finish inside the relay's request deadline; pass --fs-chunk-size to override)");
         }
     }
     // The one combination the lines above describe truthfully and still leave
@@ -430,7 +476,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     if fs_root.jail_path().is_none()
         && file_scope_is_the_whole_grant(config.security.auth.enabled, resolved.as_ref())
     {
-        println!("             this token holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given");
+        outln!("             this token holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given");
     }
     if fs_root.jail_path().is_none() && audit_log.is_some() {
         // The `exec` clause this line used to carry ("as it already is for
@@ -444,7 +490,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         // it" — puts the same token-shaped assumption back in a different
         // grammatical costume, and under `--preset file-read` no token this
         // server issues holds `fs.write` to begin with.
-        println!("             the audit log is within this scope — nothing is outside a machine-wide file API");
+        outln!("             the audit log is within this scope — nothing is outside a machine-wide file API");
     }
 
     let state = shell_tunnel::AppState::new()
@@ -706,12 +752,12 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     };
 
     match &reachable {
-        Some(url) => println!("\nRelay:        {url}"),
-        None => println!("\nRelay:        listening on {bind}"),
+        Some(url) => outln!("\nRelay:        {url}"),
+        None => outln!("\nRelay:        listening on {bind}"),
     }
     if generated {
-        println!("Enroll token: {enroll_token}   (generated)");
-        println!("{}", generated_enroll_token_note());
+        outln!("Enroll token: {enroll_token}   (generated)");
+        outln!("{}", generated_enroll_token_note());
     }
     let join_url = reachable.unwrap_or_else(|| format!("{scheme}://<this-host>:{}", bind.port()));
 
@@ -745,7 +791,7 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     } else {
         "<token>".to_string()
     };
-    println!(
+    outln!(
         "Devices join with:\n    shell-tunnel --relay {join_url} --enroll-token {token_arg}{ca_flag}\n"
     );
 
@@ -765,14 +811,14 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         } else {
             80
         };
-        eprintln!(
+        errln!(
             "Note: --public-base named no port, so the URLs above use this relay's port {}.",
             bind.port()
         );
-        eprintln!(
+        errln!(
             "      Fronted by a proxy on port {implied}? Re-run with that port in --public-base."
         );
-        eprintln!();
+        errln!();
     }
 
     // Which names the certificate covers, because a certificate that does not
@@ -789,9 +835,9 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         );
         if !lines.is_empty() {
             for line in lines {
-                println!("{line}");
+                outln!("{line}");
             }
-            println!();
+            outln!();
         }
     }
 
@@ -852,7 +898,7 @@ async fn run_with_relay(
         warn!("{}", warning);
     }
     if let Some(key) = &exposure.generated_key {
-        println!("{}", generated_api_key_lines(key));
+        outln!("{}", generated_api_key_lines(key));
     }
 
     // The first enrolment is the one worth a banner; the ones after it are
@@ -913,7 +959,7 @@ fn print_banner(tunnel: &TunnelHandle, generated_key: Option<&str>) {
     };
     let key_value = generated_key.unwrap_or("$SHELL_TUNNEL_API_KEY");
 
-    println!(
+    outln!(
         "\nPublic URL:  {url}   (via {provider})\n{key_line}\n{}\n",
         try_curl_block(url, key_value),
         provider = tunnel.provider(),
@@ -947,7 +993,7 @@ fn try_curl_block(url: &str, key_value: &str) -> String {
 #[cfg(feature = "relay-client")]
 fn print_relay_banner(url: &str, generated_key: Option<&str>) {
     let key_value = generated_key.unwrap_or("$SHELL_TUNNEL_API_KEY");
-    println!(
+    outln!(
         "\nPublic URL:  {url}   (via relay)\n{}\n",
         try_curl_block(url, key_value)
     );
@@ -1123,9 +1169,9 @@ fn resolve_chunk_size(args: &shell_tunnel::cli::Args) -> usize {
     // the relay->device leg is slow, and this process cannot see that leg.
     if args.relay_url.is_some() && size > shell_tunnel::fs::RELAY_CHUNK_SIZE {
         let safe = shell_tunnel::fs::RELAY_CHUNK_SIZE;
-        eprintln!("warning: --fs-chunk-size {size} is larger than the {safe} bytes this device would advertise over a relay.");
-        eprintln!("         A relayed request body is forwarded whole and must complete inside the relay's 120s deadline, so an oversized chunk fails at 0 bytes with 504 on a slow link rather than transferring slowly.");
-        eprintln!("         Drop the flag to use the relay-safe size.");
+        errln!("warning: --fs-chunk-size {size} is larger than the {safe} bytes this device would advertise over a relay.");
+        errln!("         A relayed request body is forwarded whole and must complete inside the relay's 120s deadline, so an oversized chunk fails at 0 bytes with 504 on a slow link rather than transferring slowly.");
+        errln!("         Drop the flag to use the relay-safe size.");
     }
     size
 }

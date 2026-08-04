@@ -294,13 +294,16 @@ pub async fn execute_command(
             )
         })?;
 
-    state.audit.record(execution_event(
-        identity.map(|axum::Extension(id)| id),
-        "POST /api/v1/sessions/{id}/execute",
-        &req.command,
-        Some(session_id),
-        &result,
-    ));
+    state
+        .audit
+        .record_async(execution_event(
+            identity.map(|axum::Extension(id)| id),
+            "POST /api/v1/sessions/{id}/execute",
+            &req.command,
+            Some(session_id),
+            &result,
+        ))
+        .await;
 
     // Update session context
     state
@@ -342,13 +345,16 @@ pub async fn execute_oneshot(
         )
     })?;
 
-    state.audit.record(execution_event(
-        identity.map(|axum::Extension(id)| id),
-        "POST /api/v1/execute",
-        &req.command,
-        None,
-        &result,
-    ));
+    state
+        .audit
+        .record_async(execution_event(
+            identity.map(|axum::Extension(id)| id),
+            "POST /api/v1/execute",
+            &req.command,
+            None,
+            &result,
+        ))
+        .await;
 
     Ok(Json(ExecuteCommandResponse::from_result(&result)))
 }

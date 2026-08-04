@@ -13,6 +13,7 @@ use axum::{
     routing::{any, get, post},
     Router,
 };
+use tokio::sync::mpsc::UnboundedSender;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -379,11 +380,13 @@ async fn capability_auth_middleware(
             // record nothing, so the trail is not a complete list of every
             // refusal the server issued. `USAGE.md` §4 names that gap and lists
             // the measured cases; keep the two in step as the layer grows.
-            audit.record(
-                crate::audit::AuditEvent::new("denied")
-                    .with_route(route)
-                    .with_denial(401, reason),
-            );
+            audit
+                .record_async(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_route(route)
+                        .with_denial(401, reason),
+                )
+                .await;
             return Err(StatusCode::UNAUTHORIZED);
         }
     };
@@ -403,12 +406,14 @@ async fn capability_auth_middleware(
             if capabilities.satisfies(cap) {
                 Ok(next.run(request).await)
             } else {
-                audit.record(
-                    crate::audit::AuditEvent::new("denied")
-                        .with_identity(identity)
-                        .with_route(route.clone())
-                        .with_denial(403, format!("missing-capability:{cap}")),
-                );
+                audit
+                    .record_async(
+                        crate::audit::AuditEvent::new("denied")
+                            .with_identity(identity)
+                            .with_route(route.clone())
+                            .with_denial(403, format!("missing-capability:{cap}")),
+                    )
+                    .await;
                 tracing::debug!(
                     %method,
                     path = %route,
@@ -636,6 +641,24 @@ pub struct ServerConfig {
     pub security: SecurityConfig,
     /// Enable graceful shutdown on SIGTERM/SIGINT.
     pub graceful_shutdown: bool,
+    /// Where to report an API key this server generated for itself.
+    ///
+    /// [`serve_on`] generates one when authentication is on and no key was
+    /// registered. It used to write that key to the log, which handed an
+    /// embedding consumer a plaintext secret in whatever its logs go to. It now
+    /// sends the key here instead: the library reports the fact, the caller
+    /// decides where it goes — the arrangement
+    /// [`crate::relay::client::RelayClientConfig`]'s `enrolled` already uses.
+    ///
+    /// `None` leaves the key unreported, and [`serve_on`] warns when it lands
+    /// there — a key nobody can read authenticates nobody. Register a key with
+    /// [`SecurityConfig::with_api_key`] if you have one; set this if you want
+    /// the generated one.
+    ///
+    /// The send happens before the listener starts accepting, and the channel
+    /// is unbounded, so the key waits in it: spawn [`serve_on`] and receive
+    /// afterwards. Nothing needs to be draining it first.
+    pub generated_key: Option<UnboundedSender<String>>,
 }
 
 impl ServerConfig {
@@ -645,6 +668,7 @@ impl ServerConfig {
             port,
             security: SecurityConfig::default(),
             graceful_shutdown: true,
+            generated_key: None,
         }
     }
 
@@ -663,6 +687,15 @@ impl ServerConfig {
         self.graceful_shutdown = false;
         self
     }
+
+    /// Report a key this server generates for itself on `tx`.
+    ///
+    /// See [`ServerConfig::generated_key`] for when that happens and what
+    /// leaving it unset costs.
+    pub fn report_generated_key_to(mut self, tx: UnboundedSender<String>) -> Self {
+        self.generated_key = Some(tx);
+        self
+    }
 }
 
 impl Default for ServerConfig {
@@ -672,6 +705,7 @@ impl Default for ServerConfig {
             port: 3000,
             security: SecurityConfig::default(),
             graceful_shutdown: true,
+            generated_key: None,
         }
     }
 }
@@ -718,7 +752,16 @@ pub async fn serve_on(
             // configured capabilities (full-control when unset).
             let key = crate::security::generate_api_key();
             register_key(&auth_store, &key, &config.security.capabilities);
-            tracing::info!("Generated API key: {}", key);
+            match &config.generated_key {
+                Some(tx) => {
+                    let _ = tx.send(key);
+                }
+                // Reported nowhere, and deliberately not logged: this used to
+                // put a plaintext secret in the consumer's log. Saying so is
+                // the difference between "the caller chose not to collect it"
+                // and "the server is now holding a key nobody can present".
+                None => tracing::warn!("authentication is on with no API key registered, so one was generated — but ServerConfig::generated_key is unset and the key is not logged, so nothing can read it. Register a key with SecurityConfig::with_api_key, or set that channel."),
+            }
         }
         tracing::info!(
             "Authentication enabled with {} API key(s)",

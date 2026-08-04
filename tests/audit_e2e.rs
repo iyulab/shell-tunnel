@@ -454,3 +454,38 @@ async fn an_uncapped_execution_carries_no_output_size() {
         "an execution that returned everything must not carry `output_bytes` at all"
     );
 }
+
+/// The handlers that record from an async context must keep doing so off the
+/// runtime's worker threads.
+///
+/// `AuditSink::record` opens, writes and flushes a file. The filesystem
+/// handlers already thread it into the `spawn_blocking` bodies they run in, so
+/// a slow disk cannot starve the pool that also serves `/health` and the accept
+/// loop; the execute, WebSocket and denial paths have no blocking body of their
+/// own and called it straight from the runtime thread. They now go through
+/// `record_async`.
+///
+/// Read off the source rather than observed at runtime, and that is a real
+/// limitation worth stating: nothing here proves a worker was freed. What it
+/// does prove is that the correction cannot be silently undone — reintroducing
+/// a bare `record` in one of these files compiles and passes every behavioural
+/// test, because the behaviour is identical and only *where it runs* differs.
+/// This is the same shape as `tests/ci_feature_gates.rs`, which holds two
+/// command lines to one rule the compiler cannot see either.
+#[test]
+fn the_async_handlers_record_without_blocking_the_runtime() {
+    for file in [
+        "src/api/handlers.rs",
+        "src/api/websocket.rs",
+        "src/api/router.rs",
+    ] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let source = std::fs::read_to_string(&path).expect("source file is readable");
+        assert!(
+            !source.contains(".record("),
+            "{file} calls the blocking `AuditSink::record` from an async context; \
+             use `record_async` (`src/audit.rs`) — `record` belongs inside a \
+             `spawn_blocking` body, as `src/api/fs.rs` uses it"
+        );
+    }
+}

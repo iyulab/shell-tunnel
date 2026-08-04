@@ -111,18 +111,21 @@ async fn handle_socket(
                         // Wait for completion and send result
                         match handle.await {
                             Ok(Ok(result)) => {
-                                state.audit.record(
-                                    crate::audit::AuditEvent::new("execute")
-                                        .with_identity(identity.clone())
-                                        .with_route("WS /api/v1/sessions/{id}/ws")
-                                        .with_command(&command)
-                                        .with_session(session_id)
-                                        .with_outcome(
-                                            result.exit_code,
-                                            result.timed_out,
-                                            result.duration.as_millis() as u64,
-                                        ),
-                                );
+                                state
+                                    .audit
+                                    .record_async(
+                                        crate::audit::AuditEvent::new("execute")
+                                            .with_identity(identity.clone())
+                                            .with_route("WS /api/v1/sessions/{id}/ws")
+                                            .with_command(&command)
+                                            .with_session(session_id)
+                                            .with_outcome(
+                                                result.exit_code,
+                                                result.timed_out,
+                                                result.duration.as_millis() as u64,
+                                            ),
+                                    )
+                                    .await;
 
                                 // Update session context
                                 state
@@ -258,17 +261,20 @@ async fn handle_oneshot_socket(
 
                         match handle.await {
                             Ok(Ok(result)) => {
-                                state.audit.record(
-                                    crate::audit::AuditEvent::new("execute")
-                                        .with_identity(identity.clone())
-                                        .with_route("WS /api/v1/ws")
-                                        .with_command(&command)
-                                        .with_outcome(
-                                            result.exit_code,
-                                            result.timed_out,
-                                            result.duration.as_millis() as u64,
-                                        ),
-                                );
+                                state
+                                    .audit
+                                    .record_async(
+                                        crate::audit::AuditEvent::new("execute")
+                                            .with_identity(identity.clone())
+                                            .with_route("WS /api/v1/ws")
+                                            .with_command(&command)
+                                            .with_outcome(
+                                                result.exit_code,
+                                                result.timed_out,
+                                                result.duration.as_millis() as u64,
+                                            ),
+                                    )
+                                    .await;
 
                                 let result_msg = WsServerMessage::Result {
                                     success: result.exit_code.map(|c| c == 0).unwrap_or(false)
