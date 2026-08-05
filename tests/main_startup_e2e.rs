@@ -90,7 +90,7 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
     let (code, _stdout, stderr) = run_with_timeout(
         &[
             "--port",
-            "39880",
+            "0",
             "--fs-root",
             root.to_str().expect("utf-8 path"),
             "--audit-log",
@@ -162,7 +162,19 @@ fn wait_for_stdout_lines(
     predicate: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let stdout = server.0.stdout.take().expect("stdout is piped");
-    read_lines_until(stdout, timeout, predicate)
+    match read_lines_until(stdout, timeout, predicate) {
+        Ok(lines) => lines,
+        Err(seen) => {
+            explain_missing_line(
+                &seen,
+                server.0.stderr.take(),
+                "stderr",
+                "a server that fails at startup says why on stderr and nowhere else, which \
+                 is why a bind failure reads from stdout alone as a banner that lost a line",
+                timeout,
+            );
+        }
+    }
 }
 
 /// As `wait_for_stdout_lines`, for the diagnostics stream.
@@ -172,7 +184,19 @@ fn wait_for_stderr_lines(
     predicate: impl Fn(&str) -> bool,
 ) -> Vec<String> {
     let stderr = server.0.stderr.take().expect("stderr is piped");
-    read_lines_until(stderr, timeout, predicate)
+    match read_lines_until(stderr, timeout, predicate) {
+        Ok(lines) => lines,
+        Err(seen) => {
+            explain_missing_line(
+                &seen,
+                server.0.stdout.take(),
+                "stdout",
+                "the banner is written to stdout, so how far it got is what says whether \
+                 the process reached the point this log line comes from",
+                timeout,
+            );
+        }
+    }
 }
 
 /// Read `stream` until a line matches `predicate`, returning everything read
@@ -190,11 +214,14 @@ fn wait_for_stderr_lines(
 /// before the match arrived, which is why it stayed hidden until a line was
 /// added to the banner and shifted the timing. Draining until EOF keeps the
 /// pipe open for as long as the child holds the other end; `Killed` ends both.
+/// Returns `Err` with everything read rather than panicking, so the caller —
+/// which still has the child — can say what the *other* stream held before it
+/// gives up. See `explain_missing_line`.
 fn read_lines_until(
     stream: impl Read + Send + 'static,
     timeout: Duration,
     predicate: impl Fn(&str) -> bool,
-) -> Vec<String> {
+) -> Result<Vec<String>, Vec<String>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in BufReader::new(stream).lines().map_while(Result::ok) {
@@ -210,17 +237,87 @@ fn read_lines_until(
                 let matched = predicate(&line);
                 seen.push(line);
                 if matched {
-                    return seen;
+                    return Ok(seen);
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    Err(seen)
+}
+
+/// Panic for a line that never arrived, saying where the reason would be.
+///
+/// A server that fails at startup writes why on stderr and stops, so on stdout
+/// the failure looks like a banner that simply stopped early — indistinguishable
+/// from a banner line being renamed. cycle-92 read exactly that and diagnosed the
+/// wrong cause; the message it had quoted the truncated stdout and said nothing
+/// about the stream that held the answer.
+///
+/// So: drain whatever is left of the sibling stream and quote it, and when the
+/// test discarded that stream, *say that* rather than printing the same
+/// truncated stdout and leaving the reader to infer a cause. Naming the blind
+/// spot is the part that stops the misdiagnosis; the drained text is a bonus
+/// when it is there.
+/// `why_it_matters` completes the sentence for the stream that is missing —
+/// stdout and stderr carry different evidence, and a note written for one reads
+/// as false about the other.
+fn explain_missing_line(
+    seen: &[String],
+    sibling: Option<impl Read + Send + 'static>,
+    sibling_name: &str,
+    why_it_matters: &str,
+    timeout: Duration,
+) -> ! {
+    let sibling_report = match sibling {
+        // Nothing waits on a predicate here: the child is already failing, so
+        // read what has been written and move on rather than adding another
+        // multi-second stall to a test that is going to fail anyway.
+        Some(stream) => match read_lines_until(stream, Duration::from_millis(500), |_| false) {
+            Ok(lines) | Err(lines) if lines.is_empty() => {
+                format!("{sibling_name} was open and carried nothing")
+            }
+            Ok(lines) | Err(lines) => format!("{sibling_name} held:\n{}", lines.join("\n")),
+        },
+        None => format!(
+            "{sibling_name} is not readable here — this test discards it, or had already \
+             read it. {why_it_matters}, so this message is missing that evidence rather \
+             than reporting its absence"
+        ),
+    };
     panic!(
-        "expected line not seen within {timeout:?}; got:\n{}",
+        "expected line not seen within {timeout:?}; got:\n{}\n\n---\n{sibling_report}",
         seen.join("\n")
     );
+}
+
+/// A TCP port nothing is listening on, for a server a test has to connect to.
+///
+/// Binding `:0` and closing hands back a port the OS had free a moment ago,
+/// which is not the same as reserving it — something else can take it in the
+/// window before the child binds. That race is against the machine's whole
+/// ephemeral range, though, where the fixed numbers this file used to carry
+/// raced against *each other*: two tests in this binary both wanted `39884`
+/// and both bound it, and `#[test]`s in one binary run in parallel by default.
+/// A leftover process from an interrupted run held those numbers too.
+///
+/// Tests that never connect do not need this — they pass `--port 0` and let the
+/// OS choose, with no window at all. That is most of them; only three here send
+/// a request, and one of those (`a_generated_key_reaches_stdout_at_every_log_level`)
+/// is why the port cannot simply be read back from the running server: the
+/// chosen port is announced by a `tracing` line at `info`, and that test exists
+/// to cover `warn`, where the line is not emitted.
+///
+/// The same bind-`:0` call already appears in the two taken-port tests below,
+/// which keep the listener open instead of dropping it. This is that pattern
+/// with the opposite intent, not a new one.
+fn reserved_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("a loopback port is available")
+        .local_addr()
+        .expect("a bound listener has an address")
+        .port()
 }
 
 /// The banner must name the scope `harden_for_public_exposure` actually chose,
@@ -240,7 +337,7 @@ fn the_exposed_banner_names_the_scope_the_hardening_chose() {
     let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "0.0.0.0", "--port", "39882"])
+        .args(["--host", "0.0.0.0", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -287,7 +384,7 @@ fn an_exposed_bind_deriving_an_audit_log_inside_the_fs_root_refuses_to_start() {
         "--host",
         "0.0.0.0",
         "--port",
-        "39881",
+        "0",
         "--fs-root",
         root.to_str().expect("utf-8 path"),
     ]);
@@ -335,7 +432,7 @@ fn the_tls_flags_are_refused_by_a_gateway_and_scoped_to_the_relay_in_help() {
             vec!["--tls-cert", "cert.pem", "--tls-key", "key.pem"],
         ),
     ] {
-        let mut with_bind = vec!["--host", "127.0.0.1", "--port", "39885"];
+        let mut with_bind = vec!["--host", "127.0.0.1", "--port", "0"];
         with_bind.extend(args);
         let (code, _stdout, stderr) = run_with_timeout(&with_bind, Duration::from_secs(10));
 
@@ -619,7 +716,12 @@ fn get_status(port: u16, token: Option<&str>) -> u16 {
 ///   time — which is close to the shape of the defect being fixed.
 #[test]
 fn a_generated_key_reaches_stdout_at_every_log_level() {
-    for (level, port) in [("info", 39883u16), ("warn", 39884u16)] {
+    // A port this test has to connect to, so `--port 0` is not available: the
+    // number the OS picks is announced only by a `tracing` line at `info`, and
+    // half of this test's point is that `warn` must work too. See
+    // `reserved_port`.
+    for level in ["info", "warn"] {
+        let port = reserved_port();
         // Loopback derives no audit trail, but a tempdir costs nothing and
         // keeps the crate root clean should that ever change.
         let dir = tempfile::tempdir().expect("tempdir");
@@ -690,7 +792,7 @@ fn the_log_stream_carries_no_ansi_escapes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "127.0.0.1", "--port", "39886"])
+        .args(["--host", "127.0.0.1", "--port", "0"])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -729,7 +831,7 @@ fn a_generated_key_is_printed_with_the_warning_that_it_is_not_saved() {
     let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "127.0.0.1", "--port", "39887", "--require-auth"])
+        .args(["--host", "127.0.0.1", "--port", "0", "--require-auth"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -778,7 +880,7 @@ fn a_generated_enrolment_token_reaches_the_join_line() {
     let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["relay", "--host", "127.0.0.1", "--port", "39888"])
+        .args(["relay", "--host", "127.0.0.1", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -825,7 +927,7 @@ fn the_audit_trail_path_is_announced_once() {
     let dir = tempfile::tempdir().expect("tempdir");
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "0.0.0.0", "--port", "39889"])
+        .args(["--host", "0.0.0.0", "--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -861,7 +963,7 @@ fn the_audit_trail_path_is_announced_once() {
             "--host",
             "127.0.0.1",
             "--port",
-            "39890",
+            "0",
             "--audit-log",
             audit_log.to_str().expect("utf-8 path"),
         ])
@@ -913,7 +1015,7 @@ fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
             "--enroll-token",
             "t",
             "--port",
-            "39884",
+            "0",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -947,9 +1049,11 @@ fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
 #[test]
 fn a_proxied_request_to_an_unauthenticated_server_is_warned_about() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // This test sends a request, so it needs the port up front. See `reserved_port`.
+    let port = reserved_port();
     let child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "127.0.0.1", "--port", "39881"])
+        .args(["--host", "127.0.0.1", "--port", &port.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -957,7 +1061,7 @@ fn a_proxied_request_to_an_unauthenticated_server_is_warned_about() {
     let mut server = Killed(child);
 
     assert_eq!(
-        get_status_with_headers(39881, &["X-Forwarded-For: 203.0.113.9"]),
+        get_status_with_headers(port, &["X-Forwarded-For: 203.0.113.9"]),
         200,
         "the warning must not change what the request gets"
     );
@@ -1034,9 +1138,19 @@ fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
 #[test]
 fn a_server_outlives_the_reader_of_its_stdout() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // The stdout this test closes is the only stream that could have carried an
+    // OS-chosen port, so the port has to be known before the child starts. See
+    // `reserved_port`.
+    let port = reserved_port();
     let mut child = Command::new(BIN)
         .current_dir(dir.path())
-        .args(["--host", "127.0.0.1", "--port", "39891", "--require-auth"])
+        .args([
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--require-auth",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -1049,7 +1163,7 @@ fn a_server_outlives_the_reader_of_its_stdout() {
     // what is being asked here is whether anything is answering at all. A dead
     // process fails this by never accepting the connection.
     assert_eq!(
-        get_status(39891, None),
+        get_status(port, None),
         401,
         "the server must outlive the reader of its stdout"
     );
