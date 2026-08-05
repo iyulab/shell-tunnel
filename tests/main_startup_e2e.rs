@@ -302,9 +302,9 @@ fn explain_missing_line(
 /// and both bound it, and `#[test]`s in one binary run in parallel by default.
 /// A leftover process from an interrupted run held those numbers too.
 ///
-/// Tests that never connect do not need this — they pass `--port 0` and let the
-/// OS choose, with no window at all. That is most of them; only three here send
-/// a request, and one of those (`a_generated_key_reaches_stdout_at_every_log_level`)
+/// The ten spawn sites that only need a port the OS will accept do not need
+/// this — they pass `--port 0` and let it choose, with no window at all. Only
+/// three send a request, and one of those (`a_generated_key_reaches_stdout_at_every_log_level`)
 /// is why the port cannot simply be read back from the running server: the
 /// chosen port is announced by a `tracing` line at `info`, and that test exists
 /// to cover `warn`, where the line is not emitted.
@@ -672,9 +672,12 @@ fn get_status(port: u16, token: Option<&str>) -> u16 {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => panic!(
-                "server on port {port} never accepted a connection: {e}
-
-                 Note the port came from `reserved_port()`, which cannot hold it: if                  something else took it before the child bound, the child exited at                  startup and never listened. That is not the same as a server that                  started and then died, and these tests are about the second — read the                  child's stderr before concluding this is the behaviour under test."
+                "server on port {port} never accepted a connection: {e}. The port came \
+                 from `reserved_port()`, which cannot hold it — if something else took \
+                 it before the child bound, the child exited at startup and never \
+                 listened. That is not a server that started and then died, which is \
+                 what these tests are about. Read the child's stderr before concluding \
+                 this is the behaviour under test."
             ),
         }
     };
@@ -1101,9 +1104,12 @@ fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(e) => panic!(
-                "server on port {port} never accepted a connection: {e}
-
-                 Note the port came from `reserved_port()`, which cannot hold it: if                  something else took it before the child bound, the child exited at                  startup and never listened. That is not the same as a server that                  started and then died, and these tests are about the second — read the                  child's stderr before concluding this is the behaviour under test."
+                "server on port {port} never accepted a connection: {e}. The port came \
+                 from `reserved_port()`, which cannot hold it — if something else took \
+                 it before the child bound, the child exited at startup and never \
+                 listened. That is not a server that started and then died, which is \
+                 what these tests are about. Read the child's stderr before concluding \
+                 this is the behaviour under test."
             ),
         }
     };
