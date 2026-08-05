@@ -334,6 +334,16 @@ command *starts* as well as when it ends, so a session thirty seconds into a
 build and one that has been idle for thirty seconds report the same
 `idle_seconds`.
 
+**Hanging up does not cancel a command.** If you close the socket or drop the
+HTTP request before its response, the command keeps running to its own end or
+its timeout. Deleting the session does not stop it either — that removes the
+bookkeeping and nothing else. What the disconnect *does* release is the
+session: it reports `running: false`
+immediately rather than waiting for a result nobody is left to receive. So for
+that one case — and only that one — `running` can read `false` while a command
+started in the session is still finishing. The window is bounded by that
+command's timeout.
+
 > **Changed in 0.20.0.** Create used to accept `shell`, `working_dir` and `env`;
 > none of the three ever reached a command, and two of them were documented here
 > as though they did. They are gone rather than wired up, because where a command
@@ -664,11 +674,20 @@ publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 
 ### Audit trail
 
-`--audit-log <file>` appends one JSON object per line for every execution, for
-every request the authentication layer refuses, and for the file operations
-listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry. Three gaps are worth naming rather than leaving
-to be discovered.
+`--audit-log <file>` appends one JSON object per line for an execution that
+reaches its result, for every request the authentication layer refuses, and for
+the file operations listed in the `kind` table below. **That table is the whole
+list** — an outcome absent from it leaves no entry. Four gaps are worth naming
+rather than leaving to be discovered.
+
+**A command whose caller hangs up is not recorded**, and it did run. The entry
+is written where the result is handled, so a caller that disconnects first takes
+that step with it — while the command itself carries on to its end or its
+timeout (§3). Measured, not read off the code: one `/execute` that completed
+wrote its entry, and an identical one abandoned after a second left the trail
+unchanged twelve seconds later, well past when the command had finished. This is
+the gap to weigh if the trail is what you would reach for after an incident,
+because "no entry" and "never ran" look the same in it.
 
 **Reading is not recorded.** `list`, `stat` and `download` write nothing when
 they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.

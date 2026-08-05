@@ -43,6 +43,25 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A caller that hangs up mid-command no longer leaves the session reporting it
+  forever.** A session's execute marked the session busy, awaited the command, and
+  marked it idle again — but a caller that disconnects before its response is written
+  has the handler's future dropped at that await, so the second half never ran. The
+  session stayed busy indefinitely: measured at 44.7 s after the caller of a
+  nine-second command vanished, and it would not have recovered on its own. The pair
+  is now a guard whose destructor restores the session, which covers cancellation as
+  well as every ordinary way out.
+
+- **A streaming consumer that stops reading can no longer stop a command's timeout
+  from being enforced.** Output is handed to a WebSocket over a bounded channel, from
+  inside the same loop that watches the deadline and reaps the child. A handler that
+  stopped receiving without dropping its receiver therefore parked that loop once the
+  channel filled: the command ran past its own timeout, its child was never killed,
+  and a blocking thread was held for good. Both WebSocket handlers now release the
+  receiver as soon as they stop reading, and forwarding gives up on its own once the
+  command's deadline has passed — enforcing the timeout is this crate's job, not
+  something each consumer has to re-earn.
+
 - **A command driven over a session's WebSocket now counts as running in that session.**
   `/api/v1/sessions/{id}/ws` verifies the session at connect and then hands the command
   straight to the executor, bypassing the one place session state is touched. So a
@@ -51,6 +70,14 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   is running in this session right now", would have been a fresh way for that sentence to
   be false. The socket path now marks the session busy and idle again on every way out,
   including the ones that never reach the executor.
+
+- **The audit section no longer claims every execution is recorded.** It said the trail
+  carries "every execution"; a command whose caller hangs up before its result is
+  handled writes no entry at all, and it did run. Measured against a running server:
+  one completed `/execute` wrote its entry, an identical one abandoned after a second
+  left the trail unchanged twelve seconds later. §4 now names this alongside the three
+  gaps it already named, and says why it is the one to weigh — in a trail, "no entry"
+  and "never ran" look the same.
 
 - **The documentation no longer tells callers to use session fields that do nothing.**
   `docs/USAGE.md` named per-session `working_dir` and `env` as what a session gives

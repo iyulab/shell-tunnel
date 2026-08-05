@@ -209,6 +209,42 @@ async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
     assert!(result.truncated, "the collected result is still capped");
 }
 
+/// A consumer that stops reading cannot park the executor.
+///
+/// The streaming channel is bounded, and the producer runs inside the control
+/// loop that enforces the timeout and reaps the child. So a consumer holding its
+/// receiver without draining it used to stop that loop from checking anything:
+/// the join handle never resolved, the child outlived its own timeout, and a
+/// blocking thread was parked for good. Both WebSocket handlers did exactly this
+/// the moment their client hung up mid-command.
+///
+/// Dropping the receiver is the right thing for a consumer to do and both
+/// handlers now do it. This pins the backstop underneath that — the guarantee
+/// belongs to the executor, not to each consumer's discipline.
+#[tokio::test]
+async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
+    let exec = executor();
+    // Far more than the channel holds, so it is full long before the command ends.
+    let cmd = Command::new(emit_bytes_command(4 * 1024 * 1024)).timeout(Duration::from_secs(2));
+
+    let (_rx, handle) = exec
+        .execute_async(&cmd)
+        .await
+        .expect("execute_async failed");
+
+    // `_rx` is deliberately alive and never read for the whole wait.
+    let joined = tokio::time::timeout(Duration::from_secs(30), handle).await;
+
+    assert!(
+        joined.is_ok(),
+        "the executor never finished: an unread receiver parked the control loop that enforces the timeout"
+    );
+    joined
+        .unwrap()
+        .expect("join failed")
+        .expect("execute failed");
+}
+
 /// A session's execute uses the same shell as `/execute`, and keeps nothing
 /// between calls.
 ///

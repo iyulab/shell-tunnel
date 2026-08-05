@@ -1340,7 +1340,7 @@
           },
           "running": {
             "type": "boolean",
-            "description": "Whether a command is running in this session right now. The one thing idle_seconds cannot say: the executor touches the session when a command starts as well as when it ends, so a session two seconds into a command and one idle for two seconds report the same idle_seconds. Until 0.20.0 this was `state`, a four-value internal enum of which two values this API can never return, alongside a `working_dir` echoed from creation that governed nothing.",
+            "description": "Whether a command is running in this session right now. The one thing idle_seconds cannot say: the executor touches the session when a command starts as well as when it ends, so a session two seconds into a command and one idle for two seconds report the same idle_seconds. One exception: a caller that hangs up mid-command releases the session immediately, while the command itself keeps running to its end or its timeout (deleting the session does not stop it either — that removes the bookkeeping only), so for that case `running` reads false while a command started in the session is still finishing. Until 0.20.0 this was `state`, a four-value internal enum of which two values this API can never return, alongside a `working_dir` echoed from creation that governed nothing.",
             "example": false
           },
           "last_exit_code": {

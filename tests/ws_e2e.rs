@@ -243,11 +243,7 @@ mod reqwest_lite {
     pub struct Client;
 
     impl Client {
-        pub async fn post_json(
-            &self,
-            url: &str,
-            body: &str,
-        ) -> std::io::Result<serde_json::Value> {
+        pub async fn post_json(&self, url: &str, body: &str) -> std::io::Result<serde_json::Value> {
             self.send("POST", url, Some(body)).await
         }
 
@@ -265,9 +261,8 @@ mod reqwest_lite {
             let (authority, path) = rest.split_once('/').expect("url has a path");
             let mut stream = TcpStream::connect(authority).await?;
 
-            let mut req = format!(
-                "{method} /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n"
-            );
+            let mut req =
+                format!("{method} /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
             if let Some(body) = body {
                 req.push_str(&format!(
                     "Content-Type: application/json\r\nContent-Length: {}\r\n",

@@ -286,9 +286,7 @@ mod tests {
         // Spawn 100 threads that each create a session
         for _ in 0..100 {
             let store = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                store.create().unwrap()
-            }));
+            handles.push(thread::spawn(move || store.create().unwrap()));
         }
 
         let ids: Vec<SessionId> = handles.into_iter().map(|h| h.join().unwrap()).collect();

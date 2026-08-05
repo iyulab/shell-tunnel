@@ -82,9 +82,7 @@ pub use execution::{Command, CommandExecutor, ExecutionResult};
 pub use fs::{FsError, FsRoot};
 pub use output::{OutputSanitizer, VirtualScreen};
 pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
-pub use session::{
-    Session, SessionContext, SessionId, SessionState, SessionStore,
-};
+pub use session::{Session, SessionContext, SessionId, SessionState, SessionStore};
 
 // Re-export API types
 pub use api::{AppState, ServerConfig};

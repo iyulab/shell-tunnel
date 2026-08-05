@@ -3,6 +3,14 @@
 //! These drive the real binary. The tunnel provider is a fake command that
 //! prints a URL, which keeps the tests runnable anywhere — installing
 //! `cloudflared` is deliberately not a prerequisite for the test suite.
+//!
+//! `--port 0` throughout: nothing here connects to the server, so the port is
+//! the OS's business. It used to be a fixed number per test, and an orphaned
+//! server from an interrupted run then held that number — the next run's server
+//! failed to bind and died right after printing its banner, which reads exactly
+//! like the banner having lost a line. That signature cost an afternoon once, so
+//! it is worth not being able to happen: an OS-chosen port cannot collide with
+//! anything, including a copy of this suite running beside it.
 
 use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, Stdio};
@@ -86,7 +94,7 @@ fn tunnel_publishes_a_banner_with_a_generated_key() {
         .current_dir(dir.path())
         .args([
             "--port",
-            "39871",
+            "0",
             "--tunnel-command",
             &fake_tunnel("https://banner-test.example"),
         ])
@@ -112,7 +120,7 @@ fn tunnel_generates_and_reports_an_api_key() {
         .current_dir(dir.path())
         .args([
             "--port",
-            "39872",
+            "0",
             "--tunnel-command",
             &fake_tunnel("https://key-test.example"),
         ])
@@ -139,7 +147,7 @@ fn tunnel_with_no_auth_is_refused() {
     let output = Command::new(BIN)
         .args([
             "--port",
-            "39873",
+            "0",
             "--no-auth",
             "--tunnel-command",
             &fake_tunnel("https://never-started.example"),
@@ -167,7 +175,7 @@ fn a_tunnel_command_that_never_publishes_fails_the_startup() {
         .current_dir(dir.path())
         .args([
             "--port",
-            "39874",
+            "0",
             "--log-level",
             "error",
             "--tunnel-command",
@@ -190,7 +198,7 @@ fn a_tunnel_command_that_never_publishes_fails_the_startup() {
 #[test]
 fn no_tunnel_flag_means_no_banner() {
     let child = Command::new(BIN)
-        .args(["--port", "39875"])
+        .args(["--port", "0"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()

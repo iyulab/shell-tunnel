@@ -14,7 +14,7 @@ use futures_util::{SinkExt, StreamExt};
 use super::handlers::AppState;
 use super::types::{WsClientMessage, WsServerMessage};
 use crate::execution::Command;
-use crate::session::{SessionId, SessionState};
+use crate::session::{BusySession, SessionId};
 
 /// WebSocket upgrade handler.
 pub async fn ws_handler(
@@ -92,19 +92,14 @@ async fn handle_socket(
                     cmd = cmd.timeout(Duration::from_secs(secs));
                 }
 
-                // Mark the session busy for the whole command, exactly as the
-                // REST path does. This handler streams through `execute_async`
-                // rather than `execute_in_session`, so nothing else here touches
-                // the session — without this a command driven over the socket
-                // left the session reporting `running: false` and its idle clock
-                // running while a build was under way.
-                state
-                    .store
-                    .update(&id, |s| {
-                        let _ = s.state.transition_to(SessionState::Active);
-                        s.touch();
-                    })
-                    .ok();
+                // Busy for the whole command, exactly as the REST path is. This
+                // handler streams through `execute_async` rather than
+                // `execute_in_session`, so nothing else here touches the session
+                // — without it a command driven over the socket left the session
+                // reporting `running: false` and its idle clock running while a
+                // build was under way. The guard also covers the ways out that
+                // no branch below expresses.
+                let _busy = BusySession::begin(&state.store, &id).ok();
 
                 // Execute with streaming
                 match state.executor.execute_async(&cmd).await {
@@ -121,6 +116,11 @@ async fn handle_socket(
                                 }
                             }
                         }
+
+                        // Let the command go once nobody is reading it. Holding
+                        // the receiver across the await below would stall the
+                        // loop that enforces the timeout — see `execute_async`.
+                        drop(rx);
 
                         // Wait for completion and send result
                         match handle.await {
@@ -191,17 +191,9 @@ async fn handle_socket(
                         }
                     }
                 }
-
-                // Idle again on every way out, including the ones that never
-                // reached the executor: a session stuck at `Active` would report
-                // a command running forever.
-                state
-                    .store
-                    .update(&id, |s| {
-                        let _ = s.state.transition_to(SessionState::Idle);
-                        s.touch();
-                    })
-                    .ok();
+                // `_busy` drops here: idle again on every way out, including the
+                // ones that never reached the executor and the ones no branch
+                // here expresses.
             }
             WsClientMessage::Ping => {
                 let pong = WsServerMessage::Pong;
@@ -283,6 +275,12 @@ async fn handle_oneshot_socket(
                                 }
                             }
                         }
+
+                        // Nobody is reading any more: release the command so its
+                        // timeout can still be enforced (see `execute_async`).
+                        // This path has no session, so a stalled command here
+                        // showed up only as a child that never died.
+                        drop(rx);
 
                         match handle.await {
                             Ok(Ok(result)) => {

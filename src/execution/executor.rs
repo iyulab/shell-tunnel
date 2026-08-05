@@ -13,7 +13,7 @@ use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
 use crate::process::{detach_process_group, kill_tree, shell_command};
-use crate::session::{SessionState, SessionStore};
+use crate::session::{BusySession, SessionStore};
 use crate::Result;
 
 /// Default execution timeout.
@@ -233,6 +233,41 @@ fn run_command(command: &Command) -> Result<ExecutionResult> {
     run_command_streaming(command, |_| {})
 }
 
+/// How long to nap between attempts at a full channel.
+const FORWARD_RETRY: Duration = Duration::from_millis(2);
+
+/// Hand one chunk to a streaming consumer, waiting while the channel is full —
+/// but never past `stop_waiting_at`.
+///
+/// This is called from inside [`run_command_streaming`]'s control loop, the same
+/// loop that checks the deadline and reaps the child. Anything that parks here
+/// parks those checks too, which is why an unbounded `blocking_send` was wrong:
+/// a consumer that stopped receiving without dropping its receiver left the
+/// child running past its timeout and a blocking thread parked for good.
+///
+/// Backpressure is preserved for a consumer that is merely slow — it only stops
+/// applying once the command has outlived the window in which it could still
+/// have been delivered, and at that point the control loop is about to kill the
+/// tree anyway. Chunks dropped here are still counted in `total_bytes` and still
+/// collected into the result under its cap; only the live stream loses them, and
+/// only for a consumer that is no longer reading it.
+fn forward_chunk(tx: &mpsc::Sender<OutputChunk>, chunk: &[u8], stop_waiting_at: Instant) {
+    let mut pending = OutputChunk::combined(chunk.to_vec());
+    loop {
+        match tx.try_send(pending) {
+            Ok(()) => return,
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+            Err(mpsc::error::TrySendError::Full(returned)) => {
+                if Instant::now() >= stop_waiting_at {
+                    return;
+                }
+                pending = returned;
+                std::thread::sleep(FORWARD_RETRY);
+            }
+        }
+    }
+}
+
 /// Command executor for running commands in shell sessions.
 pub struct CommandExecutor {
     store: Arc<SessionStore>,
@@ -275,6 +310,19 @@ impl CommandExecutor {
     /// real completion detection, enforceable timeout, and process-tree kill —
     /// none of which the previous PTY implementation could provide for
     /// non-interactive commands (see [`run_command_streaming`]).
+    ///
+    /// **A consumer that stops receiving should drop the receiver.** Holding it
+    /// while awaiting the join handle is a deadlock in waiting: the channel is
+    /// bounded, and the producer runs inside the control loop that enforces the
+    /// timeout, so a full channel stops that loop from checking anything. Both
+    /// WebSocket handlers used to do exactly this when their client hung up, and
+    /// the command then outlived its own timeout — verified by watching a child
+    /// with a five-second timeout run to completion.
+    ///
+    /// Dropping the receiver frees the producer immediately. As a backstop for
+    /// the consumer that forgets, forwarding gives up once the command's own
+    /// deadline has passed — timeout enforcement is a guarantee of this crate,
+    /// not something each consumer re-earns.
     pub async fn execute_async(
         &self,
         command: &Command,
@@ -284,11 +332,14 @@ impl CommandExecutor {
     )> {
         let (tx, rx) = mpsc::channel::<OutputChunk>(64);
         let command = command.clone();
+        let budget = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
 
         let handle = tokio::task::spawn_blocking(move || {
+            // Past this instant the command is due to be killed anyway, so no
+            // chunk is worth waiting on: see `forward_chunk`.
+            let stop_waiting_at = Instant::now() + budget;
             run_command_streaming(&command, |chunk| {
-                // Forward the chunk live; ignore if the receiver was dropped.
-                let _ = tx.blocking_send(OutputChunk::combined(chunk.to_vec()));
+                forward_chunk(&tx, chunk, stop_waiting_at);
             })
         });
 
@@ -311,22 +362,14 @@ impl CommandExecutor {
             return Err(ShellTunnelError::NotExecutable(session.state));
         }
 
-        // Mark session as active
-        self.store.update(session_id, |s| {
-            let _ = s.state.transition_to(SessionState::Active);
-            s.touch();
-        })?;
+        // Busy for as long as the guard lives. Held rather than written as a
+        // pair of transitions because the await below may never resume: a
+        // caller that hangs up mid-command has axum drop this future, and a
+        // hand-written "back to idle" line after the await would never run.
+        let _busy = BusySession::begin(&self.store, session_id)?;
 
         // Execute command (off the async runtime workers)
-        let result = self.execute(command).await;
-
-        // Mark session as idle
-        self.store.update(session_id, |s| {
-            let _ = s.state.transition_to(SessionState::Idle);
-            s.touch();
-        })?;
-
-        result
+        self.execute(command).await
     }
 }
 
