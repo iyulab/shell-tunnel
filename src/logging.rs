@@ -2,7 +2,7 @@
 //!
 //! # Why colour is off
 //!
-//! Both initializers below pass `with_ansi(false)`, and that is not a style
+//! The layer below is built with `with_ansi(false)`, and that is not a style
 //! choice. The `fmt` layer colours its output whenever `tracing-subscriber`'s
 //! `ansi` feature is compiled in, and that default asks nothing about what is
 //! downstream: it does not test whether stderr is a terminal, and on Windows
@@ -47,24 +47,18 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 /// Panics if called more than once, or if another tracing subscriber
 /// has already been set.
 pub fn init() {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("shell_tunnel=info"));
-
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            tracing_subscriber::fmt::layer()
-                .compact()
-                .with_ansi(false)
-                .with_writer(std::io::stderr),
-        )
-        .init();
+    try_init().expect("logging is initialized once, before any other subscriber is set");
 }
 
 /// Try to initialize the logging system.
 ///
 /// Returns `Ok(())` if successful, or `Err` if logging has already been
 /// initialized.
+///
+/// This is the whole implementation; `init` is this plus a panic. The two used
+/// to assemble the same filter and the same layer separately, and a change to
+/// either had to be made twice — the `with_ansi(false)` above is there because
+/// that is exactly what happened once already.
 pub fn try_init() -> Result<(), tracing_subscriber::util::TryInitError> {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("shell_tunnel=info"));
@@ -84,14 +78,22 @@ pub fn try_init() -> Result<(), tracing_subscriber::util::TryInitError> {
 mod tests {
     use super::*;
 
+    /// A second `try_init` reports failure rather than panicking — the contract
+    /// `init` turns back into a panic.
+    ///
+    /// Asserting on the *second* call is what makes this independent of test
+    /// order: whether or not a subscriber was already set when this test began,
+    /// one is certainly set after the first call, so the second must be `Err`.
+    /// This used to call `try_init` twice and assert nothing at all, on the
+    /// grounds that the first call's result depends on ordering — true of the
+    /// first call, and the reason to check the second one instead.
     #[test]
-    fn test_try_init_idempotent() {
-        // First call may or may not succeed depending on test order
+    fn a_second_try_init_fails_instead_of_panicking() {
         let _ = try_init();
-        // Second call should return error (already initialized)
-        // or succeed if this is the first test to run
-        let _ = try_init();
-        // Either way, we shouldn't panic
+        assert!(
+            try_init().is_err(),
+            "a subscriber is set by now, so initializing again must report failure"
+        );
     }
 
     #[test]
