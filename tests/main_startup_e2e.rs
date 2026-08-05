@@ -671,7 +671,11 @@ fn get_status(port: u16, token: Option<&str>) -> u16 {
                 let _ = e;
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+            Err(e) => panic!(
+                "server on port {port} never accepted a connection: {e}
+
+                 Note the port came from `reserved_port()`, which cannot hold it: if                  something else took it before the child bound, the child exited at                  startup and never listened. That is not the same as a server that                  started and then died, and these tests are about the second — read the                  child's stderr before concluding this is the behaviour under test."
+            ),
         }
     };
 
@@ -1096,7 +1100,11 @@ fn get_status_with_headers(port: u16, headers: &[&str]) -> u16 {
                 let _ = e;
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+            Err(e) => panic!(
+                "server on port {port} never accepted a connection: {e}
+
+                 Note the port came from `reserved_port()`, which cannot hold it: if                  something else took it before the child bound, the child exited at                  startup and never listened. That is not the same as a server that                  started and then died, and these tests are about the second — read the                  child's stderr before concluding this is the behaviour under test."
+            ),
         }
     };
 
