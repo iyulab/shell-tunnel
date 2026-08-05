@@ -413,15 +413,18 @@ mod tests {
         assert_eq!(cmd.timeout, Some(Duration::from_secs(5)));
     }
 
+    /// Ignored until 0.20.0 as "PTY tests need special handling" — a label left
+    /// over from before execution moved to pipes. Nothing on this path has
+    /// allocated a terminal since, and the PTY module it named is gone; both of
+    /// these run in a fresh `cmd /c` / `sh -c` like every other execute. Ran
+    /// green under `--ignored` before the gate came off.
     #[test]
-    #[ignore] // PTY tests need special handling
     fn test_execute_simple_echo() {
         let result = execute_simple("echo test").unwrap();
         assert!(result.text_output.contains("test"));
     }
 
     #[test]
-    #[ignore] // PTY tests need special handling
     fn test_execute_with_timeout() {
         let result = execute_with_timeout("echo fast", Duration::from_secs(5)).unwrap();
         assert!(!result.timed_out);

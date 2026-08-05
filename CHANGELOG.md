@@ -5,8 +5,35 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## 0.20.0 — 2026-08-05
 
-> ⚠ **Breaking for HTTP callers**, not only for library consumers. Both changes are
+> ⚠ **Breaking for HTTP callers**, not only for library consumers. The HTTP changes are
 > to the session routes; `/execute`, streaming, and the filesystem API are untouched.
+> The PTY removal below is breaking for library consumers only — it changes no endpoint,
+> no response body, and no CLI flag.
+
+### Removed
+
+- **The `pty` module is gone, and with it the `portable-pty` dependency.**
+  `NativePty`, `PtySize`, `PtyHandle`, `AsyncPtyReader`, `AsyncPtyWriter` and
+  `default_shell` are no longer exported. The crate has run commands through pipes
+  since execution moved off the PTY layer; nothing on any execute path called this
+  module afterwards, so it was a published API over code the product itself did not
+  use — including a `default_shell()` returning `powershell.exe` / `$SHELL`, which is
+  not the shell anything here runs. A command has been executed by `cmd /c` on Windows
+  and `/bin/sh -c` elsewhere throughout.
+
+  **If you depended on it**, depend on `portable-pty` directly — that is where the
+  functionality lived; this crate only wrapped it. Nothing else here changes: no
+  endpoint, no response field, no flag.
+
+  A feature that genuinely needs a terminal brings a PTY layer back deliberately.
+  Keeping this one exported meant advertising terminal control the gateway does not
+  perform.
+
+- **Three `#[ignore]`d tests came off the shelf rather than being deleted.**
+  `test_execute_simple_echo`, `test_execute_with_timeout` and `test_execute_oneshot`
+  were skipped as "requires PTY execution". They did not: all three passed on the
+  first run once the label was questioned, and they now run on every platform in CI.
+  No `#[ignore]`d test remains in the tree.
 
 ### Changed
 

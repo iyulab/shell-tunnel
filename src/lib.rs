@@ -3,12 +3,13 @@
 //! Ultra-lightweight remote shell gateway with a REST/WebSocket API.
 //!
 //! This crate provides a cross-platform API for programmatic interaction
-//! with system shells. It supports both Windows (ConPTY) and Unix (PTY)
-//! terminals through a unified interface.
+//! with system shells. A command is run by a fresh shell — `cmd /c` on
+//! Windows, `/bin/sh -c` elsewhere — and its output is captured through
+//! pipes; nothing here allocates a terminal.
 //!
 //! ## Features
 //!
-//! - **Cross-platform PTY**: Unified interface for Windows ConPTY and Unix PTY
+//! - **Cross-platform**: One API over the platform's shell
 //! - **Async I/O**: Non-blocking operations using tokio
 //! - **Session Management**: Stateful shell sessions with lifecycle tracking
 //! - **REST API**: HTTP endpoints for command execution
@@ -18,7 +19,8 @@
 //! ## Quick Start
 //!
 //! ```no_run
-//! use shell_tunnel::{NativePty, PtySize, SessionStore};
+//! use std::sync::Arc;
+//! use shell_tunnel::{Command, CommandExecutor, SessionStore};
 //!
 //! #[tokio::main]
 //! async fn main() -> shell_tunnel::Result<()> {
@@ -26,16 +28,18 @@
 //!     shell_tunnel::logging::try_init().ok();
 //!
 //!     // Create a session store
-//!     let store = SessionStore::new();
+//!     let store = Arc::new(SessionStore::new());
 //!
 //!     // Create a new session
 //!     let session_id = store.create()?;
 //!
-//!     // Spawn a PTY
-//!     let pty = NativePty::new();
-//!     let handle = pty.spawn_default(PtySize::default())?;
+//!     // Run a command in it — a fresh shell per call, nothing kept between
+//!     let executor = CommandExecutor::new(store);
+//!     let result = executor
+//!         .execute_in_session(&session_id, &Command::new("echo hello"))
+//!         .await?;
 //!
-//!     println!("Session {} created with PID {}", session_id, handle.pid);
+//!     println!("Session {} exited with {:?}", session_id, result.exit_code);
 //!
 //!     Ok(())
 //! }
@@ -66,7 +70,6 @@ pub mod fs;
 pub mod logging;
 pub mod output;
 mod process;
-pub mod pty;
 pub mod relay;
 pub mod security;
 pub mod session;
@@ -81,7 +84,6 @@ pub use error::{Result, ShellTunnelError};
 pub use execution::{Command, CommandExecutor, ExecutionResult};
 pub use fs::{FsError, FsRoot};
 pub use output::{OutputSanitizer, VirtualScreen};
-pub use pty::{AsyncPtyReader, AsyncPtyWriter, NativePty, PtyHandle, PtySize};
 pub use session::{Session, SessionContext, SessionId, SessionState, SessionStore};
 
 // Re-export API types

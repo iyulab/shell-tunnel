@@ -1,8 +1,9 @@
 //! Integration tests for non-interactive command execution.
 //!
 //! These exercise the real piped `std::process` execution path end-to-end.
-//! Unlike the PTY-based tests (which are `#[ignore]` due to platform timing),
-//! piped execution is deterministic, so these run on every platform in CI.
+//! Piped execution is deterministic, so these run on every platform in CI —
+//! which is the whole path now that the PTY module and its timing-sensitive
+//! tests are gone (0.20.0).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -298,9 +299,9 @@ async fn a_short_stream_still_reports_the_true_output_size() {
 /// USAGE says so outright, after an upstream report and this repository's own
 /// handover notes both stated the opposite — that a session runs
 /// `powershell.exe` on Windows and `$SHELL` on Unix. It does not: every command
-/// runs in a fresh shell exactly as a one-shot does. `pty::default_shell()` does
-/// return those two, which is where the wrong sentence came from; nothing on
-/// this path calls it.
+/// runs in a fresh shell exactly as a one-shot does. Those two names came from
+/// a `default_shell()` helper in the PTY module, which nothing on this path
+/// ever called; the module was removed in 0.20.0 and the names with it.
 ///
 /// A session no longer has a `shell` field to ask with — create carries no
 /// fields at all since 0.20.0 — so this now pins the shell a session's execute

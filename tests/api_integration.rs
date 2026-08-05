@@ -296,11 +296,14 @@ async fn test_delete_session_not_found() {
 }
 
 // ============================================================================
-// Execution Tests (require PTY - ignored by default)
+// Execution Tests
 // ============================================================================
 
+/// Ignored until 0.20.0 as "Requires PTY execution". It never did: `/execute`
+/// has run its command in a piped `cmd /c` / `sh -c` since execution moved off
+/// the PTY module, and that module is now gone. Ran green under `--ignored`
+/// before the gate came off.
 #[tokio::test]
-#[ignore = "Requires PTY execution"]
 async fn test_execute_oneshot() {
     let state = AppState::new();
     let app = create_router_with_state(state);
