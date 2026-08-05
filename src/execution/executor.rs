@@ -90,8 +90,10 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
 /// hung read leaked a `conhost.exe`. A piped child gives real EOF on pipe close
 /// and a working `try_wait()`/`kill()`, which is exactly what a deterministic
 /// "run command, capture output, get exit code, honor timeout" contract needs.
-/// (Interactive/streaming sessions that genuinely need a TTY keep using the PTY
-/// path in [`super::executor::CommandExecutor::execute_async`].)
+/// (This is every path, streaming included: nothing here allocates a terminal.
+/// The crate's PTY module was removed in 0.20.0 having gone uncalled since this
+/// decision was made. A feature that genuinely needs a TTY brings one back —
+/// the reasons above are what it would have to answer for.)
 ///
 /// The design keeps a blocking `read()` from ever stalling progress:
 /// - stdout and stderr are each pumped by a dedicated reader thread (reading
