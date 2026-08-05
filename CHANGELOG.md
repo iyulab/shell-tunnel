@@ -21,9 +21,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   not the shell anything here runs. A command has been executed by `cmd /c` on Windows
   and `/bin/sh -c` elsewhere throughout.
 
-  **If you depended on it**, depend on `portable-pty` directly — that is where the
-  functionality lived; this crate only wrapped it. Nothing else here changes: no
-  endpoint, no response field, no flag.
+  **If you depended on it**: `NativePty`, `PtySize`, `PtyHandle` and `default_shell` were a
+  thin layer over `portable-pty`, so depend on that directly. `AsyncPtyReader` and
+  `AsyncPtyWriter` were not — they were this crate's own `spawn_blocking` adapters bridging
+  a blocking PTY handle to tokio, and they have no upstream equivalent to swap to. Nothing
+  else here changes: no endpoint, no response field, no flag.
 
   A feature that genuinely needs a terminal brings a PTY layer back deliberately.
   Keeping this one exported meant advertising terminal control the gateway does not
