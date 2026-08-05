@@ -473,8 +473,12 @@ async fn a_capped_execution_records_how_much_output_there_was() {
 
     #[cfg(windows)]
     let command = "powershell -NoProfile -Command [Console]::Out.Write(('x'*65536))";
+    // Streamed, not built as 65,536 command-line words — see
+    // `executor_integration.rs::emit_bytes_command` for what that construct
+    // does at larger sizes. Smaller here, but the same shape, and this binary
+    // never ran on macOS before the branch was pushed.
     #[cfg(unix)]
-    let command = "printf 'x%.0s' $(seq 1 65536)";
+    let command = "head -c 65536 /dev/zero | tr '\\0' x";
 
     let body = serde_json::json!({ "command": command, "max_output_bytes": 4096 }).to_string();
     let status = post(addr, "/api/v1/execute", Some("audit-key"), &body).await;

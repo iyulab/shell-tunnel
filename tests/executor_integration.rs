@@ -127,7 +127,14 @@ fn emit_bytes_command(n: usize) -> String {
     }
     #[cfg(unix)]
     {
-        format!("printf 'x%.0s' $(seq 1 {n})")
+        // Streamed rather than built as arguments. `printf 'x%.0s' $(seq 1 N)`
+        // expands to N words on the command line, so at the 4 MiB the streaming
+        // tests use it exceeds `ARG_MAX` and the shell produces *nothing* — the
+        // command then "succeeds" with no output, and a test asserting on the
+        // size of that output fails for a reason that has nothing to do with
+        // what it is testing. Seen on macOS in CI, where the whole branch ran
+        // on a Unix for the first time.
+        format!("head -c {n} /dev/zero | tr '\\0' x")
     }
 }
 

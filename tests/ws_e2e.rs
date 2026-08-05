@@ -175,10 +175,15 @@ async fn a_command_over_a_session_websocket_marks_the_session_running() {
             .await
             .expect("WebSocket connect failed");
 
+    // Slow *and* talkative: the wait below takes the first output frame as
+    // proof the command is under way, so a command that is merely slow never
+    // satisfies it. `sleep 2` alone is silent, and this timed out on every
+    // Unix — unnoticed until the branch first ran outside Windows, where
+    // `ping` happens to print as it goes.
     let slow = if cfg!(windows) {
         "ping -n 4 127.0.0.1"
     } else {
-        "sleep 2"
+        "echo started; sleep 2"
     };
     ws.send(Message::text(format!(
         r#"{{"type":"execute","command":"{slow}"}}"#
