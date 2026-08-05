@@ -891,6 +891,14 @@ fn the_audit_trail_path_is_announced_once() {
 /// banner from a second, stale copy of the same decision — which is exactly
 /// the shape the resolution was factored out to prevent. The line has to be
 /// read off the process that also serves the value.
+///
+/// Gated because it drives the binary with `--relay`, which a build without
+/// this feature refuses outright ("this build has no relay client"). Ungated,
+/// it failed every plain `cargo test --all` — a command this repository tells
+/// you to run when you touch dependencies. It went unnoticed because CI checks
+/// the default build by *building* it (`cargo build --locked`), never by
+/// running its tests, so nothing on any machine but a developer's ran this.
+#[cfg(feature = "relay-client")]
 #[test]
 fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
     let dir = tempfile::tempdir().expect("tempdir");
