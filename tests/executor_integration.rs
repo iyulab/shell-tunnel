@@ -245,6 +245,53 @@ async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
         .expect("execute failed");
 }
 
+/// What the backstop costs, stated where it can be checked.
+///
+/// Freeing the executor from a consumer that has stopped reading is not free:
+/// chunks produced after the command's deadline are dropped rather than waited
+/// on. The trade is deliberate — the alternative is the stall above — but it
+/// makes one of this crate's older sentences conditional, so the surviving
+/// promise is pinned here instead of left to prose: `total_bytes` counts what
+/// the command produced whatever the stream carried, which is how a consumer
+/// tells a short stream from a quiet command.
+///
+/// Deliberately not asserting that bytes *were* lost: that depends on how fast
+/// the command outruns the channel, and a test that has to win a race to pass
+/// is a test that fails for the wrong reason. Measured once at 2 KB of 1 MB.
+#[tokio::test]
+async fn a_short_stream_still_reports_the_true_output_size() {
+    let exec = executor();
+    let cmd = Command::new(emit_bytes_command(4 * 1024 * 1024)).timeout(Duration::from_secs(2));
+
+    let (mut rx, handle) = exec
+        .execute_async(&cmd)
+        .await
+        .expect("execute_async failed");
+
+    // Alive, holding the receiver, reading nothing until past the deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let mut streamed = 0u64;
+    while let Some(chunk) = rx.recv().await {
+        streamed += chunk.raw.len() as u64;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the executor never finished")
+        .expect("join failed")
+        .expect("execute failed");
+
+    assert!(
+        result.total_bytes >= streamed,
+        "total_bytes ({}) must count at least what the stream carried ({streamed})",
+        result.total_bytes
+    );
+    assert!(
+        result.total_bytes > 0,
+        "the command produced output; total_bytes must say so even when the stream did not carry it"
+    );
+}
+
 /// A session's execute uses the same shell as `/execute`, and keeps nothing
 /// between calls.
 ///

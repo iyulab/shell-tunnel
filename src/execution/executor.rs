@@ -30,8 +30,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// behaves the same locally and across a relay — a limit that only bites on one
 /// path is worse than none, because it is discovered in production.
 ///
-/// The cap governs what a *result* carries. A streaming (WebSocket) consumer
-/// receives every chunk as it arrives and is not affected.
+/// The cap governs what a *result* carries; a streaming consumer is not subject
+/// to it. That is not the same as receiving everything unconditionally — a
+/// consumer that stops draining its receiver can miss chunks produced after the
+/// command's deadline, because [`forward_chunk`] stops waiting on it there
+/// rather than letting a stalled reader hold the command past its timeout.
+/// `total_bytes` counts what the command produced either way.
 pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 
 /// The largest cap a caller may ask for.

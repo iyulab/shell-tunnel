@@ -52,6 +52,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   is now a guard whose destructor restores the session, which covers cancellation as
   well as every ordinary way out.
 
+- **A consumer that stops reading its stream can now miss chunks, and that is the
+  price of the fix below.** Forwarding waits while the channel is full only until the
+  command's own deadline; past it, chunks are dropped rather than allowed to hold the
+  command open. A consumer that keeps reading is unaffected, and `total_bytes` still
+  counts everything the command produced — which is how a short stream is told from a
+  quiet command. Measured at 2 KB of 1 MB for a consumer that read nothing until three
+  seconds into a two-second command. The audit section's note on streaming said such a
+  consumer receives every chunk; it now says under what condition.
+
 - **A streaming consumer that stops reading can no longer stop a command's timeout
   from being enforced.** Output is handed to a WebSocket over a bounded channel, from
   inside the same loop that watches the deadline and reaps the child. A handler that

@@ -339,10 +339,9 @@ HTTP request before its response, the command keeps running to its own end or
 its timeout. Deleting the session does not stop it either — that removes the
 bookkeeping and nothing else. What the disconnect *does* release is the
 session: it reports `running: false`
-immediately rather than waiting for a result nobody is left to receive. So for
-that one case — and only that one — `running` can read `false` while a command
-started in the session is still finishing. The window is bounded by that
-command's timeout.
+immediately rather than waiting for a result nobody is left to receive. So a
+disconnect leaves `running` reading `false` while a command started in the
+session is still finishing, for as long as that command's timeout allows.
 
 > **Changed in 0.20.0.** Create used to accept `shell`, `working_dir` and `env`;
 > none of the three ever reached a command, and two of them were documented here
@@ -806,8 +805,14 @@ carries what the command produced rather than what the response returned (§3). 
 presence is the signal — an entry without it describes a response that carried
 everything — so a truncated result stays distinguishable from a command that simply
 printed little, which is a question the response itself cannot answer once it is gone.
-Streaming (`WS …/ws`) executions never carry it: a WebSocket consumer receives every
-chunk regardless of the cap, so there is nothing about that delivery to flag.
+Streaming (`WS …/ws`) executions never carry it: the cap governs the collected result,
+not the socket, so there is nothing about that delivery to flag. What a consumer that
+keeps reading receives is every chunk; one that stops reading while its command runs
+on can miss chunks produced after that command's timeout has passed — measured at
+2 KB of 1 MB — because the stream stops waiting on it at that point rather than
+letting a stalled reader hold the command past its deadline. `total_bytes` on the
+result still counts everything the command produced, which is how a consumer tells
+the two apart.
 
 `upload.refused` covers every refusal `POST .../fs/uploads` returns **once the
 destination has resolved**. One case is deliberately outside it: a path that does not
