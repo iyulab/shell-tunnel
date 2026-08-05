@@ -120,25 +120,153 @@ async fn test_create_session() {
     assert!(json["session_id_str"].is_string());
 }
 
+/// Create takes no fields at all, and says so rather than accepting them.
+///
+/// All three once existed and none of them ever reached a command: `shell` was
+/// documented as ignored, while `working_dir` and `env` were documented as
+/// taking effect and did not. Accepting them again would restore a body that
+/// reads as configuration and configures nothing.
 #[tokio::test]
-async fn test_create_session_with_env() {
-    let state = AppState::new();
-    let app = create_router_with_state(state);
+async fn a_session_create_refuses_every_field_it_used_to_ignore() {
+    for field in [
+        json!({"shell": "bash"}),
+        json!({"working_dir": "/tmp"}),
+        json!({"env": {"MY_VAR": "my_value"}}),
+    ] {
+        let app = create_router_with_state(AppState::new());
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/sessions",
+                Some(field.clone()),
+            ))
+            .await
+            .unwrap();
 
-    let response = app
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{field} should be refused, not accepted and dropped"
+        );
+    }
+}
+
+/// A route that takes no fields should not insist on a body carrying none.
+///
+/// This is the plain `curl -X POST .../sessions` shape: no body and no
+/// content type. Declaring `application/json` and then sending nothing is a
+/// different thing and still a refusal — the caller said a body was coming.
+#[tokio::test]
+async fn a_session_can_be_created_without_a_request_body() {
+    let app = create_router_with_state(AppState::new());
+
+    let bodyless = Request::builder()
+        .method(Method::POST)
+        .uri("/api/v1/sessions")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.oneshot(bodyless).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+/// Status reports whether a command is in flight, and nothing that governs
+/// nothing.
+///
+/// `working_dir` used to be echoed back from creation while having no bearing
+/// on where anything ran, and `state` published a four-value internal enum of
+/// which two values this API can never return.
+#[tokio::test]
+async fn a_session_status_reports_running_and_not_a_working_directory() {
+    let app = create_router_with_state(AppState::new());
+
+    let created = app
+        .clone()
         .oneshot(json_request(
             Method::POST,
             "/api/v1/sessions",
-            Some(json!({
-                "env": {
-                    "MY_VAR": "my_value"
-                }
-            })),
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    let id = response_json(created).await["session_id"].as_u64().unwrap();
+
+    let status = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/sessions/{id}"),
+            None,
         ))
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let json = response_json(status).await;
+    assert_eq!(json["running"], json!(false));
+    assert!(
+        json.get("working_dir").is_none(),
+        "status still carries working_dir: {json}"
+    );
+    assert!(
+        json.get("state").is_none(),
+        "status still publishes the internal state enum: {json}"
+    );
+}
+
+/// `running` carries the one fact `idle_seconds` cannot: the executor touches
+/// the session when a command *starts* as well as when it ends, so a session
+/// two seconds into a command and one idle for two seconds report the same
+/// `idle_seconds`.
+#[tokio::test]
+async fn a_session_reports_running_while_a_command_is_in_flight() {
+    let app = create_router_with_state(AppState::new());
+
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    let id = response_json(created).await["session_id"].as_u64().unwrap();
+
+    let slow = if cfg!(windows) {
+        "ping -n 4 127.0.0.1"
+    } else {
+        "sleep 2"
+    };
+    let executing = app.clone();
+    let in_flight = tokio::spawn(async move {
+        executing
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/api/v1/sessions/{id}/execute"),
+                Some(json!({ "command": slow })),
+            ))
+            .await
+            .unwrap()
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    let status = app
+        .oneshot(json_request(
+            Method::GET,
+            &format!("/api/v1/sessions/{id}"),
+            None,
+        ))
+        .await
+        .unwrap();
+    let json = response_json(status).await;
+    assert_eq!(
+        json["running"],
+        json!(true),
+        "a session with a command in flight reported {json}"
+    );
+
+    in_flight.await.unwrap();
 }
 
 #[tokio::test]
@@ -168,11 +296,14 @@ async fn test_delete_session_not_found() {
 }
 
 // ============================================================================
-// Execution Tests (require PTY - ignored by default)
+// Execution Tests
 // ============================================================================
 
+/// Ignored until 0.20.0 as "Requires PTY execution". It never did: `/execute`
+/// has run its command in a piped `cmd /c` / `sh -c` since execution moved off
+/// the PTY module, and that module is now gone. Ran green under `--ignored`
+/// before the gate came off.
 #[tokio::test]
-#[ignore = "Requires PTY execution"]
 async fn test_execute_oneshot() {
     let state = AppState::new();
     let app = create_router_with_state(state);

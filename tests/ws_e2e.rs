@@ -149,3 +149,141 @@ async fn ws_refuses_an_inbound_frame_with_an_unknown_field() {
         }
     }
 }
+
+/// A command driven over a session's WebSocket counts as running in that
+/// session, and leaves the same trail a REST execute does.
+///
+/// The session WS handler verifies the session exists at connect and then hands
+/// the command to the executor directly, bypassing `execute_in_session` — the
+/// only place session state is touched. So this path used to leave the session
+/// looking idle for the whole command, never advance `execution_count`, and let
+/// `idle_seconds` grow while a build was running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_over_a_session_websocket_marks_the_session_running() {
+    let addr = spawn_server().await;
+    let base = format!("http://{}/api/v1", addr);
+    let client = reqwest_lite::Client;
+
+    let created = client
+        .post_json(&format!("{base}/sessions"), "{}")
+        .await
+        .expect("create session");
+    let id = created["session_id"].as_u64().expect("session_id");
+
+    let (mut ws, _resp) =
+        tokio_tungstenite::connect_async(&format!("ws://{}/api/v1/sessions/{}/ws", addr, id))
+            .await
+            .expect("WebSocket connect failed");
+
+    // Slow *and* talkative: the wait below takes the first output frame as
+    // proof the command is under way, so a command that is merely slow never
+    // satisfies it. `sleep 2` alone is silent, and this timed out on every
+    // Unix — unnoticed until the branch first ran outside Windows, where
+    // `ping` happens to print as it goes.
+    let slow = if cfg!(windows) {
+        "ping -n 4 127.0.0.1"
+    } else {
+        "echo started; sleep 2"
+    };
+    ws.send(Message::text(format!(
+        r#"{{"type":"execute","command":"{slow}"}}"#
+    )))
+    .await
+    .expect("send failed");
+
+    // Wait for the first output frame: proof the command is under way, without
+    // racing a fixed sleep against process startup.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(msg) = ws.next().await {
+            if let Ok(Message::Text(t)) = msg {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "output" {
+                    return;
+                }
+            }
+        }
+        panic!("no output frame before the socket closed");
+    })
+    .await
+    .expect("timed out waiting for the first output frame");
+
+    let status = client
+        .get_json(&format!("{base}/sessions/{id}"))
+        .await
+        .expect("session status");
+
+    assert_eq!(
+        status["running"], true,
+        "a session streaming a command over WS reported {status}"
+    );
+
+    let final_status = tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(msg) = ws.next().await {
+            if let Ok(Message::Text(t)) = msg {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "result" {
+                    break;
+                }
+            }
+        }
+        client.get_json(&format!("{base}/sessions/{id}")).await
+    })
+    .await
+    .expect("timed out waiting for the result frame")
+    .expect("session status");
+
+    assert_eq!(final_status["running"], false, "{final_status}");
+    assert_eq!(
+        final_status["execution_count"], 1,
+        "a WS execute left no trace in the session's bookkeeping: {final_status}"
+    );
+}
+
+/// Minimal HTTP helper — this suite has no HTTP client dependency and needs
+/// only two verbs against a loopback address.
+mod reqwest_lite {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    pub struct Client;
+
+    impl Client {
+        pub async fn post_json(&self, url: &str, body: &str) -> std::io::Result<serde_json::Value> {
+            self.send("POST", url, Some(body)).await
+        }
+
+        pub async fn get_json(&self, url: &str) -> std::io::Result<serde_json::Value> {
+            self.send("GET", url, None).await
+        }
+
+        async fn send(
+            &self,
+            method: &str,
+            url: &str,
+            body: Option<&str>,
+        ) -> std::io::Result<serde_json::Value> {
+            let rest = url.strip_prefix("http://").expect("http:// url");
+            let (authority, path) = rest.split_once('/').expect("url has a path");
+            let mut stream = TcpStream::connect(authority).await?;
+
+            let mut req =
+                format!("{method} /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n");
+            if let Some(body) = body {
+                req.push_str(&format!(
+                    "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                    body.len()
+                ));
+            }
+            req.push_str("\r\n");
+            if let Some(body) = body {
+                req.push_str(body);
+            }
+            stream.write_all(req.as_bytes()).await?;
+
+            let mut raw = String::new();
+            stream.read_to_string(&mut raw).await?;
+            let payload = raw.split("\r\n\r\n").nth(1).unwrap_or("");
+            Ok(serde_json::from_str(payload.trim()).unwrap_or(serde_json::Value::Null))
+        }
+    }
+}

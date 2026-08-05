@@ -82,6 +82,69 @@ async fn events(trail: &Path, expected: usize) -> Vec<AuditEvent> {
     panic!("expected {expected} audit entries");
 }
 
+/// A command whose caller hangs up leaves no entry, and it did run.
+///
+/// USAGE §4 names this as one of four gaps, so the sentence needs a test rather
+/// than a reader's trust: the entry is written where the result is handled, and
+/// a caller that disconnects first takes that step away with it. The command
+/// itself carries on — `vanished_caller_e2e.rs` pins that half.
+///
+/// Pinned as a *gap* deliberately. The day someone closes it this fails, and
+/// that is exactly the day §4 has to stop naming it — which is the failure mode
+/// this repository keeps hitting from the other direction, where behaviour
+/// changes and the prose does not.
+#[tokio::test]
+async fn a_command_whose_caller_hangs_up_leaves_no_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    // One completed execution first: it proves the trail is live, so an empty
+    // trail below means "not recorded" rather than "audit was never wired up".
+    assert_eq!(
+        post(
+            addr,
+            "/api/v1/execute",
+            Some("audit-key"),
+            r#"{"command":"echo audited"}"#,
+        )
+        .await,
+        200
+    );
+    assert_eq!(events(&trail, 1).await.len(), 1);
+
+    // Now an identical request, abandoned while it runs.
+    let slow = if cfg!(windows) {
+        "ping -n 4 127.0.0.1"
+    } else {
+        "sleep 3"
+    };
+    let body = format!(r#"{{"command":"{slow}"}}"#);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST /api/v1/execute HTTP/1.1\r\nHost: {addr}\r\n\
+         Authorization: Bearer audit-key\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(stream);
+
+    // Well past when that command finished.
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    let parsed: Vec<AuditEvent> = std::fs::read_to_string(&trail)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        parsed.len(),
+        1,
+        "the abandoned execution left an entry after all — §4 lists it as a gap: {parsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn an_execution_is_recorded_with_who_and_what() {
     let dir = tempfile::tempdir().unwrap();
@@ -410,8 +473,12 @@ async fn a_capped_execution_records_how_much_output_there_was() {
 
     #[cfg(windows)]
     let command = "powershell -NoProfile -Command [Console]::Out.Write(('x'*65536))";
+    // Streamed, not built as 65,536 command-line words — see
+    // `executor_integration.rs::emit_bytes_command` for what that construct
+    // does at larger sizes. Smaller here, but the same shape, and this binary
+    // never ran on macOS before the branch was pushed.
     #[cfg(unix)]
-    let command = "printf 'x%.0s' $(seq 1 65536)";
+    let command = "head -c 65536 /dev/zero | tr '\\0' x";
 
     let body = serde_json::json!({ "command": command, "max_output_bytes": 4096 }).to_string();
     let status = post(addr, "/api/v1/execute", Some("audit-key"), &body).await;

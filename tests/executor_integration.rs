@@ -1,8 +1,9 @@
 //! Integration tests for non-interactive command execution.
 //!
 //! These exercise the real piped `std::process` execution path end-to-end.
-//! Unlike the PTY-based tests (which are `#[ignore]` due to platform timing),
-//! piped execution is deterministic, so these run on every platform in CI.
+//! Piped execution is deterministic, so these run on every platform in CI —
+//! which is the whole path now that the PTY module and its timing-sensitive
+//! tests are gone (0.20.0).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -126,7 +127,14 @@ fn emit_bytes_command(n: usize) -> String {
     }
     #[cfg(unix)]
     {
-        format!("printf 'x%.0s' $(seq 1 {n})")
+        // Streamed rather than built as arguments. `printf 'x%.0s' $(seq 1 N)`
+        // expands to N words on the command line, so at the 4 MiB the streaming
+        // tests use it exceeds `ARG_MAX` and the shell produces *nothing* — the
+        // command then "succeeds" with no output, and a test asserting on the
+        // size of that output fails for a reason that has nothing to do with
+        // what it is testing. Seen on macOS in CI, where the whole branch ran
+        // on a Unix for the first time.
+        format!("head -c {n} /dev/zero | tr '\\0' x")
     }
 }
 
@@ -209,40 +217,111 @@ async fn a_streaming_consumer_receives_what_the_cap_would_discard() {
     assert!(result.truncated, "the collected result is still capped");
 }
 
+/// A consumer that stops reading cannot park the executor.
+///
+/// The streaming channel is bounded, and the producer runs inside the control
+/// loop that enforces the timeout and reaps the child. So a consumer holding its
+/// receiver without draining it used to stop that loop from checking anything:
+/// the join handle never resolved, the child outlived its own timeout, and a
+/// blocking thread was parked for good. Both WebSocket handlers did exactly this
+/// the moment their client hung up mid-command.
+///
+/// Dropping the receiver is the right thing for a consumer to do and both
+/// handlers now do it. This pins the backstop underneath that — the guarantee
+/// belongs to the executor, not to each consumer's discipline.
+#[tokio::test]
+async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
+    let exec = executor();
+    // Far more than the channel holds, so it is full long before the command ends.
+    let cmd = Command::new(emit_bytes_command(4 * 1024 * 1024)).timeout(Duration::from_secs(2));
+
+    let (_rx, handle) = exec
+        .execute_async(&cmd)
+        .await
+        .expect("execute_async failed");
+
+    // `_rx` is deliberately alive and never read for the whole wait.
+    let joined = tokio::time::timeout(Duration::from_secs(30), handle).await;
+
+    assert!(
+        joined.is_ok(),
+        "the executor never finished: an unread receiver parked the control loop that enforces the timeout"
+    );
+    joined
+        .unwrap()
+        .expect("join failed")
+        .expect("execute failed");
+}
+
+/// What the backstop costs, stated where it can be checked.
+///
+/// Freeing the executor from a consumer that has stopped reading is not free:
+/// chunks produced after the command's deadline are dropped rather than waited
+/// on. The trade is deliberate — the alternative is the stall above — but it
+/// makes one of this crate's older sentences conditional, so the surviving
+/// promise is pinned here instead of left to prose: `total_bytes` counts what
+/// the command produced whatever the stream carried, which is how a consumer
+/// tells a short stream from a quiet command.
+///
+/// Deliberately not asserting that bytes *were* lost: that depends on how fast
+/// the command outruns the channel, and a test that has to win a race to pass
+/// is a test that fails for the wrong reason. Measured once at 2 KB of 1 MB.
+#[tokio::test]
+async fn a_short_stream_still_reports_the_true_output_size() {
+    let exec = executor();
+    let cmd = Command::new(emit_bytes_command(4 * 1024 * 1024)).timeout(Duration::from_secs(2));
+
+    let (mut rx, handle) = exec
+        .execute_async(&cmd)
+        .await
+        .expect("execute_async failed");
+
+    // Alive, holding the receiver, reading nothing until past the deadline.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let mut streamed = 0u64;
+    while let Some(chunk) = rx.recv().await {
+        streamed += chunk.raw.len() as u64;
+    }
+    let result = tokio::time::timeout(Duration::from_secs(30), handle)
+        .await
+        .expect("the executor never finished")
+        .expect("join failed")
+        .expect("execute failed");
+
+    assert!(
+        result.total_bytes >= streamed,
+        "total_bytes ({}) must count at least what the stream carried ({streamed})",
+        result.total_bytes
+    );
+    assert!(
+        result.total_bytes > 0,
+        "the command produced output; total_bytes must say so even when the stream did not carry it"
+    );
+}
+
 /// A session's execute uses the same shell as `/execute`, and keeps nothing
 /// between calls.
 ///
-/// USAGE §3.2 now says so outright, after an upstream report and this
-/// repository's own handover notes both stated the opposite — that a session
-/// runs `powershell.exe` on Windows and `$SHELL` on Unix. It does not: sessions
-/// carry an id, a working directory and an environment, and every command runs
-/// in a fresh shell exactly as a one-shot does. The `shell` field on create is
-/// accepted and ignored.
+/// USAGE says so outright, after an upstream report and this repository's own
+/// handover notes both stated the opposite — that a session runs
+/// `powershell.exe` on Windows and `$SHELL` on Unix. It does not: every command
+/// runs in a fresh shell exactly as a one-shot does. Those two names came from
+/// a `default_shell()` helper in the PTY module, which nothing on this path
+/// ever called; the module was removed in 0.20.0 and the names with it.
 ///
-/// Pinned as a test rather than left to the prose because a doc sentence about
-/// behaviour is the thing this repository has repeatedly shipped stale, and
-/// because the day sessions *do* get a persistent shell, this failing is how
-/// the sentence gets rewritten instead of quietly becoming false again.
+/// A session no longer has a `shell` field to ask with — create carries no
+/// fields at all since 0.20.0 — so this now pins the shell a session's execute
+/// actually uses. Pinned as a test rather than left to the prose because a doc
+/// sentence about behaviour is the thing this repository has repeatedly shipped
+/// stale, and because the day sessions *do* get a persistent shell, this
+/// failing is how the sentence gets rewritten instead of quietly becoming false
+/// again.
 #[tokio::test]
 async fn a_session_runs_each_command_in_a_fresh_shell() {
-    use shell_tunnel::session::SessionConfig;
-
     let store = Arc::new(SessionStore::new());
     let exec = CommandExecutor::new(store.clone());
-    let id = store
-        .create(SessionConfig {
-            // Named explicitly, so this fails the day it starts being honoured.
-            shell: Some(
-                if cfg!(windows) {
-                    "powershell.exe"
-                } else {
-                    "/bin/bash"
-                }
-                .to_string(),
-            ),
-            ..Default::default()
-        })
-        .expect("create session");
+    let id = store.create().expect("create session");
     store
         .update(&id, |s| {
             let _ = s

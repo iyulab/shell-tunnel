@@ -1,6 +1,6 @@
 [package]
 name = "shell-tunnel"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 # MSRV of the default (zero-dependency) build, derived from the highest declared
 # rust-version among default-feature dependencies (axum 0.8 = 1.78). The optional
@@ -13,7 +13,7 @@ repository = "https://github.com/iyulab/shell-tunnel"
 homepage = "https://github.com/iyulab/shell-tunnel"
 documentation = "https://docs.rs/shell-tunnel"
 readme = "README.md"
-keywords = ["shell", "tunnel", "pty", "api", "remote"]
+keywords = ["shell", "tunnel", "gateway", "api", "remote"]
 categories = ["command-line-utilities", "development-tools", "api-bindings"]
 authors = ["iyulab"]
 exclude = [
@@ -26,9 +26,6 @@ exclude = [
 [dependencies]
 # Async runtime
 tokio = { version = "1.43", features = ["rt-multi-thread", "io-util", "sync", "time", "macros", "signal"] }
-
-# Cross-platform PTY
-portable-pty = "0.9"
 
 # OS entropy for API keys and enroll tokens. The one crate the security layer
 # is allowed to lean on: key material derived from anything cheaper (the clock)

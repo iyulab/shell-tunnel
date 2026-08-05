@@ -3,6 +3,128 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.20.0 — 2026-08-05
+
+> ⚠ **Breaking for HTTP callers**, not only for library consumers. The HTTP changes are
+> to the session routes; `/execute`, streaming, and the filesystem API are untouched.
+> The PTY removal below is breaking for library consumers only — it changes no endpoint,
+> no response body, and no CLI flag.
+
+### Removed
+
+- **The `pty` module is gone, and with it the `portable-pty` dependency.**
+  `NativePty`, `PtySize`, `PtyHandle`, `AsyncPtyReader`, `AsyncPtyWriter` and
+  `default_shell` are no longer exported. The crate has run commands through pipes
+  since execution moved off the PTY layer; nothing on any execute path called this
+  module afterwards, so it was a published API over code the product itself did not
+  use — including a `default_shell()` returning `powershell.exe` / `$SHELL`, which is
+  not the shell anything here runs. A command has been executed by `cmd /c` on Windows
+  and `/bin/sh -c` elsewhere throughout.
+
+  **If you depended on it**: `NativePty`, `PtySize`, `PtyHandle` and `default_shell` were a
+  thin layer over `portable-pty`, so depend on that directly. `AsyncPtyReader` and
+  `AsyncPtyWriter` were not — they were this crate's own `spawn_blocking` adapters bridging
+  a blocking PTY handle to tokio, and they have no upstream equivalent to swap to. Nothing
+  else here changes: no endpoint, no response field, no flag.
+
+  A feature that genuinely needs a terminal brings a PTY layer back deliberately.
+  Keeping this one exported meant advertising terminal control the gateway does not
+  perform.
+
+- **Three `#[ignore]`d tests came off the shelf rather than being deleted.**
+  `test_execute_simple_echo`, `test_execute_with_timeout` and `test_execute_oneshot`
+  were skipped as "requires PTY execution". They did not: all three passed on the
+  first run once the label was questioned, and they now run on every platform in CI.
+  No `#[ignore]`d test remains in the tree.
+
+### Changed
+
+- **`POST /api/v1/sessions` takes no fields.** It used to accept `shell`,
+  `working_dir` and `env`. None of the three ever reached a command: a session's
+  execute consults the session only for whether it may run, and builds the command
+  from the execute request alone. A session created with a `working_dir` ran `cd`
+  in the server's own directory; one created with an `env` ran with none of those
+  variables set. Sending any of them now answers `422` naming the field, rather
+  than accepting it and dropping it. The body may be omitted entirely.
+
+  They are removed rather than wired up because where a command runs is a
+  per-execute decision, and `working_dir` and `env` on the execute request already
+  carry it — those do take effect and always did.
+
+- **Session status reports `running` instead of `state` and `working_dir`.**
+  `state` published a four-value internal enum (`Created`/`Active`/`Idle`/
+  `Terminated`) of which two values this API can never return: a session is moved
+  past `Created` before the create response is written, and removed from the store
+  in the same request that marks it `Terminated`. `working_dir` echoed back what
+  creation was given, unchanged, for a directory nothing ran in.
+
+  `running` is the one fact neither `idle_seconds` nor the caller can derive: the
+  clock is touched when a command *starts* as well as when it ends, so a session
+  thirty seconds into a build and one idle for thirty seconds report the same
+  `idle_seconds`. Keeping the enum out of the contract also means a state can be
+  added without breaking a caller. `GET /api/v1/sessions` reports the same field
+  per entry.
+
+- **Library:** `SessionConfig` and `StateProbe` are gone, `SessionStore::create`
+  takes no argument, and `SessionContext` no longer carries a working directory or
+  an environment. `StateProbe` existed to recover shell state from a persistent
+  shell this product does not keep; nothing called it.
+
+### Fixed
+
+- **A caller that hangs up mid-command no longer leaves the session reporting it
+  forever.** A session's execute marked the session busy, awaited the command, and
+  marked it idle again — but a caller that disconnects before its response is written
+  has the handler's future dropped at that await, so the second half never ran. The
+  session stayed busy indefinitely: measured at 44.7 s after the caller of a
+  nine-second command vanished, and it would not have recovered on its own. The pair
+  is now a guard whose destructor restores the session, which covers cancellation as
+  well as every ordinary way out.
+
+- **A consumer that stops reading its stream can now miss chunks, and that is the
+  price of the fix below.** Forwarding waits while the channel is full only until the
+  command's own deadline; past it, chunks are dropped rather than allowed to hold the
+  command open. A consumer that keeps reading is unaffected, and `total_bytes` still
+  counts everything the command produced — which is how a short stream is told from a
+  quiet command. Measured at 2 KB of 1 MB for a consumer that read nothing until three
+  seconds into a two-second command. The audit section's note on streaming said such a
+  consumer receives every chunk; it now says under what condition.
+
+- **A streaming consumer that stops reading can no longer stop a command's timeout
+  from being enforced.** Output is handed to a WebSocket over a bounded channel, from
+  inside the same loop that watches the deadline and reaps the child. A handler that
+  stopped receiving without dropping its receiver therefore parked that loop once the
+  channel filled: the command ran past its own timeout, its child was never killed,
+  and a blocking thread was held for good. Both WebSocket handlers now release the
+  receiver as soon as they stop reading, and forwarding gives up on its own once the
+  command's deadline has passed — enforcing the timeout is this crate's job, not
+  something each consumer has to re-earn.
+
+- **A command driven over a session's WebSocket now counts as running in that session.**
+  `/api/v1/sessions/{id}/ws` verifies the session at connect and then hands the command
+  straight to the executor, bypassing the one place session state is touched. So a
+  session streaming a build reported `running: false` for its whole duration, and its
+  idle clock kept running — which, with `running` newly documented as "whether a command
+  is running in this session right now", would have been a fresh way for that sentence to
+  be false. The socket path now marks the session busy and idle again on every way out,
+  including the ones that never reach the executor.
+
+- **The audit section no longer claims every execution is recorded.** It said the trail
+  carries "every execution"; a command whose caller hangs up before its result is
+  handled writes no entry at all, and it did run. Measured against a running server:
+  one completed `/execute` wrote its entry, an identical one abandoned after a second
+  left the trail unchanged twelve seconds later. §4 now names this alongside the three
+  gaps it already named, and says why it is the one to weigh — in a trail, "no entry"
+  and "never ran" look the same.
+
+- **The documentation no longer tells callers to use session fields that do nothing.**
+  `docs/USAGE.md` named per-session `working_dir` and `env` as what a session gives
+  you and said to use `working_dir` rather than a leading `cd`; following that ran
+  the command in the server's directory with no variables set, and reported success.
+  `docs/openapi.json` described the same two as taking effect and called the echoed
+  `working_dir` the "current working directory". `shell` had been corrected earlier
+  and its neighbours had not, which made the rest of the paragraph read as checked.
+
 ## 0.19.0 — 2026-08-04
 
 > ⚠ **A minor bump rather than a patch, because of the breaking library changes**

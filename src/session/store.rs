@@ -8,27 +8,20 @@ use super::{SessionContext, SessionId, SessionState};
 use crate::error::ShellTunnelError;
 use crate::Result;
 
-/// Configuration for creating a new session.
-#[derive(Debug, Clone, Default)]
-pub struct SessionConfig {
-    /// Initial shell command (e.g., "bash", "powershell.exe").
-    pub shell: Option<String>,
-    /// Initial working directory.
-    pub working_dir: Option<String>,
-    /// Environment variables to set.
-    pub env: HashMap<String, String>,
-}
-
 /// A shell session.
-#[derive(Debug)]
+///
+/// A session carries no execution configuration. It is an identifier the audit
+/// trail records against, a place for streaming to attach, and the bookkeeping
+/// in [`SessionContext`]; where a command runs and what it runs with are
+/// decided per execute. It once held a `shell`, a `working_dir` and an `env`
+/// that no execute ever read.
+#[derive(Debug, Clone)]
 pub struct Session {
     /// Unique identifier.
     pub id: SessionId,
     /// Current state.
     pub state: SessionState,
-    /// Configuration used to create this session.
-    pub config: SessionConfig,
-    /// Execution context (CWD, env, etc.).
+    /// Execution bookkeeping (last command, exit code, count).
     pub context: SessionContext,
     /// Time when session was created.
     pub created_at: Instant,
@@ -37,20 +30,14 @@ pub struct Session {
 }
 
 impl Session {
-    /// Create a new session with the given ID and configuration.
-    pub fn new(id: SessionId, config: SessionConfig) -> Self {
+    /// Create a new session with the given ID.
+    pub fn new(id: SessionId) -> Self {
         let now = Instant::now();
-        let context = config
-            .working_dir
-            .as_ref()
-            .map(SessionContext::with_cwd)
-            .unwrap_or_default();
 
         Self {
             id,
             state: SessionState::Created,
-            config,
-            context,
+            context: SessionContext::new(),
             created_at: now,
             last_activity: now,
         }
@@ -67,19 +54,6 @@ impl Session {
     }
 }
 
-impl Clone for Session {
-    fn clone(&self) -> Self {
-        Self {
-            id: self.id,
-            state: self.state,
-            config: self.config.clone(),
-            context: self.context.clone(),
-            created_at: self.created_at,
-            last_activity: self.last_activity,
-        }
-    }
-}
-
 /// Thread-safe storage for sessions.
 pub struct SessionStore {
     sessions: RwLock<HashMap<SessionId, Session>>,
@@ -93,12 +67,12 @@ impl SessionStore {
         }
     }
 
-    /// Create a new session with the given configuration.
+    /// Create a new session.
     ///
     /// Returns the newly assigned session ID.
-    pub fn create(&self, config: SessionConfig) -> Result<SessionId> {
+    pub fn create(&self) -> Result<SessionId> {
         let id = SessionId::new();
-        let session = Session::new(id, config);
+        let session = Session::new(id);
 
         let mut sessions = self
             .sessions
@@ -204,7 +178,7 @@ mod tests {
     #[test]
     fn test_create_session() {
         let store = SessionStore::new();
-        let id = store.create(SessionConfig::default()).unwrap();
+        let id = store.create().unwrap();
 
         assert!(store.contains(&id).unwrap());
         assert_eq!(store.count(), 1);
@@ -213,7 +187,7 @@ mod tests {
     #[test]
     fn test_get_session() {
         let store = SessionStore::new();
-        let id = store.create(SessionConfig::default()).unwrap();
+        let id = store.create().unwrap();
 
         let session = store.get(&id).unwrap().unwrap();
         assert_eq!(session.id, id);
@@ -232,7 +206,7 @@ mod tests {
     #[test]
     fn test_update_session() {
         let store = SessionStore::new();
-        let id = store.create(SessionConfig::default()).unwrap();
+        let id = store.create().unwrap();
 
         store
             .update(&id, |s| {
@@ -256,7 +230,7 @@ mod tests {
     #[test]
     fn test_remove_session() {
         let store = SessionStore::new();
-        let id = store.create(SessionConfig::default()).unwrap();
+        let id = store.create().unwrap();
 
         let removed = store.remove(&id).unwrap();
         assert!(removed.is_some());
@@ -269,9 +243,9 @@ mod tests {
     #[test]
     fn test_list_ids() {
         let store = SessionStore::new();
-        let id1 = store.create(SessionConfig::default()).unwrap();
-        let id2 = store.create(SessionConfig::default()).unwrap();
-        let id3 = store.create(SessionConfig::default()).unwrap();
+        let id1 = store.create().unwrap();
+        let id2 = store.create().unwrap();
+        let id3 = store.create().unwrap();
 
         let ids = store.list_ids().unwrap();
         assert_eq!(ids.len(), 3);
@@ -283,8 +257,8 @@ mod tests {
     #[test]
     fn test_remove_matching() {
         let store = SessionStore::new();
-        store.create(SessionConfig::default()).unwrap();
-        store.create(SessionConfig::default()).unwrap();
+        store.create().unwrap();
+        store.create().unwrap();
 
         // Mark one as terminated
         let ids = store.list_ids().unwrap();
@@ -312,9 +286,7 @@ mod tests {
         // Spawn 100 threads that each create a session
         for _ in 0..100 {
             let store = Arc::clone(&store);
-            handles.push(thread::spawn(move || {
-                store.create(SessionConfig::default()).unwrap()
-            }));
+            handles.push(thread::spawn(move || store.create().unwrap()));
         }
 
         let ids: Vec<SessionId> = handles.into_iter().map(|h| h.join().unwrap()).collect();

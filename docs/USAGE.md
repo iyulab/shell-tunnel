@@ -250,11 +250,10 @@ curl -X POST http://127.0.0.1:3000/api/v1/execute \
 ```
 
 That shell is `cmd /c` on Windows and `/bin/sh -c` on Unix, on **both**
-`/execute` and a session's execute (§3.2) — a session runs each command in a
-fresh shell of its own, not in a persistent one. `POST /api/v1/sessions` accepts
-a `shell` field and it currently has no effect; nothing but `cmd`/`sh` is
-spawned either way. Neither does a session carry state between calls: `set
-FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
+`/execute` and a session's execute (*Sessions* below) — a session runs each
+command in a fresh shell of its own, not in a persistent one, and there is no
+way to ask for a different one. Neither does a session carry state between
+calls: `set FOO=bar` followed by `echo %FOO%` prints `%FOO%`.
 
 Before 0.15.1 a quote in `command` reached the Windows shell as `\"`, so
 `dir /b "C:\Program Files"` was a syntax error and `powershell -c "a | b"` ran
@@ -303,26 +302,54 @@ consumer receives every chunk regardless, and its `result` message carries
 ### Sessions
 
 ```bash
-curl -X POST "$BASE/api/v1/sessions" -H "Authorization: Bearer $KEY" \
-     -H "Content-Type: application/json" -d '{}'
+curl -X POST "$BASE/api/v1/sessions" -H "Authorization: Bearer $KEY"
 # {"session_id":1,"session_id_str":"sess-00000001"}
 
 curl -X POST "$BASE/api/v1/sessions/1/execute" -H "Authorization: Bearer $KEY" \
-     -H "Content-Type: application/json" -d '{"command":"pwd"}'
+     -H "Content-Type: application/json" -d '{"command":"pwd","working_dir":"/srv"}'
+
+curl "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
+# {"session_id":1,"running":false,"last_exit_code":0,"execution_count":1,"idle_seconds":0.4}
 
 curl -X DELETE "$BASE/api/v1/sessions/1" -H "Authorization: Bearer $KEY"
 ```
 
-Create accepts `shell`, `working_dir`, `env`. Sessions are ready to execute the
-moment they are created.
+**Create takes no fields.** The body may be omitted; sending one means sending
+`{}`, and any field in it is refused with `422` naming the field. Sessions are
+ready to execute the moment they are created.
 
 **A session groups commands; it does not keep a shell alive.** Each execute runs
 in its own `cmd /c` (Windows) or `sh -c` (Unix), the same as `/execute` — so
-`set FOO=bar` is not visible to the next call, a `cd` does not persist, and the
-`shell` field above currently changes nothing. What a session does give you is
-an id the audit trail records against, per-session `working_dir` and `env`, and
-a place for streaming to attach. Use `working_dir` rather than a leading `cd`,
-and pass what you need in `env`.
+`set FOO=bar` is not visible to the next call and a `cd` does not persist.
+
+Set the directory and the environment **on each execute**: `working_dir` and
+`env` on `POST /api/v1/sessions/{id}/execute` do take effect (same request
+fields as *One-shot execution* above), and using them beats a leading `cd`.
+What a session gives you is an id the audit trail records against and a place
+for streaming to attach.
+
+Status reports `running` — whether a command is in flight right now. That is
+the one thing `idle_seconds` cannot tell you: the clock is touched when a
+command *starts* as well as when it ends, so a session thirty seconds into a
+build and one that has been idle for thirty seconds report the same
+`idle_seconds`.
+
+**Hanging up does not cancel a command.** If you close the socket or drop the
+HTTP request before its response, the command keeps running to its own end or
+its timeout. Deleting the session does not stop it either — that removes the
+bookkeeping and nothing else. What the disconnect *does* release is the
+session: it reports `running: false`
+immediately rather than waiting for a result nobody is left to receive. So a
+disconnect leaves `running` reading `false` while a command started in the
+session is still finishing, for as long as that command's timeout allows.
+
+> **Changed in 0.20.0.** Create used to accept `shell`, `working_dir` and `env`;
+> none of the three ever reached a command, and two of them were documented here
+> as though they did. They are gone rather than wired up, because where a command
+> runs is a per-execute decision and the per-execute fields already carry it.
+> Status used to report `state` (a four-value internal enum, two of whose values
+> this API never returned) and a `working_dir` echoed from creation that governed
+> nothing; `running` replaces both.
 
 ### Streaming over WebSocket
 
@@ -646,11 +673,20 @@ publishes. Narrow what a token can do with `--capabilities` or `--preset`.
 
 ### Audit trail
 
-`--audit-log <file>` appends one JSON object per line for every execution, for
-every request the authentication layer refuses, and for the file operations
-listed in the `kind` table below. **That table is the whole list** — an outcome
-absent from it leaves no entry. Three gaps are worth naming rather than leaving
-to be discovered.
+`--audit-log <file>` appends one JSON object per line for an execution that
+reaches its result, for every request the authentication layer refuses, and for
+the file operations listed in the `kind` table below. **That table is the whole
+list** — an outcome absent from it leaves no entry. Four gaps are worth naming
+rather than leaving to be discovered.
+
+**A command whose caller hangs up is not recorded**, and it did run. The entry
+is written where the result is handled, so a caller that disconnects first takes
+that step with it — while the command itself carries on to its end or its
+timeout (§3). Measured, not read off the code: one `/execute` that completed
+wrote its entry, and an identical one abandoned after a second left the trail
+unchanged twelve seconds later, well past when the command had finished. This is
+the gap to weigh if the trail is what you would reach for after an incident,
+because "no entry" and "never ran" look the same in it.
 
 **Reading is not recorded.** `list`, `stat` and `download` write nothing when
 they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.
@@ -769,8 +805,14 @@ carries what the command produced rather than what the response returned (§3). 
 presence is the signal — an entry without it describes a response that carried
 everything — so a truncated result stays distinguishable from a command that simply
 printed little, which is a question the response itself cannot answer once it is gone.
-Streaming (`WS …/ws`) executions never carry it: a WebSocket consumer receives every
-chunk regardless of the cap, so there is nothing about that delivery to flag.
+Streaming (`WS …/ws`) executions never carry it: the cap governs the collected result,
+not the socket, so there is nothing about that delivery to flag. What a consumer that
+keeps reading receives is every chunk; one that stops reading while its command runs
+on can miss chunks produced after that command's timeout has passed — measured at
+2 KB of 1 MB — because the stream stops waiting on it at that point rather than
+letting a stalled reader hold the command past its deadline. `total_bytes` on the
+result still counts everything the command produced, which is how a consumer tells
+the two apart.
 
 `upload.refused` covers every refusal `POST .../fs/uploads` returns **once the
 destination has resolved**. One case is deliberately outside it: a path that does not
@@ -1279,6 +1321,8 @@ startup rather than serving local-only.
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
 | **507** on an upload | destination's filesystem is out of space, or a quota on it is exhausted | free space and retry. A quota counts on both platforms — `EDQUOT` on Unix, `ERROR_DISK_QUOTA_EXCEEDED` on Windows — so a volume with space left can still answer this |
 | **422** `unknown field \`…\`, expected one of …` | a JSON body carries a field this server does not recognise — usually a misspelling such as `workingDir` for `working_dir`, or an `args` array, which `/execute` does not take (§3) | use the name the message lists. Nothing ran |
+| **422** `unknown field \`…\`, there are no fields` | `POST /api/v1/sessions` carries a body with anything in it. Create took `shell`, `working_dir` and `env` until 0.20.0 and none of them ever reached a command; they are gone rather than ignored (§3) | drop the field. Set `working_dir` and `env` on each **execute** instead, where they do take effect. Nothing ran |
+| **400** on `POST /api/v1/sessions` with an empty body | `Content-Type: application/json` was declared and no body sent. The route wants no body at all, but a declared JSON body still has to be one | send no content type and no body, or send `{}`. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
 | **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |

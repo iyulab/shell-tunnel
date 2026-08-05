@@ -152,10 +152,7 @@ pub fn remove_entry(path: &std::path::Path, _meta: &std::fs::Metadata) -> std::i
 /// from "the server has a bug, file a report" needs this to be reliable —
 /// the two respond completely differently.
 ///
-/// `ENOSPC` (`libc::ENOSPC`) is the same constant `src/pty/native.rs` and
-/// `src/pty/async_adapter.rs` already compare against for `EIO`, so this
-/// follows an established pattern rather than introducing a new way of
-/// reading `raw_os_error()`. `EDQUOT` (`libc::EDQUOT`) is its quota-analogue
+/// `EDQUOT` (`libc::EDQUOT`) accompanies `ENOSPC` as its quota-analogue
 /// sibling — a per-user or per-directory quota can be exhausted well before
 /// the volume itself is full, and from a client's perspective both answers
 /// are the same instruction ("free something up and retry"). Both are
