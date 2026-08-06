@@ -124,13 +124,26 @@ pub struct OutputChunk {
 }
 
 /// Source of output data.
+///
+/// **Execution only ever produces [`Combined`](OutputSource::Combined).** The
+/// executor merges a child's stdout and stderr into one stream before any chunk
+/// is built, so a consumer matching on this will never see the other two from
+/// this crate — do not write a branch that depends on telling them apart, and do
+/// not read the presence of these variants as a promise that separation is
+/// available. The variants and [`OutputChunk::stdout`] exist because separating
+/// the two streams is a standing proposal, not because it happens.
+///
+/// They are kept rather than deleted so the day that proposal lands does not
+/// also change this type's shape. That is a judgement, and it comes with the
+/// cost of this paragraph: a half-built structure reads as a working one unless
+/// it says otherwise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputSource {
-    /// Standard output.
+    /// Standard output. **Not produced by this crate** — see the type's note.
     Stdout,
-    /// Standard error (if separate).
+    /// Standard error. **Not produced by this crate** — see the type's note.
     Stderr,
-    /// Combined output.
+    /// Combined output. The only variant execution produces.
     Combined,
 }
 
@@ -142,6 +155,10 @@ impl OutputChunk {
     }
 
     /// Create a stdout chunk.
+    ///
+    /// **Nothing in this crate calls this** — execution merges the two streams
+    /// and builds every chunk with [`combined`](Self::combined). See
+    /// [`OutputSource`].
     pub fn stdout(raw: Vec<u8>) -> Self {
         Self::new(raw, OutputSource::Stdout)
     }
