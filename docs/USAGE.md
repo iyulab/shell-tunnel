@@ -357,6 +357,24 @@ command *starts* as well as when it ends, so a session thirty seconds into a
 build and one that has been idle for thirty seconds report the same
 `idle_seconds`.
 
+**A session left idle for an hour is swept.** It then answers `404` like any
+other unknown id, and the trail records `session.expired` (§4) so an abandoned
+session stays distinguishable from one you deleted. The sweep runs periodically
+rather than on request, so an idle server reclaims them too. Until 0.20.1
+nothing reclaimed a shell session at all: a client that created them and never
+deleted them accumulated them for as long as the server ran.
+
+**A session running a command is never swept**, however long its `idle_seconds`
+reads — which matters precisely because of the quirk above, where a session mid
+command and an abandoned one report the same figure. `running` is what parts
+them, and a command's own deadline is bounded (§3, `timeout_secs`), so nothing
+stays unsweepable indefinitely. To keep a session past the hour without a
+command in it, **run a command in it** — that is the only thing that restarts the
+clock. Reading its status does not: `idle_seconds` measures time since a command,
+not since you last looked, which is the same figure it has always reported. A
+consumer that holds a session open across gaps longer than an hour without
+executing anything will find it gone.
+
 **Hanging up does not cancel a command.** If you close the socket or drop the
 HTTP request before its response, the command keeps running to its own end or
 its timeout. Deleting the session does not stop it either — that removes the
@@ -821,6 +839,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `upload.failed` | `complete` failed for a reason other than the digest | `file`, `bytes`, `status`, `reason`, `upload_id` |
 | `upload.cancel` | a session was cancelled before completing | `file`, `bytes`, `upload_id` |
 | `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
+| `session.expired` | a shell session was swept automatically after an hour idle | `session_id` (no `file` or `command` — a swept session is named by nothing else, and what it last ran is already in its own `execute` entries) |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
 
 `output_bytes` appears on an `execute` entry **only when the output was capped**, and

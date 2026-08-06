@@ -7,6 +7,27 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A shell session left behind was never reclaimed.** `SessionStore` had no TTL, no cap
+  and no sweeper, and its own `remove_matching` had no caller outside tests — so a client
+  that created sessions and never `DELETE`d them accumulated them for as long as the
+  process ran. Upload sessions have had a periodic sweep against an hour's TTL since they
+  were introduced; shell sessions simply had no equivalent.
+
+  A session idle for an hour is now swept and answers `404` thereafter, with a
+  `session.expired` entry in the audit trail — sweeping silently would make an abandoned
+  session indistinguishable from one its client deleted. The sweep runs on the same
+  periodic task as the upload sweep, so an idle server reclaims them too.
+
+  **A session with a command running in it is never swept**, whatever its `idle_seconds`
+  reads. That clock is advanced when a command starts and when it ends and not in between,
+  so a session mid-command looks exactly as idle as an abandoned one; the state is what
+  parts them. Only running a command restarts the clock — reading a session's status does
+  not, which is what `idle_seconds` has always meant. A consumer that holds a session open
+  across gaps longer than an hour without executing anything will find it gone.
+
+  Per-session cost is small (measured: 3000 sessions for about 2.3 MB), so this is
+  unbounded growth rather than a fast leak.
+
 - **`timeout_secs` is now bounded by the range the API reference has always declared.**
   `docs/openapi.json` has carried `"minimum": 1, "maximum": 300` on that field since the
   route existed, and nothing enforced either. `timeout_secs: 999999999` was accepted and
@@ -32,6 +53,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   request for longer than 300 seconds now ends at 300 with `timed_out: true`. That is the
   reference being made true rather than a new limit being invented, but it is a behaviour
   change and is called out here for that reason.
+
+  **Library consumers are subject to it too, not only HTTP callers.** The bound lives in
+  the executor, so `Command::new(…).timeout(Duration::from_secs(3600))` and
+  `execute_with_timeout(…, Duration::from_secs(600))` are capped at 300 seconds exactly as
+  a `timeout_secs` of 3600 is — there is no path that runs a command under an unbounded
+  deadline. `Command::timeout` still records what was asked for; `Command::effective_timeout`
+  reports what will be enforced, and `MIN_TIMEOUT`/`MAX_TIMEOUT` are exported beside
+  `DEFAULT_TIMEOUT` so a consumer can check before calling rather than discovering it from
+  a `timed_out` result.
 
 - **A command that left a background process behind leaked a thread and a pipe handle,
   every time, for the life of the server.** Each execution attended its two output pipes

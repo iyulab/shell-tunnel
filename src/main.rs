@@ -512,41 +512,61 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         }
     }
 
-    // A server that goes quiet after `SESSION_TTL` elapses would otherwise
-    // hold every expired session's file descriptor and staging file
-    // indefinitely — `create_upload_blocking`'s own opportunistic sweep
-    // (`src/api/fs.rs`) only runs when a *new* upload is requested, which
-    // never happens on an idle server. This is the actual mechanism; the
-    // opportunistic call stays too, bounding staging growth between ticks.
-    if state.fs.is_some() {
+    // Reclaiming what a client abandoned. Nothing else does it on a quiet
+    // server: `create_upload_blocking`'s opportunistic sweep (`src/api/fs.rs`)
+    // only runs when a *new* upload is requested, and a shell session had no
+    // opportunistic path at all — `SessionStore::sweep_idle` had no caller
+    // outside tests, so a client that created sessions and never `DELETE`d
+    // them accumulated them for as long as the process ran.
+    //
+    // One task for both, because both answer the same question on the same
+    // clock, and two tickers would be two places to keep in step. Shell
+    // sessions are swept unconditionally; uploads only when a filesystem root
+    // makes them reachable at all.
+    {
+        let store = state.store.clone();
         let uploads = state.uploads.clone();
         let audit = state.audit.clone();
+        let sweep_uploads = state.fs.is_some();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(300));
             loop {
                 ticker.tick().await;
-                // Both `UploadStore::sweep` (removes staging files) and
-                // `AuditSink::record` (opens/writes/flushes the audit log)
-                // are blocking I/O, so — unlike the brief this task started
-                // from, which called this straight from the spawned async
-                // task — the call itself is wrapped in `spawn_blocking` here.
-                // Same convention as every filesystem route in
-                // `src/api/fs.rs` (`src/execution/executor.rs:209-215`): a
+                // `UploadStore::sweep` (removes staging files) and
+                // `AuditSink::record` (opens/writes/flushes the audit log) are
+                // both blocking I/O, so — unlike the brief this task started
+                // from, which called them straight from the spawned async task
+                // — the calls are wrapped in `spawn_blocking` here. Same
+                // convention as every filesystem route in `src/api/fs.rs`: a
                 // slow disk must never stall the worker pool that also runs
                 // `/health` and the accept loop.
+                let store = store.clone();
                 let uploads = uploads.clone();
                 let audit = audit.clone();
-                let dropped = tokio::task::spawn_blocking(move || {
-                    shell_tunnel::api::fs::sweep_expired_uploads(
-                        &uploads,
+                let (sessions_dropped, uploads_dropped) = tokio::task::spawn_blocking(move || {
+                    let sessions = shell_tunnel::api::sweep::sweep_expired_sessions(
+                        &store,
                         &audit,
-                        shell_tunnel::fs::SESSION_TTL,
-                    )
+                        shell_tunnel::session::IDLE_TTL,
+                    );
+                    let uploads = if sweep_uploads {
+                        shell_tunnel::api::fs::sweep_expired_uploads(
+                            &uploads,
+                            &audit,
+                            shell_tunnel::fs::SESSION_TTL,
+                        )
+                    } else {
+                        0
+                    };
+                    (sessions, uploads)
                 })
                 .await
-                .unwrap_or(0);
-                if dropped > 0 {
-                    info!("swept {dropped} expired upload session(s)");
+                .unwrap_or((0, 0));
+                if sessions_dropped > 0 {
+                    info!("swept {sessions_dropped} idle shell session(s)");
+                }
+                if uploads_dropped > 0 {
+                    info!("swept {uploads_dropped} expired upload session(s)");
                 }
             }
         });

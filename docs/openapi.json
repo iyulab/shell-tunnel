@@ -26,7 +26,7 @@
     },
     {
       "name": "Sessions",
-      "description": "Session management operations"
+      "description": "Session management operations. A session is an id the audit trail records against and a place for streaming to attach; it does not keep a shell alive. A session left idle for an hour is swept automatically and answers 404 thereafter, with a `session.expired` audit entry; only running a command restarts that clock, and a session with a command in flight is never swept."
     },
     {
       "name": "Execution",
@@ -209,7 +209,7 @@
             }
           },
           "404": {
-            "description": "Session not found",
+            "description": "Session not found — unknown id, or a session swept after an hour idle.",
             "content": {
               "application/json": {
                 "schema": {
@@ -243,7 +243,7 @@
             "description": "Session deleted successfully"
           },
           "404": {
-            "description": "Session not found",
+            "description": "Session not found — unknown id, or a session swept after an hour idle.",
             "content": {
               "application/json": {
                 "schema": {
@@ -313,7 +313,7 @@
             "$ref": "#/components/responses/ForbiddenError"
           },
           "404": {
-            "description": "Session not found",
+            "description": "Session not found — unknown id, or a session swept after an hour idle.",
             "content": {
               "application/json": {
                 "schema": {
@@ -436,7 +436,7 @@
             "description": "WebSocket connection established"
           },
           "404": {
-            "description": "Session not found"
+            "description": "Session not found — unknown id, or a session swept after an hour idle."
           },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"

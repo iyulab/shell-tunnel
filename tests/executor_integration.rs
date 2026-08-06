@@ -384,6 +384,24 @@ fn execution_takes_its_deadline_from_one_bounded_place() {
          backstop's. A third means a new path; fewer means one of them went back \
          to computing its own"
     );
+
+    // What the two assertions above do *not* cover, stated rather than implied.
+    //
+    // The first is name-dependent: it catches `command.timeout`, which is what
+    // both deadline sites were called, and would miss the same bypass written
+    // through a differently-named binding. This file already contains
+    // `cmd.timeout` in its own tests, which is why the check cannot simply be
+    // widened to `.timeout` — it would match those and fail for no reason.
+    //
+    // The second counts a method name in text, so a doc comment that mentions
+    // `effective_timeout()` breaks it. That direction is loud rather than
+    // silent, which is the acceptable one, and it is the same trade
+    // `no_threads_are_spawned_to_read_a_pipe` makes.
+    //
+    // Both are structural guards over a rule the compiler cannot see. Neither
+    // is a proof that no unbounded deadline can ever be constructed; what they
+    // do is make the bypass that actually happened, and the split that would
+    // undo the fix, fail loudly instead of compiling quietly.
 }
 
 /// A command that leaves a background process behind must still return on its
