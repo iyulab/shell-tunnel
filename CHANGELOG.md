@@ -7,6 +7,32 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **`timeout_secs` is now bounded by the range the API reference has always declared.**
+  `docs/openapi.json` has carried `"minimum": 1, "maximum": 300` on that field since the
+  route existed, and nothing enforced either. `timeout_secs: 999999999` was accepted and
+  honoured — one caller could hold a blocking thread for decades while the published
+  reference said the maximum was five minutes. At the other end, `timeout_secs: 0` was
+  taken literally as a deadline that had already passed, so the command was killed on the
+  control loop's first pass having run nothing at all, and the caller got
+  `timed_out: true` for a command that never started.
+
+  Values are **clamped, not refused**, which is the shape `max_output_bytes` already uses:
+  a larger value asks for as long as possible and gets 300, a zero asks for the shortest
+  timeout there is and gets 1. `timed_out` and `duration_ms` report what actually happened
+  either way. The same range now applies over the WebSocket, whose `timeout_secs` carried
+  no declared bounds at all.
+
+  The deadline is computed in exactly one place (`Command::effective_timeout`). It had
+  been worked out twice — once to time the command out and once to decide when a stalled
+  streaming consumer stops being waited on — and clamping only the first would have killed
+  a command at the ceiling while still feeding its stream for the hours originally asked
+  for.
+
+  **This can change behaviour for a caller who was relying on the unenforced range**: a
+  request for longer than 300 seconds now ends at 300 with `timed_out: true`. That is the
+  reference being made true rather than a new limit being invented, but it is a behaviour
+  change and is called out here for that reason.
+
 - **A command that left a background process behind leaked a thread and a pipe handle,
   every time, for the life of the server.** Each execution attended its two output pipes
   with a dedicated thread doing a blocking `read()`. Such a thread ends only at EOF, and

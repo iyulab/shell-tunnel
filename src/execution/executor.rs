@@ -18,6 +18,37 @@ use crate::Result;
 /// Default execution timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The longest timeout a caller may ask for.
+///
+/// `docs/openapi.json` has declared `"maximum": 300` on `timeout_secs` since the
+/// route existed, and `security::validation::ValidationConfig` names the same
+/// figure — but nothing enforced either, so `timeout_secs: 999999999` was
+/// accepted and honoured. That is the published reference being false, which is
+/// the failure this repository has been bitten by repeatedly; the value here is
+/// the one the reference already promises rather than a new one invented to
+/// match the code.
+///
+/// It also bounds a resource that is not local to the request. One command holds
+/// one blocking thread for its whole deadline, the runtime is built with tokio's
+/// default blocking pool, and `AuditSink::record_async` and every filesystem
+/// route *await* `spawn_blocking` — so a saturated pool stalls routes that have
+/// nothing to do with the command holding it.
+///
+/// Clamped rather than refused, as [`MAX_OUTPUT_BYTES_CEILING`] is: the caller
+/// asked for "as long as possible", and `timed_out` plus `duration_ms` report
+/// what actually happened either way.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// The shortest timeout a caller may ask for.
+///
+/// The same declaration carries `"minimum": 1`, and it was equally unenforced:
+/// `timeout_secs: 0` produced a deadline that had already passed, so *every*
+/// command died on its first pass through the control loop having run nothing.
+/// A caller who sends zero has asked for the smallest timeout there is, so that
+/// is what they get — the alternative, treating zero as "no timeout", would read
+/// an opt-out into a field whose whole purpose is the opposite.
+pub const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// How much output a command's result keeps, unless the caller asks for less.
 ///
 /// Until 0.14.0 nothing bounded this: the only effective limit was the timeout,
@@ -109,7 +140,7 @@ fn run_command_streaming(
     mut on_chunk: impl FnMut(&[u8]),
 ) -> Result<ExecutionResult> {
     let start = Instant::now();
-    let timeout_duration = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
+    let timeout_duration = command.effective_timeout();
 
     let mut os_cmd = shell_command(&command.command_line);
     os_cmd
@@ -375,7 +406,10 @@ impl CommandExecutor {
     )> {
         let (tx, rx) = mpsc::channel::<OutputChunk>(64);
         let command = command.clone();
-        let budget = command.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        // The same deadline the blocking core will enforce, from the same place
+        // it gets it — see `Command::effective_timeout` for why that matters
+        // here in particular.
+        let budget = command.effective_timeout();
 
         let handle = tokio::task::spawn_blocking(move || {
             // Past this instant the command is due to be killed anyway, so no

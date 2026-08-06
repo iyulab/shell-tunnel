@@ -340,6 +340,52 @@ async fn a_short_stream_still_reports_the_true_output_size() {
     );
 }
 
+/// Execution must take its deadline from `Command::effective_timeout` and
+/// nowhere else.
+///
+/// That method is where `timeout_secs` gets clamped into the range
+/// `docs/openapi.json` publishes, so a path that reads `command.timeout`
+/// directly is a path with no bounds — which is the state this replaced, where
+/// `timeout_secs: 999999999` was honoured and `0` was taken as a deadline that
+/// had already passed. It also has to be *one* place: the deadline was worked
+/// out twice, once to kill the command and once to decide when a stalled
+/// streaming consumer stops being waited on, and clamping only the first would
+/// have killed a command at the ceiling while still feeding its stream for the
+/// hours originally asked for.
+///
+/// Read off the source, and the limit is worth stating: this proves where the
+/// deadline comes from, not what it is — `Command::effective_timeout`'s own unit
+/// tests pin the arithmetic.
+///
+/// A behavioural test was written first and withdrawn, which is why this is here
+/// instead. The cheap observable is the floor: with a zero deadline the command
+/// is killed having run nothing, and with the floor applied it gets a second and
+/// finishes. But "a shell starts and echoes inside one second" is a race, and on
+/// a loaded machine it loses — that test passed alone and failed under the full
+/// suite. The expensive observable is the ceiling, which takes five minutes to
+/// reach. Neither is a test worth having, and a green that depends on winning a
+/// race is worse than none.
+#[test]
+fn execution_takes_its_deadline_from_one_bounded_place() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
+    let source = std::fs::read_to_string(&path).expect("source file is readable");
+
+    assert!(
+        !source.contains("command.timeout"),
+        "src/execution/executor.rs reads the requested timeout directly; a deadline \
+         taken from `Command::timeout` skips the bounds `docs/openapi.json` publishes. \
+         Use `Command::effective_timeout()` — and keep it to one call site per \
+         deadline, so the streaming backstop cannot outlive the command it backs"
+    );
+    assert_eq!(
+        source.matches("effective_timeout()").count(),
+        2,
+        "exactly two deadlines are taken: the command's own, and the streaming \
+         backstop's. A third means a new path; fewer means one of them went back \
+         to computing its own"
+    );
+}
+
 /// A command that leaves a background process behind must still return on its
 /// own schedule, not on that process's.
 ///

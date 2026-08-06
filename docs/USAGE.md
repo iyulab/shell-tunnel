@@ -231,7 +231,17 @@ curl -X POST "$BASE/api/v1/execute" \
 ```
 
 Request fields: `command` (required), `working_dir`, `env` (object),
-`timeout_secs` (default 30), `max_output_bytes` (default 1 MiB, ceiling 8 MiB).
+`timeout_secs` (default 30, range 1–300), `max_output_bytes` (default 1 MiB,
+ceiling 8 MiB).
+
+Both bounds are **clamped rather than refused**: a `timeout_secs` above 300 asks
+for as long as possible and gets 300, and `0` asks for the shortest timeout there
+is and gets 1 — not a deadline that has already passed. `timed_out` and
+`duration_ms` on the response say what actually happened either way. The same
+range applies to a `timeout_secs` sent over the WebSocket (*Streaming* below);
+one execute path enforces it for both. Until 0.20.1 neither bound was enforced
+anywhere — `docs/openapi.json` had declared 1–300 throughout while the server
+accepted and honoured anything, and this page named only the default.
 
 `command` is the **whole command line**, and there is no `args` array — unlike
 `spawn`-style APIs, where the program and its arguments are separate. Sending
