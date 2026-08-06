@@ -1345,7 +1345,7 @@
           },
           "last_exit_code": {
             "type": "integer",
-            "description": "Exit code of last command"
+            "description": "Exit code of the last command run in this session. **Absent until one has run** — it is omitted rather than sent as null, which is why it is not in `required`. `execution_count` is 0 in exactly that case."
           },
           "execution_count": {
             "type": "integer",
