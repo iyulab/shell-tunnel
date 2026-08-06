@@ -294,6 +294,15 @@ impl AuditSink {
     /// to put it and used to call `record` straight from the runtime thread.
     /// This is that missing half: same write, same ordering.
     ///
+    /// What this buys and what it costs were both measured rather than reasoned
+    /// (`tests/blocking_pool.rs`). With every blocking thread held, `/health`
+    /// answered in 2.5 µs — the worker threads really are untouched. The same
+    /// run had this method take 2.96 s against 1.57 ms once a thread was free:
+    /// moving blocking work off the workers does not make it free, it moves it
+    /// onto a pool that is shared with every command in flight. So a burst of
+    /// concurrent commands does delay an audited response, and that is a
+    /// deliberate trade against blocking the accept loop, not an oversight.
+    ///
     /// Awaited rather than detached, deliberately. Spawning and walking away
     /// would return the response first and leave the entry to land whenever —
     /// or not at all, if the process stops in between. An audit trail that
