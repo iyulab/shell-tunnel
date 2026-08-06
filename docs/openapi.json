@@ -771,7 +771,7 @@
           {
             "name": "recursive",
             "in": "query",
-            "description": "Required to remove a real directory; without it, a directory target is refused with `400 recursive-required`. Has no effect on a file, symlink, or other non-directory node — those are always removed regardless of this flag.",
+            "description": "Required to remove a real directory; without it, a directory target is refused with `400 recursive-required`. **This flag has no effect on a file, symlink, or other non-directory node** — such a target is removed with or without it, and setting it neither enables nor blocks anything there. That is about the flag, not a promise the removal succeeds: the filesystem can still refuse one, which is `500 delete-failed`.",
             "schema": {
               "type": "boolean",
               "default": false
