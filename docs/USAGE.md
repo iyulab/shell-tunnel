@@ -1374,6 +1374,32 @@ A relay connection that drops is retried with exponential backoff (1s→60s); th
 device keeps its URL, so callers need no change. A *tunnel* that dies takes the
 server down instead, because a restart would allocate a different URL.
 
+### What many commands at once do to everything else
+
+Commands queue rather than fail. Each one in flight occupies one thread of the
+runtime's blocking pool for as long as it runs, and the server leaves that pool
+at the runtime default — **512**. So the 513th concurrent command does not run
+late, it does not *start* until one of the 512 finishes, and a command holds its
+thread for at most its `timeout_secs` (§3, ceiling 300 s).
+
+Requests that do their own blocking work — the filesystem API, and anything that
+writes an audit entry — draw on that same pool, so they queue behind commands
+too. **`GET /health` does not**: it touches no pool and is answered by the
+runtime's worker threads, which the commands are not holding. That is what makes
+it usable as a liveness probe on a busy server, and it is the reason blocking
+work is put behind the pool in the first place.
+
+Measured rather than reasoned, on a deliberately small pool so the boundary is
+observable: with a pool of four, one command took 2.69 s, four together 2.94 s —
+they overlap — and five 5.50 s, the fifth waiting a whole round. With every
+thread of the pool held, `/health` answered in 2.5 µs while a request that writes
+an audit entry took 2.96 s, against 1.57 ms for the same write with the pool
+free. The 512 above is the shipped pool size, not a figure extrapolated from
+those runs.
+
+There is no concurrency limit to configure. If you need one, impose it in the
+caller.
+
 ### Which failures are safe to retry
 
 A relay failure does not tell you, on its own, whether the request ran. Two of them do:
