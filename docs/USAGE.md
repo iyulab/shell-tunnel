@@ -1129,9 +1129,15 @@ Two secrets, deliberately separate — they are not interchangeable:
 | `--enroll-token` | the relay | which **devices** may attach, and who may list them |
 | `-k` / `--api-key` | each device | which **callers** may run commands there |
 
-The relay forwards `Authorization` untouched and never inspects, stores, or logs
-it. Neither secret travels in a URL, so nothing leaks into the access logs of a
-proxy in front of the relay.
+**A proxied request's `Authorization` is forwarded untouched.** The relay does not
+read it, keep it, or log it — it belongs to the device's API key, which the relay
+has no copy of and could not check. The one header the relay does read is the
+`Authorization` on its own `GET /relay/v1/devices`, which carries the enrol token
+rather than a device key; that is the relay authenticating a request *to itself*,
+not looking at one passing *through* it.
+
+Neither secret travels in a URL, so nothing leaks into the access logs of a proxy
+in front of the relay.
 
 **Single-tenant.** All devices share one enrol token, so anyone holding it can
 attach connections for any device on that relay. Run a relay for devices you
@@ -1379,8 +1385,13 @@ server down instead, because a restart would allocate a different URL.
 Commands queue rather than fail. Each one in flight occupies one thread of the
 runtime's blocking pool for as long as it runs, and the server leaves that pool
 at the runtime default — **512**. So the 513th concurrent command does not run
-late, it does not *start* until one of the 512 finishes, and a command holds its
-thread for at most its `timeout_secs` (§3, ceiling 300 s).
+late, it does not *start* until one of the 512 finishes.
+
+A command's `timeout_secs` (§3, ceiling 300 s) bounds how long it *runs*, not how
+long it holds its thread. Tearing down a timed-out command happens on that same
+thread afterwards, and on Windows that shells out to `taskkill` — a process spawn,
+measured at 6.1 s on an idle workstation and over 28 s on a loaded one. Size a
+concurrency budget against the timeout plus teardown, not the timeout alone.
 
 Requests that do their own blocking work — the filesystem API, and anything that
 writes an audit entry — draw on that same pool, so they queue behind commands
