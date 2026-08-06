@@ -23,6 +23,7 @@
 
 mod command;
 mod executor;
+mod pipe;
 mod result;
 
 pub use command::{Command, CommandBuilder};

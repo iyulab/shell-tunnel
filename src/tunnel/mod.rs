@@ -231,11 +231,13 @@ mod tests {
 
     #[test]
     fn a_silent_provider_times_out() {
-        // Sleeps well past the deadline without printing anything.
+        // Sleeps well past the deadline without printing anything. Five minutes
+        // rather than thirty seconds so the gap to the bound below is wide
+        // enough that load cannot close it — see the bound's own note.
         #[cfg(windows)]
-        let quiet = "ping -n 30 127.0.0.1 > nul";
+        let quiet = "ping -n 300 127.0.0.1 > nul";
         #[cfg(unix)]
-        let quiet = "sleep 30";
+        let quiet = "sleep 300";
 
         let start_at = Instant::now();
         let err = start(&fake(quiet), addr(), Duration::from_millis(300)).unwrap_err();
@@ -245,8 +247,14 @@ mod tests {
         // ends it fast: tearing the provider down shells out to `taskkill` on
         // Windows, which is itself a process spawn and can take seconds on a
         // loaded machine. A tight bound here measures the host, not the code.
+        //
+        // Which is what it was doing. Twenty seconds against a thirty-second
+        // command left ten seconds of margin, and a busy workstation ate it —
+        // this failed repeatedly there on an unmodified tree. The margin is now
+        // in the command rather than the tolerance, so the bound still parts a
+        // hang (five minutes) from a working deadline by a wide gap.
         assert!(
-            start_at.elapsed() < Duration::from_secs(20),
+            start_at.elapsed() < Duration::from_secs(60),
             "the deadline should end the wait, not hang"
         );
     }

@@ -1,14 +1,13 @@
 //! Command execution engine.
 
-use std::io::Read;
 use std::process::Stdio;
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
 use super::command::Command;
+use super::pipe::PipeDrain;
 use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
@@ -46,37 +45,21 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 /// prevent.
 pub const MAX_OUTPUT_BYTES_CEILING: u64 = 8 * 1024 * 1024;
 
-/// Default buffer size for reading process output.
-const READ_BUFFER_SIZE: usize = 4096;
-
 /// Poll interval for the non-blocking control loop.
 const CONTROL_POLL: Duration = Duration::from_millis(5);
 
 /// Hard backstop for collecting trailing output after the process has ended.
-/// Bounds the tail so a lingering grandchild that inherited a pipe cannot block
+/// Bounds the tail so a lingering grandchild that inherited a pipe cannot hold
 /// the return past this grace period.
 const COLLECT_GRACE: Duration = Duration::from_millis(500);
 
-/// Spawn a reader thread that pumps a pipe into `tx` until EOF.
-fn spawn_pipe_reader<R: Read + Send + 'static>(
-    mut reader: R,
-    tx: std_mpsc::Sender<Vec<u8>>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut buf = [0u8; READ_BUFFER_SIZE];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF: the process closed this pipe
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
-                        break; // control side went away
-                    }
-                }
-                Err(_) => break, // broken pipe / closed handle
-            }
-        }
-    })
-}
+/// Most bytes taken from one pipe in one pass of the control loop.
+///
+/// The loop must reach its `try_wait` and deadline checks on every pass, so a
+/// command producing output faster than it is consumed — `cat` of a large file,
+/// a build log — must not be able to keep the loop inside a drain. Large enough
+/// that streaming megabytes costs a handful of passes rather than thousands.
+const DRAIN_BUDGET: usize = 256 * 1024;
 
 /// Run a non-interactive command with an *enforceable* timeout.
 ///
@@ -95,13 +78,28 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
 /// decision was made. A feature that genuinely needs a TTY brings one back —
 /// the reasons above are what it would have to answer for.)
 ///
-/// The design keeps a blocking `read()` from ever stalling progress:
-/// - stdout and stderr are each pumped by a dedicated reader thread (reading
-///   only one while the other's pipe buffer fills would deadlock the child).
-/// - the control loop here is fully non-blocking: it drains the channel, polls
-///   `try_wait()`, and checks the deadline, so the timeout is actually honored.
-/// - on timeout the child is killed; both pipes then close and the reader
-///   threads reach EOF, so nothing leaks.
+/// Nothing here ever blocks on a `read()`, which is what lets one loop own
+/// everything:
+/// - both pipes are drained by [`PipeDrain`], which reads only what is already
+///   there. Draining both every pass is what keeps one pipe's buffer from
+///   filling — and deadlocking the child — while the other is attended to.
+/// - the same loop polls `try_wait()` and checks the deadline, so the timeout is
+///   actually honored. Each drain pass is bounded by [`DRAIN_BUDGET`] so a
+///   command producing output faster than it is read cannot postpone either.
+/// - the loop can therefore *give up* on a pipe. That is the property the
+///   previous design lacked: a dedicated reader thread per pipe had EOF as its
+///   only exit, EOF needs every write end closed, and a grandchild that
+///   inherited the pipes holds one open for as long as it runs. Those threads
+///   were never joined, so each such command leaked one — measured, unbounded,
+///   for the life of the process. Here the deadline below closes the read ends
+///   and returns; a pipe nobody is blocked on cannot be leaked.
+///
+/// Note what this does *not* claim: a surviving grandchild is still surviving.
+/// It keeps its inherited handles and keeps running, and on the success path
+/// nothing kills it — the server has no grounds to decide that a background
+/// process a command deliberately started should die. What is guaranteed is
+/// narrower and is the part that belongs to this crate: **the server's own
+/// resources are released either way.**
 ///
 /// `on_chunk` is invoked for every output chunk as it arrives, which is what
 /// lets the streaming (WebSocket) path forward output live; the non-streaming
@@ -134,11 +132,8 @@ fn run_command_streaming(
 
     // stdout and stderr are merged into one output stream. True interleaving is
     // not guaranteed (nor is it with a TTY), but clients consume a single stream.
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (tx, rx) = std_mpsc::channel::<Vec<u8>>();
-    let out_handle = stdout.map(|s| spawn_pipe_reader(s, tx.clone()));
-    let err_handle = stderr.map(|s| spawn_pipe_reader(s, tx));
+    let mut out_pipe = child.stdout.take().map(PipeDrain::new);
+    let mut err_pipe = child.stderr.take().map(PipeDrain::new);
 
     // Non-blocking control loop.
     let cap = command
@@ -156,8 +151,8 @@ fn run_command_streaming(
     // `total_bytes` stays the true figure rather than the kept one.
     //
     // Draining continues after the cap is reached rather than stopping: the
-    // reader threads must keep emptying the pipes, or a child writing more than
-    // the cap would block on a full pipe buffer and never exit.
+    // pipes must keep being emptied, or a child writing more than the cap would
+    // block on a full pipe buffer and never exit.
     let mut absorb = |chunk: &[u8], raw_output: &mut Vec<u8>, total: &mut u64| {
         on_chunk(chunk);
         *total += chunk.len() as u64;
@@ -169,10 +164,36 @@ fn run_command_streaming(
         }
     };
 
+    // Both pipes, one bounded pass each. Returns how many bytes moved, which is
+    // what tells the caller whether there is any point sleeping before the next
+    // pass.
+    macro_rules! drain_pass {
+        () => {{
+            let mut moved = 0;
+            if let Some(pipe) = out_pipe.as_mut() {
+                moved += pipe.drain(DRAIN_BUDGET, &mut |chunk: &[u8]| {
+                    absorb(chunk, &mut raw_output, &mut total_bytes)
+                });
+            }
+            if let Some(pipe) = err_pipe.as_mut() {
+                moved += pipe.drain(DRAIN_BUDGET, &mut |chunk: &[u8]| {
+                    absorb(chunk, &mut raw_output, &mut total_bytes)
+                });
+            }
+            moved
+        }};
+    }
+
+    /// Whether every pipe has reached its end and nothing more can arrive.
+    macro_rules! pipes_ended {
+        () => {
+            out_pipe.as_ref().map_or(true, |p| p.finished())
+                && err_pipe.as_ref().map_or(true, |p| p.finished())
+        };
+    }
+
     loop {
-        while let Ok(chunk) = rx.try_recv() {
-            absorb(&chunk, &mut raw_output, &mut total_bytes);
-        }
+        let moved = drain_pass!();
 
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -193,26 +214,42 @@ fn run_command_streaming(
             break;
         }
 
-        std::thread::sleep(CONTROL_POLL);
+        // Only idle when there was nothing to move. A command mid-flood is
+        // served every pass instead of being metered at one pass per interval.
+        if moved == 0 {
+            std::thread::sleep(CONTROL_POLL);
+        }
     }
 
-    // Collect any remaining output. Once the process (and, on timeout, its whole
-    // tree) is gone, both pipe handles close, the reader threads reach EOF and
-    // drop their senders, and `recv_timeout` returns `Disconnected`. The grace
-    // deadline is a hard backstop so a stray grandchild that inherited a pipe
-    // can never block us — we return the timed-out result regardless.
-    drop(out_handle);
-    drop(err_handle);
+    // Collect the tail. Both pipes end on their own once every write end has
+    // closed — normally as the child exits, and on timeout once `kill_tree` has
+    // taken the tree with it. The grace deadline is the backstop for the case
+    // that has no other end: a grandchild inherited these pipes and is still
+    // holding them open. Reaching it closes our read ends and returns.
+    //
+    // That last step is the fix. The reader threads this replaced could not be
+    // told to stop — they were blocked in `read()` on a pipe held by a process
+    // this crate does not own, and dropping their `JoinHandle`s (which is all
+    // the old code could do) detached them rather than ending them. One thread
+    // and one handle leaked per such command, for the life of the server.
     let collect_deadline = Instant::now() + COLLECT_GRACE;
     loop {
-        match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(chunk) => absorb(&chunk, &mut raw_output, &mut total_bytes),
-            Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                if Instant::now() >= collect_deadline {
-                    break;
-                }
+        let moved = drain_pass!();
+
+        if pipes_ended!() {
+            break;
+        }
+        if Instant::now() >= collect_deadline {
+            if let Some(pipe) = out_pipe.as_mut() {
+                pipe.release();
             }
+            if let Some(pipe) = err_pipe.as_mut() {
+                pipe.release();
+            }
+            break;
+        }
+        if moved == 0 {
+            std::thread::sleep(CONTROL_POLL);
         }
     }
 

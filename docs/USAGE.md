@@ -276,6 +276,16 @@ by different layers, and the message is the same in both.
 `output` merges stdout and stderr. On timeout, `timed_out` is `true` and the
 whole process tree is killed.
 
+**A process the command leaves running is left running.** `some-daemon &`, or
+`start /b …` on Windows, returns as soon as the shell itself does: the call does
+not wait for what the command started, and the response is not held back for it.
+A timeout kills the whole tree, as above; a command that exits on its own has
+nothing killed for it. Such a process inherits the command's output pipes, so the
+server stops reading them shortly after the response is sent rather than waiting
+for the process to exit — anything it prints later goes nowhere. Its lifetime is
+the caller's to manage; this server does not supervise it, and no endpoint lists
+or stops it.
+
 **Output is capped.** `output` carries at most `max_output_bytes` — 1 MiB unless
 the request says otherwise — and `total_bytes` reports what the command actually
 produced. When the two differ, `truncated` is `true`:
@@ -295,9 +305,12 @@ and there is no way to disable the cap — an uncapped response is one the relay
 cannot deliver (§10). To read more than the cap allows, write the output to a
 file and fetch it with `GET /api/v1/fs/file`, which supports `Range`.
 
-The cap applies to the collected result, not to the stream: a WebSocket
-consumer receives every chunk regardless, and its `result` message carries
-`total_bytes` to confirm the whole stream arrived.
+The cap applies to the collected result, not to the stream. A WebSocket consumer
+**that keeps reading** receives every chunk regardless of the cap; one that stops
+reading while its command runs on can miss chunks produced after that command's
+timeout has passed (§4 says what that costs and why). `total_bytes` on the
+`result` message counts what the command produced either way, which is how the
+two are told apart.
 
 ### Sessions
 

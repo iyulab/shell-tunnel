@@ -3,6 +3,48 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Fixed
+
+- **A command that left a background process behind leaked a thread and a pipe handle,
+  every time, for the life of the server.** Each execution attended its two output pipes
+  with a dedicated thread doing a blocking `read()`. Such a thread ends only at EOF, and
+  EOF needs *every* holder of the write end to close it — so a grandchild that inherited
+  those pipes (a daemon, a watcher, anything started in the background) held them open
+  for as long as it ran, and the thread blocked forever. Nothing joined those threads,
+  so nothing noticed.
+
+  Measured on Windows before the fix: 30 such commands took a server from 21 threads and
+  81 handles to 52 and 122, with no path back short of killing the background process.
+  Two threads per command rather than one when the background process was quiet on both
+  pipes — the common case, since a daemon usually redirects its own output. Commands that
+  leave nothing running were never affected: 30 of those moved the figures not at all.
+
+  The pipes are now drained without blocking, from the control loop that already enforces
+  the timeout — `PeekNamedPipe` on Windows, `O_NONBLOCK` on Unix — so there is no thread
+  to leak and the loop can close its read ends and move on. After the fix the same 30
+  commands leave both figures where they started. No new dependency: the one Windows call
+  is declared directly.
+
+  **What has not changed:** a background process a command started is still left running.
+  Only a timeout kills a process tree; a command that exits on its own has nothing killed
+  for it, and that is deliberate — deciding to kill what a caller deliberately started is
+  a product question, not a leak fix. What is fixed is narrower and is the part that
+  belongs to this server: **its own resources are released either way.**
+
+### Changed
+
+- Two documentation sentences promised more than the code delivers, and are now conditional.
+  `docs/USAGE.md` §3 and the `total_bytes` description in `docs/openapi.json` both said a
+  streaming consumer receives every chunk. It holds for a consumer that keeps reading; one
+  that stops reading while its command runs on can miss chunks produced after that command's
+  timeout has passed, which 0.20.0 recorded as the price of removing a stall. The same
+  sentence was corrected in §4 at the time; these two were missed.
+
+- `docs/USAGE.md` §3 now states what happens to a process a command leaves running, which
+  nothing said before.
+
 ## 0.20.0 — 2026-08-05
 
 > ⚠ **Breaking for HTTP callers**, not only for library consumers. The HTTP changes are

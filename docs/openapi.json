@@ -1885,7 +1885,7 @@
               "total_bytes": {
                 "type": "integer",
                 "format": "int64",
-                "description": "Bytes the command produced. Carried without a `truncated` flag, unlike the REST response: every chunk reaches a streaming consumer as it arrives, so there is nothing here for a cap to discard."
+                "description": "Bytes the command produced. Carried without a `truncated` flag, unlike the REST response: the cap governs the collected result rather than the socket, so there is nothing here for a cap to discard. A consumer that keeps reading receives every chunk; one that stops reading while its command runs on can miss chunks produced after that command's timeout has passed."
               }
             }
           },
