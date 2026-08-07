@@ -510,7 +510,7 @@ mod tests {
     /// Observed through the output pipe rather than by hunting for a pid. A
     /// grandchild inherits the pipe, so the write end stays open for as long as
     /// it lives and the read end cannot reach EOF — the same mechanism that made
-    /// the reader threads removed in 0.20.1 hang forever. EOF arriving therefore
+    /// the reader threads removed in 0.21.0 hang forever. EOF arriving therefore
     /// *is* the proof that nothing in the tree survived.
     ///
     /// The margin is bought in the command, not in the tolerance: the grandchild

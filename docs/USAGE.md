@@ -239,7 +239,7 @@ for as long as possible and gets 300, and `0` asks for the shortest timeout ther
 is and gets 1 — not a deadline that has already passed. `timed_out` and
 `duration_ms` on the response say what actually happened either way. The same
 range applies to a `timeout_secs` sent over the WebSocket (*Streaming* below);
-one execute path enforces it for both. Until 0.20.1 neither bound was enforced
+one execute path enforces it for both. Until 0.21.0 neither bound was enforced
 anywhere — `docs/openapi.json` had declared 1–300 throughout while the server
 accepted and honoured anything, and this page named only the default.
 
@@ -371,7 +371,7 @@ build and one that has been idle for thirty seconds report the same
 **A session left idle for an hour is swept.** It then answers `404` like any
 other unknown id, and the trail records `session.expired` (§4) so an abandoned
 session stays distinguishable from one you deleted. The sweep runs periodically
-rather than on request, so an idle server reclaims them too. Until 0.20.1
+rather than on request, so an idle server reclaims them too. Until 0.21.0
 nothing reclaimed a shell session at all: a client that created them and never
 deleted them accumulated them for as long as the server ran.
 
