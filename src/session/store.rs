@@ -183,7 +183,17 @@ impl SessionStore {
     /// holds the session [`Active`](SessionState::Active) for the length of the
     /// command, and that guard closes every exit including a cancelled future.
     /// `Active` cannot hide an unbounded session either, since a command's
-    /// deadline is now bounded (`execution::MAX_TIMEOUT`).
+    /// deadline is bounded (`execution::MAX_TIMEOUT`).
+    ///
+    /// That last sentence is only true while the guard's life is the *command's*
+    /// life, which is a stronger condition than it sounds. Until 0.21.1 the
+    /// session WebSocket handler held it across delivery as well, and delivery
+    /// is bounded by nothing: a consumer that stopped reading its socket parked
+    /// the handler mid-send, so the session stayed `Active` — and unsweepable —
+    /// for as long as that consumer liked. Measured at 75 s on a command that
+    /// died at its 5 s deadline, ending when the consumer resumed rather than at
+    /// any deadline at all. A guard that outlives what it claims to track puts
+    /// this sweep back where it was before there was one.
     ///
     /// Ids are returned rather than counted so the caller can record what went;
     /// a session vanishing with no trace is what makes an abandoned one

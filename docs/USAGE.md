@@ -368,6 +368,14 @@ command *starts* as well as when it ends, so a session thirty seconds into a
 build and one that has been idle for thirty seconds report the same
 `idle_seconds`.
 
+It tracks the command and not the exchange around it, which is visible on the
+streaming path: a session whose consumer is reading slowly can report
+`running: false` while output from its last command is still being delivered.
+Until 0.21.1 it reported the exchange instead, and since a consumer may stop
+reading for as long as it likes, a session could read `running: true`
+indefinitely after its command had already been killed — 75 seconds, measured,
+on a command that died at its five-second deadline.
+
 **A session left idle for an hour is swept.** It then answers `404` like any
 other unknown id, and the trail records `session.expired` (§4) so an abandoned
 session stays distinguishable from one you deleted. The sweep runs periodically
@@ -379,7 +387,10 @@ deleted them accumulated them for as long as the server ran.
 reads — which matters precisely because of the quirk above, where a session mid
 command and an abandoned one report the same figure. `running` is what parts
 them, and a command's own deadline is bounded (§3, `timeout_secs`), so nothing
-stays unsweepable indefinitely. To keep a session past the hour without a
+stays unsweepable indefinitely — which holds only because `running` follows the
+command rather than the delivery of its output. It did not until 0.21.1, and a
+consumer that stopped reading a session's WebSocket kept that session out of the
+sweep for as long as it stayed away. To keep a session past the hour without a
 command in it, **run a command in it** — that is the only thing that restarts the
 clock. Reading its status does not: `idle_seconds` measures time since a command,
 not since you last looked, which is the same figure it has always reported. A

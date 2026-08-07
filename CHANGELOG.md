@@ -3,6 +3,27 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.21.1 — 2026-08-07
+
+### Fixed
+
+- **A session whose WebSocket consumer stopped reading was never reclaimed.** The guard that
+  marks a session busy spanned the delivery of the command's output as well as the command
+  itself. Delivery is bounded by nothing: a consumer that stops reading parks the handler
+  mid-send, so the session went on reporting `running: true` after its command had already
+  been killed at its own deadline — measured at 75 seconds on a command that died at 5, ending
+  when the consumer came back rather than at any deadline. The idle sweep skips sessions that
+  report a command running, on the grounds that a command's deadline bounds how long that can
+  last, so such a session was never swept at all. The guard now follows the command.
+
+  Two consequences worth knowing before upgrading. A consumer polling `GET
+  /api/v1/sessions/{id}` while it reads slowly will now see `running: false` where it saw
+  `true`, because output is still being delivered after the command is over. And the command
+  itself was never the problem — it died on time throughout; only the bookkeeping outlived it.
+
+  This bounds the session, not the socket. A consumer that never reads again still holds the
+  connection open: there is no WebSocket idle timeout, which is a separate open item.
+
 ## 0.21.0 — 2026-08-07
 
 > ⚠ **One behaviour change for an existing caller**: a `timeout_secs` above 300 now ends

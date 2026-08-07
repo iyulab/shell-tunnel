@@ -99,11 +99,19 @@ async fn handle_socket(
                 // reporting `running: false` and its idle clock running while a
                 // build was under way. The guard also covers the ways out that
                 // no branch below expresses.
-                let _busy = BusySession::begin(&state.store, &id).ok();
+                //
+                // Held in an `Option` so the delivery loop can put it down the
+                // moment the command itself is over: see `while_running`.
+                let mut busy = BusySession::begin(&state.store, &id).ok();
 
                 // Execute with streaming
                 match state.executor.execute_async(&cmd).await {
-                    Ok((mut rx, handle)) => {
+                    Ok((mut rx, mut handle)) => {
+                        // The command's own outcome, if it finished while output
+                        // was still being delivered — which is the normal case
+                        // for a consumer that reads slowly or not at all.
+                        let mut finished = None;
+
                         // Stream output chunks
                         while let Some(chunk) = rx.recv().await {
                             let output = WsServerMessage::Output {
@@ -111,7 +119,14 @@ async fn handle_socket(
                                 is_final: false,
                             };
                             if let Ok(json) = serde_json::to_string(&output) {
-                                if sink.send(Message::Text(json.into())).await.is_err() {
+                                let sent = while_running(
+                                    sink.send(Message::Text(json.into())),
+                                    &mut handle,
+                                    &mut finished,
+                                    &mut busy,
+                                )
+                                .await;
+                                if sent.is_err() {
                                     break;
                                 }
                             }
@@ -122,8 +137,15 @@ async fn handle_socket(
                         // loop that enforces the timeout — see `execute_async`.
                         drop(rx);
 
-                        // Wait for completion and send result
-                        match handle.await {
+                        // Wait for completion and send result. `while_running`
+                        // has usually taken it already — awaiting a handle it
+                        // has consumed would panic, which is why it is stored
+                        // rather than re-awaited.
+                        let outcome = match finished {
+                            Some(res) => res,
+                            None => handle.await,
+                        };
+                        match outcome {
                             Ok(Ok(result)) => {
                                 state
                                     .audit
@@ -191,9 +213,10 @@ async fn handle_socket(
                         }
                     }
                 }
-                // `_busy` drops here: idle again on every way out, including the
-                // ones that never reached the executor and the ones no branch
-                // here expresses.
+                // `busy` drops here if `while_running` did not already put it
+                // down: idle again on every way out, including the ones that
+                // never reached the executor and the ones no branch here
+                // expresses.
             }
             WsClientMessage::Ping => {
                 let pong = WsServerMessage::Pong;
@@ -203,6 +226,65 @@ async fn handle_socket(
             }
             _ => {
                 // Ignore other message types from client
+            }
+        }
+    }
+}
+
+/// The task running one streamed command, as `execute_async` hands it over.
+type CommandHandle = tokio::task::JoinHandle<crate::Result<crate::execution::ExecutionResult>>;
+
+/// What that task produced: the command's result, or the join error if the task
+/// itself came apart.
+type CommandOutcome =
+    std::result::Result<crate::Result<crate::execution::ExecutionResult>, tokio::task::JoinError>;
+
+/// Await `fut`, releasing the session's busy guard the moment the *command*
+/// ends rather than when delivery does.
+///
+/// The two are not the same wait, and the gap between them is unbounded. A
+/// consumer that stops reading its socket parks `sink.send` for as long as it
+/// likes; the command still dies at its own deadline (`forward_chunk` stops
+/// waiting on a stalled receiver there), but the handler is still inside a send
+/// and cannot reach the end of the arm where the guard would drop. Measured on
+/// 0.21.0: a command with `timeout_secs: 5` died at 5.005 s and its session went
+/// on reporting `running: true` for **75 seconds**, ending not at any deadline
+/// but at the instant the consumer resumed reading. A silent command released at
+/// 5.3 s, which is what says the delay belongs to undelivered output rather than
+/// to the deadline. The direct and relayed paths behaved identically.
+///
+/// That mattered beyond the field's own honesty: the idle sweep skips sessions
+/// in [`SessionState::Active`](crate::session::SessionState::Active), on the
+/// stated grounds that a command's deadline bounds how long that can last. A
+/// session pinned by an unread socket is therefore never swept at all.
+///
+/// `fut` is pinned once and re-polled rather than re-created, so a send that was
+/// half-written when the command finished is resumed, not cancelled — cancelling
+/// mid-frame would corrupt the stream. The handle branch is disabled after it
+/// fires, since polling a completed `JoinHandle` panics.
+///
+/// This bounds the *session*, not the socket: a consumer that never reads again
+/// still holds the connection, which is the separate open item (there is no
+/// WebSocket idle timeout).
+async fn while_running<F: std::future::Future>(
+    fut: F,
+    handle: &mut CommandHandle,
+    finished: &mut Option<CommandOutcome>,
+    busy: &mut Option<BusySession>,
+) -> F::Output {
+    tokio::pin!(fut);
+    loop {
+        if finished.is_some() {
+            return fut.await;
+        }
+        tokio::select! {
+            out = &mut fut => return out,
+            res = &mut *handle => {
+                *finished = Some(res);
+                // Dropping the guard returns the session to idle and restarts
+                // its clock from the command's end, which is the instant the
+                // clock is meant to measure from.
+                *busy = None;
             }
         }
     }

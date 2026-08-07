@@ -239,6 +239,111 @@ async fn a_command_over_a_session_websocket_marks_the_session_running() {
     );
 }
 
+/// A session leaves `Active` when its *command* ends, not when the consumer
+/// gets round to reading the output.
+///
+/// The two used to be the same wait, and the second one is unbounded: a
+/// consumer that stops reading parks the handler inside `sink.send`, so the
+/// guard that marks the session busy could not drop even though the command had
+/// already been killed at its deadline. Measured on 0.21.0 over both the direct
+/// and relayed paths — a command that died at 5.005 s left its session reporting
+/// `running: true` for 75 seconds, ending at the instant the consumer resumed
+/// rather than at any deadline. The idle sweep skips `Active` sessions on the
+/// stated grounds that a command's deadline bounds them, so such a session was
+/// never reclaimed at all.
+///
+/// This test reads nothing until after it has watched the session go idle. It
+/// asserts both directions: `running` must be observed **true** first, or a fix
+/// that simply never marked the session busy would pass; and the result frame
+/// must still arrive afterwards with `timed_out`, or a command that died some
+/// other way would look the same. The 30 s ceiling is a hang detector, not a
+/// measurement — the discriminating gap is against the command's own 2 s
+/// deadline, and the command itself is unbounded so it cannot end early on a
+/// slow machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_goes_idle_when_the_command_ends_not_when_the_consumer_resumes() {
+    let addr = spawn_server().await;
+    let base = format!("http://{}/api/v1", addr);
+    let client = reqwest_lite::Client;
+
+    let created = client
+        .post_json(&format!("{base}/sessions"), "{}")
+        .await
+        .expect("create session");
+    let id = created["session_id"].as_u64().expect("session_id");
+
+    let (mut ws, _resp) =
+        tokio_tungstenite::connect_async(&format!("ws://{}/api/v1/sessions/{}/ws", addr, id))
+            .await
+            .expect("WebSocket connect failed");
+
+    // Endlessly talkative, and a shell builtin on both platforms: the point is
+    // to fill the socket the consumer is not draining, and a test whose premise
+    // is an interpreter starting measures the interpreter (cycle-110).
+    let loud = if cfg!(windows) {
+        "for /L %i in (1,1,100000000) do @echo pinning-the-session-with-output"
+    } else {
+        "while :; do echo pinning-the-session-with-output; done"
+    };
+    ws.send(Message::text(format!(
+        r#"{{"type":"execute","command":"{loud}","timeout_secs":2}}"#
+    )))
+    .await
+    .expect("send failed");
+
+    let poll_running = |want: bool| {
+        let base = base.clone();
+        async move {
+            let client = reqwest_lite::Client;
+            tokio::time::timeout(Duration::from_secs(30), async {
+                loop {
+                    let status = client
+                        .get_json(&format!("{base}/sessions/{id}"))
+                        .await
+                        .expect("session status");
+                    if status["running"] == want {
+                        return status;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+        }
+    };
+
+    poll_running(true)
+        .await
+        .expect("the session never reported `running: true` — nothing marked it busy");
+
+    // Still not a single frame read from `ws`.
+    let idle = poll_running(false).await.expect(
+        "the session stayed `running: true` after its command's deadline, with the consumer \
+         not reading — the busy guard is spanning delivery again",
+    );
+    assert_eq!(idle["running"], false, "{idle}");
+
+    // Only now does the consumer come back. Delivery must still complete, and
+    // the result must say the command was killed by its own deadline.
+    let result = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(msg) = ws.next().await {
+            if let Ok(Message::Text(t)) = msg {
+                let v: serde_json::Value = serde_json::from_str(&t).unwrap();
+                if v["type"] == "result" {
+                    return v;
+                }
+            }
+        }
+        panic!("the socket closed without a result frame");
+    })
+    .await
+    .expect("timed out waiting for the result frame after the consumer resumed");
+
+    assert_eq!(
+        result["timed_out"], true,
+        "the command should have been killed by its own deadline: {result}"
+    );
+}
+
 /// Minimal HTTP helper — this suite has no HTTP client dependency and needs
 /// only two verbs against a loopback address.
 mod reqwest_lite {
