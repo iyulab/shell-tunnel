@@ -1064,6 +1064,18 @@ A certificate without its key (or the reverse) is refused at startup, and an
 unreadable or mismatched pair stops the relay rather than letting it serve
 plaintext. The advertised URL becomes `https://…` automatically.
 
+**The generated certificate does not expire** — the validity period is the
+certificate library's default, `1975-01-01` to `4096-01-01`, and this product
+does not narrow it. With fingerprint pinning that is irrelevant, since dates are
+not consulted (below); with `--relay-ca` an ordinary verifier does look at them,
+and the two tested here accept it. What it means either way is that **nothing
+ever prompts you to rotate the key**, and the pair is reused across restarts by
+design. Rotating is deleting both files and restarting — which mints a new
+certificate, and therefore a new fingerprint, and therefore breaks the join line
+of every device already attached. That is the reason the period was left alone
+rather than shortened: a finite one turns that breakage into a scheduled event
+you have to plan for.
+
 Renewed certificates are picked up without a restart: the files are checked once
 a minute, and a replacement is loaded for new handshakes while existing
 connections keep the certificate they started with. A file that is unreadable

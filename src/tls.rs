@@ -57,6 +57,34 @@ impl TlsFiles {
     ///
     /// Returns whether a certificate was generated, so the caller can tell an
     /// operator what just happened.
+    ///
+    /// **The validity period is `rcgen`'s default and effectively unbounded** —
+    /// measured on a generated pair: `notBefore` 1975-01-01, `notAfter`
+    /// 4096-01-01, 774,680 days. That is inherited rather than chosen, and it is
+    /// worth saying so here, because everything else about these parameters is
+    /// chosen: the names are assembled by hand a few lines below.
+    ///
+    /// Where it does not matter: the trust path this product actually advertises
+    /// is fingerprint pinning, and `relay::client::PinnedCertificate` says in as
+    /// many words that name validity and chain building are not consulted. The
+    /// banner's claim that the fingerprint is the whole trust anchor is true,
+    /// and was verified over a WAN relay against a live handshake.
+    ///
+    /// Where it might: the banner also offers `--relay-ca`, which is ordinary
+    /// verification, and a verifier is entitled to reject a certificate on its
+    /// dates. The two this product was tested against (rustls and .NET) accepted
+    /// it, so no claim is made that anything refuses it today.
+    ///
+    /// What it costs regardless of either: a certificate that never expires
+    /// gives an operator no occasion to rotate the key, and this one is reused
+    /// across restarts by design (see above). A leaked relay key has no natural
+    /// event that retires it.
+    ///
+    /// Left as it is deliberately rather than by omission. Choosing a finite
+    /// period means choosing a rotation procedure too, and rotation changes the
+    /// fingerprint — which breaks the join line of every attached device. That
+    /// trade-off is a decision for whoever runs a fleet, not one to make while
+    /// passing through.
     pub fn ensure_self_signed(&self, names: &[String]) -> Result<bool> {
         if self.exist() {
             return Ok(false);

@@ -34,6 +34,17 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   and `execution_count: 0` together while frames are still arriving. `docs/openapi.json` and
   the `BusySession` doc comment carry the same split.
 
+- **The generated TLS certificate never expires, and that is now written down.** `--tls-self-signed`
+  takes the certificate library's default validity — 1975-01-01 to 4096-01-01, measured on a
+  generated pair — while every other parameter of that certificate is chosen deliberately. It
+  does not matter on the trust path this product advertises, since fingerprint pinning does not
+  consult dates, and the verifiers tested against `--relay-ca` accept it. What it does mean is
+  that nothing ever prompts a key rotation, on a pair that is reused across restarts by design.
+  The period is unchanged: shortening it would make the fingerprint change — and so break every
+  attached device's join line — into a scheduled event, which is a decision for whoever runs a
+  fleet. `docs/USAGE.md` §5 and the `ensure_self_signed` doc comment now say all of this instead
+  of leaving it to be discovered.
+
 - **`fs/list`'s `limit` bounds the response, not the work — now said so.** Every page walks and
   sorts everything under `path` before slicing out its slice, so a page costs what the tree
   costs however small the page is: measured, 93 MB and 1.3 s for `limit=1` and `limit=10000`
