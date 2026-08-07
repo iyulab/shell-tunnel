@@ -3,7 +3,11 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## Unreleased
+## 0.21.0 — 2026-08-07
+
+> ⚠ **One behaviour change for an existing caller**: a `timeout_secs` above 300 now ends
+> at 300 rather than running for as long as it asked. The range was published in
+> `docs/openapi.json` from the day the route existed and nothing enforced it — see *Fixed*.
 
 ### Added
 
@@ -22,15 +26,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   existing MSRV runner, since what is being caught is "does this run without features", not
   portability.
 
-### Documentation
+- **`--kill-orphans`: end whatever a command leaves running when the command ends.** Off by
+  default, which is exactly what the server did before — a command that starts a daemon on
+  purpose still gets to keep it, and no existing deployment changes behaviour by upgrading.
 
-- **WebSocket connection lifetime is now written down, and it was measured rather than read.**
-  `docs/USAGE.md` said nothing about it while listing a `ping`/`pong` message pair, which reads
-  as liveness management the server does not do: it answers a ping it is sent and never sends
-  one, and there is no inactivity deadline. What it does *not* mean is that abandoned
-  connections pile up — 600 connections opened and dropped in batches of 50 left the server's
-  handle count identical from the second batch to the twelfth. The case with no measurement is
-  the one with no TCP signal either, a network path that dies silently.
+  With the flag set, the command's descendants are ended on every exit path, the timeout
+  branch included. Output the background process had already written is still collected;
+  what it would have written after being killed is not. The two behaviours are both
+  legitimate and only the operator knows which applies — a machine used to *launch* services
+  wants the default, a machine running throwaway or untrusted commands wants the flag.
+
+  There is deliberately no per-request form. Whether a process may outlive a request is a
+  property of the machine, not of the request, so the same command line means the same thing
+  whoever sends it. Library consumers opt in with `CommandExecutor::kill_orphans`.
 
 ### Changed
 
@@ -50,24 +58,6 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
   Library consumers are unaffected: `AuditSink::file` is still unbounded, and the default is
   applied by the binary.
-
-### Added
-
-- **`--kill-orphans`: end whatever a command leaves running when the command ends.** Off by
-  default, which is exactly what the server did before — a command that starts a daemon on
-  purpose still gets to keep it, and no existing deployment changes behaviour by upgrading.
-
-  With the flag set, the command's descendants are ended on every exit path, the timeout
-  branch included. Output the background process had already written is still collected;
-  what it would have written after being killed is not. The two behaviours are both
-  legitimate and only the operator knows which applies — a machine used to *launch* services
-  wants the default, a machine running throwaway or untrusted commands wants the flag.
-
-  There is deliberately no per-request form. Whether a process may outlive a request is a
-  property of the machine, not of the request, so the same command line means the same thing
-  whoever sends it. Library consumers opt in with `CommandExecutor::kill_orphans`.
-
-### Changed
 
 - **Terminating a command's process tree no longer spawns a process to do it.** On Windows
   the kill ran `taskkill /T /F /PID`, so ending a process cost a full process spawn — and
@@ -172,7 +162,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   a product question, not a leak fix. What is fixed is narrower and is the part that
   belongs to this server: **its own resources are released either way.**
 
-### Changed
+### Documentation
+
+- **WebSocket connection lifetime is now written down, and it was measured rather than read.**
+  `docs/USAGE.md` said nothing about it while listing a `ping`/`pong` message pair, which reads
+  as liveness management the server does not do: it answers a ping it is sent and never sends
+  one, and there is no inactivity deadline. What it does *not* mean is that abandoned
+  connections pile up — 600 connections opened and dropped in batches of 50 left the server's
+  handle count identical from the second batch to the twelfth. The case with no measurement is
+  the one with no TCP signal either, a network path that dies silently.
 
 - Two documentation sentences promised more than the code delivers, and are now conditional.
   `docs/USAGE.md` §3 and the `total_bytes` description in `docs/openapi.json` both said a
