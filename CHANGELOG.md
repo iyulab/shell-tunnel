@@ -5,6 +5,17 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## 0.21.1 — 2026-08-07
 
+### Added
+
+- **Two startup signals for defaults that were being reversed in silence.** A server started
+  with `--kill-orphans` now says so under an `Orphans:` heading; a relay started with
+  `--no-rate-limit` now warns that its enrol token can be guessed at line speed. Both were
+  invisible: a device running with `--kill-orphans` printed a banner not one byte different
+  from one running without it, even though the flag reverses what `--help` promises, and a
+  relay dropped its brute-force defence without a word — while a *device* given the same flag
+  had always warned. Neither prints anything when the default is in force; the deviation is
+  the signal, as it already is for the generated key and the upload chunk size.
+
 ### Fixed
 
 - **A session whose WebSocket consumer stopped reading was never reclaimed.** The guard that

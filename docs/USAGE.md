@@ -307,6 +307,13 @@ have printed after being killed is not. There is no per-request form of this: it
 is a property of the machine, so the same command line means the same thing
 whoever sends it.
 
+A server started with it says so on startup, under an `Orphans:` heading; one
+running the default prints nothing there, since the default is the behaviour
+described above. Until 0.21.1 neither did, and the two banners were identical —
+so a machine on which daemons quietly died with the request that started them
+could only be told apart from a normal one by reading the process's command
+line.
+
 **Output is capped.** `output` carries at most `max_output_bytes` — 1 MiB unless
 the request says otherwise — and `total_bytes` reports what the command actually
 produced. When the two differ, `truncated` is `true`:
@@ -1194,7 +1201,9 @@ Every relay route except `/health` is limited per client IP (100/minute by
 default, `--no-rate-limit` to disable). This is not decoration, and it holds two
 things back rather than one: enrolment attempts land on `/relay/v1/control`, so
 without a limit a weak enrolment token can be guessed at line speed — and it is
-also the only thing bounding the device-name lookup described below.
+also the only thing bounding the device-name lookup described below. A relay
+started with the flag warns at startup for that reason; until 0.21.1 it took
+effect in silence, while a *device* given the same flag had always warned.
 
 **A device's own connections are charged and then refunded once it has proven
 the enrol token**, so what accumulates against an address is failed and

@@ -1248,3 +1248,145 @@ fn help_names_the_audit_rotation_default_the_binary_uses() {
         "--help must say what 0 does, or an operator reads it as a zero-byte limit. Got:\n{stdout}"
     );
 }
+
+/// A device started with `--kill-orphans` says so, and one without it does not.
+///
+/// The flag reverses a promise `--help` makes in as many words — "a daemon
+/// started on purpose is meant to outlive the request" — and a device running
+/// with it used to print a banner not one byte different from a device running
+/// without it. An operator inheriting such a server, whose deployment daemon
+/// then died with the request that started it, had nothing to read anywhere:
+/// not the banner, not the response, not the audit trail.
+///
+/// Both directions are asserted from one run each, because the absence half is
+/// the one that catches a line printed unconditionally — which would be a
+/// worse defect than the silence, since a banner that always claims the flag
+/// is on tells every operator the wrong thing rather than one of them nothing.
+/// `tests/kill_orphans_e2e.rs` proves the *behaviour* from the router down; it
+/// never sees a banner, because it serves an `AppState` rather than spawning
+/// the binary.
+#[test]
+fn the_banner_says_when_kill_orphans_is_on_and_stays_quiet_when_it_is_not() {
+    let with = spawn_and_read_banner(&["--host", "0.0.0.0", "--port", "0", "--kill-orphans"]);
+    let without = spawn_and_read_banner(&["--host", "0.0.0.0", "--port", "0"]);
+
+    let orphan_line = with
+        .iter()
+        .find(|l| l.starts_with("Orphans:"))
+        .unwrap_or_else(|| {
+            panic!(
+                "--kill-orphans left no trace in the banner. Got:\n{}",
+                with.join("\n")
+            )
+        });
+    assert!(
+        orphan_line.contains("--kill-orphans"),
+        "the line must name the flag, or an operator cannot tell what to remove: {orphan_line}"
+    );
+    assert!(
+        with.iter()
+            .any(|l| l.contains("does NOT outlive its request")),
+        "the line must say what stops happening, not only that a flag is set. Got:\n{}",
+        with.join("\n")
+    );
+    assert!(
+        !without.iter().any(|l| l.starts_with("Orphans:")),
+        "the default behaviour is the documented one and needs no line. Got:\n{}",
+        without.join("\n")
+    );
+}
+
+/// Spawn an exposed server, read its banner up to the file-API block, and
+/// return every line seen.
+///
+/// `File API:` is the last block of the banner, so waiting for the line after
+/// which nothing more is printed is what makes an *absence* assertion sound: a
+/// test that stopped reading earlier could not tell "the line is not printed"
+/// from "the line had not been printed yet".
+fn spawn_and_read_banner(args: &[&str]) -> Vec<String> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+    // The audit-scope note is the last line an exposed bare bind prints, and
+    // the orphan line sits above it — so reaching this predicate means the
+    // whole banner has been read, including the place the orphan line would
+    // have been. `Public URL`/`Try:` never appear on a bare bind.
+    wait_for_stdout_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("nothing is outside a machine-wide file API")
+    })
+}
+
+/// A relay started with its limiter off says what that turned off.
+///
+/// The relay's limiter is not throughput management: enrolment attempts land on
+/// a relay route, so it is the only thing standing between a weak enrol token
+/// and line-speed guessing — which `docs/USAGE.md` says outright. The *device*
+/// warned on the same flag; the relay, the more exposed of the two, said
+/// nothing. Measured on 0.21.0: 200 wrong tokens, 200 `401`s, no `429`.
+///
+/// This test is why the warning sits below `logging::init`. Written beside the
+/// flag it reads — the obvious place — it compiled, ran, and printed nothing,
+/// because no subscriber existed that early. Reading the code could not have
+/// shown that; spawning the binary did.
+#[test]
+fn a_relay_started_without_its_limiter_says_what_that_turned_off() {
+    let port = reserved_port().to_string();
+    let child = Command::new(BIN)
+        .args([
+            "relay",
+            "--port",
+            &port,
+            "--enroll-token",
+            "t",
+            "--no-rate-limit",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let lines = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("relay listening on")
+    });
+    let warning = lines
+        .iter()
+        .find(|l| l.contains("rate limiting is disabled"))
+        .unwrap_or_else(|| {
+            panic!(
+                "a relay that dropped its brute-force defence said nothing. Got:\n{}",
+                lines.join("\n")
+            )
+        });
+    assert!(
+        warning.contains("enrol token"),
+        "naming the flag is not enough — the line must say what is now guessable: {warning}"
+    );
+
+    // The control. A relay keeping its limiter must not carry the warning, or
+    // the line means nothing wherever it appears.
+    let port = reserved_port().to_string();
+    let child = Command::new(BIN)
+        .args(["relay", "--port", &port, "--enroll-token", "t"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+    let lines = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("relay listening on")
+    });
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("rate limiting is disabled")),
+        "a relay with its limiter on must not claim otherwise. Got:\n{}",
+        lines.join("\n")
+    );
+}

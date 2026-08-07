@@ -453,6 +453,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // needed to name it.
     let chunk_size = resolve_chunk_size(&args);
 
+    // Above the file-API block rather than below it, so that the block's last
+    // line is still the last line of the banner. An absence assertion has to
+    // read past where the missing line would have been, and a test that stops
+    // at the previous line cannot tell "not printed" from "not printed yet".
+    for line in orphan_banner(args.kill_orphans) {
+        outln!("{line}");
+    }
     outln!("File API:    {}", fs_root.describe());
     // Only when it is not the plain default. A device joined to a relay
     // advertises a smaller chunk than a directly-reached one, and cycle-64
@@ -734,6 +741,25 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
     }
     std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
     logging::init();
+
+    // The gateway path says this through `PublicExposure`, whose comment gives
+    // the reason: a defence the consumer explicitly turned off is not something
+    // a default may decide for them. `run_relay` never touches that path, so
+    // the flag took effect in complete silence — while the *device*, the less
+    // exposed of the two, warned. Measured on 0.21.0: 200 wrong tokens, 200
+    // `401`s, no `429` at any point, and nothing said at startup.
+    //
+    // What it turns off is named rather than left as "rate limiting": a relay's
+    // limiter is not throughput management. Enrolment attempts land on a relay
+    // route, so without it a weak token can be guessed as fast as the link
+    // allows.
+    //
+    // It sits *below* `logging::init` because there is no subscriber above it —
+    // written beside the flag it reads, this line compiled, ran, and printed
+    // nothing at all. Found by running the binary, not by reading it.
+    if args.no_rate_limit {
+        warn!("rate limiting is disabled: the enrol token can be guessed at line speed");
+    }
 
     // `0.0.0.0` is a bind address, not somewhere a device can dial. Printing it
     // as a join URL would hand the operator a command that cannot work off-box,
@@ -1246,6 +1272,34 @@ fn generated_enroll_token_note() -> &'static str {
 /// as a qualifier of the line it follows rather than as a new fact.
 fn generated_api_key_lines(key: &str) -> String {
     format!("API key:     {key}   (generated)\n             not saved: a restart generates a new one and every existing caller is refused. Pass --api-key (or SHELL_TUNNEL_API_KEY) to keep it across restarts.")
+}
+
+/// The banner line for `--kill-orphans`, which is empty unless the flag is on.
+///
+/// The deviation is the signal, as it is for the generated key and the upload
+/// chunk size: a server behaving the documented way says nothing. What makes
+/// this one worth a line is that the flag *reverses* a promise `--help` makes
+/// in as many words — "a daemon started on purpose is meant to outlive the
+/// request" — and until 0.21.1 a device running with it printed a banner not
+/// one byte different from a device running without it. An operator inheriting
+/// such a server, whose deployment daemon then dies with the request that
+/// started it, had nothing to read: not the banner, not the response, not the
+/// audit trail. Only the process's own command line said so.
+///
+/// Unlike [`posture_banner`] this does not go quiet on a local bind. The reach
+/// of a token is a property of exposure; what happens to a process a command
+/// leaves behind is not.
+fn orphan_banner(kill_orphans: bool) -> Vec<String> {
+    if !kill_orphans {
+        return Vec::new();
+    }
+    // Two calls rather than one continued literal: `cargo fmt` folds a
+    // backslash continuation inside a string into a run of spaces, and this
+    // repository has shipped user-facing text that way four times.
+    vec![
+        "Orphans:     killed when the command ends (--kill-orphans)".to_string(),
+        "             a process a command leaves running does NOT outlive its request on this device".to_string(),
+    ]
 }
 
 /// The banner lines announcing the posture. Local is an empty list — with
