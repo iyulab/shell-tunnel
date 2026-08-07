@@ -74,8 +74,19 @@ pub struct Args {
     pub fs_root: Option<PathBuf>,
     /// Chunk size advertised to upload clients, in bytes.
     pub fs_chunk_size: Option<usize>,
-    /// Rotate the audit trail once it passes this many bytes.
-    pub audit_max_bytes: Option<u64>,
+    /// Rotation limit for the audit trail exactly as the operator wrote it.
+    ///
+    /// `None` means the flag was absent, which is *not* the same as unbounded —
+    /// see [`Args::audit_rotation_limit`], which is what callers should use.
+    /// Kept raw so the three cases (absent / a size / an explicit `0`) stay
+    /// distinguishable here.
+    pub audit_max_bytes_raw: Option<u64>,
+    /// Kill whatever a command leaves running when the command ends.
+    ///
+    /// Off by default: a command that deliberately starts a daemon expects it
+    /// to outlive the request, and turning that off by default would break it
+    /// silently. See `src/process.rs`.
+    pub kill_orphans: bool,
     /// Allow any CORS origin (permissive; opt-in for browser UIs).
     pub cors_allow_any: bool,
     /// Log level (error, warn, info, debug, trace).
@@ -120,9 +131,10 @@ impl Default for Args {
             relay_ca: None,
             allow_hosts: Vec::new(),
             audit_log: None,
-            audit_max_bytes: None,
+            audit_max_bytes_raw: None,
             fs_root: None,
             fs_chunk_size: None,
+            kill_orphans: false,
             cors_allow_any: false,
             log_level: None,
             version: false,
@@ -130,6 +142,31 @@ impl Default for Args {
             check_update: false,
             update: false,
             no_update_check: false,
+        }
+    }
+}
+
+impl Args {
+    /// The audit rotation limit to apply, or `None` to never rotate.
+    ///
+    /// Three inputs, three answers, and the middle one is the reason this is a
+    /// method rather than a field read:
+    ///
+    /// | `--audit-max-bytes` | result |
+    /// |---|---|
+    /// | absent | [`audit::DEFAULT_MAX_BYTES`](crate::audit::DEFAULT_MAX_BYTES) |
+    /// | `0` | `None` — never rotate |
+    /// | `N` | `Some(N)` |
+    ///
+    /// `0` has to mean "unbounded" rather than "rotate immediately", because
+    /// rotating at zero bytes would rotate on every single entry and keep
+    /// nothing. It is also the escape hatch for an operator who had the old
+    /// unbounded behaviour and wants it back.
+    pub fn audit_rotation_limit(&self) -> Option<u64> {
+        match self.audit_max_bytes_raw {
+            None => Some(crate::audit::DEFAULT_MAX_BYTES),
+            Some(0) => None,
+            Some(n) => Some(n),
         }
     }
 }
@@ -242,11 +279,14 @@ where
             }
             Long("audit-max-bytes") => {
                 let value: String = parser.value()?.parse()?;
-                result.audit_max_bytes = Some(
+                result.audit_max_bytes_raw = Some(
                     value
                         .parse()
                         .map_err(|_| ArgsError::InvalidValue("audit-max-bytes", value))?,
                 );
+            }
+            Long("kill-orphans") => {
+                result.kill_orphans = true;
             }
             Long("cors-allow-any") => {
                 result.cors_allow_any = true;
@@ -397,8 +437,12 @@ OPTIONS:
                             itself is never written)
                             [default: off; shell-tunnel-audit.jsonl when reachable]
         --audit-max-bytes <N>
-                            Rotate the audit trail to <FILE>.1 past this size
-                            [default: unbounded]
+                            Rotate the audit trail to <FILE>.1 past this size,
+                            keeping one generation. 0 never rotates
+                            [default: 67108864 (64 MiB)]
+        --kill-orphans      Kill anything a command leaves running when the
+                            command ends. Off by default, because a daemon
+                            started on purpose is meant to outlive the request
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
         --fs-root <PATH>    Confine the file API to this directory. Without it
                             the API reaches everything this account can
@@ -735,5 +779,42 @@ mod tests {
         let result = parse_args_from(vec![OsString::from("shell-tunnel")]).unwrap();
         assert!(!result.tunnel);
         assert!(result.tunnel_command.is_none());
+    }
+
+    /// The three inputs and the three answers, with `0` singled out.
+    ///
+    /// `0` meaning "never rotate" is the whole reason `audit_rotation_limit`
+    /// exists. Read as a plain size it would mean "rotate past zero bytes",
+    /// which rotates on every entry and keeps nothing — a trail that silently
+    /// retains one line is worse than one that is switched off, because it still
+    /// looks like a trail.
+    #[test]
+    fn the_audit_rotation_limit_maps_absent_zero_and_a_size_differently() {
+        let absent = parse_args_from(vec![OsString::from("shell-tunnel")]).unwrap();
+        assert_eq!(
+            absent.audit_rotation_limit(),
+            Some(crate::audit::DEFAULT_MAX_BYTES),
+            "an operator who said nothing gets the bounded default"
+        );
+
+        let zero = parse_args_from(vec![
+            OsString::from("shell-tunnel"),
+            OsString::from("--audit-max-bytes"),
+            OsString::from("0"),
+        ])
+        .unwrap();
+        assert_eq!(
+            zero.audit_rotation_limit(),
+            None,
+            "0 is the opt-out to the old unbounded behaviour, not a zero-byte limit"
+        );
+
+        let sized = parse_args_from(vec![
+            OsString::from("shell-tunnel"),
+            OsString::from("--audit-max-bytes"),
+            OsString::from("4096"),
+        ])
+        .unwrap();
+        assert_eq!(sized.audit_rotation_limit(), Some(4096));
     }
 }

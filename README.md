@@ -33,6 +33,10 @@ curl -X POST http://127.0.0.1:3000/api/v1/execute \
 #  "total_bytes":6,"truncated":false}
 ```
 
+That body is from a Unix host. The same call on Windows answers `"hello\r\n"` with
+`total_bytes: 7` — the command runs in the platform's own shell, so its line endings are the
+platform's too.
+
 That's the whole loop: run the binary, POST a command, get structured output. No config, no
 account, no daemon. When you want auth or a public URL, add one flag at a time — the next
 section shows each, including TLS on a relay you host. The gateway's own socket is plaintext.
@@ -171,7 +175,7 @@ authenticated, not just encrypted. The startup banner states what is actually in
 
 | | |
 |---|---|
-| [docs/USAGE.md](docs/USAGE.md) | Operating guide — every flag, endpoint, and failure mode |
+| [docs/USAGE.md](docs/USAGE.md) | Operating guide — the flags, the endpoints, and what each failure means |
 | [docs/openapi.json](docs/openapi.json) | Machine-readable API contract (OpenAPI 3.0) |
 
 ## Status

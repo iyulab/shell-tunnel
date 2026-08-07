@@ -23,8 +23,12 @@
 
 mod command;
 mod executor;
+mod pipe;
 mod result;
 
 pub use command::{Command, CommandBuilder};
-pub use executor::{execute_simple, execute_with_timeout, CommandExecutor, DEFAULT_TIMEOUT};
+pub use executor::{
+    execute_simple, execute_with_timeout, CommandExecutor, DEFAULT_TIMEOUT, MAX_TIMEOUT,
+    MIN_TIMEOUT,
+};
 pub use result::{ExecutionResult, OutputChunk, OutputSource};

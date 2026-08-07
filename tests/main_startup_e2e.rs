@@ -1185,3 +1185,66 @@ fn a_server_outlives_the_reader_of_its_stdout() {
     // Touch `server` after the request so the child is not killed before it.
     let _ = &mut server;
 }
+
+/// Both periodic sweeps are wired into the running server, not merely written.
+///
+/// `SessionStore::sweep_idle` and `UploadStore::sweep` are the only things that
+/// reclaim an abandoned session, and a sweep with no caller is indistinguishable
+/// from no sweep at all — which is exactly the state shell sessions were in:
+/// the reclaim method existed and nothing outside tests called it, so sessions
+/// accumulated for the life of the process.
+///
+/// Read off the source, and the reason is worth stating rather than implying:
+/// the sweeps run on a five-minute ticker against a one-hour TTL, so observing
+/// one from outside means either waiting an hour or making the interval and the
+/// TTL configurable purely so a test can shorten them. Adding configuration to
+/// a product surface to make a test possible is the tail wagging the dog, and
+/// an hour-long test would be skipped and then rot (this repository has already
+/// had three skipped tests whose stated reasons had quietly become false).
+///
+/// So what is pinned is the wiring: that the periodic task exists and calls
+/// both audit-aware sweeps. `SessionStore::sweep_idle`'s own unit tests pin what
+/// a sweep does; this pins that something asks for one.
+#[test]
+fn the_periodic_sweeps_are_wired_into_the_server() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+    let source = std::fs::read_to_string(&path).expect("source file is readable");
+
+    for call in [
+        "sweep_expired_sessions(",
+        "sweep_expired_uploads(",
+        "tokio::time::interval(",
+    ] {
+        assert!(
+            source.contains(call),
+            "src/main.rs no longer contains `{call}` — an abandoned session or upload is \
+             reclaimed by nothing else on a server that has gone quiet, and a reclaim \
+             method with no caller is the state this guard exists to prevent"
+        );
+    }
+}
+
+/// `--help` must name the audit rotation default the binary actually applies.
+///
+/// Read from the running binary rather than from the source string, because
+/// what an operator sees is the output — this repository has shipped
+/// user-facing text no test asserted on four separate occasions, and `--help`
+/// is the only place most operators ever read a default.
+///
+/// The pairing matters more than either half. A default that changes without
+/// the help changing, and help that names a default the code does not have,
+/// are the same defect seen from two sides, and both read as reassurance.
+#[test]
+fn help_names_the_audit_rotation_default_the_binary_uses() {
+    let (_code, stdout, _stderr) = run_with_timeout(&["--help"], Duration::from_secs(20));
+    let figure = shell_tunnel::audit::DEFAULT_MAX_BYTES.to_string();
+
+    assert!(
+        stdout.contains(&figure),
+        "--help should name {figure}, the limit it actually applies. Got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 never rotates"),
+        "--help must say what 0 does, or an operator reads it as a zero-byte limit. Got:\n{stdout}"
+    );
+}

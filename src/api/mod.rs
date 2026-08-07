@@ -36,6 +36,7 @@
 pub mod fs;
 pub mod handlers;
 pub mod router;
+pub mod sweep;
 pub mod types;
 pub mod websocket;
 

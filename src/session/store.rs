@@ -163,6 +163,48 @@ impl SessionStore {
         sessions.retain(|_, session| !predicate(session));
         Ok(before - sessions.len())
     }
+
+    /// Drop sessions that have sat idle past `ttl`, returning their ids.
+    ///
+    /// Nothing reclaimed a shell session before this: there was no TTL, no cap
+    /// and no sweeper, and [`remove_matching`](Self::remove_matching) had no
+    /// caller outside tests. A client that creates sessions and never `DELETE`s
+    /// them therefore accumulated them for as long as the process ran. Upload
+    /// sessions have had exactly this — a periodic sweep against
+    /// `fs::SESSION_TTL` — since they were introduced; shell sessions simply had
+    /// no equivalent.
+    ///
+    /// **A session running a command is never swept, whatever its idle clock
+    /// says.** That clock is only advanced when a command starts and when it
+    /// ends (`BusySession`), so during a long command it does not move at all —
+    /// idle time alone cannot tell "abandoned" from "busy", and a sweep keyed on
+    /// it would reap a session with a command actively running in it. The state
+    /// is what distinguishes them: the same guard that stops the clock also
+    /// holds the session [`Active`](SessionState::Active) for the length of the
+    /// command, and that guard closes every exit including a cancelled future.
+    /// `Active` cannot hide an unbounded session either, since a command's
+    /// deadline is now bounded (`execution::MAX_TIMEOUT`).
+    ///
+    /// Ids are returned rather than counted so the caller can record what went;
+    /// a session vanishing with no trace is what makes an abandoned one
+    /// indistinguishable from one the client deleted.
+    pub fn sweep_idle(&self, ttl: std::time::Duration) -> Result<Vec<SessionId>> {
+        let mut sessions = self
+            .sessions
+            .write()
+            .map_err(|_| ShellTunnelError::LockPoisoned)?;
+
+        let expired: Vec<SessionId> = sessions
+            .values()
+            .filter(|s| s.state != SessionState::Active && s.idle_duration() > ttl)
+            .map(|s| s.id)
+            .collect();
+
+        for id in &expired {
+            sessions.remove(id);
+        }
+        Ok(expired)
+    }
 }
 
 impl Default for SessionStore {
@@ -273,6 +315,79 @@ mod tests {
 
         assert_eq!(removed, 1);
         assert_eq!(store.count(), 1);
+    }
+
+    /// A session nobody has touched past the TTL goes.
+    ///
+    /// Nothing reclaimed one before: no TTL, no cap, no sweeper, and
+    /// `remove_matching` had no caller outside this file.
+    #[test]
+    fn an_idle_session_is_swept() {
+        let store = SessionStore::new();
+        let id = store.create().unwrap();
+        store
+            .update(&id, |s| {
+                let _ = s.state.transition_to(SessionState::Idle);
+            })
+            .unwrap();
+
+        // Every session here is older than a zero TTL.
+        let swept = store.sweep_idle(std::time::Duration::ZERO).unwrap();
+
+        assert_eq!(swept, vec![id], "the idle session must be the one reported");
+        assert_eq!(store.count(), 0);
+    }
+
+    /// A session running a command is never swept, however still its clock is.
+    ///
+    /// This is the contract the sweep exists under, and the one that is easy to
+    /// get wrong: `last_activity` is advanced when a command starts and when it
+    /// ends, and *not in between*, so a session mid-command looks exactly as
+    /// idle as an abandoned one. Keyed on the clock alone this sweep would reap
+    /// a session with a command actively running in it; `Active` is what parts
+    /// them.
+    #[test]
+    fn a_session_running_a_command_is_never_swept() {
+        let store = SessionStore::new();
+        let running = store.create().unwrap();
+        let abandoned = store.create().unwrap();
+        store
+            .update(&running, |s| {
+                let _ = s.state.transition_to(SessionState::Active);
+            })
+            .unwrap();
+        store
+            .update(&abandoned, |s| {
+                let _ = s.state.transition_to(SessionState::Idle);
+            })
+            .unwrap();
+
+        let swept = store.sweep_idle(std::time::Duration::ZERO).unwrap();
+
+        assert_eq!(
+            swept,
+            vec![abandoned],
+            "only the abandoned session may be swept"
+        );
+        assert!(
+            store.contains(&running).unwrap(),
+            "a session with a command running in it must survive a sweep"
+        );
+    }
+
+    /// A session younger than the TTL stays, so the sweep is not just "remove
+    /// everything that is not busy".
+    #[test]
+    fn a_session_within_the_ttl_stays() {
+        let store = SessionStore::new();
+        let id = store.create().unwrap();
+
+        let swept = store
+            .sweep_idle(std::time::Duration::from_secs(3600))
+            .unwrap();
+
+        assert!(swept.is_empty(), "nothing has been idle for an hour yet");
+        assert!(store.contains(&id).unwrap());
     }
 
     #[test]

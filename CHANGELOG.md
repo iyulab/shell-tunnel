@@ -3,6 +3,185 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.21.0 — 2026-08-07
+
+> ⚠ **One behaviour change for an existing caller**: a `timeout_secs` above 300 now ends
+> at 300 rather than running for as long as it asked. The range was published in
+> `docs/openapi.json` from the day the route existed and nothing enforced it — see *Fixed*.
+
+### Added
+
+- **`CONTRIBUTING.md`.** The three commands CI actually gates on — `cargo fmt --all -- --check`,
+  `cargo test-all`, `cargo clippy-all` — were written down only in a file that is not committed,
+  so they did not reach anyone who cloned the repository. The first is the one that gets
+  forgotten, because the other two have cargo aliases and it cannot have one.
+
+  It also records why `cargo test-all` is not `cargo test --all`: with `default = []` the
+  feature-gated suites compile to zero tests, so they do not fail, they stop existing, and the
+  run still reports `ok`.
+
+- **CI now runs the default build's tests, not just its build.** Every other job enables
+  `relay-client,tls`, so a test that only compiles with a feature could sit red in the default
+  build indefinitely while all three OS jobs stayed green. One did. No new job — one step on the
+  existing MSRV runner, since what is being caught is "does this run without features", not
+  portability.
+
+- **`--kill-orphans`: end whatever a command leaves running when the command ends.** Off by
+  default, which is exactly what the server did before — a command that starts a daemon on
+  purpose still gets to keep it, and no existing deployment changes behaviour by upgrading.
+
+  With the flag set, the command's descendants are ended on every exit path, the timeout
+  branch included. Output the background process had already written is still collected;
+  what it would have written after being killed is not. The two behaviours are both
+  legitimate and only the operator knows which applies — a machine used to *launch* services
+  wants the default, a machine running throwaway or untrusted commands wants the flag.
+
+  There is deliberately no per-request form. Whether a process may outlive a request is a
+  property of the machine, not of the request, so the same command line means the same thing
+  whoever sends it. Library consumers opt in with `CommandExecutor::kill_orphans`.
+
+### Changed
+
+- **The audit trail now rotates by default, at 64 MiB.** It was unbounded, and it is on by
+  default whenever the server is reachable — so a long-running device accumulated one line
+  per execution forever. Filling the disk is a distinct way to take a server down from
+  running out of memory, and it is self-defeating: a trail that fills the disk stops
+  recording, so "keep everything" kept nothing past that point.
+
+  One generation is kept beside the live file, so a trail bounds itself at 128 MiB on disk.
+  At the size an entry actually is — around 200 bytes — that retains on the order of 670,000
+  entries.
+
+  **`--audit-max-bytes 0` restores the old behaviour** for an operator who would rather keep
+  everything and manage the size themselves. Zero means "never rotate" rather than "rotate at
+  zero bytes", which would keep nothing.
+
+  Library consumers are unaffected: `AuditSink::file` is still unbounded, and the default is
+  applied by the binary.
+
+- **Terminating a command's process tree no longer spawns a process to do it.** On Windows
+  the kill ran `taskkill /T /F /PID`, so ending a process cost a full process spawn — and
+  on a machine with a filter driver attached that is not a rounding error: 238 ms measured
+  on a quiet workstation, 6.12 s on the same machine while it was busy, over 28 s under a
+  parallel build. That latency sat inside the response time of every command that reached
+  its `timeout_secs` deadline.
+
+  The child and its descendants are now held in a job object, and the kill is
+  `TerminateJobObject` — one system call, measured at 0.097 ms against the identical
+  children in the same session. Unix is unchanged: it already signalled the process group
+  with one call. The two are now one type rather than a pair of free functions, which also
+  removes a hazard the old path carried — it identified the tree by pid, and a pid can be
+  recycled once the child exits.
+
+  **What did not change: a command that leaves a background process running still leaves
+  it running.** The job is created without `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so
+  membership does not shorten any member's life, and the kill still happens only on the
+  timeout path. Only its cost changed.
+
+### Fixed
+
+- **A shell session left behind was never reclaimed.** `SessionStore` had no TTL, no cap
+  and no sweeper, and its own `remove_matching` had no caller outside tests — so a client
+  that created sessions and never `DELETE`d them accumulated them for as long as the
+  process ran. Upload sessions have had a periodic sweep against an hour's TTL since they
+  were introduced; shell sessions simply had no equivalent.
+
+  A session idle for an hour is now swept and answers `404` thereafter, with a
+  `session.expired` entry in the audit trail — sweeping silently would make an abandoned
+  session indistinguishable from one its client deleted. The sweep runs on the same
+  periodic task as the upload sweep, so an idle server reclaims them too.
+
+  **A session with a command running in it is never swept**, whatever its `idle_seconds`
+  reads. That clock is advanced when a command starts and when it ends and not in between,
+  so a session mid-command looks exactly as idle as an abandoned one; the state is what
+  parts them. Only running a command restarts the clock — reading a session's status does
+  not, which is what `idle_seconds` has always meant. A consumer that holds a session open
+  across gaps longer than an hour without executing anything will find it gone.
+
+  Per-session cost is small (measured: 3000 sessions for about 2.3 MB), so this is
+  unbounded growth rather than a fast leak.
+
+- **`timeout_secs` is now bounded by the range the API reference has always declared.**
+  `docs/openapi.json` has carried `"minimum": 1, "maximum": 300` on that field since the
+  route existed, and nothing enforced either. `timeout_secs: 999999999` was accepted and
+  honoured — one caller could hold a blocking thread for decades while the published
+  reference said the maximum was five minutes. At the other end, `timeout_secs: 0` was
+  taken literally as a deadline that had already passed, so the command was killed on the
+  control loop's first pass having run nothing at all, and the caller got
+  `timed_out: true` for a command that never started.
+
+  Values are **clamped, not refused**, which is the shape `max_output_bytes` already uses:
+  a larger value asks for as long as possible and gets 300, a zero asks for the shortest
+  timeout there is and gets 1. `timed_out` and `duration_ms` report what actually happened
+  either way. The same range now applies over the WebSocket, whose `timeout_secs` carried
+  no declared bounds at all.
+
+  The deadline is computed in exactly one place (`Command::effective_timeout`). It had
+  been worked out twice — once to time the command out and once to decide when a stalled
+  streaming consumer stops being waited on — and clamping only the first would have killed
+  a command at the ceiling while still feeding its stream for the hours originally asked
+  for.
+
+  **This can change behaviour for a caller who was relying on the unenforced range**: a
+  request for longer than 300 seconds now ends at 300 with `timed_out: true`. That is the
+  reference being made true rather than a new limit being invented, but it is a behaviour
+  change and is called out here for that reason.
+
+  **Library consumers are subject to it too, not only HTTP callers.** The bound lives in
+  the executor, so `Command::new(…).timeout(Duration::from_secs(3600))` and
+  `execute_with_timeout(…, Duration::from_secs(600))` are capped at 300 seconds exactly as
+  a `timeout_secs` of 3600 is — there is no path that runs a command under an unbounded
+  deadline. `Command::timeout` still records what was asked for; `Command::effective_timeout`
+  reports what will be enforced, and `MIN_TIMEOUT`/`MAX_TIMEOUT` are exported beside
+  `DEFAULT_TIMEOUT` so a consumer can check before calling rather than discovering it from
+  a `timed_out` result.
+
+- **A command that left a background process behind leaked a thread and a pipe handle,
+  every time, for the life of the server.** Each execution attended its two output pipes
+  with a dedicated thread doing a blocking `read()`. Such a thread ends only at EOF, and
+  EOF needs *every* holder of the write end to close it — so a grandchild that inherited
+  those pipes (a daemon, a watcher, anything started in the background) held them open
+  for as long as it ran, and the thread blocked forever. Nothing joined those threads,
+  so nothing noticed.
+
+  Measured on Windows before the fix: 30 such commands took a server from 21 threads and
+  81 handles to 52 and 122, with no path back short of killing the background process.
+  Two threads per command rather than one when the background process was quiet on both
+  pipes — the common case, since a daemon usually redirects its own output. Commands that
+  leave nothing running were never affected: 30 of those moved the figures not at all.
+
+  The pipes are now drained without blocking, from the control loop that already enforces
+  the timeout — `PeekNamedPipe` on Windows, `O_NONBLOCK` on Unix — so there is no thread
+  to leak and the loop can close its read ends and move on. After the fix the same 30
+  commands leave both figures where they started. No new dependency: the one Windows call
+  is declared directly.
+
+  **What has not changed:** a background process a command started is still left running.
+  Only a timeout kills a process tree; a command that exits on its own has nothing killed
+  for it, and that is deliberate — deciding to kill what a caller deliberately started is
+  a product question, not a leak fix. What is fixed is narrower and is the part that
+  belongs to this server: **its own resources are released either way.**
+
+### Documentation
+
+- **WebSocket connection lifetime is now written down, and it was measured rather than read.**
+  `docs/USAGE.md` said nothing about it while listing a `ping`/`pong` message pair, which reads
+  as liveness management the server does not do: it answers a ping it is sent and never sends
+  one, and there is no inactivity deadline. What it does *not* mean is that abandoned
+  connections pile up — 600 connections opened and dropped in batches of 50 left the server's
+  handle count identical from the second batch to the twelfth. The case with no measurement is
+  the one with no TCP signal either, a network path that dies silently.
+
+- Two documentation sentences promised more than the code delivers, and are now conditional.
+  `docs/USAGE.md` §3 and the `total_bytes` description in `docs/openapi.json` both said a
+  streaming consumer receives every chunk. It holds for a consumer that keeps reading; one
+  that stops reading while its command runs on can miss chunks produced after that command's
+  timeout has passed, which 0.20.0 recorded as the price of removing a stall. The same
+  sentence was corrected in §4 at the time; these two were missed.
+
+- `docs/USAGE.md` §3 now states what happens to a process a command leaves running, which
+  nothing said before.
+
 ## 0.20.0 — 2026-08-05
 
 > ⚠ **Breaking for HTTP callers**, not only for library consumers. The HTTP changes are

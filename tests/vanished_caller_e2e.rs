@@ -88,7 +88,13 @@ async fn a_session_whose_websocket_client_vanishes_stops_reporting_a_command() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     drop(ws);
 
-    wait_until_idle(&base, id, Duration::from_secs(30)).await;
+    // Generous on purpose. What this guards is *unbounded* — before the fix the
+    // session reported a command running for ever, with no recovery — so every
+    // finite bound discriminates equally well and a tight one only buys false
+    // reds. Thirty seconds was buying them: this passes 3/3 in isolation
+    // (7.5–21.5 s) and failed once under the full parallel suite on a loaded
+    // workstation, where `chatty()` has `cmd` spawn twenty thousand echoes.
+    wait_until_idle(&base, id, Duration::from_secs(120)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -63,25 +63,50 @@ async fn stderr_is_captured_in_output() {
 async fn timeout_is_enforced_and_returns_promptly() {
     let exec = executor();
 
-    // A command that would otherwise run ~20s.
+    // A command that would otherwise run for five minutes. The gap between that
+    // and the bound below is the point: it has to be wide enough that machine
+    // load cannot close it, because most of the wall clock measured here is not
+    // the executor's at all (see below).
     #[cfg(windows)]
-    let cmd_line = "ping -n 20 127.0.0.1";
+    let cmd_line = "ping -n 300 127.0.0.1";
     #[cfg(unix)]
-    let cmd_line = "sleep 20";
+    let cmd_line = "sleep 300";
 
     let cmd = Command::new(cmd_line).timeout(Duration::from_secs(2));
     let start = Instant::now();
     let result = exec.execute(&cmd).await.expect("execute failed");
     let elapsed = start.elapsed();
 
+    // This is the enforcement claim. `timed_out` is set only where the deadline
+    // branch runs, and that branch is reached only when `try_wait` had not yet
+    // reported an exit — so a command that had simply finished cannot produce
+    // it.
     assert!(result.timed_out, "expected timed_out=true");
-    // Must return near the deadline (timeout + collection grace), never the
-    // full 20s — proves the timeout is actually enforced and the process tree
-    // is killed rather than left to run.
+
+    // And this is a different claim: having killed the tree, the call returned
+    // rather than waiting the command out.
+    //
+    // Almost none of this elapsed time is the executor's. Instrumented once, on
+    // the 0.20.x tree: killing a tree **6.12 s**, `child.wait()` 24 µs — the
+    // Windows kill shelled out to `taskkill.exe`, and spawning a process is
+    // exactly what a loaded machine is slow at. Under the full parallel suite
+    // the same call exceeded 28 s. So a tight bound here did not measure the
+    // code; it measured the host, and it measured it wrong — six seconds against
+    // a twenty-second command failed at 9.6 s, 13.6 s and 25.9 s on a busy
+    // workstation, *identically on the unmodified tree*.
+    //
+    // 0.21.0 took that term out: the kill is a job object now, measured at
+    // 0.097 ms. The bound below stays wide anyway, because the host still varies
+    // in the one place this test cannot avoid — spawning the command itself —
+    // and a bound that has stopped tripping is not evidence that tightening it
+    // would be safe.
+    //
+    // The margin is therefore bought in the command rather than in the
+    // tolerance, which is what keeps the discriminating power: a version that
+    // waited for the command out would take five minutes, not one.
     assert!(
-        elapsed < Duration::from_secs(6),
-        "timeout took too long: {:?}",
-        elapsed
+        elapsed < Duration::from_secs(60),
+        "returning waited for the command instead of killing it: {elapsed:?}"
     );
 }
 
@@ -241,7 +266,15 @@ async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
         .expect("execute_async failed");
 
     // `_rx` is deliberately alive and never read for the whole wait.
-    let joined = tokio::time::timeout(Duration::from_secs(30), handle).await;
+    //
+    // The bound is generous on purpose, and widening it costs nothing: the
+    // failure this guards against is *unbounded* — a parked control loop never
+    // resolves the handle at all — so any finite bound discriminates equally
+    // well, while a tight one only adds false reds. At thirty seconds it was
+    // producing them: measured at 13–32 s across five runs on a busy
+    // workstation, and 13–32 s on the unmodified 0.20.0 tree as well, which is
+    // how it was established as load rather than regression.
+    let joined = tokio::time::timeout(Duration::from_secs(120), handle).await;
 
     assert!(
         joined.is_ok(),
@@ -269,7 +302,20 @@ async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
 #[tokio::test]
 async fn a_short_stream_still_reports_the_true_output_size() {
     let exec = executor();
-    let cmd = Command::new(emit_bytes_command(4 * 1024 * 1024)).timeout(Duration::from_secs(2));
+    // Primed with an `echo` that the shell itself runs, so the command has
+    // produced *something* the instant it starts. Without it this test depends
+    // on the emitter's interpreter booting inside the two-second deadline —
+    // PowerShell on a loaded machine does not, the command is killed having
+    // written nothing, and the final assertion then fails over interpreter
+    // startup rather than over what it is testing. Observed failing four times
+    // out of four that way. The flood after it is what the rest of the test
+    // needs; the priming byte is what makes the precondition hold.
+    #[cfg(windows)]
+    let line = format!("echo primed & {}", emit_bytes_command(4 * 1024 * 1024));
+    #[cfg(unix)]
+    let line = format!("echo primed; {}", emit_bytes_command(4 * 1024 * 1024));
+
+    let cmd = Command::new(line).timeout(Duration::from_secs(2));
 
     let (mut rx, handle) = exec
         .execute_async(&cmd)
@@ -298,6 +344,158 @@ async fn a_short_stream_still_reports_the_true_output_size() {
         result.total_bytes > 0,
         "the command produced output; total_bytes must say so even when the stream did not carry it"
     );
+}
+
+/// Execution must take its deadline from `Command::effective_timeout` and
+/// nowhere else.
+///
+/// That method is where `timeout_secs` gets clamped into the range
+/// `docs/openapi.json` publishes, so a path that reads `command.timeout`
+/// directly is a path with no bounds — which is the state this replaced, where
+/// `timeout_secs: 999999999` was honoured and `0` was taken as a deadline that
+/// had already passed. It also has to be *one* place: the deadline was worked
+/// out twice, once to kill the command and once to decide when a stalled
+/// streaming consumer stops being waited on, and clamping only the first would
+/// have killed a command at the ceiling while still feeding its stream for the
+/// hours originally asked for.
+///
+/// Read off the source, and the limit is worth stating: this proves where the
+/// deadline comes from, not what it is — `Command::effective_timeout`'s own unit
+/// tests pin the arithmetic.
+///
+/// A behavioural test was written first and withdrawn, which is why this is here
+/// instead. The cheap observable is the floor: with a zero deadline the command
+/// is killed having run nothing, and with the floor applied it gets a second and
+/// finishes. But "a shell starts and echoes inside one second" is a race, and on
+/// a loaded machine it loses — that test passed alone and failed under the full
+/// suite. The expensive observable is the ceiling, which takes five minutes to
+/// reach. Neither is a test worth having, and a green that depends on winning a
+/// race is worse than none.
+#[test]
+fn execution_takes_its_deadline_from_one_bounded_place() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execution/executor.rs");
+    let source = std::fs::read_to_string(&path).expect("source file is readable");
+
+    assert!(
+        !source.contains("command.timeout"),
+        "src/execution/executor.rs reads the requested timeout directly; a deadline \
+         taken from `Command::timeout` skips the bounds `docs/openapi.json` publishes. \
+         Use `Command::effective_timeout()` — and keep it to one call site per \
+         deadline, so the streaming backstop cannot outlive the command it backs"
+    );
+    assert_eq!(
+        source.matches("effective_timeout()").count(),
+        2,
+        "exactly two deadlines are taken: the command's own, and the streaming \
+         backstop's. A third means a new path; fewer means one of them went back \
+         to computing its own"
+    );
+
+    // What the two assertions above do *not* cover, stated rather than implied.
+    //
+    // The first is name-dependent: it catches `command.timeout`, which is what
+    // both deadline sites were called, and would miss the same bypass written
+    // through a differently-named binding. This file already contains
+    // `cmd.timeout` in its own tests, which is why the check cannot simply be
+    // widened to `.timeout` — it would match those and fail for no reason.
+    //
+    // The second counts a method name in text, so a doc comment that mentions
+    // `effective_timeout()` breaks it. That direction is loud rather than
+    // silent, which is the acceptable one, and it is the same trade
+    // `no_threads_are_spawned_to_read_a_pipe` makes.
+    //
+    // Both are structural guards over a rule the compiler cannot see. Neither
+    // is a proof that no unbounded deadline can ever be constructed; what they
+    // do is make the bypass that actually happened, and the split that would
+    // undo the fix, fail loudly instead of compiling quietly.
+}
+
+/// A command that leaves a background process behind must still return on its
+/// own schedule, not on that process's.
+///
+/// The grandchild inherits both output pipes and does not close them, because it
+/// is still running. Nothing in the crate can make it close them, and nothing
+/// should try — a background process a command deliberately started is not the
+/// server's to kill on the success path. So the executor's own release is what
+/// bounds this: the tail is collected for the grace period and then the read
+/// ends are closed, whatever is still holding the write ends.
+///
+/// The shape this guards against is a "wait for EOF" collection loop, which is
+/// what the reader threads underneath the previous implementation did — with no
+/// way to be told to stop, they blocked on those pipes for as long as the
+/// grandchild ran, one leaked thread and one leaked handle per command, never
+/// reclaimed. Measured on Windows before the change: 30 such commands took the
+/// server from 21 threads to 52, and from 81 handles to 122, with no path back.
+/// The pipes are drained without blocking now (`src/execution/pipe.rs`), so the
+/// loop can simply give up on them; `no_threads_are_spawned_to_read_a_pipe`
+/// below pins the absence of the threads themselves.
+///
+/// Deliberately quiet on both pipes — a grandchild that *writes* would end its
+/// reader by other means, and the quiet one is both the harder case and the
+/// common one, since a daemon usually redirects its own output.
+#[tokio::test]
+async fn a_command_that_leaves_a_background_process_still_returns_promptly() {
+    let exec = executor();
+
+    #[cfg(windows)]
+    let cmd_line = "start /b ping -n 10 127.0.0.1 >nul 2>nul";
+    #[cfg(unix)]
+    let cmd_line = "sleep 10 >/dev/null 2>&1 &";
+
+    let start = Instant::now();
+    let result = exec
+        .execute(&Command::new(cmd_line).timeout(Duration::from_secs(30)))
+        .await
+        .expect("execute failed");
+    let elapsed = start.elapsed();
+
+    assert!(
+        !result.timed_out,
+        "the command itself finished at once; only the process it left behind is still running"
+    );
+    assert_eq!(
+        result.exit_code,
+        Some(0),
+        "the shell reported the background start as successful: {:?}",
+        result.text_output
+    );
+    // Well under the grandchild's ten seconds. The bound is the collection
+    // grace, not the lifetime of whatever the command left running.
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "returning waited on the surviving process rather than on the grace period: {elapsed:?}"
+    );
+}
+
+/// Reading a child's pipes must not put a thread on them.
+///
+/// Read off the source rather than observed at runtime, and the limitation is
+/// worth stating plainly: this proves no thread is spawned, not that no resource
+/// leaks. It is here because the failure it guards is invisible to every
+/// behavioural test in this file — a blocking reader thread produces identical
+/// output, identical exit codes and identical timing, and differs only in that
+/// it never ends when the pipe outlives the child. That is precisely how the
+/// leak above shipped and stayed. Same shape as
+/// `audit_e2e::the_async_handlers_record_without_blocking_the_runtime` and
+/// `tests/ci_feature_gates.rs`: a rule the compiler cannot see, held in the one
+/// place that can see it.
+///
+/// If a future change genuinely needs a thread here, it needs an answer for how
+/// that thread ends when a process this crate does not own is holding the pipe
+/// open — and this assertion is where that answer gets written down.
+#[test]
+fn no_threads_are_spawned_to_read_a_pipe() {
+    for file in ["src/execution/executor.rs", "src/execution/pipe.rs"] {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+        let source = std::fs::read_to_string(&path).expect("source file is readable");
+        assert!(
+            !source.contains("thread::spawn"),
+            "{file} spawns a thread to attend a child's pipes; a thread blocked in \
+             `read()` ends only at EOF, and EOF needs every inherited write end \
+             closed — which a surviving grandchild will not do. Drain the pipe \
+             instead (`PipeDrain`, `src/execution/pipe.rs`), so giving up stays possible"
+        );
+    }
 }
 
 /// A session's execute uses the same shell as `/execute`, and keeps nothing
@@ -394,4 +592,120 @@ async fn a_session_runs_each_command_in_a_fresh_shell() {
         "a session is documented as keeping no state between calls: {:?}",
         after.text_output
     );
+}
+
+/// Whether `--kill-orphans` actually reaches the thing that kills.
+///
+/// The flag is parsed in `cli.rs`, stored on `AppState`, rebuilt into a
+/// `CommandExecutor`, and read three call frames further down in
+/// `run_command_streaming`. Every one of those links can be written and none of
+/// them observed — "the primitive exists but nothing calls it" is this
+/// repository's most repeated defect, and a flag that parses but does nothing
+/// looks exactly like a working one. So this asserts the *effect*, on a real
+/// process, from the public API.
+///
+/// Both directions are asserted, because the default is a promise: a command
+/// that deliberately starts a daemon must still get to keep it.
+mod kill_orphans {
+    use super::*;
+
+    /// Prints the pid of a process it leaves running, then exits.
+    ///
+    /// 25 s rather than something longer so the surviving half cleans up after
+    /// itself even if its explicit teardown fails.
+    fn spawn_background_and_print_pid() -> &'static str {
+        #[cfg(windows)]
+        {
+            concat!(
+                r#"powershell -NoProfile -Command "#,
+                r#""(Start-Process powershell -ArgumentList '-NoProfile','-Command',"#,
+                r#"'Start-Sleep -Seconds 25' -PassThru).Id""#
+            )
+        }
+        #[cfg(unix)]
+        {
+            "sleep 25 & echo $!"
+        }
+    }
+
+    fn alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        }
+        #[cfg(unix)]
+        {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    }
+
+    fn terminate(pid: u32) {
+        #[cfg(windows)]
+        let mut c = std::process::Command::new("taskkill");
+        #[cfg(windows)]
+        c.args(["/F", "/PID", &pid.to_string()]);
+        #[cfg(unix)]
+        let mut c = std::process::Command::new("kill");
+        #[cfg(unix)]
+        c.args(["-9", &pid.to_string()]);
+        let _ = c
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn background_pid(kill_orphans: bool) -> u32 {
+        let exec = CommandExecutor::new(Arc::new(SessionStore::new())).kill_orphans(kill_orphans);
+        let result = exec
+            .execute_sync(&Command::new(spawn_background_and_print_pid()))
+            .expect("command should run");
+        result
+            .text_output
+            .split_whitespace()
+            .find_map(|w| w.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("no pid in output: {:?}", result.text_output))
+    }
+
+    #[test]
+    fn on_the_background_process_is_gone_when_the_command_returns() {
+        let pid = background_pid(true);
+
+        // Polled rather than slept on: the kill is a system call, so this
+        // normally succeeds on the first pass. The bound is only here so a
+        // failure reports rather than hangs, and it is far under the 25 s the
+        // process would otherwise run for — a pass cannot be the sleeper simply
+        // having finished.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let still_there = alive(pid);
+        if still_there {
+            terminate(pid);
+        }
+        assert!(
+            !still_there,
+            "--kill-orphans is on, so pid {pid} should not have outlived the command"
+        );
+    }
+
+    #[test]
+    fn off_the_background_process_keeps_running() {
+        let pid = background_pid(false);
+        let survived = alive(pid);
+        terminate(pid);
+        assert!(
+            survived,
+            "with --kill-orphans off, pid {pid} must survive: a daemon started on purpose is meant to outlive the request"
+        );
+    }
 }

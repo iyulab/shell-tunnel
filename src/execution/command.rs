@@ -79,6 +79,27 @@ impl Command {
         self.max_output_bytes = Some(bytes);
         self
     }
+
+    /// The deadline this command will actually run under.
+    ///
+    /// [`timeout`](Self::timeout) records what the caller *asked for*; this is
+    /// what they get. Absent, it is [`DEFAULT_TIMEOUT`]; present, it is bounded
+    /// by [`MIN_TIMEOUT`] and [`MAX_TIMEOUT`] — the range `docs/openapi.json`
+    /// has published all along without anything enforcing it.
+    ///
+    /// **This is deliberately the only place the deadline is computed.** It used
+    /// to be worked out twice — once in the blocking core to time the command
+    /// out, and once in `execute_async` to decide when a stalled streaming
+    /// consumer stops being waited on. Two copies of one rule is a bug waiting
+    /// for the first edit that reaches only one of them, and clamping was
+    /// exactly such an edit: applied to the first alone, a command would have
+    /// been killed at the ceiling while the stream went on being fed to a
+    /// consumer for the hours the caller originally named.
+    pub fn effective_timeout(&self) -> Duration {
+        self.timeout
+            .unwrap_or(super::executor::DEFAULT_TIMEOUT)
+            .clamp(super::executor::MIN_TIMEOUT, super::executor::MAX_TIMEOUT)
+    }
 }
 
 impl Default for Command {
@@ -155,6 +176,57 @@ impl CommandBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execution::{DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT};
+
+    /// Asking for nothing gets the default, and the default is inside the range.
+    #[test]
+    fn an_unset_timeout_is_the_default() {
+        assert_eq!(Command::new("echo hi").effective_timeout(), DEFAULT_TIMEOUT);
+        assert!(
+            DEFAULT_TIMEOUT >= MIN_TIMEOUT && DEFAULT_TIMEOUT <= MAX_TIMEOUT,
+            "the default must itself be a value a caller could have asked for"
+        );
+    }
+
+    /// A value inside the published range is honoured exactly.
+    #[test]
+    fn a_timeout_within_the_range_is_taken_as_asked() {
+        let asked = Duration::from_secs(45);
+        assert_eq!(
+            Command::new("echo hi").timeout(asked).effective_timeout(),
+            asked
+        );
+    }
+
+    /// Above the ceiling is clamped, not refused — the same shape
+    /// `max_output_bytes` uses, and the figure `docs/openapi.json` publishes.
+    ///
+    /// Nothing enforced this before: `timeout_secs: 999999999` was accepted and
+    /// honoured, so one caller could hold a blocking thread for decades while
+    /// the published reference said the maximum was 300.
+    #[test]
+    fn a_timeout_above_the_ceiling_is_clamped() {
+        let absurd = Duration::from_secs(999_999_999);
+        assert_eq!(
+            Command::new("echo hi").timeout(absurd).effective_timeout(),
+            MAX_TIMEOUT
+        );
+    }
+
+    /// Zero is raised to the floor rather than taken literally.
+    ///
+    /// Taken literally it is a deadline that has already passed, so the control
+    /// loop killed every such command on its first pass having run nothing —
+    /// while `docs/openapi.json` said `"minimum": 1`.
+    #[test]
+    fn a_zero_timeout_is_raised_to_the_floor() {
+        assert_eq!(
+            Command::new("echo hi")
+                .timeout(Duration::from_secs(0))
+                .effective_timeout(),
+            MIN_TIMEOUT
+        );
+    }
 
     #[test]
     fn test_command_new() {
