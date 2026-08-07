@@ -52,6 +52,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **The relay's published 16 MiB response ceiling was a dependency's default, not a value this
+  crate set.** `docs/USAGE.md` names it in two places and `fs/file` tells relayed callers to
+  use `Range` because of it, while the number itself came from `tungstenite`'s default
+  `max_frame_size`, which nothing here declared. A version bump could have moved a published
+  contract with nothing failing — not a test, not a build, only a caller meeting a different
+  limit in production. It is now `relay::MAX_RELAY_FRAME`, set explicitly on both ends of the
+  data connection, and a test holds the constant and the documents that quote it to the same
+  number. The value is unchanged.
+
 - **A session whose WebSocket consumer stopped reading was never reclaimed.** The guard that
   marks a session busy spanned the delivery of the command's output as well as the command
   itself. Delivery is bounded by nothing: a consumer that stops reading parks the handler

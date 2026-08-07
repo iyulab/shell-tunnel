@@ -1587,7 +1587,9 @@ documented here.
   relay, and gets **413**. The `.../fs/uploads/{id}` routes are the ones that set their own
   ceiling instead (8 MiB), which is what lets `chunk_size` be as large as it is. Bulk bytes
   belong in an upload session; a large JSON body is not a supported way to move them.
-- **16 MiB** response body limit through the relay — a separate ceiling, and the one a
+- **16 MiB** response body limit through the relay (`relay::MAX_RELAY_FRAME`, declared by
+  this crate since 0.21.1 — before that it was a WebSocket library default this crate never
+  set, so the number here rested on a dependency) — a separate ceiling, and the one a
   `GET .../fs/file` on a large file reaches first. Over it, the relay answers **502**:
   the device carries a response body in a single frame, and a frame that large cannot be
   read. Range requests are the way to fetch a bigger file (§3.1); nothing about the file

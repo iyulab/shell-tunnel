@@ -356,3 +356,48 @@ fn the_scan_finds_the_gates_that_are_known_to_exist() {
         "an item-level gate must be found too: {gates:?}"
     );
 }
+
+/// The relay's published response ceiling must be a number this crate declares,
+/// and the documents that quote it must quote *that* number.
+///
+/// It was neither until 0.21.1. `docs/USAGE.md` §8 and §10 name 16 MiB, and the
+/// `fs/file` route tells relayed callers to use `Range` because of it — while
+/// the value itself was `tungstenite`'s default `max_frame_size`, which this
+/// crate never set. A published contract rested on a dependency default, where
+/// a version bump would have moved it with nothing failing: not a test, not a
+/// build, only a caller discovering a new limit in production.
+///
+/// This lives beside the feature-gate check for the same reason that one does.
+/// Both guard a rule that prose cannot: a set of documents and a value have to
+/// agree, and agreement is not something a reader can be relied on to re-verify.
+/// Deliberately behind no feature gate — a guard its subject can switch off is
+/// not a guard, and `MAX_RELAY_FRAME` is compiled in every build.
+#[test]
+fn the_published_relay_ceiling_is_the_constant_this_crate_declares() {
+    let mib = shell_tunnel::relay::MAX_RELAY_FRAME / (1024 * 1024);
+    assert_eq!(
+        shell_tunnel::relay::MAX_RELAY_FRAME % (1024 * 1024),
+        0,
+        "the ceiling is quoted in whole MiB, so a value that is not whole MiB \
+         cannot be stated the way the documents state it"
+    );
+    // Anchored on the phrase around the number, not the number alone. Checking
+    // for "16 MiB" anywhere is vacuous: `docs/USAGE.md` also names an 8 MiB
+    // output ceiling, so setting the constant to 8 MiB left this test green —
+    // confirmed by doing exactly that before trusting it.
+    for (name, phrase) in [
+        ("docs/USAGE.md", format!("relay's {mib} MiB ceiling")),
+        (
+            "docs/openapi.json",
+            format!("a body over {mib} MiB cannot cross the relay"),
+        ),
+    ] {
+        let path = repo_root().join(name);
+        let text = std::fs::read_to_string(&path).expect("document is readable");
+        assert!(
+            text.contains(&phrase),
+            "{name} must say `{phrase}`; if the constant changed, the document \
+             promising it did not"
+        );
+    }
+}

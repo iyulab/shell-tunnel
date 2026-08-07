@@ -356,7 +356,17 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
             .data_url()
             .into_client_request()
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
-        None,
+        // The other end of the same ceiling: this connection reads relayed
+        // request bodies and writes response bodies, and both sides must agree
+        // on the limit or the disagreement shows up as a truncation on one of
+        // them. Declared rather than defaulted — see `relay::MAX_RELAY_FRAME`.
+        // Struct literal rather than the builder method: the field is public in
+        // every version this crate has compiled against, while the builder
+        // arrived later.
+        Some(tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+            max_frame_size: Some(crate::relay::MAX_RELAY_FRAME),
+            ..Default::default()
+        }),
         false,
         // The recorded certificate is not read here: a data connection only
         // opens after the control channel enrolled over the same TLS

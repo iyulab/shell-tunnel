@@ -53,6 +53,21 @@ pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
 /// How long to wait for the enrollment frame before dropping a connection.
 const ENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Largest response body that can cross the relay, because a device sends one
+/// as a single WebSocket frame.
+///
+/// This value is published — `docs/USAGE.md` §8 and §10 name it, and it is the
+/// reason `fs/file` over a relay tells callers to use `Range`. It was not
+/// declared anywhere until 0.21.1: it was `tungstenite`'s **default**
+/// `max_frame_size`, which this crate never set, so a documented contract rested
+/// on a dependency's default and a version bump could have moved it in silence.
+/// The number is unchanged; what changed is who owns it.
+///
+/// Set on both ends, since the reader is what refuses: the relay reads device
+/// responses, and a device reads relayed request bodies. [`MAX_BODY`] bounds the
+/// request direction separately and more tightly.
+pub const MAX_RELAY_FRAME: usize = 16 * 1024 * 1024;
+
 /// Relay server settings.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -590,7 +605,12 @@ async fn data_handler(
     charge: Option<Extension<RateLimitCharge>>,
 ) -> Response {
     let charge = charge.map(|Extension(charge)| charge);
-    ws.on_upgrade(move |socket| attach_data_connection(socket, state, peer, charge))
+    // The reader is what refuses an oversized frame, and this is the reader for
+    // every response body a device sends. Stating the limit here rather than
+    // inheriting `tungstenite`'s default is what makes the published ceiling
+    // this crate's — see [`MAX_RELAY_FRAME`].
+    ws.max_frame_size(MAX_RELAY_FRAME)
+        .on_upgrade(move |socket| attach_data_connection(socket, state, peer, charge))
 }
 
 /// Read the attach frame, verify it, and hand the socket to the device's pool.
