@@ -34,6 +34,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   and `execution_count: 0` together while frames are still arriving. `docs/openapi.json` and
   the `BusySession` doc comment carry the same split.
 
+- **`fs/list`'s `limit` bounds the response, not the work — now said so.** Every page walks and
+  sorts everything under `path` before slicing out its slice, so a page costs what the tree
+  costs however small the page is: measured, 93 MB and 1.3 s for `limit=1` and `limit=10000`
+  alike on a 200,000-entry tree, against 28 MB and 0.27 s on a 50,000-entry one. Paging right
+  through therefore costs *more* the smaller the pages are, which is the opposite of the usual
+  advice and easy to diagnose backwards. The `hash` parameter's note — that hashing is per page
+  rather than per tree — is true and read as though the page discipline bounded the work in
+  general; it now says which part it is about. The memory is a per-request spike, fully
+  released, but it is unbounded in the tree and concurrent listings add up.
+
 - **`timeout_secs` is clamped rather than refused, but not below zero.** A negative value is
   `422`, since the field is an unsigned integer and never becomes a number the clamp could
   see. To a consumer reading `minimum: 1` off the schema, `-1` and `0` are equally out of

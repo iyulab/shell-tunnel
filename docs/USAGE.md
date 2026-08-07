@@ -543,6 +543,26 @@ which entries fall on which page but never invalidates a cursor already handed o
 file in that page (never per whole tree, so a large recursive listing cannot outrun the
 relay's 120s request timeout).
 
+**`limit` bounds the response, not the work**, and "once per page" above is the whole
+cost: each page walks and sorts everything under `path` before slicing out its slice.
+Measured on a 200,000-entry tree, one page cost 93 MB and 1.3 s for `limit=1` and for
+`limit=10000` alike — the figures do not move with the page size, only with the tree
+(a 50,000-entry tree: 28 MB, 0.27 s; roughly half a kilobyte held per entry, released
+when the request ends). Two consequences worth having before you meet them:
+
+- **Paging right through costs more the smaller the pages are** — `N/limit` walks of the
+  whole tree, so a 200,000-entry listing at the default `limit=1000` is 200 walks and
+  around four minutes, against 1.3 s for one. This is the opposite of the usual advice,
+  which is why it is easy to diagnose backwards. Prefer a large `limit`; better still,
+  prefer a narrower `path` or `recursive=false`, which is the only parameter that changes
+  what a request costs.
+- **The `hash` note above is about hashing only.** It says the hash is per page rather
+  than per tree, which is true and reads as though the page discipline bounded the work
+  in general. The walk beneath it is per tree either way.
+
+Nothing here is unbounded over time — the memory is a spike per request, fully released —
+but it is unbounded in the tree, and concurrent listings add up.
+
 `GET /api/v1/fs/file?path=...` serves the whole file, or a `Range` of it — ordinary HTTP,
 so any client that already speaks `Range`/`If-Range` gets resumable downloads for free.
 

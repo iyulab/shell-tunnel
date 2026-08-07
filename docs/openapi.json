@@ -490,7 +490,7 @@
           {
             "name": "recursive",
             "in": "query",
-            "description": "Walk subdirectories too. Default false (one level only).",
+            "description": "Walk subdirectories too. Default false (one level only). A recursive listing holds every entry under `path` in memory while it sorts them, about half a kilobyte each, so it is the one parameter that decides what a request costs.",
             "schema": {
               "type": "boolean",
               "default": false
@@ -499,7 +499,7 @@
           {
             "name": "hash",
             "in": "query",
-            "description": "Set to `sha256` to include a content hash on every file entry in this page. Hashing is per page, never per tree, so a large recursive listing cannot outrun the relay's 120s request timeout. Any other value is ignored.",
+            "description": "Set to `sha256` to include a content hash on every file entry in this page. Hashing is per page, never per tree, so a large recursive listing cannot outrun the relay's 120s request timeout. That applies to the hashing alone - the walk underneath it is per tree either way, see `limit`. Any other value is ignored.",
             "schema": {
               "type": "string",
               "enum": [
@@ -518,7 +518,7 @@
           {
             "name": "limit",
             "in": "query",
-            "description": "Page size. Clamped to [1, 10000] rather than refused; default 1000.",
+            "description": "Page size. Clamped to [1, 10000] rather than refused; default 1000. It bounds the response, not the work: every page walks and sorts the whole tree under `path` before slicing out its slice, so a page costs what the tree costs however small the page is - measured, 93 MB and 1.3 s for both limit=1 and limit=10000 on a 200,000-entry tree. Paging right through therefore costs more the smaller the pages are, which is the opposite of the usual advice: prefer a large limit, and prefer a narrower `path` or `recursive=false` to either.",
             "schema": {
               "type": "integer",
               "default": 1000,
