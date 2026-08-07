@@ -372,7 +372,8 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // fs jail never gets this far at all.
     let audit = match &audit_log {
         Some(path) => {
-            match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_max_bytes) {
+            match shell_tunnel::audit::AuditSink::file_with_limit(path, args.audit_rotation_limit())
+            {
                 Ok(sink) => std::sync::Arc::new(sink),
                 // Two failures again, for the same reason the containment check
                 // above splits: an exposed server in an unwritable working
@@ -495,6 +496,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
 
     let state = shell_tunnel::AppState::new()
         .with_audit(audit)
+        .with_kill_orphans(args.kill_orphans)
         .with_fs_root(fs_root);
 
     let state = state.with_chunk_size(chunk_size);

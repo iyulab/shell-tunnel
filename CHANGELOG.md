@@ -5,6 +5,89 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Added
+
+- **`CONTRIBUTING.md`.** The three commands CI actually gates on — `cargo fmt --all -- --check`,
+  `cargo test-all`, `cargo clippy-all` — were written down only in a file that is not committed,
+  so they did not reach anyone who cloned the repository. The first is the one that gets
+  forgotten, because the other two have cargo aliases and it cannot have one.
+
+  It also records why `cargo test-all` is not `cargo test --all`: with `default = []` the
+  feature-gated suites compile to zero tests, so they do not fail, they stop existing, and the
+  run still reports `ok`.
+
+- **CI now runs the default build's tests, not just its build.** Every other job enables
+  `relay-client,tls`, so a test that only compiles with a feature could sit red in the default
+  build indefinitely while all three OS jobs stayed green. One did. No new job — one step on the
+  existing MSRV runner, since what is being caught is "does this run without features", not
+  portability.
+
+### Documentation
+
+- **WebSocket connection lifetime is now written down, and it was measured rather than read.**
+  `docs/USAGE.md` said nothing about it while listing a `ping`/`pong` message pair, which reads
+  as liveness management the server does not do: it answers a ping it is sent and never sends
+  one, and there is no inactivity deadline. What it does *not* mean is that abandoned
+  connections pile up — 600 connections opened and dropped in batches of 50 left the server's
+  handle count identical from the second batch to the twelfth. The case with no measurement is
+  the one with no TCP signal either, a network path that dies silently.
+
+### Changed
+
+- **The audit trail now rotates by default, at 64 MiB.** It was unbounded, and it is on by
+  default whenever the server is reachable — so a long-running device accumulated one line
+  per execution forever. Filling the disk is a distinct way to take a server down from
+  running out of memory, and it is self-defeating: a trail that fills the disk stops
+  recording, so "keep everything" kept nothing past that point.
+
+  One generation is kept beside the live file, so a trail bounds itself at 128 MiB on disk.
+  At the size an entry actually is — around 200 bytes — that retains on the order of 670,000
+  entries.
+
+  **`--audit-max-bytes 0` restores the old behaviour** for an operator who would rather keep
+  everything and manage the size themselves. Zero means "never rotate" rather than "rotate at
+  zero bytes", which would keep nothing.
+
+  Library consumers are unaffected: `AuditSink::file` is still unbounded, and the default is
+  applied by the binary.
+
+### Added
+
+- **`--kill-orphans`: end whatever a command leaves running when the command ends.** Off by
+  default, which is exactly what the server did before — a command that starts a daemon on
+  purpose still gets to keep it, and no existing deployment changes behaviour by upgrading.
+
+  With the flag set, the command's descendants are ended on every exit path, the timeout
+  branch included. Output the background process had already written is still collected;
+  what it would have written after being killed is not. The two behaviours are both
+  legitimate and only the operator knows which applies — a machine used to *launch* services
+  wants the default, a machine running throwaway or untrusted commands wants the flag.
+
+  There is deliberately no per-request form. Whether a process may outlive a request is a
+  property of the machine, not of the request, so the same command line means the same thing
+  whoever sends it. Library consumers opt in with `CommandExecutor::kill_orphans`.
+
+### Changed
+
+- **Terminating a command's process tree no longer spawns a process to do it.** On Windows
+  the kill ran `taskkill /T /F /PID`, so ending a process cost a full process spawn — and
+  on a machine with a filter driver attached that is not a rounding error: 238 ms measured
+  on a quiet workstation, 6.12 s on the same machine while it was busy, over 28 s under a
+  parallel build. That latency sat inside the response time of every command that reached
+  its `timeout_secs` deadline.
+
+  The child and its descendants are now held in a job object, and the kill is
+  `TerminateJobObject` — one system call, measured at 0.097 ms against the identical
+  children in the same session. Unix is unchanged: it already signalled the process group
+  with one call. The two are now one type rather than a pair of free functions, which also
+  removes a hazard the old path carried — it identified the tree by pid, and a pid can be
+  recycled once the child exits.
+
+  **What did not change: a command that leaves a background process running still leaves
+  it running.** The job is created without `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, so
+  membership does not shorten any member's life, and the kill still happens only on the
+  timeout path. Only its cost changed.
+
 ### Fixed
 
 - **A shell session left behind was never reclaimed.** `SessionStore` had no TTL, no cap

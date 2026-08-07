@@ -1223,3 +1223,28 @@ fn the_periodic_sweeps_are_wired_into_the_server() {
         );
     }
 }
+
+/// `--help` must name the audit rotation default the binary actually applies.
+///
+/// Read from the running binary rather than from the source string, because
+/// what an operator sees is the output — this repository has shipped
+/// user-facing text no test asserted on four separate occasions, and `--help`
+/// is the only place most operators ever read a default.
+///
+/// The pairing matters more than either half. A default that changes without
+/// the help changing, and help that names a default the code does not have,
+/// are the same defect seen from two sides, and both read as reassurance.
+#[test]
+fn help_names_the_audit_rotation_default_the_binary_uses() {
+    let (_code, stdout, _stderr) = run_with_timeout(&["--help"], Duration::from_secs(20));
+    let figure = shell_tunnel::audit::DEFAULT_MAX_BYTES.to_string();
+
+    assert!(
+        stdout.contains(&figure),
+        "--help should name {figure}, the limit it actually applies. Got:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("0 never rotates"),
+        "--help must say what 0 does, or an operator reads it as a zero-byte limit. Got:\n{stdout}"
+    );
+}

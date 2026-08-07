@@ -86,14 +86,20 @@ async fn timeout_is_enforced_and_returns_promptly() {
     // And this is a different claim: having killed the tree, the call returned
     // rather than waiting the command out.
     //
-    // Almost none of this elapsed time is the executor's. Instrumented once:
-    // `kill_tree` **6.12 s**, `child.wait()` 24 µs — killing a tree shells out
-    // to `taskkill.exe` on Windows, and spawning a process is exactly what a
-    // loaded machine is slow at. Under the full parallel suite the same call
-    // exceeded 28 s. So a tight bound here does not measure the code; it
-    // measures the host, and it was measuring it wrong — six seconds against a
-    // twenty-second command failed at 9.6 s, 13.6 s and 25.9 s on a busy
-    // workstation, *identically on the unmodified 0.20.0 tree*.
+    // Almost none of this elapsed time is the executor's. Instrumented once, on
+    // the 0.20.x tree: killing a tree **6.12 s**, `child.wait()` 24 µs — the
+    // Windows kill shelled out to `taskkill.exe`, and spawning a process is
+    // exactly what a loaded machine is slow at. Under the full parallel suite
+    // the same call exceeded 28 s. So a tight bound here did not measure the
+    // code; it measured the host, and it measured it wrong — six seconds against
+    // a twenty-second command failed at 9.6 s, 13.6 s and 25.9 s on a busy
+    // workstation, *identically on the unmodified tree*.
+    //
+    // 0.21.0 took that term out: the kill is a job object now, measured at
+    // 0.097 ms. The bound below stays wide anyway, because the host still varies
+    // in the one place this test cannot avoid — spawning the command itself —
+    // and a bound that has stopped tripping is not evidence that tightening it
+    // would be safe.
     //
     // The margin is therefore bought in the command rather than in the
     // tolerance, which is what keeps the discriminating power: a version that
@@ -586,4 +592,120 @@ async fn a_session_runs_each_command_in_a_fresh_shell() {
         "a session is documented as keeping no state between calls: {:?}",
         after.text_output
     );
+}
+
+/// Whether `--kill-orphans` actually reaches the thing that kills.
+///
+/// The flag is parsed in `cli.rs`, stored on `AppState`, rebuilt into a
+/// `CommandExecutor`, and read three call frames further down in
+/// `run_command_streaming`. Every one of those links can be written and none of
+/// them observed — "the primitive exists but nothing calls it" is this
+/// repository's most repeated defect, and a flag that parses but does nothing
+/// looks exactly like a working one. So this asserts the *effect*, on a real
+/// process, from the public API.
+///
+/// Both directions are asserted, because the default is a promise: a command
+/// that deliberately starts a daemon must still get to keep it.
+mod kill_orphans {
+    use super::*;
+
+    /// Prints the pid of a process it leaves running, then exits.
+    ///
+    /// 25 s rather than something longer so the surviving half cleans up after
+    /// itself even if its explicit teardown fails.
+    fn spawn_background_and_print_pid() -> &'static str {
+        #[cfg(windows)]
+        {
+            concat!(
+                r#"powershell -NoProfile -Command "#,
+                r#""(Start-Process powershell -ArgumentList '-NoProfile','-Command',"#,
+                r#"'Start-Sleep -Seconds 25' -PassThru).Id""#
+            )
+        }
+        #[cfg(unix)]
+        {
+            "sleep 25 & echo $!"
+        }
+    }
+
+    fn alive(pid: u32) -> bool {
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        }
+        #[cfg(unix)]
+        {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+    }
+
+    fn terminate(pid: u32) {
+        #[cfg(windows)]
+        let mut c = std::process::Command::new("taskkill");
+        #[cfg(windows)]
+        c.args(["/F", "/PID", &pid.to_string()]);
+        #[cfg(unix)]
+        let mut c = std::process::Command::new("kill");
+        #[cfg(unix)]
+        c.args(["-9", &pid.to_string()]);
+        let _ = c
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
+    fn background_pid(kill_orphans: bool) -> u32 {
+        let exec = CommandExecutor::new(Arc::new(SessionStore::new())).kill_orphans(kill_orphans);
+        let result = exec
+            .execute_sync(&Command::new(spawn_background_and_print_pid()))
+            .expect("command should run");
+        result
+            .text_output
+            .split_whitespace()
+            .find_map(|w| w.trim().parse::<u32>().ok())
+            .unwrap_or_else(|| panic!("no pid in output: {:?}", result.text_output))
+    }
+
+    #[test]
+    fn on_the_background_process_is_gone_when_the_command_returns() {
+        let pid = background_pid(true);
+
+        // Polled rather than slept on: the kill is a system call, so this
+        // normally succeeds on the first pass. The bound is only here so a
+        // failure reports rather than hangs, and it is far under the 25 s the
+        // process would otherwise run for — a pass cannot be the sleeper simply
+        // having finished.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        let still_there = alive(pid);
+        if still_there {
+            terminate(pid);
+        }
+        assert!(
+            !still_there,
+            "--kill-orphans is on, so pid {pid} should not have outlived the command"
+        );
+    }
+
+    #[test]
+    fn off_the_background_process_keeps_running() {
+        let pid = background_pid(false);
+        let survived = alive(pid);
+        terminate(pid);
+        assert!(
+            survived,
+            "with --kill-orphans off, pid {pid} must survive: a daemon started on purpose is meant to outlive the request"
+        );
+    }
 }

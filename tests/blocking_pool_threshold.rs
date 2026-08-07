@@ -48,9 +48,12 @@ fn slow_command() -> &'static str {
 ///
 /// **Measured against a control on the same machine at the same time**, which is
 /// what makes the figure mean anything here: this workstation's process spawn
-/// varies by an order of magnitude with load (`kill_tree` alone was measured at
-/// 6.1 s under it), so an absolute duration would be meaningless. What is
-/// asserted is a *ratio* between runs taken seconds apart on that same host.
+/// varies by an order of magnitude with load, so an absolute duration would be
+/// meaningless. The measurement that established that is historical — the
+/// pre-0.21.0 kill spawned `taskkill` and was clocked at 238 ms quiet, 6.12 s
+/// busy — but what it showed about the *host* still holds, and every command
+/// here still spawns a shell. What is asserted is therefore a *ratio* between
+/// runs taken seconds apart on that same host.
 ///
 /// **Three points, not two**, because two would not have been an experiment.
 /// Timing `POOL + 1` commands against one alone gives a ratio near two — but so

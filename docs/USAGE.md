@@ -286,15 +286,26 @@ by different layers, and the message is the same in both.
 `output` merges stdout and stderr. On timeout, `timed_out` is `true` and the
 whole process tree is killed.
 
-**A process the command leaves running is left running.** `some-daemon &`, or
-`start /b …` on Windows, returns as soon as the shell itself does: the call does
-not wait for what the command started, and the response is not held back for it.
-A timeout kills the whole tree, as above; a command that exits on its own has
-nothing killed for it. Such a process inherits the command's output pipes, so the
-server stops reading them shortly after the response is sent rather than waiting
-for the process to exit — anything it prints later goes nowhere. Its lifetime is
-the caller's to manage; this server does not supervise it, and no endpoint lists
-or stops it.
+**A process the command leaves running is left running, unless the server was
+started with `--kill-orphans`.** `some-daemon &`, or `start /b …` on Windows,
+returns as soon as the shell itself does: the call does not wait for what the
+command started, and the response is not held back for it. A timeout kills the
+whole tree, as above; by default a command that exits on its own has nothing
+killed for it. Such a process inherits the command's output pipes, so the server
+stops reading them shortly after the response is sent rather than waiting for the
+process to exit — anything it prints later goes nowhere. Its lifetime is the
+caller's to manage; this server does not supervise it, and no endpoint lists or
+stops it.
+
+`--kill-orphans` (§6) reverses that one part: whatever the command started is
+ended when the command ends, on every exit path including the timeout one. It is
+off by default because the two behaviours are both legitimate and only the
+operator knows which applies — a machine used to *launch* services wants the
+default, and a machine running untrusted or throwaway commands wants the flag.
+Output already produced is still collected either way; what the process would
+have printed after being killed is not. There is no per-request form of this: it
+is a property of the machine, so the same command line means the same thing
+whoever sends it.
 
 **Output is capped.** `output` carries at most `max_output_bytes` — 1 MiB unless
 the request says otherwise — and `total_bytes` reports what the command actually
@@ -418,6 +429,21 @@ ignored.
 
 WebSockets work over a direct connection, through a tunnel, and through the
 relay. Server-sent events do not pass through the relay.
+
+**The server does not close an idle connection, and does not ping.** The
+`ping`/`pong` pair above is client-driven: the server answers a ping it is sent
+and never sends one, and there is no inactivity deadline — a connection that
+says nothing is held for as long as it stays open. A client that wants to know
+its connection is still live has to ask.
+
+What that does *not* mean is that abandoned connections pile up. A client that
+closes, exits, or crashes takes its socket down at the TCP level, and the server
+reclaims it: measured at 600 connections opened and dropped in batches of 50, the
+server's handle count stopped moving after the first two batches and was
+identical at the twelfth. The case with no measurement is the one with no TCP
+signal either — a network path that dies silently, where no close ever arrives.
+There the connection is held until the operating system's own TCP keepalive
+notices, which on default settings is hours.
 
 ### Endpoints
 
@@ -803,9 +829,17 @@ Executions over WebSocket are recorded the same way — a trail that only saw th
 REST path would miss whichever caller preferred streaming.
 
 `--audit-max-bytes <N>` rotates the file to `<file>.1` once it passes that size,
-keeping one generation. Unbounded by default; a trail that grows forever
-eventually fills the disk it was meant to protect, but how much history to keep
-belongs to whoever runs the machine.
+keeping one generation. **The default is 67108864 (64 MiB), so a trail bounds
+itself at 128 MiB on disk** — it was unbounded before 0.21.0, and one line per
+execution accumulating forever fills the disk the trail was meant to protect.
+That is a different way to take a server down than running out of memory, and it
+is self-defeating: a trail that fills the disk stops recording.
+
+At the size an entry actually is — around 200 bytes, more when a long command
+line is recorded — the default retains on the order of 670,000 entries across
+the two files. **`--audit-max-bytes 0` never rotates**, which is the pre-0.21.0
+behaviour for an operator who would rather keep everything and manage the size
+themselves. Zero does not mean "rotate at zero bytes"; that would keep nothing.
 
 **The token is never written.** Entries carry a `token_id` assigned at
 registration and the token's label, which identify a caller across a run without
@@ -1228,6 +1262,7 @@ is involved to spend anything further.
 | `--capabilities <C>` | Scope issued tokens, e.g. `exec,session.read` | full-control; `operator` when reachable |
 | `--preset <NAME>` | `operator` / `file-write` / `file-read` / `full-control` | full-control; `operator` when reachable |
 | `--no-rate-limit` | Disable rate limiting. Responses then carry no `X-RateLimit-*` headers — there is no budget to report | `false` |
+| `--kill-orphans` | Kill whatever a command leaves running when the command ends (§3) | `false` |
 | `--cors-allow-any` | Allow any CORS origin | `false` |
 | `--tunnel` | Publish via a Cloudflare quick tunnel | `false` |
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
@@ -1237,7 +1272,7 @@ is involved to spend anything further.
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
 | `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
-| `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation) | unbounded |
+| `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation); `0` never rotates | `67108864` (64 MiB) |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
 | `--fs-chunk-size <N>` | Upload chunk size advertised to callers, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB); `262144` (256 KiB) when `--relay` is given |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
@@ -1388,10 +1423,17 @@ at the runtime default — **512**. So the 513th concurrent command does not run
 late, it does not *start* until one of the 512 finishes.
 
 A command's `timeout_secs` (§3, ceiling 300 s) bounds how long it *runs*, not how
-long it holds its thread. Tearing down a timed-out command happens on that same
-thread afterwards, and on Windows that shells out to `taskkill` — a process spawn,
-measured at 6.1 s on an idle workstation and over 28 s on a loaded one. Size a
-concurrency budget against the timeout plus teardown, not the timeout alone.
+long it holds its thread: tearing a timed-out command down happens on that same
+thread afterwards. Since 0.21.0 that teardown is a system call on both platforms
+— a job object on Windows, a process-group signal elsewhere — and was measured at
+**0.097 ms**, so the timeout is now a close approximation of how long the thread
+is held.
+
+Before 0.21.0 the Windows teardown ran `taskkill`, and paying a process spawn to
+end a process cost what a spawn costs on that machine: **238 ms** measured on a
+quiet workstation, **6.12 s** on the same machine while it was busy, over **28 s**
+under a parallel build. If you sized a concurrency budget against that, it can
+come down.
 
 Requests that do their own blocking work — the filesystem API, and anything that
 writes an audit entry — draw on that same pool, so they queue behind commands

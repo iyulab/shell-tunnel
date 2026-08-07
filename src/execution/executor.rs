@@ -11,7 +11,7 @@ use super::pipe::PipeDrain;
 use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
-use crate::process::{detach_process_group, kill_tree, shell_command};
+use crate::process::{shell_command, KillGroup};
 use crate::session::{BusySession, SessionStore};
 use crate::Result;
 
@@ -125,18 +125,25 @@ const DRAIN_BUDGET: usize = 256 * 1024;
 ///   for the life of the process. Here the deadline below closes the read ends
 ///   and returns; a pipe nobody is blocked on cannot be leaked.
 ///
-/// Note what this does *not* claim: a surviving grandchild is still surviving.
-/// It keeps its inherited handles and keeps running, and on the success path
-/// nothing kills it — the server has no grounds to decide that a background
-/// process a command deliberately started should die. What is guaranteed is
-/// narrower and is the part that belongs to this crate: **the server's own
-/// resources are released either way.**
+/// Note what this does *not* claim by default: a surviving grandchild is still
+/// surviving. It keeps its inherited handles and keeps running, and on the
+/// success path nothing kills it — a background process a command deliberately
+/// started is not the server's to end unless the operator says so. What is
+/// guaranteed unconditionally is narrower, and is the part that belongs to this
+/// crate: **the server's own resources are released either way.**
+///
+/// `kill_orphans` is that operator's say-so ([`CommandExecutor::kill_orphans`],
+/// `--kill-orphans`). With it set, the group is reaped when it drops — which is
+/// after the collection loop below, so output the background process already
+/// wrote is still collected — and every exit path reaps alike, including an
+/// early `?` and the timeout branch.
 ///
 /// `on_chunk` is invoked for every output chunk as it arrives, which is what
 /// lets the streaming (WebSocket) path forward output live; the non-streaming
 /// callers pass a no-op.
 fn run_command_streaming(
     command: &Command,
+    kill_orphans: bool,
     mut on_chunk: impl FnMut(&[u8]),
 ) -> Result<ExecutionResult> {
     let start = Instant::now();
@@ -154,12 +161,19 @@ fn run_command_streaming(
         os_cmd.env(key, value);
     }
 
-    // Put the child in its own process group so that on timeout we can signal
-    // the whole tree (a shell that spawned grandchildren) at once.
-    detach_process_group(&mut os_cmd);
+    // Group the child with everything it spawns so that on timeout we can kill
+    // the whole tree (a shell that spawned grandchildren) at once. `prepare`
+    // must run before the spawn and `adopt` immediately after it.
+    let kill_group = KillGroup::prepare(&mut os_cmd);
+    if kill_orphans {
+        // Set before the spawn can fail, so no exit path can skip it. Dropping
+        // the group is what reaps, and the group outlives the collection loop
+        // below — output a background process already wrote is still collected.
+        kill_group.reap_on_drop();
+    }
 
     let mut child = os_cmd.spawn().map_err(ShellTunnelError::Io)?;
-    let child_pid = child.id();
+    kill_group.adopt(&child);
 
     // stdout and stderr are merged into one output stream. True interleaving is
     // not guaranteed (nor is it with a TTY), but clients consume a single stream.
@@ -240,7 +254,7 @@ fn run_command_streaming(
             // Kill the whole tree: `cmd /c ...` / `sh -c ...` may have spawned
             // grandchildren that would otherwise keep the output pipes open and
             // stall our collection below (and keep running as orphans).
-            kill_tree(child_pid);
+            kill_group.kill();
             let _ = child.wait();
             break;
         }
@@ -253,8 +267,8 @@ fn run_command_streaming(
     }
 
     // Collect the tail. Both pipes end on their own once every write end has
-    // closed — normally as the child exits, and on timeout once `kill_tree` has
-    // taken the tree with it. The grace deadline is the backstop for the case
+    // closed — normally as the child exits, and on timeout once the kill group
+    // has taken the tree with it. The grace deadline is the backstop for the case
     // that has no other end: a grandchild inherited these pipes and is still
     // holding them open. Reaching it closes our read ends and returns.
     //
@@ -303,8 +317,8 @@ fn run_command_streaming(
 }
 
 /// Run a non-interactive command, collecting all output (no streaming).
-fn run_command(command: &Command) -> Result<ExecutionResult> {
-    run_command_streaming(command, |_| {})
+fn run_command(command: &Command, kill_orphans: bool) -> Result<ExecutionResult> {
+    run_command_streaming(command, kill_orphans, |_| {})
 }
 
 /// How long to nap between attempts at a full channel.
@@ -345,12 +359,35 @@ fn forward_chunk(tx: &mpsc::Sender<OutputChunk>, chunk: &[u8], stop_waiting_at: 
 /// Command executor for running commands in shell sessions.
 pub struct CommandExecutor {
     store: Arc<SessionStore>,
+    kill_orphans: bool,
 }
 
 impl CommandExecutor {
     /// Create a new command executor.
+    ///
+    /// Commands run under it leave their background processes running; see
+    /// [`kill_orphans`](Self::kill_orphans) to change that.
     pub fn new(store: Arc<SessionStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            kill_orphans: false,
+        }
+    }
+
+    /// Kill whatever a command leaves running when the command ends.
+    ///
+    /// This is server policy rather than a property of any one request, which is
+    /// why it lives here and not on [`Command`]: the same command line means the
+    /// same thing whoever sends it, and what changes is the machine's rule about
+    /// what may outlive a request. Consumers of this crate opt in the same way
+    /// the binary does, with `--kill-orphans`.
+    ///
+    /// Off by default. A command that deliberately starts a daemon expects it to
+    /// survive, so switching this on by default would break working callers
+    /// silently — the reason it is a flag at all.
+    pub fn kill_orphans(mut self, kill: bool) -> Self {
+        self.kill_orphans = kill;
+        self
     }
 
     /// Execute a command synchronously (blocking).
@@ -359,7 +396,7 @@ impl CommandExecutor {
     /// [`CommandExecutor::execute`] from async contexts — this blocking variant
     /// must never be called directly on a tokio worker thread.
     pub fn execute_sync(&self, command: &Command) -> Result<ExecutionResult> {
-        run_command(command)
+        run_command(command, self.kill_orphans)
     }
 
     /// Execute a command, keeping the async runtime responsive.
@@ -371,7 +408,8 @@ impl CommandExecutor {
     /// completes without leaking runtime capacity.
     pub async fn execute(&self, command: &Command) -> Result<ExecutionResult> {
         let command = command.clone();
-        tokio::task::spawn_blocking(move || run_command(&command))
+        let kill_orphans = self.kill_orphans;
+        tokio::task::spawn_blocking(move || run_command(&command, kill_orphans))
             .await
             .map_err(|e| ShellTunnelError::Pty(format!("execution task failed: {e}")))?
     }
@@ -406,6 +444,7 @@ impl CommandExecutor {
     )> {
         let (tx, rx) = mpsc::channel::<OutputChunk>(64);
         let command = command.clone();
+        let kill_orphans = self.kill_orphans;
         // The same deadline the blocking core will enforce, from the same place
         // it gets it — see `Command::effective_timeout` for why that matters
         // here in particular.
@@ -415,7 +454,7 @@ impl CommandExecutor {
             // Past this instant the command is due to be killed anyway, so no
             // chunk is worth waiting on: see `forward_chunk`.
             let stop_waiting_at = Instant::now() + budget;
-            run_command_streaming(&command, |chunk| {
+            run_command_streaming(&command, kill_orphans, |chunk| {
                 forward_chunk(&tx, chunk, stop_waiting_at);
             })
         });

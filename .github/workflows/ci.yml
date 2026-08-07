@@ -99,3 +99,14 @@ jobs:
       # toolchain, which the manifest comment already records.
       - name: Build with the declared MSRV
         run: cargo build --locked
+
+      # And run that build's tests, which nothing else does. Every other job
+      # enables `relay-client,tls`, so a test that only compiles with a feature
+      # can sit red in the default build indefinitely while all three OS jobs
+      # stay green -- one did, and it was found by hand rather than by CI.
+      #
+      # The marker is load bearing: `tests/ci_feature_gates.rs` otherwise
+      # requires every `cargo test` here to enable every gated feature, which is
+      # exactly what this command must not do.
+      - name: Test the default build
+        run: cargo test --all # default-build-on-purpose

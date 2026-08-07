@@ -257,8 +257,43 @@ pub struct FileState {
     written: u64,
 }
 
+/// How large the trail is allowed to get before it rotates, unless told otherwise.
+///
+/// The trail is on by default whenever the server is reachable, so its size is
+/// not something an operator opts into thinking about — until 0.21.0 it had no
+/// bound at all, and one line per execution accumulating forever is a way to
+/// fill a disk. That is a *different* way to take a server down than running out
+/// of memory, and a trail that fills the disk stops recording, so "keep
+/// everything" does not actually keep everything.
+///
+/// The figure is derived rather than picked: an entry as the trail writes them
+/// runs about 200 bytes (an `execute` entry with identity and command measures
+/// 211, a `denied` entry 108–183). One generation is kept beside the live file,
+/// so this bounds the trail at 128 MiB on disk and roughly 670,000 entries
+/// retained — far more history than an incident needs to look back through, and
+/// small enough that it cannot be the thing that fills a disk.
+///
+/// `--audit-max-bytes 0` restores the old unbounded behaviour for an operator
+/// who would rather keep everything and manage the size themselves.
+pub const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The default must be a bound, not the opt-out.
+///
+/// Zero is the escape hatch meaning "never rotate" ([`Args::audit_rotation_limit`]),
+/// so a default of zero would silently switch rotation off for everyone while
+/// still reading as "bounded by default". Checked here rather than in a test
+/// because it is a property of the constant, and a test asserting it would be
+/// asserting something the compiler already knows.
+///
+/// [`Args::audit_rotation_limit`]: crate::cli::Args::audit_rotation_limit
+const _: () = assert!(DEFAULT_MAX_BYTES > 0);
+
 impl AuditSink {
     /// Open `path` for appending, creating it if needed.
+    ///
+    /// Unbounded: rotation is [`file_with_limit`](Self::file_with_limit), and the
+    /// binary passes [`DEFAULT_MAX_BYTES`] through that. This constructor exists
+    /// for consumers that manage the file's size themselves.
     pub fn file(path: impl AsRef<Path>) -> Result<Self> {
         Self::file_with_limit(path, None)
     }

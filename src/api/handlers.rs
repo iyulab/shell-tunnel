@@ -56,6 +56,15 @@ impl AppState {
         self
     }
 
+    /// Kill whatever a command leaves running when the command ends.
+    ///
+    /// Rebuilds the executor, so call it before handing the state out. Off
+    /// unless asked for — see [`CommandExecutor::kill_orphans`].
+    pub fn with_kill_orphans(mut self, kill: bool) -> Self {
+        self.executor = Arc::new(CommandExecutor::new(Arc::clone(&self.store)).kill_orphans(kill));
+        self
+    }
+
     /// Enable the filesystem API, confined to `root`.
     pub fn with_fs_root(mut self, root: crate::fs::FsRoot) -> Self {
         self.fs = Some(Arc::new(root));

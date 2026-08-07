@@ -117,21 +117,78 @@ fn features_on(command: &str) -> BTreeSet<String> {
     BTreeSet::new()
 }
 
+/// The one exemption from the feature rule, spelled out in the workflow itself.
+///
+/// A command carrying this marker is asserting that running the *default* build
+/// is its whole point, so requiring it to enable every gate would defeat it.
+/// Nothing infers the exemption — it has to be written next to the command, so
+/// that dropping features from some other command can never be mistaken for it.
+const DEFAULT_BUILD_MARKER: &str = "# default-build-on-purpose";
+
 /// CI commands that build the integration tests, and so decide which of them
 /// exist at all: `cargo test`, and `cargo clippy --all-targets`.
 ///
 /// A command that builds neither (the MSRV job's `cargo build`) is not listed
-/// here, because no suite can go missing from it.
+/// here, because no suite can go missing from it. Nor is a command marked
+/// [`DEFAULT_BUILD_MARKER`]: the default build is precisely the one nothing else
+/// runs, and the check below would otherwise forbid the job that covers it.
 fn commands_that_build_the_tests(workflow: &str) -> Vec<String> {
     workflow
         .lines()
         .map(str::trim)
+        // A comment is not a command. This scan is textual, so a comment that
+        // *names* a command was being checked as though it were one — writing
+        // "every `cargo test` here must enable every feature" in the workflow
+        // made this file fail on its own prose. Present since the check was
+        // written; only reached once a comment happened to say the words.
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| !line.contains(DEFAULT_BUILD_MARKER))
         .filter(|line| {
             line.contains("cargo test")
                 || (line.contains("cargo clippy") && line.contains("--all-targets"))
         })
         .map(|line| line.to_string())
         .collect()
+}
+
+/// CI must actually run the default build's tests, and exactly once.
+///
+/// `CLAUDE.md` recorded the failure this closes: CI checked that build by
+/// *building* it and never ran its tests, so a test that only passes with a
+/// feature could sit red there indefinitely while all three OS jobs stayed
+/// green. One did.
+///
+/// "Exactly once" is the other half. The marker is an exemption from the
+/// feature rule above, so more than one of them would be a way to opt whole
+/// commands out of that rule while this file still reports ok.
+#[test]
+fn ci_runs_the_default_builds_tests_exactly_once() {
+    let workflow_path = repo_root().join(".github/workflows/ci.yml");
+    let workflow = std::fs::read_to_string(&workflow_path).expect("the CI workflow is readable");
+
+    let marked: Vec<&str> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.contains(DEFAULT_BUILD_MARKER) && line.contains("cargo test"))
+        .collect();
+
+    assert_eq!(
+        marked.len(),
+        1,
+        "expected exactly one `cargo test` marked `{DEFAULT_BUILD_MARKER}` in {}, found {}: {marked:?}\n\
+         None means nothing runs the default build's tests, and a feature-gated test can go red \
+         there without any job noticing. More than one means the exemption is being used to \
+         excuse commands from the feature rule this file exists to enforce.",
+        workflow_path.display(),
+        marked.len()
+    );
+
+    let command = marked[0];
+    assert!(
+        features_on(command).is_empty(),
+        "the default-build command must enable no features -- that is what makes it the default \
+         build. Got: {command}"
+    );
 }
 
 #[test]

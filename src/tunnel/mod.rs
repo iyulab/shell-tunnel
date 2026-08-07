@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::error::ShellTunnelError;
-use crate::process::{detach_process_group, kill_tree};
+use crate::process::KillGroup;
 use crate::Result;
 
 pub use spawned::{Cloudflared, CustomCommand, TunnelProvider};
@@ -36,6 +36,9 @@ const POLL: Duration = Duration::from_millis(50);
 #[derive(Debug)]
 pub struct TunnelHandle {
     child: Child,
+    /// Kept for the lifetime of the handle: dropping it early would release the
+    /// job the provider's tree lives in, leaving `Drop` nothing to kill.
+    kill_group: KillGroup,
     public_url: String,
     provider: String,
 }
@@ -63,7 +66,7 @@ impl TunnelHandle {
 
 impl Drop for TunnelHandle {
     fn drop(&mut self) {
-        kill_tree(self.child.id());
+        self.kill_group.kill();
         let _ = self.child.wait();
     }
 }
@@ -83,7 +86,7 @@ pub fn start(
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    detach_process_group(&mut cmd);
+    let kill_group = KillGroup::prepare(&mut cmd);
 
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -96,6 +99,7 @@ pub fn start(
             ShellTunnelError::Tunnel(format!("failed to start `{}`: {}", name, e))
         }
     })?;
+    kill_group.adopt(&child);
 
     // Providers announce the URL on either stream (cloudflared uses stderr), so
     // both are scanned. Every line is also logged, which is how an operator
@@ -114,6 +118,7 @@ pub fn start(
             if let Some(url) = provider.extract_url(&line) {
                 return Ok(TunnelHandle {
                     child,
+                    kill_group,
                     public_url: url,
                     provider: name,
                 });
@@ -126,6 +131,7 @@ pub fn start(
                 if let Some(url) = provider.extract_url(&line) {
                     return Ok(TunnelHandle {
                         child,
+                        kill_group,
                         public_url: url,
                         provider: name,
                     });
@@ -138,7 +144,7 @@ pub fn start(
         }
 
         if Instant::now() >= deadline {
-            kill_tree(child.id());
+            kill_group.kill();
             let _ = child.wait();
             return Err(ShellTunnelError::Tunnel(format!(
                 "`{}` did not publish a public URL within {}s",
@@ -244,9 +250,10 @@ mod tests {
         assert!(err.to_string().contains("did not publish"), "{err}");
 
         // The property is that the deadline ends the wait at all, not that it
-        // ends it fast: tearing the provider down shells out to `taskkill` on
-        // Windows, which is itself a process spawn and can take seconds on a
-        // loaded machine. A tight bound here measures the host, not the code.
+        // ends it fast. A tight bound here measures the host, not the code:
+        // until 0.21.0 tearing the provider down shelled out to `taskkill`,
+        // itself a process spawn that took seconds on a loaded machine, and
+        // spawning the provider still does.
         //
         // Which is what it was doing. Twenty seconds against a thirty-second
         // command left ten seconds of margin, and a busy workstation ate it —
@@ -268,10 +275,14 @@ mod tests {
 
         let mut handle = start(&fake(long_lived), addr(), Duration::from_secs(10)).unwrap();
         assert!(handle.is_alive());
-        let pid = handle.child.id();
         drop(handle);
 
-        // The process group is gone: a second kill is a no-op and must not hang.
-        kill_tree(pid);
+        // What this proves is that `Drop` kills and reaps without hanging — the
+        // test returning *is* the assertion, because `Drop` waits on the child.
+        // That the tree actually dies is proved where the kill lives:
+        // `process::a_group_kills_a_background_process_the_command_left_behind`.
+        // Before 0.21.0 this ended with a second `kill_tree(pid)` to show a
+        // repeat kill was harmless; the group owning the job means there is no
+        // longer a pid lying around to kill twice, which is the point of it.
     }
 }
