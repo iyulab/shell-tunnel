@@ -325,40 +325,58 @@ mod tests {
     }
 
     /// The budget bounds one pass, so the caller's loop always gets to run.
+    ///
+    /// The writer is the shell's own `echo` and the whole payload fits the pipe
+    /// buffer, so waiting for the child settles the question of what is readable:
+    /// a single write that fits cannot be observed half-done, and the child is
+    /// gone before anything is read. That is what lets this assert the exact
+    /// budget rather than "no more than" it — a pass that ignored the budget
+    /// returns the whole payload, and there is no third answer to confuse it with.
+    ///
+    /// It used to start PowerShell and poll two seconds for a first byte. That
+    /// measured an interpreter's startup: 319 ms on a warm workstation, over the
+    /// two seconds on a cold CI runner, where it failed on its first run there.
+    /// With `stderr` discarded, a slow interpreter and a broken command line were
+    /// also the same observation — zero bytes.
     #[test]
     fn a_pass_stops_at_its_budget() {
-        #[cfg(windows)]
-        let line = "powershell -NoProfile -Command [Console]::Out.Write(('x'*20000))";
-        #[cfg(unix)]
-        let line = "head -c 20000 /dev/zero | tr '\\0' x";
+        // Twice the budget, and well under the 4 KiB a Windows anonymous pipe
+        // buffers, so the writer never blocks and `wait` cannot deadlock on it.
+        const PAYLOAD: usize = 2048;
+        const BUDGET: usize = 1024;
 
-        let mut child = shell_command(line)
+        let mut child = shell_command(&format!("echo {}", "x".repeat(PAYLOAD)))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn");
         let mut pipe = PipeDrain::new(child.stdout.take().expect("stdout is piped"));
+        let _ = child.wait();
 
-        // Wait for bytes to actually be available, so the assertion is about the
-        // budget rather than about a pipe that had not filled yet.
-        let mut first = Vec::new();
-        for _ in 0..400 {
-            first = collect(&mut pipe, 1024);
-            if !first.is_empty() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-
-        assert!(!first.is_empty(), "the command produced no output at all");
-        assert!(
-            first.len() <= 1024,
-            "one pass must not exceed its budget: took {}",
-            first.len()
+        let first = collect(&mut pipe, BUDGET);
+        assert_eq!(
+            first.len(),
+            BUDGET,
+            "one pass must stop at its budget, with the payload already buffered"
         );
 
-        let _ = child.kill();
-        let _ = child.wait();
+        // And the remainder is still there: a budget that dropped what it did not
+        // return would pass the assertion above and lose output.
+        let rest = collect(&mut pipe, 64 * 1024);
+        assert_eq!(
+            first.len() + rest.len(),
+            PAYLOAD + line_ending_len(),
+            "the bytes past the budget are kept for the next pass"
+        );
+    }
+
+    /// What the shell's `echo` appends: `\r\n` under `cmd`, `\n` under `sh`.
+    const fn line_ending_len() -> usize {
+        if cfg!(windows) {
+            2
+        } else {
+            1
+        }
     }
 }
