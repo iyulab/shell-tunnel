@@ -408,7 +408,9 @@ OPTIONS:
         --preset <NAME>     Scope issued token(s) by role preset
                             (operator | file-write | file-read | full-control)
         --no-rate-limit     Disable rate limiting. No X-RateLimit-* headers are
-                            then sent — there is no budget to report
+                            then sent — there is no budget to report. On a relay
+                            it also drops the only thing bounding guesses at the
+                            enrol token, which the relay warns about at startup
         --tunnel            Expose publicly via a Cloudflare quick tunnel
                             (requires `cloudflared`; implies authentication)
         --tunnel-command <C>

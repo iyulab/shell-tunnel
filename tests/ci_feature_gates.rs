@@ -396,8 +396,9 @@ fn the_published_relay_ceiling_is_the_constant_this_crate_declares() {
         let text = std::fs::read_to_string(&path).expect("document is readable");
         assert!(
             text.contains(&phrase),
-            "{name} must say `{phrase}`; if the constant changed, the document \
-             promising it did not"
+            "{name} must say `{phrase}`. Either the constant changed and this \
+             document did not, or the phrase was reworded — the second is the \
+             likelier one, so read the document before reaching for the constant"
         );
     }
 }
