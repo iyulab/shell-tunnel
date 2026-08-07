@@ -239,7 +239,14 @@ for as long as possible and gets 300, and `0` asks for the shortest timeout ther
 is and gets 1 — not a deadline that has already passed. `timed_out` and
 `duration_ms` on the response say what actually happened either way. The same
 range applies to a `timeout_secs` sent over the WebSocket (*Streaming* below);
-one execute path enforces it for both. Until 0.21.0 neither bound was enforced
+one execute path enforces it for both.
+
+Clamping starts at zero. **A negative `timeout_secs` is refused with `422`**,
+before any of the above applies, because the field is an unsigned integer and
+the value never becomes a number the clamp could see. To a consumer reading
+`minimum: 1` off the schema, `-1` and `0` are equally out of range and the two
+behave differently — the boundary is the field's type, which the schema calls
+`integer`. Until 0.21.0 neither bound was enforced
 anywhere — `docs/openapi.json` had declared 1–300 throughout while the server
 accepted and honoured anything, and this page named only the default.
 
@@ -375,13 +382,27 @@ command *starts* as well as when it ends, so a session thirty seconds into a
 build and one that has been idle for thirty seconds report the same
 `idle_seconds`.
 
-It tracks the command and not the exchange around it, which is visible on the
-streaming path: a session whose consumer is reading slowly can report
-`running: false` while output from its last command is still being delivered.
-Until 0.21.1 it reported the exchange instead, and since a consumer may stop
-reading for as long as it likes, a session could read `running: true`
-indefinitely after its command had already been killed — 75 seconds, measured,
-on a command that died at its five-second deadline.
+It tracks the command, not the exchange around it and not the caller's presence.
+Two situations show an observer something that looks like a contradiction, and
+both are that distinction rather than an exception to it:
+
+- **A direct caller that hangs up sees `false` while the command runs on.** The
+  disconnect releases the *session*, not the command (below). Over a relay the
+  same disconnect does nothing: the device replays each request to its own
+  listener and reads that response to the end, so it never learns the caller
+  left, and `running` stays `true` until the command finishes. Measured on both
+  paths in the same minute — the direct one reads `false` about a second after
+  the caller goes, the relayed one stays `true` for the command's full length.
+- **A WebSocket consumer that reads slowly sees `false` while frames are still
+  arriving.** The command is over; what remains is delivery. `execution_count`
+  and the audit entry land at the end of delivery too, so a consumer that has
+  stopped reading sees `running: false` and `execution_count: 0` together for a
+  command that has already run — measured, 20 seconds after a 3-second command,
+  both catching up the moment it resumed. Until 0.21.1 `running` reported the
+  exchange instead, which closed that window at the cost of a much worse one: a
+  consumer that never read again held the session `true` indefinitely, 75
+  seconds measured on a command that died at its five-second deadline, and the
+  sweep below could never reclaim it.
 
 **A session left idle for an hour is swept.** It then answers `404` like any
 other unknown id, and the trail records `session.expired` (§4) so an abandoned
@@ -407,11 +428,18 @@ executing anything will find it gone.
 **Hanging up does not cancel a command.** If you close the socket or drop the
 HTTP request before its response, the command keeps running to its own end or
 its timeout. Deleting the session does not stop it either — that removes the
-bookkeeping and nothing else. What the disconnect *does* release is the
-session: it reports `running: false`
-immediately rather than waiting for a result nobody is left to receive. So a
-disconnect leaves `running` reading `false` while a command started in the
-session is still finishing, for as long as that command's timeout allows.
+bookkeeping and nothing else. This part holds on every path.
+
+What a disconnect does to the *session* depends on the path, which is the first
+bullet above. Reached directly, it releases the session at once — `running` goes
+`false` rather than waiting for a result nobody is left to receive, so it reads
+`false` while a command started in that session is still finishing. Reached
+through a relay, it releases nothing, because nothing tells the device the
+caller went away; `running` stays `true` for the command's full length and
+`execution_count` rises when it ends, exactly as it would have without a
+disconnect. Neither is wrong about the command, which runs to its own end
+either way — they disagree about what a vanished caller means, and only one of
+them can see that it vanished.
 
 > **Changed in 0.20.0.** Create used to accept `shell`, `working_dir` and `env`;
 > none of the three ever reached a command, and two of them were documented here
@@ -764,14 +792,30 @@ the file operations listed in the `kind` table below. **That table is the whole
 list** — an outcome absent from it leaves no entry. Four gaps are worth naming
 rather than leaving to be discovered.
 
-**A command whose caller hangs up is not recorded**, and it did run. The entry
-is written where the result is handled, so a caller that disconnects first takes
-that step with it — while the command itself carries on to its end or its
-timeout (§3). Measured, not read off the code: one `/execute` that completed
-wrote its entry, and an identical one abandoned after a second left the trail
-unchanged twelve seconds later, well past when the command had finished. This is
-the gap to weigh if the trail is what you would reach for after an incident,
-because "no entry" and "never ran" look the same in it.
+**A command whose caller hangs up may not be recorded, and it did run.** The
+entry is written where the result is handled, so anything that stops the handler
+reaching that point takes the entry with it — while the command itself carries
+on to its end or its timeout (§3). Which callers this reaches is not uniform,
+and the difference is worth having before an incident rather than during one:
+
+- **Reached directly, a disconnect loses the entry.** Measured: one `/execute`
+  that completed wrote its entry, and an identical one abandoned after a second
+  left the trail unchanged twelve seconds later, well past when the command had
+  finished.
+- **Reached through a relay, the same disconnect loses nothing.** The device
+  never learns the caller left (§3), so the handler runs to the end and writes
+  the entry — measured over a relay, `exit_code: 0` and a `duration_ms` covering
+  the whole command, for a caller that had been gone for nine seconds.
+- **Over a session WebSocket the entry waits for delivery**, not for the
+  command. A consumer that stops reading leaves the command recorded nowhere
+  until it comes back — measured, nothing in the trail 20 seconds after a
+  3-second command, and the entry present within half a second of the consumer
+  resuming. One that never comes back never produces it.
+
+So "no entry" and "never ran" look the same in the trail, and on the direct path
+that is a gap you cannot close from the outside. It is narrower than it was
+described as being through 0.21.0, when this said flatly that such a command is
+not recorded: that sentence was measured on one path and was false on the other.
 
 **Reading is not recorded.** `list`, `stat` and `download` write nothing when
 they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.

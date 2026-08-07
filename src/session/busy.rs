@@ -20,6 +20,16 @@ use crate::Result;
 ///
 /// A guard closes every exit through one path, including cancellation, because
 /// dropping a future runs the destructors of everything it owns.
+///
+/// That is about the exits. It says nothing about how long the guard is *held*,
+/// and the two are separate mistakes with the same symptom. A session reporting
+/// a command that has already finished was seen twice for different reasons:
+/// once because a cancelled handler never ran the transition back (fixed here),
+/// and once because the session WebSocket held this guard across the delivery of
+/// the command's output, which a consumer that stops reading can extend without
+/// limit (fixed at the holder, `api::websocket::while_running`). A guard whose
+/// exits are all covered still lies if its lifetime is not the thing it claims
+/// to track.
 pub(crate) struct BusySession {
     store: Arc<SessionStore>,
     id: SessionId,

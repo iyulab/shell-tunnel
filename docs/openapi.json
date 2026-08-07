@@ -1340,7 +1340,7 @@
           },
           "running": {
             "type": "boolean",
-            "description": "Whether a command is running in this session right now. The one thing idle_seconds cannot say: the executor touches the session when a command starts as well as when it ends, so a session two seconds into a command and one idle for two seconds report the same idle_seconds. A caller that hangs up mid-command releases the session immediately, while the command itself keeps running to its end or its timeout (deleting the session does not stop it either — that removes the bookkeeping only), so after a disconnect `running` reads false while a command started in the session is still finishing. Until 0.20.0 this was `state`, a four-value internal enum of which two values this API can never return, alongside a `working_dir` echoed from creation that governed nothing.",
+            "description": "Whether a command is running in this session right now. The one thing idle_seconds cannot say: the executor touches the session when a command starts as well as when it ends, so a session two seconds into a command and one idle for two seconds report the same idle_seconds. It tracks the command, not the exchange around it and not the caller's presence, and two situations show an observer what looks like a contradiction. A caller that hangs up mid-command releases the session when it reached the device directly, so `running` reads false while the command keeps running to its end or its timeout; through a relay the same disconnect releases nothing, because nothing tells the device the caller went away, and `running` stays true for the command's full length. And on a session WebSocket, `running` goes false when the command ends rather than when its output finishes being delivered, so a consumer that reads slowly sees false while frames are still arriving - with execution_count still 0, since that and the audit entry are written at the end of delivery. Deleting the session does not stop a command either; that removes the bookkeeping only. Until 0.21.1 `running` reported the exchange rather than the command, so a WebSocket consumer that stopped reading held the session true indefinitely and kept it out of the idle sweep. Until 0.20.0 this was `state`, a four-value internal enum of which two values this API can never return, alongside a `working_dir` echoed from creation that governed nothing.",
             "example": false
           },
           "last_exit_code": {
@@ -1421,7 +1421,7 @@
           },
           "timeout_secs": {
             "type": "integer",
-            "description": "Command timeout in seconds. Clamped into this range rather than refused, the way `max_output_bytes` is: a larger value asks for \"as long as possible\" and gets the maximum, and `0` asks for the smallest timeout there is and gets 1 rather than a deadline that has already passed. `timed_out` and `duration_ms` on the response report what actually happened either way.",
+            "description": "Command timeout in seconds. Clamped into this range rather than refused, the way `max_output_bytes` is: a larger value asks for \"as long as possible\" and gets the maximum, and `0` asks for the smallest timeout there is and gets 1 rather than a deadline that has already passed. `timed_out` and `duration_ms` on the response report what actually happened either way. Clamping starts at zero: a negative value is refused with 422 before any clamp applies, because the field is an unsigned integer. To a consumer reading `minimum: 1` off this schema -1 and 0 are equally out of range, and only one of them is clamped.",
             "default": 30,
             "minimum": 1,
             "maximum": 300
@@ -1804,7 +1804,7 @@
               },
               "timeout_secs": {
                 "type": "integer",
-                "description": "Command timeout in seconds. Clamped into this range rather than refused, the way `max_output_bytes` is: a larger value asks for \"as long as possible\" and gets the maximum, and `0` asks for the smallest timeout there is and gets 1 rather than a deadline that has already passed. `timed_out` and `duration_ms` on the response report what actually happened either way. Same bounds as the REST route: one execute path enforces them for both.",
+                "description": "Command timeout in seconds. Clamped into this range rather than refused, the way `max_output_bytes` is: a larger value asks for \"as long as possible\" and gets the maximum, and `0` asks for the smallest timeout there is and gets 1 rather than a deadline that has already passed. `timed_out` and `duration_ms` on the response report what actually happened either way. Same bounds as the REST route: one execute path enforces them for both. Clamping starts at zero: a negative value is refused with 422 before any clamp applies, because the field is an unsigned integer. To a consumer reading `minimum: 1` off this schema -1 and 0 are equally out of range, and only one of them is clamped.",
                 "default": 30,
                 "minimum": 1,
                 "maximum": 300

@@ -16,6 +16,30 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   had always warned. Neither prints anything when the default is in force; the deviation is
   the signal, as it already is for the generated key and the upload chunk size.
 
+### Documentation
+
+- **Two statements about a hung-up caller described one path and were false on the other.**
+  `docs/USAGE.md` said a disconnect leaves `running` reading `false` while the command
+  finishes, and that a command whose caller hangs up is not recorded — the second marked
+  "measured, not read off the code". Both measurements were taken against a directly reached
+  server. Over a relay neither holds: the device replays each request to its own listener and
+  reads that response to the end, so nothing tells it the caller went away, `running` stays
+  `true` for the command's full length, and the execute *is* recorded, with the session's
+  `execution_count` rising as though nothing had happened.
+
+  Rather than restating either as a more careful universal — three attempts at that in 0.14.0
+  produced three false sentences — `running` is now defined once, as tracking the command, and
+  the two situations that look otherwise are enumerated beside it: a disconnect, whose effect
+  depends on the path, and a WebSocket consumer reading slowly, which sees `running: false`
+  and `execution_count: 0` together while frames are still arriving. `docs/openapi.json` and
+  the `BusySession` doc comment carry the same split.
+
+- **`timeout_secs` is clamped rather than refused, but not below zero.** A negative value is
+  `422`, since the field is an unsigned integer and never becomes a number the clamp could
+  see. To a consumer reading `minimum: 1` off the schema, `-1` and `0` are equally out of
+  range and only one of them is clamped; that boundary is now stated in `docs/USAGE.md` and in
+  both `timeout_secs` descriptions in `docs/openapi.json`.
+
 ### Fixed
 
 - **A session whose WebSocket consumer stopped reading was never reclaimed.** The guard that
