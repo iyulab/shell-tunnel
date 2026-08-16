@@ -3,6 +3,22 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.21.2 — 2026-08-14
+
+### Fixed
+
+- **A pooled data connection that sat idle long enough could be silently dropped by a NAT,
+  firewall, or reverse proxy between a device and its relay — and nothing found out until a
+  real request tried to use it, failing with `502 device did not answer`.** The control
+  channel already defends against exactly this with a 30-second heartbeat, sized to stay
+  under the ~60s idle-close default those intermediaries commonly use; nothing did the same
+  for the four connections a device keeps parked in its data pool, because nothing on the
+  relay's side was reading them while idle for a heartbeat to even reach. The relay now
+  closes and replaces every pooled connection on a fixed 25-second sweep instead
+  (`RelayConfig::pool_recycle_interval`), which bounds a connection's maximum possible age at
+  the sweep interval itself rather than detecting staleness after a request has already
+  failed on it. `docs/USAGE.md` §"What decides how fast a relayed request is" describes it.
+
 ## 0.21.1 — 2026-08-07
 
 ### Added

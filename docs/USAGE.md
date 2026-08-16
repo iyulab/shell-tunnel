@@ -1242,6 +1242,17 @@ keeps a small pool of connections open and refills it as they are consumed), but
 more than a handful of *concurrent* requests to one device will outrun that pool
 and start paying for new connections.
 
+The relay also closes and replaces every idle pooled connection on its own,
+every 25s, whether or not anything has consumed one. A connection waiting in
+the pool carries no traffic at all, so nothing would otherwise notice a NAT
+table entry, firewall session, or intermediate proxy quietly dropping it —
+the first request after a long gap would find out by failing with `502
+device did not answer` and a retry would succeed once a fresh connection
+replaced it. Recycling on a fixed interval well under common idle-connection
+timeouts removes that gap instead of recovering from it: a request should
+never again be the first thing to discover a pooled connection has gone
+stale from sitting unused.
+
 Chunk size is not a tuning knob for this. There is no per-chunk
 acknowledgement and no window: a bigger chunk is one bigger frame. `chunk_size`
 exists for the relay's body ceiling and its per-request deadline (§3.2), and the

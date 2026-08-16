@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::ws::WebSocket;
+use futures_util::SinkExt;
 use tokio::sync::mpsc;
 
 /// How many idle data connections a device is asked to keep ready.
@@ -102,6 +103,28 @@ impl Device {
             .await
             .ok()
             .flatten()
+    }
+
+    /// Close every idle connection currently sitting in the pool and ask for
+    /// replacements. Returns how many were recycled.
+    ///
+    /// A connection waiting here for its first request carries no traffic at
+    /// all — see [`super::DEFAULT_POOL_RECYCLE_INTERVAL`] for why that makes
+    /// it vulnerable to exactly what the control channel's heartbeat defends
+    /// against. Draining with `try_recv` rather than `recv` is what keeps this
+    /// non-blocking: an empty pool recycles zero and returns immediately.
+    pub async fn recycle_idle_pool(&self) -> usize {
+        let mut rx = self.pool_rx.lock().await;
+        let mut recycled = 0usize;
+        while let Ok(mut conn) = rx.try_recv() {
+            let _ = conn.close().await;
+            recycled += 1;
+        }
+        drop(rx);
+        for _ in 0..recycled {
+            let _ = self.refill_tx.try_send(());
+        }
+        recycled
     }
 }
 
@@ -270,6 +293,27 @@ impl DeviceRegistry {
             });
         }
         evicted
+    }
+
+    /// Recycle idle pool connections across every attached device.
+    ///
+    /// See [`Device::recycle_idle_pool`]. Returns how many were recycled in
+    /// total, so a caller can log it.
+    ///
+    /// Collects the attached `Arc<Device>`s and drops the registry lock
+    /// before awaiting anything: a `std::sync::RwLock` guard held across an
+    /// `.await` would block every other reader for as long as recycling
+    /// takes, and recycling is the one thing here that talks to the network.
+    pub async fn recycle_idle_pools(&self) -> usize {
+        let devices: Vec<Arc<Device>> = match self.devices.read() {
+            Ok(devices) => devices.values().cloned().collect(),
+            Err(_) => return 0,
+        };
+        let mut total = 0;
+        for device in devices {
+            total += device.recycle_idle_pool().await;
+        }
+        total
     }
 }
 

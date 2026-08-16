@@ -68,6 +68,26 @@ const ENROLL_TIMEOUT: Duration = Duration::from_secs(10);
 /// request direction separately and more tightly.
 pub const MAX_RELAY_FRAME: usize = 16 * 1024 * 1024;
 
+/// Default interval between pool-recycle sweeps ([`RelayConfig::pool_recycle_interval`]).
+///
+/// A pooled data connection carries no traffic at all while it sits idle
+/// waiting for a request — unlike the control channel, which proves itself
+/// alive with a `Heartbeat` frame every 30 seconds specifically to stay under
+/// the ~60s idle-close default common in NATs, firewalls and reverse proxies
+/// (see `protocol::DeviceMessage::Heartbeat`). Nothing defends a pooled
+/// connection the same way, so one can be silently dropped by any of those
+/// and neither side finds out until a real request tries to use it and fails.
+///
+/// Recycling — closing every pooled connection and asking for replacements —
+/// bounds a connection's maximum possible age at the sweep interval itself:
+/// whatever is in the pool when a sweep runs is at most one interval old,
+/// because the previous sweep already cleared everything older. 25s keeps
+/// that bound under the same ~60s default with a similar margin to the
+/// control channel's, using the same fix in the only form available to a
+/// connection nothing is reading — replace it, rather than prove it is
+/// alive over it. See [`registry::Device::recycle_idle_pool`].
+pub const DEFAULT_POOL_RECYCLE_INTERVAL: Duration = Duration::from_secs(25);
+
 /// Relay server settings.
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -91,6 +111,11 @@ pub struct RelayConfig {
     /// `X-Forwarded-*`) headers, so a relay behind TLS termination still tells
     /// devices an address that actually works.
     pub public_base: Option<String>,
+    /// How often idle pooled data connections are closed and replaced.
+    ///
+    /// Defaults to [`DEFAULT_POOL_RECYCLE_INTERVAL`]. Overridable mainly so a
+    /// test can shrink it rather than waiting tens of seconds for a real sweep.
+    pub pool_recycle_interval: Duration,
 }
 
 impl RelayConfig {
@@ -103,6 +128,7 @@ impl RelayConfig {
             #[cfg(feature = "tls")]
             tls: None,
             public_base: None,
+            pool_recycle_interval: DEFAULT_POOL_RECYCLE_INTERVAL,
         }
     }
 
@@ -296,6 +322,7 @@ pub async fn serve_relay_on(
     let bind = config.bind;
     #[cfg(feature = "tls")]
     let tls = config.tls.clone();
+    let pool_recycle_interval = config.pool_recycle_interval;
     let state = RelayState::new(config);
     let router = relay_router(state.clone());
 
@@ -308,6 +335,23 @@ pub async fn serve_relay_on(
             ticker.tick().await;
             for id in sweeper.evict_stale(HEARTBEAT_TIMEOUT) {
                 tracing::info!(target: "relay", device_id = %id, "device evicted (no heartbeat)");
+            }
+        }
+    });
+
+    // A pooled data connection carries no traffic while idle, unlike the
+    // control channel's heartbeat, so nothing here would otherwise notice one
+    // quietly dying — a NAT entry expiring, a firewall reaping an idle
+    // session — until a real request tried to use it and got a 502. See
+    // `DEFAULT_POOL_RECYCLE_INTERVAL`.
+    let recycler = state.devices().clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(pool_recycle_interval);
+        loop {
+            ticker.tick().await;
+            let recycled = recycler.recycle_idle_pools().await;
+            if recycled > 0 {
+                tracing::debug!(target: "relay", recycled, "idle pool connections recycled");
             }
         }
     });

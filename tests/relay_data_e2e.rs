@@ -281,6 +281,82 @@ async fn credentials_never_appear_in_a_data_connection_url() {
     assert_ne!(status, 503, "the connection should have joined the pool");
 }
 
+/// Start a relay the same way [`start_relay`] does, but keep the
+/// [`RelayState`] handle so a test can trigger a pool recycle directly
+/// instead of waiting for the real interval to elapse.
+async fn start_relay_with_state() -> (SocketAddr, RelayState) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = RelayConfig::new(addr, "secret").with_public_base("https://relay.test");
+    let state = RelayState::new(config);
+    let router = relay_router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, state)
+}
+
+/// A pooled connection nothing has requested yet carries no traffic at all —
+/// unlike the control channel, which proves itself alive with a heartbeat.
+/// Left alone, a proxy, NAT or firewall between the device and the relay can
+/// drop it without either side finding out until a real request tries to use
+/// it and fails with a `502`. Recycling closes it — and asks for a
+/// replacement — before that can happen.
+#[tokio::test]
+async fn an_idle_pooled_connection_is_recycled_and_replaced() {
+    let (addr, state) = start_relay_with_state().await;
+    let (device_id, mut control) = enroll(addr).await;
+
+    // Initial fill.
+    assert_eq!(
+        recv(&mut control).await,
+        RelayMessage::OpenData { count: POOL_TARGET }
+    );
+
+    // Open one data connection and never use it — this is what an idle
+    // pooled connection looks like.
+    let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+        .await
+        .expect("data connection should be accepted");
+    let attach = DeviceMessage::Attach {
+        device_id: device_id.clone(),
+        enroll_token: "secret".to_string(),
+    };
+    conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+        .await
+        .unwrap();
+    // Give the relay a moment to park it in the pool before recycling.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let recycled = state.devices().recycle_idle_pools().await;
+    assert_eq!(recycled, 1, "the one idle pooled connection should recycle");
+
+    // The relay's end closed; the device's end observes that.
+    let ended = tokio::time::timeout(Duration::from_secs(2), conn.next())
+        .await
+        .expect("the relay should have closed the idle connection");
+    assert!(
+        matches!(ended, Some(Ok(Message::Close(_))) | None),
+        "expected the connection to end, got {ended:?}"
+    );
+
+    // And the device must have been asked for a replacement, or the pool
+    // drains to nothing every time it is recycled while idle.
+    assert!(
+        matches!(
+            recv(&mut control).await,
+            RelayMessage::OpenData { count: 1 }
+        ),
+        "recycling an idle pooled connection must trigger a refill"
+    );
+}
+
 #[tokio::test]
 async fn consuming_a_connection_asks_the_device_for_another() {
     let addr = start_relay().await;
