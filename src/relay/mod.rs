@@ -533,7 +533,7 @@ async fn control_session(
     let registry::DeviceHandles {
         device,
         mut refill_rx,
-    } = state.devices.attach(&device_id, label.clone());
+    } = state.devices.attach(&device_id, label.clone(), peer);
     tracing::info!(
         target: "relay",
         device_id = %device_id,
@@ -544,6 +544,7 @@ async fn control_session(
     let enrolled = RelayMessage::Enrolled {
         device_id: device_id.clone(),
         public_url,
+        reflexive_addr: peer.to_string(),
     };
     if send_json(&mut sink, &enrolled).await.is_err() {
         state.devices.detach(&device_id);

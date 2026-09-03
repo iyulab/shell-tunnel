@@ -68,6 +68,12 @@ pub enum RelayMessage {
         device_id: String,
         /// Public URL prefix that now routes to this device.
         public_url: String,
+        /// This device's address as the relay observed it on the control
+        /// connection's TCP socket — a STUN-style reflexive address. The NAT
+        /// mapping it names was created *toward the relay*, not toward a
+        /// future peer, so it is a hint a direct-connect attempt starts from,
+        /// not a guarantee a peer can reach it.
+        reflexive_addr: String,
     },
     /// Enrollment refused; the connection closes afterwards.
     Rejected {
@@ -139,6 +145,7 @@ mod tests {
             RelayMessage::Enrolled {
                 device_id: "d-1".into(),
                 public_url: "https://relay.example/d/d-1".into(),
+                reflexive_addr: "203.0.113.5:51820".into(),
             },
             RelayMessage::Rejected {
                 code: reject::BAD_TOKEN.into(),

@@ -1,6 +1,7 @@
 //! Which devices are attached, and the idle connections that reach them.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,9 @@ pub struct Device {
     pub id: String,
     /// Optional label the device supplied, for operator-facing logs.
     pub label: Option<String>,
+    /// This device's address as the relay observed it on the control
+    /// connection — set once at attach time, never mutated afterward.
+    pub reflexive_addr: SocketAddr,
     attached_at: Instant,
     last_seen: Mutex<Instant>,
     exchanges: Mutex<Exchanges>,
@@ -191,7 +195,12 @@ impl DeviceRegistry {
     }
 
     /// Attach a device under `id`, replacing any previous entry for it.
-    pub fn attach(&self, id: impl Into<String>, label: Option<String>) -> DeviceHandles {
+    pub fn attach(
+        &self,
+        id: impl Into<String>,
+        label: Option<String>,
+        reflexive_addr: SocketAddr,
+    ) -> DeviceHandles {
         let id = id.into();
         let (pool_tx, pool_rx) = mpsc::channel(POOL_TARGET);
         let (refill_tx, refill_rx) = mpsc::channel(POOL_TARGET);
@@ -199,6 +208,7 @@ impl DeviceRegistry {
         let device = Arc::new(Device {
             id: id.clone(),
             label,
+            reflexive_addr,
             attached_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             exchanges: Mutex::new(Exchanges::default()),
@@ -321,10 +331,14 @@ impl DeviceRegistry {
 mod tests {
     use super::*;
 
+    fn addr() -> SocketAddr {
+        "127.0.0.1:9".parse().unwrap()
+    }
+
     #[tokio::test]
     async fn attach_and_get() {
         let registry = DeviceRegistry::new();
-        let handles = registry.attach("dev-1", Some("build-box".into()));
+        let handles = registry.attach("dev-1", Some("build-box".into()), addr());
 
         assert_eq!(handles.device.id, "dev-1");
         assert_eq!(registry.count(), 1);
@@ -338,7 +352,7 @@ mod tests {
     #[tokio::test]
     async fn detach_removes_the_device() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", None);
+        registry.attach("dev-1", None, addr());
 
         assert!(registry.detach("dev-1"));
         assert!(!registry.detach("dev-1"));
@@ -348,7 +362,7 @@ mod tests {
     #[tokio::test]
     async fn touch_only_succeeds_for_attached_devices() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", None);
+        registry.attach("dev-1", None, addr());
 
         assert!(registry.touch("dev-1"));
         assert!(!registry.touch("dev-2"));
@@ -357,7 +371,7 @@ mod tests {
     #[tokio::test]
     async fn stale_devices_are_evicted() {
         let registry = DeviceRegistry::new();
-        registry.attach("fresh", None);
+        registry.attach("fresh", None, addr());
 
         // Zero timeout: everything already attached counts as stale.
         let evicted = registry.evict_stale(Duration::ZERO);
@@ -368,7 +382,7 @@ mod tests {
     #[tokio::test]
     async fn a_heartbeat_keeps_a_device_attached() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", None);
+        registry.attach("dev-1", None, addr());
         registry.touch("dev-1");
 
         assert!(registry.evict_stale(Duration::from_secs(60)).is_empty());
@@ -378,8 +392,8 @@ mod tests {
     #[tokio::test]
     async fn reattaching_replaces_the_previous_entry() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", Some("old".into()));
-        registry.attach("dev-1", Some("new".into()));
+        registry.attach("dev-1", Some("old".into()), addr());
+        registry.attach("dev-1", Some("new".into()), addr());
 
         assert_eq!(registry.count(), 1);
         assert_eq!(registry.get("dev-1").unwrap().label.as_deref(), Some("new"));
@@ -388,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn taking_from_an_empty_pool_times_out_and_asks_for_a_refill() {
         let registry = DeviceRegistry::new();
-        let mut handles = registry.attach("dev-1", None);
+        let mut handles = registry.attach("dev-1", None, addr());
 
         let taken = handles.device.take(Duration::from_millis(50)).await;
         assert!(taken.is_none(), "an empty pool must not hand out a socket");
@@ -401,8 +415,8 @@ mod tests {
     #[tokio::test]
     async fn listing_reports_attached_devices() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", Some("build-box".into()));
-        registry.attach("dev-2", None);
+        registry.attach("dev-1", Some("build-box".into()), addr());
+        registry.attach("dev-2", None, addr());
 
         let listed = registry.list();
         assert_eq!(listed.len(), 2);
@@ -420,7 +434,7 @@ mod tests {
     async fn registry_is_shared_across_clones() {
         let registry = DeviceRegistry::new();
         let clone = registry.clone();
-        clone.attach("dev-1", None);
+        clone.attach("dev-1", None, addr());
 
         assert_eq!(registry.count(), 1);
     }

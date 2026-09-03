@@ -294,6 +294,7 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
         RelayMessage::Enrolled {
             device_id,
             public_url,
+            ..
         } => {
             if let Some(enrolled) = &config.enrolled {
                 // A closed receiver means the caller stopped listening, which

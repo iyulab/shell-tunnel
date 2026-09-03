@@ -94,6 +94,7 @@ async fn a_device_enrolls_and_is_registered() {
     let RelayMessage::Enrolled {
         device_id,
         public_url,
+        reflexive_addr,
     } = recv(&mut device).await
     else {
         panic!("expected an enrolled message");
@@ -104,6 +105,13 @@ async fn a_device_enrolls_and_is_registered() {
     assert_eq!(
         public_url,
         format!("https://relay.test:{}/d/{device_id}", addr.port())
+    );
+    let reflexive: SocketAddr = reflexive_addr
+        .parse()
+        .expect("reflexive_addr must be a socket address");
+    assert_eq!(
+        reflexive.ip(),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
     );
     assert_eq!(state.devices().count(), 1);
     assert_eq!(
@@ -242,6 +250,7 @@ async fn a_named_device_keeps_that_name_as_its_routing_key() {
     let RelayMessage::Enrolled {
         device_id,
         public_url,
+        ..
     } = recv(&mut device).await
     else {
         panic!("expected an enrolled message");
