@@ -1010,6 +1010,133 @@ async fn list_refuses_a_bad_cursor() {
     assert_eq!(json["error"], "bad-cursor");
 }
 
+/// An independent reference walk: recurse with `std::fs::read_dir`, collect
+/// every relative path (forward-slash, matching `FsRoot::relative`), sort.
+/// Deliberately not a call into `fs.rs` — the point is to check the
+/// production walk against ground truth built a different way, not against
+/// itself.
+fn reference_list(base: &std::path::Path, root: &std::path::Path, recursive: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut entries: Vec<_> = std::fs::read_dir(base)
+        .expect("read_dir")
+        .map(|e| e.expect("dirent"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let mut relative = String::new();
+        for component in path.strip_prefix(root).expect("under root").components() {
+            if let std::path::Component::Normal(part) = component {
+                if !relative.is_empty() {
+                    relative.push('/');
+                }
+                relative.push_str(&part.to_string_lossy());
+            }
+        }
+        let is_dir = entry.file_type().expect("file_type").is_dir();
+        out.push(relative);
+        if recursive && is_dir {
+            out.extend(reference_list(&path, root, true));
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Page through `list` with a given `limit` and return every path seen, in
+/// the order the pages delivered them.
+async fn paginate_all(state: &AppState, path: &str, recursive: bool, limit: usize) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let uri = match &cursor {
+            Some(c) => format!(
+                "/api/v1/fs/list?path={path}&recursive={recursive}&limit={limit}&cursor={c}"
+            ),
+            None => format!("/api/v1/fs/list?path={path}&recursive={recursive}&limit={limit}"),
+        };
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "page must succeed");
+        let json = body_json(response).await;
+        for entry in json["entries"].as_array().expect("entries") {
+            seen.push(entry["path"].as_str().expect("path").to_string());
+        }
+        match json["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+    seen
+}
+
+/// Pins the exact interleave that makes lexicographic order surprising
+/// relative to a directory-first (DFS) walk: `-` (0x2D) < `.` (0x2E) <
+/// `/` (0x2F) < `0` (0x30) < `_` (0x5F), so a directory's own children sort
+/// *between* some of its siblings rather than immediately after the
+/// directory itself.
+///
+/// `B` sorts before `a` (uppercase before lowercase) without colliding with
+/// `a` under a case-insensitive filesystem's directory-entry namespace
+/// (Windows NTFS, by default) — `A` and `a` in the same directory would not
+/// be two files there, so this fixture does not use that pair.
+#[tokio::test]
+async fn list_pagination_matches_an_independent_walk_at_every_limit() {
+    let (dir, state) = state_with_files(&[
+        ("app/B", b"b"),
+        ("app/a-x", b"1"),
+        ("app/a.txt", b"2"),
+        ("app/a/b", b"3"),
+        ("app/a0", b"4"),
+        ("app/a_x", b"5"),
+        ("app/deep/deep2/deep3/leaf.txt", b"6"),
+        ("app/plus+file.txt", b"7"),
+    ]);
+    let app_dir = dir.path().join("app");
+
+    for recursive in [false, true] {
+        let reference = reference_list(&app_dir, dir.path(), recursive);
+        for limit in [1usize, 2, 3, 7, 10_000] {
+            let paginated = paginate_all(&state, "app", recursive, limit).await;
+            assert_eq!(
+                paginated, reference,
+                "recursive={recursive}, limit={limit}: paginated order must match an \
+                 independent walk+sort"
+            );
+        }
+    }
+
+    // The interleave itself, pinned directly rather than only through the
+    // reference comparison above — this is the property a directory-first
+    // (DFS) rewrite would get wrong.
+    let recursive_all = paginate_all(&state, "app", true, 10_000).await;
+    assert_eq!(
+        recursive_all,
+        vec![
+            "app/B",
+            "app/a",
+            "app/a-x",
+            "app/a.txt",
+            "app/a/b",
+            "app/a0",
+            "app/a_x",
+            "app/deep",
+            "app/deep/deep2",
+            "app/deep/deep2/deep3",
+            "app/deep/deep2/deep3/leaf.txt",
+            "app/plus+file.txt",
+        ],
+        "a/b must land between a.txt and a0, not right after a — '.' (0x2E) < '/' (0x2F) < '0' (0x30)"
+    );
+}
+
 #[tokio::test]
 async fn list_refuses_a_file_path() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);

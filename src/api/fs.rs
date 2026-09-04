@@ -400,19 +400,11 @@ fn list_blocking(root: &FsRoot, query: &ListQuery) -> Response {
     let limit = resolve_limit(query.limit);
     let want_hash = query.hash.as_deref() == Some("sha256");
 
-    let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
-    if let Err(WalkError::Unreadable) = walk(root, &base, query.recursive, &mut collected) {
-        return error_response(StatusCode::FORBIDDEN, "unreadable", "directory unreadable");
-    }
-    collected.sort_by(|a, b| a.0.cmp(&b.0));
-
     // Strictly greater than the cursor, so the page boundary cannot repeat an
     // entry or skip one.
-    let start = match query.cursor.as_deref() {
+    let cursor = match query.cursor.as_deref() {
         Some(token) => match decode_cursor(token) {
-            Some(cursor) => {
-                collected.partition_point(|(path, _, _)| path.as_str() <= cursor.as_str())
-            }
+            Some(cursor) => Some(cursor),
             None => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -421,19 +413,32 @@ fn list_blocking(root: &FsRoot, query: &ListQuery) -> Response {
                 )
             }
         },
-        None => 0,
+        None => None,
     };
 
-    let end = (start + limit).min(collected.len());
-    // `saturating_sub` rather than `end - 1`: the index is safe only because the
-    // clamp keeps `limit` at 1 or more, which is a guarantee living in a
-    // different expression. A future edit that relaxes the clamp would turn this
-    // into a panic, and a panicking handler is a 500.
-    let next_cursor =
-        (end < collected.len()).then(|| encode_cursor(&collected[end.saturating_sub(1)].0));
+    let (collected, has_more) =
+        match lazy_list_page(root, &base, query.recursive, cursor.as_deref(), limit) {
+            Ok(page) => page,
+            Err(WalkError::Unreadable) => {
+                return error_response(StatusCode::FORBIDDEN, "unreadable", "directory unreadable")
+            }
+        };
 
-    let mut entries = Vec::with_capacity(end.saturating_sub(start));
-    for (relative, absolute, meta) in &collected[start..end] {
+    // `has_more` is `true` only when the frontier heap still held something
+    // when the page filled up, and filling up (rather than the frontier
+    // running dry) is the only way `collected` can be empty here while
+    // `has_more` is `true` — so this always has a last element to key off.
+    let next_cursor = has_more.then(|| {
+        encode_cursor(
+            &collected
+                .last()
+                .expect("has_more implies at least one collected entry")
+                .0,
+        )
+    });
+
+    let mut entries = Vec::with_capacity(collected.len());
+    for (relative, absolute, meta) in &collected {
         // Hashing is per page, never per tree: a recursive hashed walk of a
         // large root would otherwise outrun the relay's 120s request timeout.
         let sha256 = match want_hash && !meta.is_dir() {
@@ -497,7 +502,11 @@ fn decode_cursor(token: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// The one fatal outcome `walk` can report.
+/// A collected listing entry: its relative path, its resolved absolute path,
+/// and the `lstat`-equivalent metadata read for it while walking.
+type ListedEntry = (String, std::path::PathBuf, std::fs::Metadata);
+
+/// The one fatal outcome a lazy walk can report.
 ///
 /// A dedicated enum rather than `Result<(), Response>`: the latter trips
 /// `clippy::result_large_err` (a `Response` is well over the 128-byte
@@ -508,33 +517,71 @@ enum WalkError {
     Unreadable,
 }
 
-/// Collect entries under `base`, skipping the upload staging directory.
+/// One candidate on the lazy walk's frontier — enough to emit it, and to
+/// descend into it later if it is a directory. Ordered by `relative` alone:
+/// `Metadata` implements none of `Eq`/`Ord`, and `relative` is the sort key
+/// this endpoint's docstring promises entries come back in.
+struct Frontier {
+    relative: String,
+    absolute: std::path::PathBuf,
+    meta: std::fs::Metadata,
+}
+
+impl PartialEq for Frontier {
+    fn eq(&self, other: &Self) -> bool {
+        self.relative == other.relative
+    }
+}
+impl Eq for Frontier {}
+impl PartialOrd for Frontier {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Frontier {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.relative.cmp(&other.relative)
+    }
+}
+
+/// Whether a candidate belongs on the frontier at all, given the page's
+/// cursor (`None` on the first page).
 ///
-/// Only `base` itself being unreadable is fatal, and only to the caller of
-/// this exact invocation — `list`'s top-level call turns that into a 403.
-/// Below that, nothing is fatal: an entry whose metadata cannot be read is
-/// skipped, and so is a nested subdirectory that fails to open. A
-/// permission-restricted subdirectory is ordinary in a real deployment tree;
-/// one bad subtree, however deep, must not discard everything already
-/// collected from the rest of the walk.
+/// Two separate ways in, because a directory can matter without itself being
+/// ahead of the cursor: it will be emitted itself (`relative > cursor`), or —
+/// being a directory — some descendant of it might still be ahead even
+/// though the directory's own name sorts at or before the cursor.
 ///
-/// **`base` must already have been resolved through `root`** — as
-/// `list_blocking` does with `resolve_existing` before calling this. Every
-/// entry is named by `root.relative`, which is a pure `strip_prefix` and does
-/// no resolution of its own, so a `base` that merely *points* inside the root
-/// without being its canonical form yields `None` for every entry and this
-/// returns `Ok(())` with **nothing collected** — an empty listing rather than
-/// an error. That failure is invisible on a platform where the paths in play
-/// are already canonical and loud on one where they are not: passing an
-/// unresolved temp-dir path here read as a product bug on macOS, where
-/// `/var/folders/…` canonicalises to `/private/var/folders/…`, while the same
-/// code was silently fine on Linux. Resolve first; do not hand this a path
-/// assembled by `join`.
-fn walk(
+/// `relative + "0"` is the algebraic form of "every path under `relative` is
+/// behind the cursor": a child's full path is always `relative/something`,
+/// `/` (0x2F) sorts immediately below `0` (0x30), so `relative/anything` is
+/// always less than `relative0` — and `cursor >= relative0` is exactly the
+/// condition under which no descendant of `relative` can still be ahead of
+/// the cursor. Below that, the directory has to be opened to find out.
+fn frontier_worthy(relative: &str, is_dir: bool, cursor: Option<&str>) -> bool {
+    let Some(cursor) = cursor else {
+        return true;
+    };
+    relative > cursor || (is_dir && cursor < format!("{relative}0").as_str())
+}
+
+/// Read one directory's immediate children onto the frontier, skipping the
+/// upload staging directory and anything the cursor already rules out
+/// entirely (see [`frontier_worthy`]). Only `base` failing to open is
+/// reported — an entry this crate cannot stat is dropped rather than failing
+/// the whole page, the same tolerance the previous full-tree walk had for a
+/// permission-restricted subtree.
+///
+/// **`base` must already be resolved through `root`** — see the equivalent
+/// warning this replaced on the old `walk` function: an unresolved path
+/// (`/var/folders/…` versus `/private/var/folders/…` on macOS) yields `None`
+/// from `root.relative` for every entry and this silently contributes
+/// nothing, rather than erroring.
+fn push_children(
     root: &FsRoot,
     base: &std::path::Path,
-    recursive: bool,
-    out: &mut Vec<(String, std::path::PathBuf, std::fs::Metadata)>,
+    cursor: Option<&str>,
+    heap: &mut std::collections::BinaryHeap<std::cmp::Reverse<Frontier>>,
 ) -> Result<(), WalkError> {
     let read = std::fs::read_dir(base).map_err(|_| WalkError::Unreadable)?;
 
@@ -546,18 +593,77 @@ fn walk(
         if is_reserved_path(&relative) {
             continue;
         }
+        // Cheap first (a `DirEntry`'s own type, not necessarily a fresh
+        // syscall) so an entry the cursor rules out never pays for a `stat`
+        // it will not need.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let is_dir = file_type.is_dir();
+        if !frontier_worthy(&relative, is_dir, cursor) {
+            continue;
+        }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
-        let is_dir = meta.is_dir();
-        out.push((relative, absolute.clone(), meta));
-        if recursive && is_dir {
-            // Discarded, not propagated with `?`: only the top-level `base`
-            // being unreadable is fatal (see the doc comment above).
-            let _ = walk(root, &absolute, true, out);
-        }
+        heap.push(std::cmp::Reverse(Frontier {
+            relative,
+            absolute,
+            meta,
+        }));
     }
     Ok(())
+}
+
+/// Collect exactly one page: at most `limit` entries at or after `cursor`,
+/// in path order, without walking anything the cursor already places behind
+/// it and without reading ahead past what this page needs.
+///
+/// A min-heap frontier rather than the directory-first (DFS) order a plain
+/// recursive walk produces, because full-path lexicographic order is *not*
+/// DFS order: `a`'s child `a/b` sorts between the sibling files `a.txt` and
+/// `a0` (`.` 0x2E < `/` 0x2F < `0` 0x30), not immediately after `a` itself.
+/// Popping the smallest path across every directory opened so far — pushing
+/// a popped directory's own children before continuing — is what keeps that
+/// interleave right without buffering the whole subtree to sort it
+/// afterward. Each request re-derives this from `base` independently
+/// (nothing carries over between pages beside the cursor), and
+/// [`frontier_worthy`] is what keeps that cheap: a subtree entirely behind
+/// the cursor is never opened by any page that starts after it.
+///
+/// Returns the page and whether the frontier still held anything when the
+/// page filled — see the call site for why that alone is enough to answer
+/// "is there a next page" without looking further.
+fn lazy_list_page(
+    root: &FsRoot,
+    base: &std::path::Path,
+    recursive: bool,
+    cursor: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<ListedEntry>, bool), WalkError> {
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<Frontier>> =
+        std::collections::BinaryHeap::new();
+    push_children(root, base, cursor, &mut heap)?;
+
+    let mut collected = Vec::with_capacity(limit.min(1024));
+    while collected.len() < limit {
+        let Some(std::cmp::Reverse(top)) = heap.pop() else {
+            break;
+        };
+        if recursive && top.meta.is_dir() {
+            // Discarded, not propagated: only `base` itself being unreadable
+            // is fatal (see `push_children`'s doc comment).
+            let _ = push_children(root, &top.absolute, cursor, &mut heap);
+        }
+        let emit = match cursor {
+            Some(c) => top.relative.as_str() > c,
+            None => true,
+        };
+        if emit {
+            collected.push((top.relative, top.absolute, top.meta));
+        }
+    }
+    Ok((collected, !heap.is_empty()))
 }
 
 /// A validator that changes whenever the bytes at a path might have changed.
@@ -2351,10 +2457,10 @@ mod tests {
     }
 
     /// Regression for the bug where a nested `read_dir` failure propagated
-    /// with `?` all the way out of `walk`, discarding every entry the walk
-    /// had already collected. Only the top-level directory being unreadable
-    /// should be fatal; a permission-restricted subdirectory further down is
-    /// ordinary in a real deployment tree.
+    /// with `?` all the way out of the walk, discarding every entry already
+    /// collected. Only the top-level directory being unreadable should be
+    /// fatal; a permission-restricted subdirectory further down is ordinary
+    /// in a real deployment tree.
     ///
     /// `#[cfg(unix)]` because removing read permission from a directory has
     /// no direct `std::fs` equivalent on Windows (ACLs, not a mode bit) —
@@ -2384,9 +2490,9 @@ mod tests {
         }
 
         // Resolved through the root rather than assembled with `join`, which
-        // is what `list_blocking` does and what `walk` documents as its
-        // precondition. Handing `walk` a raw `dir.path().join("app")` made
-        // this test fail on macOS for a reason that had nothing to do with
+        // is what `list_blocking` does and what this walk documents as its
+        // precondition. Handing it a raw `dir.path().join("app")` made this
+        // test fail on macOS for a reason that had nothing to do with
         // permissions: `FsRoot::new` canonicalises, `/var/folders/…` becomes
         // `/private/var/folders/…`, and `root.relative` (a pure
         // `strip_prefix`) then returned `None` for every entry — so the walk
@@ -2396,18 +2502,15 @@ mod tests {
         // `/tmp` canonicalises to itself.
         let base = root.resolve_existing("app").expect("app resolves");
 
-        let mut collected: Vec<(String, std::path::PathBuf, std::fs::Metadata)> = Vec::new();
-        let result = walk(&root, &base, true, &mut collected);
+        let result = lazy_list_page(&root, &base, true, None, MAX_LIST_LIMIT);
 
         // Restore permissions before any assertion can panic and leak a
         // directory the temp-dir cleanup would otherwise be unable to remove.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755))
             .expect("restore permissions");
 
-        assert!(
-            result.is_ok(),
-            "an unreadable nested subdirectory must not fail the whole walk"
-        );
+        let (collected, _has_more) =
+            result.expect("an unreadable nested subdirectory must not fail the whole walk");
         let paths: Vec<&str> = collected.iter().map(|(p, _, _)| p.as_str()).collect();
         assert!(paths.contains(&"app/visible.txt"));
         assert!(paths.contains(&"app/zzz.txt"));

@@ -537,31 +537,35 @@ curl "$BASE/api/v1/fs/list?path=app"
 ```
 
 `list` is paginated by an opaque path cursor (`?cursor=...&limit=...`), not an offset —
-the tree is walked and sorted once per page, so a file added or removed mid-walk shifts
-which entries fall on which page but never invalidates a cursor already handed out. Add
+entries are visited in path order, so a file added or removed mid-walk shifts which
+entries fall on which page but never invalidates a cursor already handed out. Add
 `&recursive=true` to walk subdirectories, `&hash=sha256` to get a content hash on every
 file in that page (never per whole tree, so a large recursive listing cannot outrun the
 relay's 120s request timeout).
 
-**`limit` bounds the response, not the work**, and "once per page" above is the whole
-cost: each page walks and sorts everything under `path` before slicing out its slice.
-Measured on a 200,000-entry tree, one page cost 93 MB and 1.3 s for `limit=1` and for
-`limit=10000` alike — the figures do not move with the page size, only with the tree
-(a 50,000-entry tree: 28 MB, 0.27 s; roughly half a kilobyte held per entry, released
-when the request ends). Two consequences worth having before you meet them:
+**`limit` bounds the work, not only the response.** A page opens only what it needs to
+reach the cursor and collect up to `limit` further entries — the directories on the way
+to the cursor, plus each directory a returned entry itself turns out to be — never the
+whole tree beneath `path`. Measured on a 20,200-entry tree (200 directories of 100 files
+each): a `limit=1` first page took 1.5 ms, a `limit=10000` first page (the whole tree in
+one response) took 54 ms, and paging all the way through at the default `limit=1000` —
+21 pages, every entry — took 133 ms total. Until this crate's next release every page
+walked and sorted the entire subtree first and only then sliced out its page, so page
+cost tracked the tree's size, not the page's; it does not any more.
 
-- **Paging right through costs more the smaller the pages are** — `N/limit` walks of the
-  whole tree, so a 200,000-entry listing at the default `limit=1000` is 200 walks and
-  around four minutes, against 1.3 s for one. This is the opposite of the usual advice,
-  which is why it is easy to diagnose backwards. Prefer a large `limit`; better still,
-  prefer a narrower `path` or `recursive=false`, which is the only parameter that changes
-  what a request costs.
-- **The `hash` note above is about hashing only.** It says the hash is per page rather
-  than per tree, which is true and reads as though the page discipline bounded the work
-  in general. The walk beneath it is per tree either way.
+- **A large `limit` no longer buys anything paging costs would otherwise lose** — with
+  the per-page work bounded by what that page actually returns (plus the directories
+  opened along the way), reading a tree through many small pages costs about the same,
+  in total, as reading it through few large ones. A narrower `path` or
+  `recursive=false` still narrows what a request touches, same as before.
+- **The `hash` note above is still about hashing only** — a content hash is computed per
+  entry in the page being built, never for entries outside it, independent of this
+  section's change.
 
-Nothing here is unbounded over time — the memory is a spike per request, fully released —
-but it is unbounded in the tree, and concurrent listings add up.
+Memory now scales with how many directories are open on the frontier at once — roughly
+the width of the tree along the path to the cursor, not its total size — rather than
+holding every entry under `path` at once. Nothing here is unbounded over time in either
+case: whatever a request holds is a spike released when the request ends.
 
 `GET /api/v1/fs/file?path=...` serves the whole file, or a `Range` of it — ordinary HTTP,
 so any client that already speaks `Range`/`If-Range` gets resumable downloads for free.
