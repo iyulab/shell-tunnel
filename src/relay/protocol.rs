@@ -68,6 +68,14 @@ pub enum DeviceMessage {
     },
     /// Tell the relay this device is ready to be connected to directly by
     /// `to`, in response to a `RelayMessage::DirectRequested`.
+    ///
+    /// The relay does not track which devices have an outstanding
+    /// `RequestDirect`: it does not remember who asked whom, so any attached
+    /// device may send this at any time and `to` receives `PeerReady`
+    /// regardless of whether it ever sent a matching `RequestDirect`. Not a
+    /// privilege issue — every attached device already shares the enrollment
+    /// secret — but a future consumer must not assume request/response
+    /// pairing is enforced by the relay.
     DirectReady {
         /// Device id of the peer that requested this direct connection.
         to: String,
@@ -89,8 +97,20 @@ pub enum RelayMessage {
         /// connection's TCP socket — a STUN-style reflexive address. The NAT
         /// mapping it names was created *toward the relay*, not toward a
         /// future peer, so it is a hint a direct-connect attempt starts from,
-        /// not a guarantee a peer can reach it.
-        reflexive_addr: String,
+        /// not a guarantee a peer can reach it. `None` when talking to a
+        /// relay that predates this field — the absence is itself
+        /// information (no hint available), which is why this is `Option`
+        /// rather than defaulting to an empty string.
+        ///
+        /// Behind this relay's own documented reverse-proxy TLS-termination
+        /// deployment mode (see `observed_base()` in `mod.rs`), the address
+        /// this relay observes is the proxy's own address, not a usable STUN
+        /// hint for a real peer — the connection info axum sees is the
+        /// proxy's socket, not the device's. This field can be structurally
+        /// useless in that deployment mode, and a later phase building a
+        /// direct-connect attempt on top of it needs to account for that.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reflexive_addr: Option<String>,
     },
     /// Enrollment refused; the connection closes afterwards.
     Rejected {
@@ -122,7 +142,8 @@ pub enum RelayMessage {
     DirectUnavailable {
         /// Device id that was requested.
         target: String,
-        /// Why the request could not be forwarded.
+        /// Why the request could not be forwarded. One of the constants in
+        /// [`direct_unavailable`].
         reason: String,
     },
     /// The peer this device asked to reach is ready.
@@ -130,7 +151,7 @@ pub enum RelayMessage {
         /// Device id of the peer that is ready.
         from: String,
         /// That peer's address, as the relay observed it on its own control
-        /// connection.
+        /// connection — never self-reported by the peer.
         from_addr: String,
     },
 }
@@ -145,6 +166,18 @@ pub mod reject {
     pub const BAD_HANDSHAKE: &str = "bad-handshake";
     /// The requested device name cannot be used as a routing key.
     pub const BAD_DEVICE_NAME: &str = "bad-device-name";
+}
+
+/// Reason codes used in [`RelayMessage::DirectUnavailable`].
+pub mod direct_unavailable {
+    /// The requested target device is not attached.
+    pub const NO_SUCH_DEVICE: &str = "no-such-device";
+    /// The target's control session could not accept the signal right now.
+    pub const PEER_BUSY: &str = "peer-busy";
+    /// The target's control session ended before the signal was delivered.
+    pub const PEER_GONE: &str = "peer-gone";
+    /// A device asked to connect directly to itself.
+    pub const SELF_TARGET: &str = "self-target";
 }
 
 #[cfg(test)]
@@ -185,7 +218,7 @@ mod tests {
             RelayMessage::Enrolled {
                 device_id: "d-1".into(),
                 public_url: "https://relay.example/d/d-1".into(),
-                reflexive_addr: "203.0.113.5:51820".into(),
+                reflexive_addr: Some("203.0.113.5:51820".into()),
             },
             RelayMessage::Rejected {
                 code: reject::BAD_TOKEN.into(),
@@ -197,6 +230,24 @@ mod tests {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<RelayMessage>(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn an_old_relays_enrolled_message_has_no_reflexive_addr() {
+        // A relay that predates this field omits it entirely; a new device
+        // must still be able to enroll against it rather than hard-failing
+        // deserialization on a missing field.
+        let json =
+            r#"{"type":"enrolled","device_id":"d-1","public_url":"https://relay.example/d/d-1"}"#;
+        let msg: RelayMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            msg,
+            RelayMessage::Enrolled {
+                device_id: "d-1".into(),
+                public_url: "https://relay.example/d/d-1".into(),
+                reflexive_addr: None,
+            }
+        );
     }
 
     #[test]

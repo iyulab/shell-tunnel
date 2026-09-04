@@ -11,7 +11,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
 use tokio_tungstenite::tungstenite::Message;
 
-use shell_tunnel::relay::protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
+use shell_tunnel::relay::protocol::{
+    direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION,
+};
 use shell_tunnel::relay::{relay_router, RelayConfig, RelayState};
 
 /// Start a relay on an ephemeral port; returns its address and shared state.
@@ -107,6 +109,7 @@ async fn a_device_enrolls_and_is_registered() {
         format!("https://relay.test:{}/d/{device_id}", addr.port())
     );
     let reflexive: SocketAddr = reflexive_addr
+        .expect("this relay always sets it")
         .parse()
         .expect("reflexive_addr must be a socket address");
     assert_eq!(
@@ -375,6 +378,7 @@ async fn a_device_can_request_a_direct_connection_to_another() {
     else {
         panic!("expected an enrolled message");
     };
+    let a_addr = a_addr.expect("this relay always sets it");
     let _ = recv(&mut a).await; // pool-fill request
 
     let mut b = connect(addr).await;
@@ -386,6 +390,7 @@ async fn a_device_can_request_a_direct_connection_to_another() {
     else {
         panic!("expected an enrolled message");
     };
+    let b_addr = b_addr.expect("this relay always sets it");
     let _ = recv(&mut b).await; // pool-fill request
 
     send(
@@ -430,8 +435,31 @@ async fn requesting_direct_to_an_unknown_device_is_reported() {
         },
     )
     .await;
-    let RelayMessage::DirectUnavailable { target, reason: _ } = recv(&mut a).await else {
+    let RelayMessage::DirectUnavailable { target, reason } = recv(&mut a).await else {
         panic!("expected a direct-unavailable message");
     };
     assert_eq!(target, "ghost");
+    assert_eq!(reason, direct_unavailable::NO_SUCH_DEVICE);
+}
+
+#[tokio::test]
+async fn requesting_direct_to_yourself_is_reported() {
+    let (addr, _state) = start_relay("secret").await;
+    let mut a = connect(addr).await;
+    send(&mut a, &enroll_as("secret", "device-a")).await;
+    let _ = recv(&mut a).await; // Enrolled
+    let _ = recv(&mut a).await; // pool-fill request
+
+    send(
+        &mut a,
+        &DeviceMessage::RequestDirect {
+            target: "device-a".into(),
+        },
+    )
+    .await;
+    let RelayMessage::DirectUnavailable { target, reason } = recv(&mut a).await else {
+        panic!("expected a direct-unavailable message");
+    };
+    assert_eq!(target, "device-a");
+    assert_eq!(reason, direct_unavailable::SELF_TARGET);
 }

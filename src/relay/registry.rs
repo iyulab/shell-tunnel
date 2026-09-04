@@ -95,12 +95,13 @@ impl Device {
 
     /// Deliver a message to whichever control session owns this device.
     ///
-    /// Awaits channel capacity rather than dropping on backpressure: unlike a
-    /// heartbeat or a pool refill, a dropped direct-connect signal has no
-    /// retry — the sender would wait for a reply that never comes. Returns
-    /// `false` only if the control session has already gone away.
-    pub async fn signal(&self, msg: RelayMessage) -> bool {
-        self.signal_tx.send(msg).await.is_ok()
+    /// Non-blocking: unlike a heartbeat or a pool refill, this is not naturally
+    /// retried, but blocking here would let one wedged control session (whoever
+    /// owns this device) stall an unrelated device's control session that is
+    /// trying to deliver to it. A full or closed channel is reported to the
+    /// caller instead, so it can answer with `RelayMessage::DirectUnavailable`.
+    pub fn signal(&self, msg: RelayMessage) -> Result<(), mpsc::error::TrySendError<RelayMessage>> {
+        self.signal_tx.try_send(msg)
     }
 
     /// Offer a freshly opened data connection to the pool.
@@ -473,10 +474,9 @@ mod tests {
 
         let delivered = handles
             .device
-            .signal(crate::relay::protocol::RelayMessage::HeartbeatAck)
-            .await;
+            .signal(crate::relay::protocol::RelayMessage::HeartbeatAck);
 
-        assert!(delivered);
+        assert!(delivered.is_ok());
         assert_eq!(
             handles.signal_rx.recv().await,
             Some(crate::relay::protocol::RelayMessage::HeartbeatAck)

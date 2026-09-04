@@ -39,7 +39,7 @@ use crate::error::ShellTunnelError;
 use crate::security::{
     generate_api_key, rate_limit_middleware, RateLimitCharge, RateLimitConfig, RateLimiter,
 };
-use protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
+use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
 };
@@ -545,7 +545,7 @@ async fn control_session(
     let enrolled = RelayMessage::Enrolled {
         device_id: device_id.clone(),
         public_url,
-        reflexive_addr: peer.to_string(),
+        reflexive_addr: Some(peer.to_string()),
     };
     if send_json(&mut sink, &enrolled).await.is_err() {
         state.devices.detach(&device_id);
@@ -576,39 +576,62 @@ async fn control_session(
                             }
                         }
                         Ok(DeviceMessage::RequestDirect { target }) => {
-                            match state.devices.get(&target) {
-                                Some(peer_device) => {
-                                    peer_device
-                                        .signal(RelayMessage::DirectRequested {
+                            // A device asking to connect directly to itself:
+                            // nothing to look up or signal.
+                            let reason = if target == device_id {
+                                Some(direct_unavailable::SELF_TARGET)
+                            } else {
+                                match state.devices.get(&target) {
+                                    Some(peer_device) => {
+                                        match peer_device.signal(RelayMessage::DirectRequested {
                                             from: device_id.clone(),
                                             from_addr: peer.to_string(),
-                                        })
-                                        .await;
-                                }
-                                None => {
-                                    if send_json(
-                                        &mut sink,
-                                        &RelayMessage::DirectUnavailable {
-                                            target,
-                                            reason: "no such device".into(),
-                                        },
-                                    )
-                                    .await
-                                    .is_err()
-                                    {
-                                        break;
+                                        }) {
+                                            Ok(()) => None,
+                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                                Some(direct_unavailable::PEER_BUSY)
+                                            }
+                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(
+                                                _,
+                                            )) => Some(direct_unavailable::PEER_GONE),
+                                        }
                                     }
+                                    None => Some(direct_unavailable::NO_SUCH_DEVICE),
+                                }
+                            };
+                            if let Some(reason) = reason {
+                                if send_json(
+                                    &mut sink,
+                                    &RelayMessage::DirectUnavailable {
+                                        target,
+                                        reason: reason.into(),
+                                    },
+                                )
+                                .await
+                                .is_err()
+                                {
+                                    break;
                                 }
                             }
                         }
                         Ok(DeviceMessage::DirectReady { to }) => {
                             if let Some(peer_device) = state.devices.get(&to) {
-                                peer_device
-                                    .signal(RelayMessage::PeerReady {
-                                        from: device_id.clone(),
-                                        from_addr: peer.to_string(),
-                                    })
-                                    .await;
+                                // Unlike `RequestDirect`, there is no clean way
+                                // to notify the *original* requester here (its
+                                // identity is not in scope) — a full or closed
+                                // channel is a pre-existing protocol asymmetry
+                                // left for a later phase, not solved here.
+                                if let Err(err) = peer_device.signal(RelayMessage::PeerReady {
+                                    from: device_id.clone(),
+                                    from_addr: peer.to_string(),
+                                }) {
+                                    tracing::debug!(
+                                        target: "relay",
+                                        device_id = %to,
+                                        error = ?err,
+                                        "could not deliver peer-ready signal"
+                                    );
+                                }
                             }
                         }
                         // A second enrollment on an attached connection is a
