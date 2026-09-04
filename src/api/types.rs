@@ -301,6 +301,8 @@ pub struct SessionSummary {
     /// Whether a command is running in this session right now — see
     /// [`SessionStatusResponse::running`].
     pub running: bool,
+    /// Total commands executed — see [`SessionStatusResponse::execution_count`].
+    pub execution_count: u64,
     pub idle_seconds: f64,
 }
 

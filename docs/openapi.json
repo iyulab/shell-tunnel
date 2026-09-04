@@ -1386,6 +1386,7 @@
         "required": [
           "session_id",
           "running",
+          "execution_count",
           "idle_seconds"
         ],
         "properties": {
@@ -1396,6 +1397,12 @@
           "running": {
             "type": "boolean",
             "description": "Whether a command is running in this session right now. See SessionStatusResponse.running."
+          },
+          "execution_count": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Total commands executed. See SessionStatusResponse.execution_count. The list view used to omit this while the detail view (SessionStatusResponse) carried it — an asymmetry observed live and left undecided until now.",
+            "example": 5
           },
           "idle_seconds": {
             "type": "number",
