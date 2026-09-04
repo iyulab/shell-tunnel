@@ -9,11 +9,19 @@ use axum::extract::ws::WebSocket;
 use futures_util::SinkExt;
 use tokio::sync::mpsc;
 
+use super::protocol::RelayMessage;
+
 /// How many idle data connections a device is asked to keep ready.
 ///
 /// Pre-opened so a request does not pay a WebSocket handshake (2–3 RTT) before
 /// it can be forwarded; small because each one is a real socket on both ends.
 pub const POOL_TARGET: usize = 4;
+
+/// How many pending cross-device signals (direct-connect requests, peer
+/// readiness) a device's control session buffers before backpressure kicks
+/// in. Small: a device negotiates at most one or two direct connections at a
+/// time in this design.
+const SIGNAL_CHANNEL_CAPACITY: usize = 8;
 
 /// A device attached to the relay.
 ///
@@ -35,6 +43,7 @@ pub struct Device {
     pool_tx: mpsc::Sender<WebSocket>,
     pool_rx: tokio::sync::Mutex<mpsc::Receiver<WebSocket>>,
     refill_tx: mpsc::Sender<()>,
+    signal_tx: mpsc::Sender<RelayMessage>,
 }
 
 /// How long this device has been taking to answer proxied requests.
@@ -82,6 +91,16 @@ impl Device {
         if let Ok(mut seen) = self.last_seen.lock() {
             *seen = Instant::now();
         }
+    }
+
+    /// Deliver a message to whichever control session owns this device.
+    ///
+    /// Awaits channel capacity rather than dropping on backpressure: unlike a
+    /// heartbeat or a pool refill, a dropped direct-connect signal has no
+    /// retry — the sender would wait for a reply that never comes. Returns
+    /// `false` only if the control session has already gone away.
+    pub async fn signal(&self, msg: RelayMessage) -> bool {
+        self.signal_tx.send(msg).await.is_ok()
     }
 
     /// Offer a freshly opened data connection to the pool.
@@ -177,6 +196,8 @@ pub struct DeviceHandles {
     pub device: Arc<Device>,
     /// Fires whenever the pool wants another data connection.
     pub refill_rx: mpsc::Receiver<()>,
+    /// Fires when another device asks the relay to forward it something.
+    pub signal_rx: mpsc::Receiver<RelayMessage>,
 }
 
 /// Thread-safe set of attached devices.
@@ -204,6 +225,7 @@ impl DeviceRegistry {
         let id = id.into();
         let (pool_tx, pool_rx) = mpsc::channel(POOL_TARGET);
         let (refill_tx, refill_rx) = mpsc::channel(POOL_TARGET);
+        let (signal_tx, signal_rx) = mpsc::channel(SIGNAL_CHANNEL_CAPACITY);
 
         let device = Arc::new(Device {
             id: id.clone(),
@@ -215,12 +237,17 @@ impl DeviceRegistry {
             pool_tx,
             pool_rx: tokio::sync::Mutex::new(pool_rx),
             refill_tx,
+            signal_tx,
         });
 
         if let Ok(mut devices) = self.devices.write() {
             devices.insert(id, Arc::clone(&device));
         }
-        DeviceHandles { device, refill_rx }
+        DeviceHandles {
+            device,
+            refill_rx,
+            signal_rx,
+        }
     }
 
     /// Detach a device, e.g. when its control connection closes.
@@ -437,5 +464,22 @@ mod tests {
         clone.attach("dev-1", None, addr());
 
         assert_eq!(registry.count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_signal_reaches_the_devices_control_session() {
+        let registry = DeviceRegistry::new();
+        let mut handles = registry.attach("dev-1", None, addr());
+
+        let delivered = handles
+            .device
+            .signal(crate::relay::protocol::RelayMessage::HeartbeatAck)
+            .await;
+
+        assert!(delivered);
+        assert_eq!(
+            handles.signal_rx.recv().await,
+            Some(crate::relay::protocol::RelayMessage::HeartbeatAck)
+        );
     }
 }

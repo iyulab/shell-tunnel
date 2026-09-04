@@ -533,6 +533,7 @@ async fn control_session(
     let registry::DeviceHandles {
         device,
         mut refill_rx,
+        mut signal_rx,
     } = state.devices.attach(&device_id, label.clone(), peer);
     tracing::info!(
         target: "relay",
@@ -588,6 +589,12 @@ async fn control_session(
                     break;
                 }
                 if send_json(&mut sink, &RelayMessage::OpenData { count: 1 }).await.is_err() {
+                    break;
+                }
+            }
+            signal = signal_rx.recv() => {
+                let Some(msg) = signal else { break };
+                if send_json(&mut sink, &msg).await.is_err() {
                     break;
                 }
             }
