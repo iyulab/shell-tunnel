@@ -575,6 +575,42 @@ async fn control_session(
                                 break;
                             }
                         }
+                        Ok(DeviceMessage::RequestDirect { target }) => {
+                            match state.devices.get(&target) {
+                                Some(peer_device) => {
+                                    peer_device
+                                        .signal(RelayMessage::DirectRequested {
+                                            from: device_id.clone(),
+                                            from_addr: peer.to_string(),
+                                        })
+                                        .await;
+                                }
+                                None => {
+                                    if send_json(
+                                        &mut sink,
+                                        &RelayMessage::DirectUnavailable {
+                                            target,
+                                            reason: "no such device".into(),
+                                        },
+                                    )
+                                    .await
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Ok(DeviceMessage::DirectReady { to }) => {
+                            if let Some(peer_device) = state.devices.get(&to) {
+                                peer_device
+                                    .signal(RelayMessage::PeerReady {
+                                        from: device_id.clone(),
+                                        from_addr: peer.to_string(),
+                                    })
+                                    .await;
+                            }
+                        }
                         // A second enrollment on an attached connection is a
                         // protocol error, not a re-key: ignore it rather than
                         // reassigning an id.

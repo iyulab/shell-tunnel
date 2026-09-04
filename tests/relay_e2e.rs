@@ -361,3 +361,77 @@ async fn a_device_reports_its_public_url_to_whoever_started_it() {
         "the reported URL must address the device by the name it asked for: {url:?}"
     );
 }
+
+#[tokio::test]
+async fn a_device_can_request_a_direct_connection_to_another() {
+    let (addr, _state) = start_relay("secret").await;
+
+    let mut a = connect(addr).await;
+    send(&mut a, &enroll_as("secret", "device-a")).await;
+    let RelayMessage::Enrolled {
+        reflexive_addr: a_addr,
+        ..
+    } = recv(&mut a).await
+    else {
+        panic!("expected an enrolled message");
+    };
+    let _ = recv(&mut a).await; // pool-fill request
+
+    let mut b = connect(addr).await;
+    send(&mut b, &enroll_as("secret", "device-b")).await;
+    let RelayMessage::Enrolled {
+        reflexive_addr: b_addr,
+        ..
+    } = recv(&mut b).await
+    else {
+        panic!("expected an enrolled message");
+    };
+    let _ = recv(&mut b).await; // pool-fill request
+
+    send(
+        &mut a,
+        &DeviceMessage::RequestDirect {
+            target: "device-b".into(),
+        },
+    )
+    .await;
+    let RelayMessage::DirectRequested { from, from_addr } = recv(&mut b).await else {
+        panic!("expected a direct-requested message");
+    };
+    assert_eq!(from, "device-a");
+    assert_eq!(from_addr, a_addr);
+
+    send(
+        &mut b,
+        &DeviceMessage::DirectReady {
+            to: "device-a".into(),
+        },
+    )
+    .await;
+    let RelayMessage::PeerReady { from, from_addr } = recv(&mut a).await else {
+        panic!("expected a peer-ready message");
+    };
+    assert_eq!(from, "device-b");
+    assert_eq!(from_addr, b_addr);
+}
+
+#[tokio::test]
+async fn requesting_direct_to_an_unknown_device_is_reported() {
+    let (addr, _state) = start_relay("secret").await;
+    let mut a = connect(addr).await;
+    send(&mut a, &enroll("secret")).await;
+    let _ = recv(&mut a).await; // Enrolled
+    let _ = recv(&mut a).await; // pool-fill request
+
+    send(
+        &mut a,
+        &DeviceMessage::RequestDirect {
+            target: "ghost".into(),
+        },
+    )
+    .await;
+    let RelayMessage::DirectUnavailable { target, reason: _ } = recv(&mut a).await else {
+        panic!("expected a direct-unavailable message");
+    };
+    assert_eq!(target, "ghost");
+}
