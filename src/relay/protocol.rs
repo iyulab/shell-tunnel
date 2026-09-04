@@ -55,6 +55,23 @@ pub enum DeviceMessage {
     /// common default), and tungstenite answers pings but never originates
     /// them.
     Heartbeat,
+    /// Ask the relay to forward a direct-connect request to another attached
+    /// device.
+    ///
+    /// Only meaningful between two devices — an ordinary HTTP caller has no
+    /// control channel to receive the forwarded request on. The relay does
+    /// not require anything special of `target`; if it is not attached, the
+    /// sender gets `RelayMessage::DirectUnavailable` back.
+    RequestDirect {
+        /// Device id of the peer to attempt a direct connection to.
+        target: String,
+    },
+    /// Tell the relay this device is ready to be connected to directly by
+    /// `to`, in response to a `RelayMessage::DirectRequested`.
+    DirectReady {
+        /// Device id of the peer that requested this direct connection.
+        to: String,
+    },
 }
 
 /// Relay → device.
@@ -92,6 +109,29 @@ pub enum RelayMessage {
     OpenData {
         /// How many connections to open.
         count: usize,
+    },
+    /// Another device asked to connect to this one directly.
+    DirectRequested {
+        /// Device id of the peer that wants to connect directly.
+        from: String,
+        /// That peer's address, as the relay observed it on its own control
+        /// connection — never self-reported by the peer.
+        from_addr: String,
+    },
+    /// A `RequestDirect` could not be forwarded.
+    DirectUnavailable {
+        /// Device id that was requested.
+        target: String,
+        /// Why the request could not be forwarded.
+        reason: String,
+    },
+    /// The peer this device asked to reach is ready.
+    PeerReady {
+        /// Device id of the peer that is ready.
+        from: String,
+        /// That peer's address, as the relay observed it on its own control
+        /// connection.
+        from_addr: String,
     },
 }
 
@@ -186,5 +226,46 @@ mod tests {
     fn unknown_message_types_are_rejected() {
         // A future message type must not silently deserialize as something else.
         assert!(serde_json::from_str::<DeviceMessage>(r#"{"type":"teleport"}"#).is_err());
+    }
+
+    #[test]
+    fn request_direct_roundtrips() {
+        let msg = DeviceMessage::RequestDirect {
+            target: "device-b".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"request_direct\""));
+        assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn direct_ready_roundtrips() {
+        let msg = DeviceMessage::DirectReady {
+            to: "device-a".into(),
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"direct_ready\""));
+        assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn direct_connect_relay_messages_roundtrip() {
+        for msg in [
+            RelayMessage::DirectRequested {
+                from: "device-a".into(),
+                from_addr: "203.0.113.5:51820".into(),
+            },
+            RelayMessage::DirectUnavailable {
+                target: "ghost".into(),
+                reason: "no such device".into(),
+            },
+            RelayMessage::PeerReady {
+                from: "device-b".into(),
+                from_addr: "203.0.113.9:41230".into(),
+            },
+        ] {
+            let json = serde_json::to_string(&msg).unwrap();
+            assert_eq!(serde_json::from_str::<RelayMessage>(&json).unwrap(), msg);
+        }
     }
 }
