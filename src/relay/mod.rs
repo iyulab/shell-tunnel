@@ -863,6 +863,21 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
 
     match outcome {
         Ok(Ok(response)) => response,
+        Ok(Err("response-frame-too-large")) => {
+            tracing::debug!(
+                target: "relay",
+                device_id = %device.id,
+                "proxy failed: response over the relay's frame limit"
+            );
+            (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "device's response exceeds the relay's {} MiB ceiling",
+                    MAX_RELAY_FRAME / (1024 * 1024)
+                ),
+            )
+                .into_response()
+        }
         Ok(Err(reason)) => {
             tracing::debug!(target: "relay", device_id = %device.id, reason, "proxy failed");
             (StatusCode::BAD_GATEWAY, "device did not answer").into_response()
@@ -953,6 +968,23 @@ async fn pipe_websocket(mut client: WebSocket, device: Arc<Device>, request: Pro
 /// Largest request body the relay will buffer before forwarding.
 const MAX_BODY: usize = 8 * 1024 * 1024;
 
+/// Whether a WebSocket read failed because the frame it was reading declared a
+/// size over this connection's `max_frame_size` ([`MAX_RELAY_FRAME`]), rather
+/// than for any other reason (a dropped connection, a protocol violation).
+///
+/// `axum::Error` only exposes this through `Display` — the underlying
+/// `tungstenite::CapacityError::MessageTooLong` is not reachable by downcast,
+/// because axum's WebSocket implementation and this crate's own
+/// `tokio-tungstenite` dependency ([`client`]) resolve to *different major
+/// versions* of the `tungstenite` crate, so `axum::Error::into_inner()` would
+/// never downcast to a type this crate names. `MessageTooLong`'s wording
+/// (`"Message too long: {size} > {max_size}"`) is a stable part of that
+/// dependency's public `Display` contract across the versions in this tree —
+/// checked directly against 0.24.0 and 0.28.0's source rather than assumed.
+fn is_frame_too_large(err: &axum::Error) -> bool {
+    err.to_string().contains("Message too long")
+}
+
 /// Drive one request/response exchange over a dedicated data connection.
 ///
 /// Wire shape: request header (text) → request body (binary) → response header
@@ -994,6 +1026,7 @@ async fn forward(
             Some(Ok(Message::Binary(chunk))) => body.extend_from_slice(&chunk),
             Some(Ok(Message::Close(_))) | None => break,
             Some(Ok(_)) => continue,
+            Some(Err(err)) if is_frame_too_large(&err) => return Err("response-frame-too-large"),
             Some(Err(_)) => return Err("response-body-truncated"),
         }
     }

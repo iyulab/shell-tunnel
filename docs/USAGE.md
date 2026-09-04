@@ -1502,10 +1502,10 @@ startup rather than serving local-only.
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
-| **502** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay |
+| **413** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay. Read-only — always safe to retry, though retrying without `Range` answers the same `413` again |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
 | **504** from a relay URL | device did not answer in 120s | **the outcome is unknown, not failed** — the request may have been carried out in full and only the answer lost. Never treat it as "did not happen". For an upload chunk, ask the session where it is (§3.2) and continue from there; for `/execute`, the command may still be running on the device |
-| **413** | request body over 8 MiB (refused by the relay), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), or an upload chunk over `chunk_size` | split the request. Bulk bytes belong in an upload session, not in a JSON body |
+| **413** | request body over 8 MiB (refused by the relay), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), an upload chunk over `chunk_size`, or a relayed response over the relay's 16 MiB ceiling (row above) | split the request; bulk bytes belong in an upload session, not in a JSON body. For the response-side case, use `Range` instead |
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body. This is also the cheapest way to recover from a `504` — resending the lost chunk unchanged answers with the true offset (§3.2) |
 | **409** `destination-busy` on `POST .../fs/uploads` | a live session already targets this path | the body names it in `upload_id`. Resume it (`GET .../uploads/{upload_id}` for its offset) or abandon it (`DELETE`). An idle session is swept after an hour, but do not wait for that |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
@@ -1569,6 +1569,10 @@ A relay failure does not tell you, on its own, whether the request ran. Two of t
 - **`502 device did not answer`** and **`504`** happen *after* the exchange started. The
   device may have run the command and failed only on the way back. Do not blindly retry a
   request that is not safe to run twice.
+- A relayed **`413`** on `GET .../fs/file` is neither of these — it means the file's whole-file
+  response is too big for the relay to carry (above), not that the exchange failed. `GET` has
+  no side effect, so it is always safe to retry; retrying without `Range` just answers `413`
+  again.
 
 shell-tunnel does not deduplicate requests: there is no request id, and no result cache.
 A retried `POST /execute` is a second execution. Callers that issue commands which must
@@ -1613,10 +1617,12 @@ documented here.
 - **16 MiB** response body limit through the relay (`relay::MAX_RELAY_FRAME`, declared by
   this crate since 0.21.1 — before that it was a WebSocket library default this crate never
   set, so the number here rested on a dependency) — a separate ceiling, and the one a
-  `GET .../fs/file` on a large file reaches first. Over it, the relay answers **502**:
+  `GET .../fs/file` on a large file reaches first. Over it, the relay answers **413**:
   the device carries a response body in a single frame, and a frame that large cannot be
   read. Range requests are the way to fetch a bigger file (§3.1); nothing about the file
-  itself is wrong.
+  itself is wrong. Until this crate's next release this answered a synthetic `502` instead —
+  technically true (the relay's read of that frame did fail) but pointed an operator at "is
+  the device up?" when the actual condition is a fixed, known-in-advance response-size ceiling.
 - Each device keeps **4 idle connections** pre-opened; beyond that, requests wait
   briefly for a refill and get **503** after 5 seconds.
 - **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a

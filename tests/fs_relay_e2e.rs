@@ -284,6 +284,12 @@ async fn a_download_too_large_for_one_frame_is_not_reported_as_success() {
     //
     // What this pins is the *honesty* of the answer, not a particular limit: a
     // body that cannot be carried must not arrive wearing a success status.
+    //
+    // Until this cycle the failed read answered `502 device did not answer` —
+    // technically true (the relay's read of the device's frame did fail) but
+    // misdirecting: an operator reading that reaches for "is the device up?"
+    // when the actual answer is "this response is too big for the relay,
+    // fetch it with Range instead" (§3.1). `413` says that directly.
     let relay_addr = start_relay().await;
     let (dir, local_addr) = start_device_server().await;
 
@@ -314,9 +320,9 @@ async fn a_download_too_large_for_one_frame_is_not_reported_as_success() {
         );
     } else {
         assert_eq!(
-            status, 502,
-            "a body the relay cannot carry is a failed upstream read, which is \
-             what 502 means; got {status}"
+            status, 413,
+            "a body over the relay's frame limit is a payload-too-large \
+             condition, not an unreachable device; got {status}"
         );
     }
 }
