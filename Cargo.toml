@@ -68,6 +68,12 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["c
 # selected here and installed explicitly at startup — otherwise the first wss://
 # connection panics at runtime rather than failing gracefully.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"], optional = true }
+# The raw TLS stream the outbound relay-connect client dials with — the same
+# version already used by this crate's TLS end-to-end tests (see
+# [dev-dependencies] below), now needed at runtime too. Kept separate from
+# the dev-dependency entry rather than replacing it, so that entry's existing
+# consumers are untouched.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"], optional = true }
 
 # Serving TLS directly (optional). Terminating TLS in-process is what lets a
 # relay run without a reverse proxy in front of it; the accept loop and the
@@ -97,7 +103,7 @@ default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
-relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:ring"]
+relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:ring", "dep:tokio-rustls"]
 # Terminate TLS in-process (--tls-cert / --tls-key), no reverse proxy required.
 tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:ring"]
 

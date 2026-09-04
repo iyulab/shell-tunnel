@@ -125,6 +125,11 @@ impl RelayClientConfig {
         }
     }
 
+    /// Whether [`dial_target`](Self::dial_target) should be reached over TLS.
+    pub fn is_tls(&self) -> bool {
+        self.base().starts_with("wss://")
+    }
+
     /// Normalise the relay URL to a WebSocket scheme without a trailing slash.
     ///
     /// Operators paste whatever they have — the `https://` they browse to, or
@@ -769,13 +774,18 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
     }
 }
 
-/// Build the TLS connector this configuration calls for.
+/// Build the TLS trust configuration a relay dial calls for.
 ///
-/// Returning `None` means "use the defaults", which is what a relay with a
-/// publicly-signed certificate needs.
-fn connector(
+/// `None` means "use the default public-root trust" — [`connector`] passes
+/// that straight through to `tokio_tungstenite::Connector`'s own default, but
+/// [`send_to_relay`]'s raw TLS dial has no such default to fall through to,
+/// so it must build one explicitly (see that function's [`default_tls_config`]).
+fn tls_client_config(
     config: &RelayClientConfig,
-) -> Result<(Option<tokio_tungstenite::Connector>, SeenCertificate)> {
+) -> Result<(
+    Option<std::sync::Arc<rustls::ClientConfig>>,
+    SeenCertificate,
+)> {
     let seen: SeenCertificate = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some(fingerprint) = &config.fingerprint {
         let expected = crate::fingerprint::parse(fingerprint)
@@ -792,12 +802,7 @@ fn connector(
                 seen: std::sync::Arc::clone(&seen),
             }))
             .with_no_client_auth();
-        return Ok((
-            Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
-                tls,
-            ))),
-            seen,
-        ));
+        return Ok((Some(std::sync::Arc::new(tls)), seen));
     }
 
     let Some(path) = &config.ca_file else {
@@ -827,12 +832,18 @@ fn connector(
     let tls = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    Ok((
-        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
-            tls,
-        ))),
-        seen,
-    ))
+    Ok((Some(std::sync::Arc::new(tls)), seen))
+}
+
+/// Build the TLS connector this configuration calls for.
+///
+/// Returning `None` means "use the defaults", which is what a relay with a
+/// publicly-signed certificate needs.
+fn connector(
+    config: &RelayClientConfig,
+) -> Result<(Option<tokio_tungstenite::Connector>, SeenCertificate)> {
+    let (tls, seen) = tls_client_config(config)?;
+    Ok((tls.map(tokio_tungstenite::Connector::Rustls), seen))
 }
 
 /// Parse every certificate in a PEM blob, ignoring anything that is not one.
@@ -944,8 +955,6 @@ async fn replay_locally(
     request: &ProxyRequest,
     body: Vec<u8>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
     let stream = match tokio::net::TcpStream::connect(local).await {
         Ok(stream) => stream,
         Err(e) => return bad_gateway(format!("local server unreachable: {e}")),
@@ -967,29 +976,57 @@ async fn replay_locally(
     }
     head.push_str("\r\n");
 
-    // Write and read at the same time, and stop writing the moment an answer
-    // starts arriving.
-    //
-    // A server that refuses a request on its body length answers *before* the
-    // body has finished arriving and then closes. Writing on into a closed peer
-    // draws a RST, and a RST discards whatever is still sitting unread in the
-    // receive buffer — so a client that writes to completion and only then
-    // reads loses the answer the server did send. That is how the device's
-    // `413` reached callers as a synthetic `502`, sending an operator to check
-    // whether the device was alive when what they needed was "split the
-    // request". It reproduced as a race, not a constant: on loopback the write
-    // usually finishes first, so roughly one attempt in ten lost it, while the
-    // first attempt across a relay lost it outright.
-    //
-    // Two halves of one fix, and neither alone is enough. Reading concurrently
-    // gets the bytes into memory, where a later RST cannot reach them. Stopping
-    // the write as soon as any arrive is what keeps the RST from being provoked
-    // in the first place — with the write left running, the reader is racing a
-    // reset that erases exactly what it came for.
-    //
-    // Chunked so the check happens more than once, and so each chunk boundary
-    // is a scheduling point where the reader can actually run.
-    let (mut read_half, mut write_half) = stream.into_split();
+    write_and_read_http1(stream, head, body).await
+}
+
+/// Write an HTTP/1.1 request head + body to `stream` and read its response,
+/// generic over the transport (plain TCP for [`replay_locally`], TLS for
+/// [`send_to_relay`]).
+///
+/// `head` must already end in `\r\n\r\n` and declare its own `content-length`
+/// and `Connection: close` — this function does not build either. On any
+/// failure the result is a synthetic 502 (`bad_gateway`), matching
+/// `replay_locally`'s prior behaviour exactly: this extraction changes no
+/// observable behaviour, only where the code lives.
+///
+/// `S: 'static + Send` because the read half runs on its own spawned task
+/// (below) — `tokio::spawn` requires both, and a plain `TcpStream` and a
+/// `tokio_rustls::client::TlsStream<TcpStream>` (this function's two callers)
+/// both satisfy them.
+///
+/// Write and read run concurrently, and the write stops the instant any byte
+/// of an answer has arrived:
+///
+/// A server that refuses a request on its body length answers *before* the
+/// body has finished arriving and then closes. Writing on into a closed peer
+/// draws a RST, and a RST discards whatever is still sitting unread in the
+/// receive buffer — so a client that writes to completion and only then
+/// reads loses the answer the server did send. That is how the device's
+/// `413` reached callers as a synthetic `502`, sending an operator to check
+/// whether the device was alive when what they needed was "split the
+/// request". It reproduced as a race, not a constant: on loopback the write
+/// usually finishes first, so roughly one attempt in ten lost it, while the
+/// first attempt across a relay lost it outright.
+///
+/// Two halves of one fix, and neither alone is enough. Reading concurrently
+/// gets the bytes into memory, where a later RST cannot reach them. Stopping
+/// the write as soon as any arrive is what keeps the RST from being provoked
+/// in the first place — with the write left running, the reader is racing a
+/// reset that erases exactly what it came for.
+///
+/// Chunked so the check happens more than once, and so each chunk boundary
+/// is a scheduling point where the reader can actually run.
+async fn write_and_read_http1<S>(
+    stream: S,
+    head: String,
+    body: Vec<u8>,
+) -> (u16, Vec<(String, String)>, Vec<u8>)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
     let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_answered = std::sync::Arc::clone(&answered);
     let reader = tokio::spawn(async move {
@@ -1021,7 +1058,7 @@ async fn replay_locally(
             // current-thread runtime it does not get polled at all.
             tokio::task::yield_now().await;
             if answered.load(std::sync::atomic::Ordering::Acquire) {
-                // The server has already answered. Everything still unwritten
+                // The peer has already answered. Everything still unwritten
                 // would only provoke the reset that erases that answer.
                 break;
             }
@@ -1033,28 +1070,185 @@ async fn replay_locally(
     }
 
     // Deliberately *not* half-closed. The reader reaches EOF anyway, because
-    // the request above asks for `Connection: close` and the server closes once
-    // it has answered. Shutting the write side down instead makes every request
-    // fail: hyper does not serve a half-closed connection — it reads EOF from
-    // the client and abandons the response in progress, so the reader sees a
-    // clean close with zero bytes. Verified: with the shutdown in place
-    // `/health` answered an empty-bodied 502 on every call.
+    // the request head above asks for `Connection: close` and a well-behaved
+    // peer closes once it has answered. Shutting the write side down instead
+    // makes every request fail against a peer that does not serve a
+    // half-closed connection — it reads EOF from the client and abandons the
+    // response in progress, so the reader sees a clean close with zero bytes.
+    // Verified: with the shutdown in place `/health` answered an empty-bodied
+    // 502 on every call.
     let (raw, read_ok) = reader.await.unwrap_or_else(|_| (Vec::new(), false));
     drop(write_half);
 
-    // Whatever arrived wins over either failure: an answer the server actually
+    // Whatever arrived wins over either failure: an answer the peer actually
     // sent is more informative than this function's guess at why it stopped.
     if !raw.is_empty() {
         return parse_response(&raw);
     }
     if write_failed {
-        return bad_gateway("local server closed the connection".to_string());
+        return bad_gateway("connection closed before an answer arrived".to_string());
     }
     if !read_ok {
-        return bad_gateway("local server response was cut short".to_string());
+        return bad_gateway("response was cut short".to_string());
     }
 
     parse_response(&raw)
+}
+
+// `send_to_relay` and everything below it up to `parse_response` are only
+// called by tests until the P2P Phase 2 plan's Task 3 wires them into
+// `connect`'s router (`claudedocs/plans/2026-09-04-p2p-direct-transfer-phase2-plan.md`,
+// not committed — gitignored dev tracking). `#[allow(dead_code)]` on each
+// item is temporary and removed as part of that task, once a production
+// call site exists; `cargo clippy -- -D warnings` is what would otherwise
+// refuse this task's own commit for code Task 3 is already planned to use.
+
+/// Cap on a request or response body this function will build or read — the
+/// same figure the relay itself enforces on the other side of this call
+/// (`relay::MAX_RELAY_FRAME`), so a body this crate would refuse to relay
+/// anyway is refused here before a socket is even opened.
+#[allow(dead_code)]
+const MAX_FORWARDED_BODY: usize = super::MAX_RELAY_FRAME;
+
+/// Forward one HTTP request to the relay's own public `/d/<device>/...`
+/// endpoint — the same endpoint an ordinary HTTP client could call directly.
+///
+/// Hand-rolled for the same reason [`replay_locally`] is: the destination is
+/// named once per process (the relay this device is already attached to),
+/// and pulling in an HTTP client crate for that would cost more than it
+/// saves. `path_and_query` must already start with `/d/<device>` — this
+/// function does not add the prefix, so a caller forwards the request's
+/// original path unchanged.
+#[allow(dead_code)]
+pub(crate) async fn send_to_relay(
+    config: &RelayClientConfig,
+    method: &str,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    if body.len() > MAX_FORWARDED_BODY {
+        return relay_unreachable(format!(
+            "request body of {} bytes exceeds the relay's {} MiB ceiling",
+            body.len(),
+            MAX_FORWARDED_BODY / (1024 * 1024)
+        ));
+    }
+
+    // `authority` keeps its port (needed for both `TcpStream::connect` and a
+    // correct `Host` header — `replay_locally` sends the full `local` the
+    // same way, not a bare host); `bare_host` strips brackets/port for
+    // `ServerName`, which rejects an IPv6 literal's `[...]` delimiters.
+    let authority = config.dial_target();
+    let host = bare_host(&authority);
+
+    let mut head = format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\ncontent-length: {}\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        if is_forwardable(name) && !name.eq_ignore_ascii_case("content-length") {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+
+    let tcp = match tokio::net::TcpStream::connect(&authority).await {
+        Ok(stream) => stream,
+        Err(e) => return relay_unreachable(format!("relay unreachable: {e}")),
+    };
+
+    if !config.is_tls() {
+        let (status, headers, body) = write_and_read_http1(tcp, head, body).await;
+        return cap_response_body(status, headers, body);
+    }
+
+    let (tls_config, _seen) = match tls_client_config(config) {
+        Ok(pair) => pair,
+        Err(e) => return relay_unreachable(format!("bad TLS configuration: {e}")),
+    };
+    let tls_config = tls_config.unwrap_or_else(default_tls_config);
+    let connector = tokio_rustls::TlsConnector::from(tls_config);
+    let server_name = match rustls::pki_types::ServerName::try_from(host.to_string()) {
+        Ok(name) => name,
+        Err(e) => return relay_unreachable(format!("bad relay host name: {e}")),
+    };
+    let tls_stream = match connector.connect(server_name, tcp).await {
+        Ok(stream) => stream,
+        Err(e) => return relay_unreachable(format!("TLS handshake with relay failed: {e}")),
+    };
+    let (status, headers, body) = write_and_read_http1(tls_stream, head, body).await;
+    cap_response_body(status, headers, body)
+}
+
+/// Split `authority` (`host:port`, an IPv6 literal in brackets or not) into
+/// its bare host — no brackets, no port — for a TLS `ServerName`, which
+/// rejects both. Mirrors the bracket-aware check
+/// [`RelayClientConfig::dial_target`] already uses to decide whether a port
+/// is present, so a bracketed `[::1]:8443` and a plain `relay.example.com:443`
+/// both resolve correctly.
+#[allow(dead_code)]
+fn bare_host(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    authority
+        .rsplit_once(':')
+        .map(|(h, _)| h)
+        .unwrap_or(authority)
+}
+
+/// The response `send_to_relay` reports when it could not reach the relay
+/// itself — deliberately not [`bad_gateway`], whose text ("device could not
+/// reach its local server") describes the opposite direction:
+/// `replay_locally` is the device failing to reach *its own* local server,
+/// while this is the connect process failing to reach *the relay*. Reusing
+/// `bad_gateway`'s wording here would tell an operator to check the wrong
+/// machine.
+#[allow(dead_code)]
+fn relay_unreachable(reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    tracing::debug!(target: "connect", "{reason}");
+    (
+        502,
+        vec![("content-type".to_string(), "text/plain".to_string())],
+        b"connect could not reach the relay".to_vec(),
+    )
+}
+
+/// The trust `connector`/`tls_client_config` fall back to when neither
+/// `--relay-fingerprint` nor `--relay-ca` was given: the public root store,
+/// same as `tokio_tungstenite::Connector`'s own implicit default that
+/// [`connector`]'s `None` return relies on — spelled out here because a raw
+/// [`tokio_rustls::TlsConnector`] has no such implicit default to fall
+/// through to.
+#[allow(dead_code)]
+fn default_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    std::sync::Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
+}
+
+/// Refuse a response whose body would exceed [`MAX_FORWARDED_BODY`], the
+/// same ceiling a request is checked against above — a relay-emitted answer
+/// is subject to the same limit its own frame carries.
+#[allow(dead_code)]
+fn cap_response_body(
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    if body.len() > MAX_FORWARDED_BODY {
+        return (
+            502,
+            vec![("content-type".to_string(), "text/plain".to_string())],
+            b"relay response exceeded the forwarding ceiling".to_vec(),
+        );
+    }
+    (status, headers, body)
 }
 
 /// Split a raw HTTP/1.1 response into status, headers, and body.
@@ -1141,6 +1335,115 @@ mod tests {
             ca_file: None,
             enrolled: None,
         }
+    }
+
+    #[tokio::test]
+    async fn write_and_read_http1_round_trips_over_a_plain_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                .await
+                .unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /hello HTTP/1.1\r\n"));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nhi",
+            )
+            .await
+            .unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head =
+            "GET /hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\ncontent-length: 0\r\n\r\n"
+                .to_string();
+        let (status, headers, body) = write_and_read_http1(stream, head, Vec::new()).await;
+        assert_eq!(status, 200);
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "content-length" && v == "2"));
+        assert_eq!(body, b"hi");
+    }
+
+    #[tokio::test]
+    async fn send_to_relay_reaches_a_plain_http_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                .await
+                .unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]);
+            assert!(head.starts_with("GET /d/box1/api/v1/health HTTP/1.1\r\n"));
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK",
+            )
+            .await
+            .unwrap();
+        });
+
+        let cfg = config(&format!("http://{addr}"));
+        let (status, _headers, body) =
+            send_to_relay(&cfg, "GET", "/d/box1/api/v1/health", &[], Vec::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn send_to_relay_reaches_a_tls_listener_with_a_pinned_fingerprint() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_der = issued.cert.der().to_vec();
+        let key_der = issued.signing_key.serialize_der();
+        let fingerprint = crate::fingerprint::of_certificate(&cert_der);
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key_der).into(),
+            )
+            .expect("valid self-signed cert+key");
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_config));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let mut tls = acceptor.accept(tcp).await.expect("TLS handshake");
+            let mut buf = vec![0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut tls, &mut buf)
+                .await
+                .unwrap();
+            let head = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                head.starts_with("GET /d/box1/health HTTP/1.1\r\n"),
+                "{head}"
+            );
+            tokio::io::AsyncWriteExt::write_all(
+                &mut tls,
+                b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK",
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut cfg = config(&format!("https://localhost:{}", addr.port()));
+        cfg.fingerprint = Some(fingerprint);
+        assert!(cfg.is_tls());
+
+        let (status, _headers, body) =
+            send_to_relay(&cfg, "GET", "/d/box1/health", &[], Vec::new()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
     }
 
     #[test]
