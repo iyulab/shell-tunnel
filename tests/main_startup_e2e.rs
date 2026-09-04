@@ -591,6 +591,121 @@ fn a_relay_on_a_taken_port_says_nothing_about_listening() {
     drop(holder);
 }
 
+/// `connect` only makes sense on a build with the relay client compiled in;
+/// every test in this module checks required-flag/unimplemented behavior
+/// that lives inside the `#[cfg(feature = "relay-client")]` branch of
+/// `connect`'s dispatch (`src/main.rs`), so all four are gated the same way
+/// — matching the incident `CLAUDE.md` records under "Nothing but you runs
+/// the default build's tests"
+/// (`a_relay_joined_banner_names_the_chunk_size_it_will_advertise`, ungated,
+/// failing every plain `cargo test --all`).
+#[cfg(feature = "relay-client")]
+mod connect_refusals {
+    use super::*;
+
+    /// `connect` without `--relay`/`--enroll-token`/`--peer` refuses at startup,
+    /// the same way a device attach without `--enroll-token` already does
+    /// (`src/main.rs`) — before any relay connection is attempted.
+    #[test]
+    fn connect_without_relay_refuses_to_start() {
+        let (code, _stdout, stderr) =
+            run_with_timeout(&["connect", "--peer", "box1"], Duration::from_secs(10));
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("connect requires --relay"),
+            "stderr was: {stderr}"
+        );
+    }
+
+    #[test]
+    fn connect_without_enroll_token_refuses_to_start() {
+        let (code, _stdout, stderr) = run_with_timeout(
+            &[
+                "connect",
+                "--relay",
+                "https://relay.example.com",
+                "--peer",
+                "box1",
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("connect requires --enroll-token"),
+            "stderr was: {stderr}"
+        );
+    }
+
+    #[test]
+    fn connect_without_peer_refuses_to_start() {
+        let (code, _stdout, stderr) = run_with_timeout(
+            &[
+                "connect",
+                "--relay",
+                "https://relay.example.com",
+                "--enroll-token",
+                "t",
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("connect requires --peer"),
+            "stderr was: {stderr}"
+        );
+    }
+
+    /// A fully-specified `connect` invocation is accepted by argument parsing and
+    /// only then refused as unimplemented — proves Task 1's validation runs
+    /// before the "not implemented" line, not instead of it.
+    #[test]
+    fn connect_fully_specified_is_accepted_then_refused_as_unimplemented() {
+        let (code, _stdout, stderr) = run_with_timeout(
+            &[
+                "connect",
+                "--relay",
+                "https://relay.example.com",
+                "--enroll-token",
+                "t",
+                "--peer",
+                "box1",
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("connect mode is not implemented yet"),
+            "stderr was: {stderr}"
+        );
+    }
+}
+
+/// A default build (no `relay-client`) refuses `connect` the same way it
+/// already refuses `--relay` — before any of the required-flag checks run,
+/// since those checks live inside the `#[cfg(feature = "relay-client")]`
+/// branch of the dispatch.
+#[test]
+#[cfg(not(feature = "relay-client"))]
+fn connect_without_relay_client_feature_refuses_with_a_rebuild_hint() {
+    let (code, _stdout, stderr) = run_with_timeout(
+        &[
+            "connect",
+            "--relay",
+            "https://relay.example.com",
+            "--enroll-token",
+            "t",
+            "--peer",
+            "box1",
+        ],
+        Duration::from_secs(10),
+    );
+    assert_eq!(code, Some(1));
+    assert!(
+        stderr.contains("this build has no relay client"),
+        "stderr was: {stderr}"
+    );
+}
+
 /// The gateway shares the translation, because it had the identical screen.
 ///
 /// Fixing only the relay would have left `Error: Io(Os { code: 10048, ... })`

@@ -66,6 +66,11 @@ pub struct Args {
     pub relay_fingerprint: Option<String>,
     /// Extra PEM certificate authority to trust when dialling a relay.
     pub relay_ca: Option<PathBuf>,
+    /// Run as a local reverse-proxy that forwards to one relay-attached device
+    /// (`shell-tunnel connect`), instead of a shell gateway or a relay server.
+    pub connect: bool,
+    /// The device to forward every request to, when `connect` is set.
+    pub peer: Option<String>,
     /// Additional host names this server answers to.
     pub allow_hosts: Vec<String>,
     /// Append an audit trail of executions and refusals to this file.
@@ -129,6 +134,8 @@ impl Default for Args {
             tls_self_signed: false,
             relay_fingerprint: None,
             relay_ca: None,
+            connect: false,
+            peer: None,
             allow_hosts: Vec::new(),
             audit_log: None,
             audit_max_bytes_raw: None,
@@ -270,6 +277,9 @@ where
             Long("relay-ca") => {
                 result.relay_ca = Some(parser.value()?.parse()?);
             }
+            Long("peer") => {
+                result.peer = Some(parser.value()?.parse()?);
+            }
             Long("allow-host") => {
                 let value: String = parser.value()?.parse()?;
                 result.allow_hosts.push(value);
@@ -317,11 +327,23 @@ where
             Long("no-update-check") => {
                 result.no_update_check = true;
             }
-            // The only positional is the `relay` subcommand, which switches the
-            // binary into relay-server mode. Bind address and port keep using
-            // -H/-p so one CLI vocabulary covers both modes.
+            // The two positionals are `relay` (relay-server mode) and `connect`
+            // (local reverse-proxy mode). Bind address and port keep using -H/-p
+            // for `relay`; `connect` does not bind a configurable address at all
+            // — it always listens on loopback.
+            //
+            // Each arm only self-dedups (`connect connect` is the one repeat this
+            // guards against) — it deliberately does NOT also guard against the
+            // *other* flag, so `connect relay` parses cleanly with both booleans
+            // set and falls through to the conflict check below. Cross-guarding
+            // here would make `Conflicting("connect", "relay")` unreachable: the
+            // second positional would hit the `Value(val) => UnexpectedArgument`
+            // arm first and report the wrong error.
             Value(val) if val == "relay" && !result.relay => {
                 result.relay = true;
+            }
+            Value(val) if val == "connect" && !result.connect => {
+                result.connect = true;
             }
             Value(val) => {
                 return Err(ArgsError::UnexpectedArgument(val.to_string_lossy().into()));
@@ -356,6 +378,28 @@ where
     }
     if result.relay_url.is_some() && result.tunnel_command.is_some() {
         return Err(ArgsError::Conflicting("--relay", "--tunnel-command"));
+    }
+
+    // connect mode is a third top-level mode: it shares nothing with the
+    // gateway or the relay server, so nothing that configures either of those
+    // makes sense alongside it.
+    if result.connect && result.relay {
+        return Err(ArgsError::Conflicting("connect", "relay"));
+    }
+    if result.connect && (result.tunnel || result.tunnel_command.is_some()) {
+        return Err(ArgsError::Conflicting("connect", "--tunnel"));
+    }
+    // The design commits to an ephemeral, unnamed device: a stable name is
+    // meaningless for a process that exists for one invocation and leaves no
+    // URL worth remembering. Accepting the flag and silently ignoring it
+    // would be exactly the silent failure this project's conventions refuse.
+    if result.connect && result.device_name.is_some() {
+        return Err(ArgsError::Conflicting("connect", "--device-name"));
+    }
+    // A local proxy by name: nothing publishes it, so a non-default bind
+    // address is a user error worth naming rather than silently accepting.
+    if result.connect && result.host_explicit {
+        return Err(ArgsError::Conflicting("connect", "-H/--host"));
     }
 
     // Reachability paths are mutually exclusive: two tunnels would each publish
@@ -590,6 +634,53 @@ mod tests {
             .chain(args.iter().copied())
             .map(OsString::from)
             .collect()
+    }
+
+    #[test]
+    fn test_connect_subcommand() {
+        let result = parse_args_from(args(&[
+            "connect",
+            "--relay",
+            "https://relay.example.com",
+            "--enroll-token",
+            "t",
+            "--peer",
+            "box1",
+        ]))
+        .unwrap();
+        assert!(result.connect);
+        assert!(!result.relay);
+        assert_eq!(result.peer, Some("box1".to_string()));
+    }
+
+    #[test]
+    fn test_connect_and_relay_conflict() {
+        let err = parse_args_from(args(&["connect", "relay"])).unwrap_err();
+        assert!(matches!(err, ArgsError::Conflicting("connect", "relay")));
+    }
+
+    #[test]
+    fn test_connect_and_tunnel_conflict() {
+        let err = parse_args_from(args(&["connect", "--tunnel"])).unwrap_err();
+        assert!(matches!(err, ArgsError::Conflicting("connect", "--tunnel")));
+    }
+
+    #[test]
+    fn test_connect_and_device_name_conflict() {
+        let err = parse_args_from(args(&["connect", "--device-name", "x"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::Conflicting("connect", "--device-name")
+        ));
+    }
+
+    #[test]
+    fn test_connect_and_explicit_host_conflict() {
+        let err = parse_args_from(args(&["connect", "-H", "0.0.0.0"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::Conflicting("connect", "-H/--host")
+        ));
     }
 
     #[test]

@@ -35,17 +35,17 @@ fn without_line_comments(source: &str) -> String {
 /// `all(…)` and `any(…)` need no special handling: requiring every name they
 /// mention is at worst stricter than necessary, and being stricter cannot hide
 /// a test. `not(feature = "…")` is the one form where that reasoning inverts —
-/// enabling the feature is what would remove those tests — so it is refused
-/// rather than modelled wrongly.
-fn gates_in(source: &str, file: &Path) -> BTreeSet<String> {
+/// enabling the feature is what would remove those tests — so it is stripped
+/// out before the scan below ever sees it, rather than added to what a
+/// feature-gated command must enable. A negated gate's coverage comes from
+/// the opposite side: [`ci_runs_the_default_builds_tests_exactly_once`]
+/// already requires and verifies exactly one CI command runs the *empty*-
+/// features build, which is what makes a `not(feature = "…")` test exist at
+/// all — that command builds every file in `tests/`, this negated-gated one
+/// included, so nothing here needs to additionally require the feature.
+fn gates_in(source: &str, _file: &Path) -> BTreeSet<String> {
     let source = without_line_comments(source);
-    assert!(
-        !source.contains("not(feature"),
-        "{} carries a negated feature gate, which this check does not model: \
-         enabling the feature would *remove* those tests, so the subset rule below \
-         would be exactly backwards. Teach this check that form before using it.",
-        file.display()
-    );
+    let source = without_negated_gates(&source);
 
     let mut found = BTreeSet::new();
     let mut rest = source.as_str();
@@ -57,6 +57,31 @@ fn gates_in(source: &str, file: &Path) -> BTreeSet<String> {
         }
     }
     found
+}
+
+/// Remove every `not(feature = "…")` occurrence — the parenthesised name and
+/// its closing paren — so the general `feature = "…"` scan in [`gates_in`]
+/// never turns a negated gate into a requirement. Textual, matching this
+/// file's own scanning style (see [`without_line_comments`]).
+fn without_negated_gates(source: &str) -> String {
+    const PREFIX: &str = "not(feature = \"";
+    let mut result = String::with_capacity(source.len());
+    let mut rest = source;
+    loop {
+        let Some(at) = rest.find(PREFIX) else {
+            result.push_str(rest);
+            break;
+        };
+        result.push_str(&rest[..at]);
+        let after_prefix = &rest[at + PREFIX.len()..];
+        rest = match after_prefix.find('"') {
+            Some(end) => after_prefix[end + 1..]
+                .strip_prefix(')')
+                .unwrap_or(&after_prefix[end + 1..]),
+            None => after_prefix,
+        };
+    }
+    result
 }
 
 /// This file's own name, so the scan can skip itself.
@@ -401,4 +426,27 @@ fn the_published_relay_ceiling_is_the_constant_this_crate_declares() {
              likelier one, so read the document before reaching for the constant"
         );
     }
+}
+
+/// `gates_in` must not turn a `not(feature = "…")` occurrence into a
+/// requirement, while still catching an ordinary positive gate in the same
+/// file — pins the fix that replaced the old refuse-and-panic behaviour
+/// (`tests/main_startup_e2e.rs` was the first file in `tests/` to mix both
+/// forms, which is what surfaced the gap this test now closes).
+#[test]
+fn a_negated_gate_is_not_a_requirement_but_a_positive_one_still_is() {
+    let source = r#"
+        #[cfg(feature = "relay-client")]
+        fn needs_it() {}
+
+        #[cfg(not(feature = "relay-client"))]
+        fn refuses_without_it() {}
+    "#;
+    let found = gates_in(source, Path::new("fixture.rs"));
+    assert_eq!(
+        found,
+        BTreeSet::from(["relay-client".to_string()]),
+        "the positive gate must still be required; the negated one must not \
+         double it up or leak in some other form"
+    );
 }

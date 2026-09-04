@@ -140,6 +140,35 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         return run_relay(&args).await;
     }
 
+    // connect mode forwards to one device over the relay's existing public
+    // path; it shares no configuration with the gateway, so it returns here
+    // exactly as relay-server mode does.
+    if args.connect {
+        #[cfg(not(feature = "relay-client"))]
+        {
+            eprintln!("Configuration error: this build has no relay client.");
+            eprintln!("Rebuild with `--features relay-client`.");
+            std::process::exit(1);
+        }
+        #[cfg(feature = "relay-client")]
+        {
+            if args.relay_url.is_none() {
+                eprintln!("Configuration error: connect requires --relay");
+                std::process::exit(1);
+            }
+            if args.enroll_token.is_none() {
+                eprintln!("Configuration error: connect requires --enroll-token");
+                std::process::exit(1);
+            }
+            if args.peer.is_none() {
+                eprintln!("Configuration error: connect requires --peer");
+                std::process::exit(1);
+            }
+            eprintln!("connect mode is not implemented yet.");
+            std::process::exit(1);
+        }
+    }
+
     // Load configuration
     let mut config = match Config::load(&args) {
         Ok(config) => config,
