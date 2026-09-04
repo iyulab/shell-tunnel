@@ -1095,19 +1095,10 @@ where
     parse_response(&raw)
 }
 
-// `send_to_relay` and everything below it up to `parse_response` are only
-// called by tests until the P2P Phase 2 plan's Task 3 wires them into
-// `connect`'s router (`claudedocs/plans/2026-09-04-p2p-direct-transfer-phase2-plan.md`,
-// not committed — gitignored dev tracking). `#[allow(dead_code)]` on each
-// item is temporary and removed as part of that task, once a production
-// call site exists; `cargo clippy -- -D warnings` is what would otherwise
-// refuse this task's own commit for code Task 3 is already planned to use.
-
 /// Cap on a request or response body this function will build or read — the
 /// same figure the relay itself enforces on the other side of this call
 /// (`relay::MAX_RELAY_FRAME`), so a body this crate would refuse to relay
 /// anyway is refused here before a socket is even opened.
-#[allow(dead_code)]
 const MAX_FORWARDED_BODY: usize = super::MAX_RELAY_FRAME;
 
 /// Forward one HTTP request to the relay's own public `/d/<device>/...`
@@ -1119,7 +1110,6 @@ const MAX_FORWARDED_BODY: usize = super::MAX_RELAY_FRAME;
 /// saves. `path_and_query` must already start with `/d/<device>` — this
 /// function does not add the prefix, so a caller forwards the request's
 /// original path unchanged.
-#[allow(dead_code)]
 pub(crate) async fn send_to_relay(
     config: &RelayClientConfig,
     method: &str,
@@ -1187,7 +1177,6 @@ pub(crate) async fn send_to_relay(
 /// [`RelayClientConfig::dial_target`] already uses to decide whether a port
 /// is present, so a bracketed `[::1]:8443` and a plain `relay.example.com:443`
 /// both resolve correctly.
-#[allow(dead_code)]
 fn bare_host(authority: &str) -> &str {
     if let Some(rest) = authority.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
@@ -1205,7 +1194,6 @@ fn bare_host(authority: &str) -> &str {
 /// while this is the connect process failing to reach *the relay*. Reusing
 /// `bad_gateway`'s wording here would tell an operator to check the wrong
 /// machine.
-#[allow(dead_code)]
 fn relay_unreachable(reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
     tracing::debug!(target: "connect", "{reason}");
     (
@@ -1221,7 +1209,6 @@ fn relay_unreachable(reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
 /// [`connector`]'s `None` return relies on — spelled out here because a raw
 /// [`tokio_rustls::TlsConnector`] has no such implicit default to fall
 /// through to.
-#[allow(dead_code)]
 fn default_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1235,7 +1222,6 @@ fn default_tls_config() -> std::sync::Arc<rustls::ClientConfig> {
 /// Refuse a response whose body would exceed [`MAX_FORWARDED_BODY`], the
 /// same ceiling a request is checked against above — a relay-emitted answer
 /// is subject to the same limit its own frame carries.
-#[allow(dead_code)]
 fn cap_response_body(
     status: u16,
     headers: Vec<(String, String)>,

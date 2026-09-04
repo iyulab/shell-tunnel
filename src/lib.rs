@@ -62,6 +62,8 @@ pub mod api;
 pub mod audit;
 pub mod cli;
 pub mod config;
+#[cfg(feature = "relay-client")]
+pub mod connect;
 pub mod error;
 pub mod execution;
 #[cfg(any(feature = "tls", feature = "relay-client"))]

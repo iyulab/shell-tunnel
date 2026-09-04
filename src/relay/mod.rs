@@ -887,7 +887,7 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
 }
 
 /// Whether these headers ask to switch protocols to WebSocket.
-fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+pub(crate) fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
     let header_contains = |name: axum::http::HeaderName, needle: &str| {
         headers
             .get(name)
