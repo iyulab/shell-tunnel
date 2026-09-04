@@ -1398,6 +1398,10 @@
             "type": "boolean",
             "description": "Whether a command is running in this session right now. See SessionStatusResponse.running."
           },
+          "last_exit_code": {
+            "type": "integer",
+            "description": "Exit code of the last command run in this session. See SessionStatusResponse.last_exit_code. Absent until one has run, the same as the detail view."
+          },
           "execution_count": {
             "type": "integer",
             "format": "int64",

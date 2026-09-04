@@ -301,6 +301,10 @@ pub struct SessionSummary {
     /// Whether a command is running in this session right now — see
     /// [`SessionStatusResponse::running`].
     pub running: bool,
+    /// Last exit code (if available) — see
+    /// [`SessionStatusResponse::last_exit_code`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_exit_code: Option<i32>,
     /// Total commands executed — see [`SessionStatusResponse::execution_count`].
     pub execution_count: u64,
     pub idle_seconds: f64,

@@ -269,11 +269,13 @@ async fn a_session_reports_running_while_a_command_is_in_flight() {
     in_flight.await.unwrap();
 }
 
-/// Until this cycle, `SessionSummary` (the list view) carried no
-/// `execution_count` while `SessionStatusResponse` (the detail view) did —
-/// an asymmetry observed live (2026-08-05) and left undecided since. The list
-/// entry now carries the same count the detail view would report for the same
-/// session, read from the same in-memory `Session`.
+/// Until this cycle, `SessionSummary` (the list view) carried neither
+/// `execution_count` nor `last_exit_code` while `SessionStatusResponse` (the
+/// detail view) carried both — an asymmetry observed live (2026-08-05) and
+/// left undecided since for the first field, discovered as the same pattern
+/// while fixing it. The list entry now carries the same values the detail
+/// view would report for the same session, read from the same in-memory
+/// `Session`.
 #[tokio::test]
 async fn a_session_list_entry_carries_the_same_execution_count_as_its_detail() {
     let app = create_router_with_state(AppState::new());
@@ -311,6 +313,11 @@ async fn a_session_list_entry_carries_the_same_execution_count_as_its_detail() {
         json!(1),
         "list entry did not carry execution_count: {entry}"
     );
+    assert_eq!(
+        entry["last_exit_code"],
+        json!(0),
+        "list entry did not carry last_exit_code: {entry}"
+    );
 
     let detail = app
         .oneshot(json_request(
@@ -324,6 +331,38 @@ async fn a_session_list_entry_carries_the_same_execution_count_as_its_detail() {
     assert_eq!(
         entry["execution_count"], detail_json["execution_count"],
         "list and detail disagree on execution_count: list={entry} detail={detail_json}"
+    );
+    assert_eq!(
+        entry["last_exit_code"], detail_json["last_exit_code"],
+        "list and detail disagree on last_exit_code: list={entry} detail={detail_json}"
+    );
+}
+
+/// Before any command has run, `last_exit_code` is absent — omitted, not
+/// `null` — the same as `SessionStatusResponse::last_exit_code` on the
+/// detail view (`#[serde(skip_serializing_if = "Option::is_none")]` on both).
+#[tokio::test]
+async fn a_session_list_entry_omits_last_exit_code_before_any_command_runs() {
+    let app = create_router_with_state(AppState::new());
+
+    app.clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+
+    let list = app
+        .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
+        .await
+        .unwrap();
+    let list_json = response_json(list).await;
+    let entry = &list_json["sessions"][0];
+    assert!(
+        entry.get("last_exit_code").is_none(),
+        "last_exit_code must be omitted, not null, before any command runs: {entry}"
     );
 }
 

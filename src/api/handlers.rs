@@ -143,6 +143,7 @@ pub async fn list_sessions(
             sessions.push(SessionSummary {
                 session_id: session.id.as_u64(),
                 running: session.state == SessionState::Active,
+                last_exit_code: session.context.last_exit_code(),
                 execution_count: session.context.execution_count(),
                 idle_seconds: session.idle_duration().as_secs_f64(),
             });
