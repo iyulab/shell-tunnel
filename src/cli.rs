@@ -433,6 +433,8 @@ Ultra-lightweight remote shell gateway with a REST/WebSocket API
 USAGE:
     shell-tunnel [OPTIONS]              Serve a shell gateway
     shell-tunnel relay [OPTIONS]        Serve a relay that devices dial out to
+    shell-tunnel connect [OPTIONS]      Forward one relay-attached device's
+                                         traffic to a local port
 
 OPTIONS:
     -H, --host <ADDR>       Host address to bind [default: 127.0.0.1]
@@ -529,6 +531,10 @@ RELAY OPTIONS (with `relay`):
                             uses this relay's listen port; name a port only when
                             a proxy remaps it [default: http://<bind address>]
 
+CONNECT OPTIONS (with `connect`):
+        --peer <DEVICE>     Forward every request to this device, through the
+                            same relay named by --relay
+
 OTHER OPTIONS:
 {update_opts}    -h, --help              Print help
     -V, --version           Print version
@@ -562,6 +568,9 @@ EXAMPLES:
 
     # Attach to a relay under a stable name
     shell-tunnel --relay https://relay.example.com --enroll-token <t> --device-name box
+
+    # Reach one relay-attached device through a local port
+    shell-tunnel connect --relay https://relay.example.com --enroll-token <t> --peer box1
 
     # Run a relay with HTTPS, generating a certificate on first run.
     # --public-base names the host; the URL uses this relay's port (8443).

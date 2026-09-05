@@ -152,20 +152,67 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         }
         #[cfg(feature = "relay-client")]
         {
-            if args.relay_url.is_none() {
-                eprintln!("Configuration error: connect requires --relay");
-                std::process::exit(1);
-            }
-            if args.enroll_token.is_none() {
-                eprintln!("Configuration error: connect requires --enroll-token");
-                std::process::exit(1);
-            }
-            if args.peer.is_none() {
-                eprintln!("Configuration error: connect requires --peer");
-                std::process::exit(1);
-            }
-            eprintln!("connect mode is not implemented yet.");
-            std::process::exit(1);
+            let relay_url = match args.relay_url.clone() {
+                Some(url) => url,
+                None => {
+                    eprintln!("Configuration error: connect requires --relay");
+                    std::process::exit(1);
+                }
+            };
+            let enroll_token = match args.enroll_token.clone() {
+                Some(token) => token,
+                None => {
+                    eprintln!("Configuration error: connect requires --enroll-token");
+                    std::process::exit(1);
+                }
+            };
+            let peer = match args.peer.clone() {
+                Some(peer) => peer,
+                None => {
+                    eprintln!("Configuration error: connect requires --peer");
+                    std::process::exit(1);
+                }
+            };
+
+            // Mirrors run_relay's own startup (main.rs:742-743): connect
+            // dispatches before the gateway path's logging::init() call, so
+            // every tracing:: line inside relay::client::run / send_to_relay
+            // / connect's idle-shutdown watchdog would be silently dropped —
+            // no subscriber installed, nothing panics, nothing prints —
+            // unless this dispatch installs one itself first.
+            std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
+            logging::init();
+
+            let config = shell_tunnel::relay::client::RelayClientConfig {
+                relay_url,
+                enroll_token,
+                local: "127.0.0.1:1".parse().expect("valid placeholder addr"),
+                label: None,
+                device_name: None,
+                fingerprint: args.relay_fingerprint.clone(),
+                ca_file: args.relay_ca.clone(),
+                enrolled: None,
+            };
+            let local_port = if args.port_explicit { args.port } else { 0 };
+
+            // serve_until_idle only reports the bound address on this
+            // channel — printing the banner is main.rs's job, the same
+            // division `RelayClientConfig::enrolled` already draws for the
+            // relay-attach path (see connect::serve's own doc comment).
+            let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                if let Ok(addr) = bound_rx.await {
+                    outln!("connect: forwarding http://{addr}/d/{peer}/... to {peer}");
+                }
+            });
+            let peer_for_serve = args.peer.clone().expect("checked above");
+            return shell_tunnel::connect::serve_until_idle(
+                config,
+                peer_for_serve,
+                local_port,
+                Some(bound_tx),
+            )
+            .await;
         }
     }
 

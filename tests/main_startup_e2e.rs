@@ -655,29 +655,17 @@ mod connect_refusals {
         );
     }
 
-    /// A fully-specified `connect` invocation is accepted by argument parsing and
-    /// only then refused as unimplemented — proves Task 1's validation runs
-    /// before the "not implemented" line, not instead of it.
-    #[test]
-    fn connect_fully_specified_is_accepted_then_refused_as_unimplemented() {
-        let (code, _stdout, stderr) = run_with_timeout(
-            &[
-                "connect",
-                "--relay",
-                "https://relay.example.com",
-                "--enroll-token",
-                "t",
-                "--peer",
-                "box1",
-            ],
-            Duration::from_secs(10),
-        );
-        assert_eq!(code, Some(1));
-        assert!(
-            stderr.contains("connect mode is not implemented yet"),
-            "stderr was: {stderr}"
-        );
-    }
+    // A fifth test here (`connect_fully_specified_is_accepted_then_refused_as_unimplemented`)
+    // pinned Task 1's temporary "connect mode is not implemented yet." stub —
+    // removed in Task 4, which replaced that stub with the real dispatch
+    // (`shell_tunnel::connect::serve_until_idle`). A fully-specified `connect`
+    // now actually attaches to the named relay and keeps running rather than
+    // exiting 1, so the old assertion no longer has a premise: this binary
+    // spawn model (a refusal that exits promptly) cannot express "runs
+    // indefinitely, and that's correct." The same role — proving a
+    // fully-specified invocation is accepted by parsing and does real work —
+    // is now covered by `tests/connect_e2e.rs`, which exercises the
+    // implemented path end to end.
 }
 
 /// A default build (no `relay-client`) refuses `connect` the same way it

@@ -13,6 +13,89 @@ use axum::Router;
 
 use crate::relay::client::{send_to_relay, RelayClientConfig};
 
+/// How long `connect` may sit with no forwarded request before it exits on
+/// its own.
+///
+/// The same hour [`session::IDLE_TTL`](crate::session::IDLE_TTL) and
+/// `fs::SESSION_TTL` already use for "how long does an abandoned thing stay
+/// alive?" on this product — kept as `connect`'s own constant rather than a
+/// third use of either of those, because this is a different resource (a
+/// whole local process, not a session or upload) and may need to move
+/// independently, exactly as `session::IDLE_TTL`'s own doc comment reasons
+/// about the same relationship to `fs::SESSION_TTL`.
+///
+/// A safety net for a caller script that forgot to stop this process, or
+/// died without cleaning it up — not a normal way to end a session, so an
+/// hour is deliberately generous rather than tuned tight.
+pub const CONNECT_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Shared last-activity clock for the idle-shutdown watchdog: nanoseconds
+/// since `epoch`, bumped by [`track_activity`] on every request the router
+/// actually handles (including a 404 for the wrong device — anything that
+/// reached this process counts as activity; only true silence should exit).
+///
+/// `epoch` is `tokio::time::Instant`, not `std::time::Instant`: the former is
+/// what `tokio::time::pause`/`advance` actually virtualize in tests — the
+/// latter reads the real OS clock regardless, which made an early version of
+/// `idle_clock_reports_expired_only_after_the_full_timeout` fail: the
+/// interval below ticked on virtual time (correctly, near-instantly under
+/// `advance`), but each tick's `idle_for()` check read real elapsed
+/// microseconds and could never reach a 60-second threshold inside a test
+/// that runs in milliseconds. Outside tests `tokio::time::Instant` behaves
+/// identically to the real clock, so this costs nothing in production.
+#[derive(Clone)]
+struct IdleClock {
+    epoch: tokio::time::Instant,
+    last_activity_nanos: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl IdleClock {
+    fn new() -> Self {
+        Self {
+            epoch: tokio::time::Instant::now(),
+            last_activity_nanos: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn touch(&self) {
+        let nanos = self.epoch.elapsed().as_nanos() as u64;
+        self.last_activity_nanos
+            .store(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> std::time::Duration {
+        let last = self
+            .last_activity_nanos
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.epoch
+            .elapsed()
+            .saturating_sub(std::time::Duration::from_nanos(last))
+    }
+
+    /// Resolves once no request has arrived for `timeout`. Polls rather than
+    /// sleeping once for the full timeout so a request that arrives with 1ms
+    /// left still resets the countdown, not just delays a shutdown that was
+    /// already decided.
+    async fn expired(&self, timeout: std::time::Duration) {
+        let mut ticker = tokio::time::interval(timeout / 4);
+        loop {
+            ticker.tick().await;
+            if self.idle_for() >= timeout {
+                return;
+            }
+        }
+    }
+}
+
+async fn track_activity(
+    axum::extract::State(clock): axum::extract::State<IdleClock>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    clock.touch();
+    next.run(request).await
+}
+
 #[derive(Clone)]
 struct ConnectState {
     config: std::sync::Arc<RelayClientConfig>,
@@ -118,7 +201,9 @@ pub async fn serve(
     mut config: RelayClientConfig,
     peer: String,
     local_port: u16,
+    idle_timeout: std::time::Duration,
     bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> crate::Result<()> {
     // `relay::client::run` already installs this once it reaches its own
     // first `wss://` dial (`src/relay/client.rs:193`), but `send_to_relay`'s
@@ -139,9 +224,35 @@ pub async fn serve(
         let _ = tx.send(local_addr);
     }
 
-    let router = router(config.clone(), peer);
+    // Cloned before `router` takes ownership of `peer` below — kept only for
+    // the idle-shutdown log line, which is worth naming the peer in ("idle,
+    // stopped forwarding to box1" tells an operator which process just
+    // exited; "idle, shutting down" on its own does not, once more than one
+    // connect process might be running).
+    let peer_for_log = peer.clone();
+    let clock = IdleClock::new();
+    let router = router(config.clone(), peer).layer(axum::middleware::from_fn_with_state(
+        clock.clone(),
+        track_activity,
+    ));
+    let idle_watchdog = {
+        let clock = clock.clone();
+        async move { clock.expired(idle_timeout).await }
+    };
+
     let server = tokio::spawn(async move {
         axum::serve(listener, router.into_make_service())
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = shutdown => {}
+                    _ = idle_watchdog => {
+                        tracing::info!(
+                            "connect: idle for {:?}, stopped forwarding to {peer_for_log}",
+                            idle_timeout
+                        );
+                    }
+                }
+            })
             .await
             .map_err(|e| crate::ShellTunnelError::Io(std::io::Error::other(e.to_string())))
     });
@@ -149,6 +260,52 @@ pub async fn serve(
     tokio::select! {
         result = server => result.expect("connect server task panicked"),
         result = crate::relay::client::run(config) => result,
+    }
+}
+
+/// Attach `config` and serve `peer` until Ctrl-C/SIGTERM or
+/// [`CONNECT_IDLE_TIMEOUT`] of inactivity, whichever comes first. What
+/// `main.rs`'s `run_connect` actually calls; `bound` lets the caller learn
+/// the port before printing the banner (`outln!` lives in `main.rs`, not
+/// this library — see `serve`'s own doc comment, Task 3).
+pub async fn serve_until_idle(
+    config: RelayClientConfig,
+    peer: String,
+    local_port: u16,
+    bound: Option<tokio::sync::oneshot::Sender<std::net::SocketAddr>>,
+) -> crate::Result<()> {
+    serve(
+        config,
+        peer,
+        local_port,
+        CONNECT_IDLE_TIMEOUT,
+        bound,
+        shutdown_signal_for_connect(),
+    )
+    .await
+}
+
+/// Ctrl-C/SIGTERM, exactly as `api::router::shutdown_signal` — kept as its
+/// own small copy rather than a cross-module `pub(crate)` export, since this
+/// is the only other place in the crate that needs it and the body is short.
+async fn shutdown_signal_for_connect() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
 
@@ -168,6 +325,43 @@ mod tests {
             ca_file: None,
             enrolled: None,
         }
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn idle_clock_reports_expired_only_after_the_full_timeout() {
+        let clock = IdleClock::new();
+        let timeout = std::time::Duration::from_secs(60);
+
+        let expired = tokio::spawn({
+            let clock = clock.clone();
+            async move {
+                clock.expired(timeout).await;
+            }
+        });
+
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        assert!(!expired.is_finished());
+        clock.touch(); // activity resets the countdown
+        tokio::time::advance(std::time::Duration::from_secs(45)).await;
+        assert!(
+            !expired.is_finished(),
+            "touch() should have reset the clock"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(20)).await;
+        // Awaiting the handle directly (rather than polling `is_finished()`
+        // after a bare `yield_now()`) is what actually proves completion —
+        // `is_finished()` reflects whatever the executor has gotten around to
+        // scheduling, which one yield does not guarantee even with virtual
+        // time already advanced past the deadline. The outer `timeout` is a
+        // safety net against a real bug hanging the test, not the thing
+        // doing the waiting: with `IdleClock::epoch` as `tokio::time::Instant`
+        // (see its doc comment), the paused clock resolves this the instant
+        // `expired`'s own interval next ticks — no real wall-clock wait.
+        tokio::time::timeout(std::time::Duration::from_secs(5), expired)
+            .await
+            .expect("expired() should have resolved once the full timeout elapsed")
+            .expect("the spawned task should not have panicked");
     }
 
     #[tokio::test]

@@ -111,7 +111,9 @@ async fn a_caller_reaches_the_peer_device_through_connect_mode() {
         connect_config,
         "box1".to_string(),
         0,
+        Duration::from_secs(3600),
         Some(bound_tx),
+        std::future::pending(),
     ));
     let connect_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
         .await
@@ -155,7 +157,9 @@ async fn a_request_for_a_device_other_than_the_configured_peer_is_404() {
         connect_config,
         "box1".to_string(),
         0,
+        Duration::from_secs(3600),
         Some(bound_tx),
+        std::future::pending(),
     ));
     let connect_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
         .await
@@ -165,4 +169,39 @@ async fn a_request_for_a_device_other_than_the_configured_peer_is_404() {
     let (status, _body) =
         http_get(&format!("http://{connect_addr}/d/some-other-device/health")).await;
     assert_eq!(status, 404);
+}
+
+/// New in Task 4, not a Task-3 carryover: proves the idle-timeout wiring did
+/// not change what an unattached peer looks like to a caller (still the
+/// relay's own 502, unaffected by connect's own idle clock).
+#[tokio::test]
+async fn a_request_for_an_unattached_peer_gets_the_relays_own_502() {
+    let relay_addr = start_relay().await;
+    let connect_config = RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: "secret".to_string(),
+        local: "127.0.0.1:1".parse().unwrap(),
+        label: None,
+        device_name: None,
+        fingerprint: None,
+        ca_file: None,
+        enrolled: None,
+    };
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(shell_tunnel::connect::serve(
+        connect_config,
+        "nobody-attached".to_string(),
+        0,
+        Duration::from_secs(3600),
+        Some(bound_tx),
+        std::future::pending(),
+    ));
+    let connect_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (status, _body) =
+        http_get(&format!("http://{connect_addr}/d/nobody-attached/health")).await;
+    assert_eq!(status, 502);
 }

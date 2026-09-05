@@ -1220,6 +1220,26 @@ curl -X POST "https://relay.example.com/d/build-box/api/v1/execute" \
   -H "Content-Type: application/json" -d '{"command":"echo hello"}'
 ```
 
+### Reaching a device through a local port (`connect`)
+
+```bash
+shell-tunnel connect --relay https://relay.example.com --enroll-token <secret> --peer build-box
+```
+
+`shell-tunnel connect` is a local reverse-proxy to exactly one attached device — everything it
+forwards still crosses the relay path above, just through a shorter URL: swap the base URL from
+`https://relay.example.com` to the port `connect` prints, and `/d/build-box/...` stays the same.
+
+```bash
+curl "http://127.0.0.1:<port>/d/build-box/api/v1/execute" ...
+```
+
+It attaches to the same relay as an unnamed device of its own — reserved for a future
+direct-connectivity path, not yet built, and not used by this version — while every request it
+forwards still takes the relay path above. It refuses a WebSocket upgrade (`501`) rather than
+forwarding it. It exits on Ctrl-C/SIGTERM, or on its own after an hour with nothing forwarded
+through it.
+
 ### What decides how fast a relayed request is
 
 Not a number this document can give you, and that is the useful thing to know
@@ -1419,6 +1439,13 @@ still the thing to follow.
 | `--public-base <URL>` | Canonical public URL of the relay | derived from headers |
 | `--tls-self-signed` | Serve HTTPS with a generated certificate, reused across restarts — its names are fixed when it is generated ([§5](#tls-without-a-proxy)) | `false` |
 | `--tls-cert <FILE>` / `--tls-key <FILE>` | Serve HTTPS on the relay (given together) | `shell-tunnel-{cert,key}.pem` with `--tls-self-signed` |
+
+`shell-tunnel connect [OPTIONS]` ([§5, Reaching a device through a local port](#reaching-a-device-through-a-local-port-connect))
+takes `--relay`, `--enroll-token`, `--relay-fingerprint` and `--relay-ca` exactly as above, plus:
+
+| Option | Description | Default |
+|---|---|---|
+| `--peer <DEVICE>` | Forward every request to this device, through the relay named by `--relay` | required |
 
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
