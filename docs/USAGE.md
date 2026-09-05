@@ -1648,12 +1648,13 @@ documented here.
 - **16 MiB** response body limit through the relay (`relay::MAX_RELAY_FRAME`, declared by
   this crate since 0.21.1 — before that it was a WebSocket library default this crate never
   set, so the number here rested on a dependency) — a separate ceiling, and the one a
-  `GET .../fs/file` on a large file reaches first. Over it, the relay answers **413**:
-  the device carries a response body in a single frame, and a frame that large cannot be
-  read. Range requests are the way to fetch a bigger file (§3.1); nothing about the file
-  itself is wrong. Until this crate's next release this answered a synthetic `502` instead —
-  technically true (the relay's read of that frame did fail) but pointed an operator at "is
-  the device up?" when the actual condition is a fixed, known-in-advance response-size ceiling.
+  `GET .../fs/file` on a large file reaches first. Over it, the device answers **413**
+  itself, before it reads a byte: every request the relay forwards carries the ceiling as
+  a header, and the device checks the file's size (or a `Range` request's length) against
+  it up front. A relay old enough not to send that header gets the same **413** the slow
+  way instead — the device reads and sends the whole file, and the relay's own read of that
+  oversized frame is what fails. Either way, Range requests are the way to fetch a bigger
+  file (§3.1); nothing about the file itself is wrong.
 - Each device keeps **4 idle connections** pre-opened; beyond that, requests wait
   briefly for a refill and get **503** after 5 seconds.
 - **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a

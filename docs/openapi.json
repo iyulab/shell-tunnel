@@ -739,6 +739,22 @@
               }
             }
           },
+          "413": {
+            "description": "`response-too-large-for-relay` — behind a relay, the whole file (or the requested `Range`) is over the relay's 16 MiB response ceiling. Checked, and answered, before the file is read: every request the relay forwards carries that ceiling, so this is what a caller normally sees. A relay old enough not to send it falls back to the same 413 the slow way instead — plain text, not this JSON body, produced by the relay's own read of an oversized frame failing after the device already sent it. `Range` fetches a smaller piece instead (`GET /api/v1/fs/file` above). Never reached on a direct (non-relay) connection.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                },
+                "example": "device's response exceeds the relay's 16 MiB ceiling"
+              }
+            }
+          },
           "416": {
             "description": "Range Not Satisfiable — a well-formed `bytes` range naming bytes the file does not currently have. Header: `content-range: bytes */<size>`."
           },

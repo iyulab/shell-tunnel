@@ -17,6 +17,22 @@ pub const POOL_WAIT: Duration = Duration::from_secs(5);
 /// How long a proxied request may take before the relay gives up on the device.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Header the relay injects on every request it forwards to a device, naming
+/// the byte limit its own data-connection framing enforces on the response
+/// (`relay::MAX_RELAY_FRAME`).
+///
+/// Carries the limit's value rather than a bare marker: relay and device are
+/// not guaranteed to be the same version, so a device must not assume its own
+/// compiled-in limit matches the relay's — the number travels with the
+/// request instead of being duplicated as a second constant that could drift.
+/// A handler that finds this header can refuse a response it knows will not
+/// fit *before* reading it, rather than reading the whole thing only for the
+/// relay to reject the frame afterward. Never present on a request that did
+/// not come through a relay — a caller can send it, but a spoofed value only
+/// makes their own request fail early instead of late, since the relay itself
+/// is what enforces the limit either way.
+pub const VIA_RELAY_FRAME_LIMIT_HEADER: &str = "x-shell-tunnel-relay-frame-limit";
+
 /// Request metadata sent to the device ahead of the body.
 ///
 /// Sent once per connection rather than per frame: this is a header, not a

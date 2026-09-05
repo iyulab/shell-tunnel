@@ -42,6 +42,7 @@ use crate::security::{
 use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
+    VIA_RELAY_FRAME_LIMIT_HEADER,
 };
 use registry::{Device, DeviceRegistry};
 
@@ -791,10 +792,18 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
     };
 
     let method = request.method().to_string();
-    let headers: Vec<(String, String)> = request
+    let mut headers: Vec<(String, String)> = request
         .headers()
         .iter()
-        .filter(|(name, _)| is_forwardable(name.as_str()))
+        // A caller could set this header themselves trying to force the early
+        // rejection this relay is about to add below; dropping any incoming
+        // instance keeps exactly one, and it is always the relay's own.
+        .filter(|(name, _)| {
+            is_forwardable(name.as_str())
+                && !name
+                    .as_str()
+                    .eq_ignore_ascii_case(VIA_RELAY_FRAME_LIMIT_HEADER)
+        })
         .filter_map(|(name, value)| {
             value
                 .to_str()
@@ -802,6 +811,14 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
                 .map(|v| (name.as_str().to_string(), v.to_string()))
         })
         .collect();
+    // Every request this relay forwards to a device travelled over this same
+    // handler, so the marker is unconditional rather than limited to a
+    // specific method or route — `download`'s early-rejection check is the
+    // one consumer today, but the fact "this arrived via relay" is generic.
+    headers.push((
+        VIA_RELAY_FRAME_LIMIT_HEADER.to_string(),
+        MAX_RELAY_FRAME.to_string(),
+    ));
 
     // A WebSocket upgrade cannot be answered by buffering: the exchange has no
     // end until one side closes. Because one request already owns one data

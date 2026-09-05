@@ -103,6 +103,32 @@ pub fn fs_error_response(error: FsError) -> Response {
     }
 }
 
+/// Refuse a download before reading it, when it arrived via relay and the
+/// response it is about to build cannot fit in that relay's frame limit.
+///
+/// `limit` is `None` on a direct (non-relay) request — this never applies to
+/// one. This is the *same* refusal a relay would eventually deliver on its
+/// own after reading the whole file and failing to forward it
+/// (`relay::mod::forward`'s `response-frame-too-large`); the only thing this
+/// changes is when it is caught. Suggests `Range` because that is the escape
+/// hatch this codebase already documents (`docs/USAGE.md` §8) for exactly
+/// this ceiling.
+fn refuse_if_over_relay_limit(limit: Option<u64>, response_len: u64) -> Option<Response> {
+    let limit = limit?;
+    if response_len <= limit {
+        return None;
+    }
+    Some(error_response(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "response-too-large-for-relay",
+        &format!(
+            "this response is {response_len} bytes; the relay this request came through \
+             cannot carry a response over {limit} bytes — retry with a Range request that \
+             fits, or fetch it over a direct (non-relay) connection"
+        ),
+    ))
+}
+
 /// The refusal sent when no `--fs-root` was configured.
 ///
 /// A function rather than a `Result`-returning guard: handlers return `Response`
@@ -787,6 +813,18 @@ pub async fn download(
     let range_header = header_str(axum::http::header::RANGE);
     let if_range_header = header_str(axum::http::header::IF_RANGE);
     let include_body = method != axum::http::Method::HEAD;
+    // Present only when this request arrived through a relay (`relay::mod`'s
+    // device-forwarding handler injects it on every request it forwards) —
+    // absent on a direct call, so a direct download of a large file is never
+    // held to this limit. A malformed value is treated the same as absent
+    // rather than refused: this header only ever *narrows* what already
+    // succeeds without it, so failing to honour a garbled one costs nothing
+    // that the relay's own after-the-fact `413` (`relay::mod::forward`)
+    // would not already have caught.
+    let relay_frame_limit: Option<u64> = header_str(axum::http::HeaderName::from_static(
+        crate::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
+    ))
+    .and_then(|v| v.parse().ok());
 
     // Resolving the path, `stat`-ing it, and reading the bytes (whole file or
     // a span) are all blocking I/O. Same convention as `execution::executor::execute`
@@ -802,6 +840,7 @@ pub async fn download(
             range_header.as_deref(),
             if_range_header.as_deref(),
             include_body,
+            relay_frame_limit,
         )
     })
     .await
@@ -829,6 +868,7 @@ fn download_blocking(
     range_header: Option<&str>,
     if_range_header: Option<&str>,
     include_body: bool,
+    relay_frame_limit: Option<u64>,
 ) -> Response {
     let resolved = match root.resolve_existing(&query.path) {
         Ok(path) => path,
@@ -883,6 +923,9 @@ fn download_blocking(
     match requested {
         Some(RangeOutcome::Satisfiable(start, end)) => {
             let length = end - start + 1;
+            if let Some(response) = refuse_if_over_relay_limit(relay_frame_limit, length) {
+                return response;
+            }
             let bytes = if include_body {
                 match read_span(&resolved, start, length) {
                     Ok(bytes) => bytes,
@@ -913,6 +956,9 @@ fn download_blocking(
         // spec — RFC 9110 §14.2) falls through to the whole file exactly as
         // `None` (no `Range` header at all) does.
         Some(RangeOutcome::Ignore) | None => {
+            if let Some(response) = refuse_if_over_relay_limit(relay_frame_limit, size) {
+                return response;
+            }
             let bytes = if include_body {
                 match std::fs::read(&resolved) {
                     Ok(bytes) => bytes,

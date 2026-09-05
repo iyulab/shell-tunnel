@@ -327,6 +327,69 @@ async fn a_download_too_large_for_one_frame_is_not_reported_as_success() {
     }
 }
 
+/// The device now refuses a download over the relay's frame limit *before*
+/// reading the file — `download_blocking`'s `refuse_if_over_relay_limit`,
+/// gated on the marker header `proxy_handler` (`relay::mod`) injects on every
+/// request it forwards. The test above pins the outward status only, because
+/// it predates this and still holds for the old after-the-fact path too; this
+/// one pins the distinguishing evidence — the error code only the early check
+/// produces (`response-too-large-for-relay`, not the relay's own
+/// `response-frame-too-large`) — so a regression that silently fell back to
+/// reading the whole file and letting the relay's frame read fail would be
+/// caught even though the status code alone would look unchanged.
+#[tokio::test]
+async fn a_relay_forwarded_download_over_the_frame_limit_is_rejected_before_reading_it() {
+    let relay_addr = start_relay().await;
+    let (dir, local_addr) = start_device_server().await;
+
+    let device_name = "early-reject-device";
+    spawn_device(relay_addr, local_addr, device_name);
+    let base = format!("http://{relay_addr}/d/{device_name}");
+    wait_until_attached(&base).await;
+
+    let payload = vec![b'x'; 20 * 1024 * 1024];
+    std::fs::write(dir.path().join("oversize.bin"), &payload).expect("write");
+
+    let (status, json) = http_json(
+        &format!("{base}/api/v1/fs/file?path=oversize.bin"),
+        "GET",
+        &[],
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 413, "got {json:?}");
+    assert_eq!(
+        json["error"], "response-too-large-for-relay",
+        "this code only comes from the device's own pre-read check; \
+         `response-frame-too-large` would mean it read the whole file first"
+    );
+}
+
+/// The same download, direct — no relay in the path, so no marker header
+/// exists to gate the check against. Pins that `refuse_if_over_relay_limit`
+/// cannot fire for a caller who never went through a relay at all: without
+/// this, a bug that made the check unconditional would only ever be caught by
+/// a relay test, which would misattribute the defect to relay forwarding
+/// rather than to the check itself applying somewhere it must not.
+#[tokio::test]
+async fn a_direct_download_over_the_relay_frame_limit_still_succeeds() {
+    let (dir, local_addr) = start_device_server().await;
+    let payload = vec![b'x'; 20 * 1024 * 1024];
+    std::fs::write(dir.path().join("oversize.bin"), &payload).expect("write");
+
+    let (status, body) = http_request(
+        &format!("http://{local_addr}/api/v1/fs/file?path=oversize.bin"),
+        "GET",
+        &[],
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, 200, "a direct download has no relay ceiling to hit");
+    assert_eq!(body.len(), payload.len());
+}
+
 #[tokio::test]
 async fn an_upload_completes_over_the_relay() {
     let relay_addr = start_relay().await;
