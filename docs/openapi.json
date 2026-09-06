@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "Shell-Tunnel API",
-    "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells.",
+    "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells. \n\nScope: these are the paths a device serves — the gateway's own API. The relay and `shell-tunnel connect` are transports that carry this same API rather than surfaces of their own, so their routes (`/d/<device>/...`, `/relay/v1/devices`, and connect's local port) are not listed here; docs/USAGE.md documents those. A status code that only arises when a request crosses a relay is documented on the path it happens to, not separately.",
     "version": "0.21.2",
     "license": {
       "name": "MIT",

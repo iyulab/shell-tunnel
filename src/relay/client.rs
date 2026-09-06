@@ -1571,7 +1571,19 @@ fn bare_host(authority: &str) -> &str {
 /// `bad_gateway`'s wording here would tell an operator to check the wrong
 /// machine.
 fn relay_unreachable(reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
-    tracing::debug!(target: "connect", "{reason}");
+    // The 502 body below is deliberately generic, so this line is the only
+    // place the actual cause is named. At `debug!` an operator saw the failure
+    // and not the reason for it — the worst half of the pair to hide, and the
+    // same silence `direct_or_fallback`'s cooldown paths were carrying. One
+    // production caller (`connect.rs`'s forward path), one line per failed
+    // request, and that request is already returning 502.
+    //
+    // `warn!`, not the `info!` the direct-fallback lines use: those describe a
+    // request that still succeeded by another route, while this one is the
+    // request failing. The reconnect loop in `run` already reports the same
+    // underlying condition — a relay that cannot be reached — at `warn!`, and
+    // one condition should not carry two severities.
+    tracing::warn!(target: "connect", "{reason}");
     (
         502,
         vec![("content-type".to_string(), "text/plain".to_string())],

@@ -207,9 +207,15 @@ async fn forward(State(state): State<ConnectState>, request: Request) -> Respons
     }
 
     if crate::relay::is_websocket_upgrade(request.headers()) {
+        // Says what to do instead, because the caller has a working route and
+        // only this shortcut declines: the relay serves the same device at the
+        // same path over a WebSocket. The previous wording named an internal
+        // plan phase as the thing that would enable this, which stopped being
+        // true the moment that phase shipped without changing the answer —
+        // and named an internal document in a public response body besides.
         return (
             StatusCode::NOT_IMPLEMENTED,
-            "WebSocket forwarding needs direct connectivity (Phase 3); this build only relays plain HTTP",
+            "connect does not forward WebSocket upgrades; call the relay URL for this device directly",
         )
             .into_response();
     }
@@ -288,7 +294,7 @@ async fn try_direct(
         match established {
             Ok(Some(DirectEvent::Connected(stream))) => inner.cached = Some(*stream),
             Ok(Some(DirectEvent::Failed(reason))) => {
-                tracing::debug!(target: "connect", "direct connect to {peer} failed: {reason}");
+                tracing::info!(target: "connect", "direct connect to {peer} failed ({reason}); using the relay for this request and pausing direct attempts for {DIRECT_COOLDOWN:?}");
                 inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
                 return Err(body);
             }
@@ -297,7 +303,7 @@ async fn try_direct(
                 return Err(body);
             }
             Err(_elapsed) => {
-                tracing::debug!(target: "connect", "direct connect to {peer} timed out; falling back to the relay");
+                tracing::info!(target: "connect", "direct connect to {peer} timed out; using the relay for this request and pausing direct attempts for {DIRECT_COOLDOWN:?}");
                 inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
                 return Err(body);
             }
@@ -321,6 +327,13 @@ async fn try_direct(
             // The cached stream is unusable either way now (send_keepalive
             // never leaves a half-written connection open) — evict it and
             // let the caller fall back to relay for this one request.
+            //
+            // Logged at the same level as the two negotiation failures above:
+            // this path sets the same cooldown they do, so leaving it silent
+            // made the *reused*-connection failure the one an operator could
+            // not see, which is the one that appears after everything looked
+            // healthy.
+            tracing::info!(target: "connect", "direct connection to {peer} broke mid-request; using the relay for this request and pausing direct attempts for {DIRECT_COOLDOWN:?}");
             inner.cached = None;
             inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
             Err(body)
@@ -602,5 +615,21 @@ mod tests {
             .unwrap();
         let response = tower::ServiceExt::oneshot(router, response).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+
+        // The body too, not just the code. A 501 tells a caller that this
+        // route declined; only the body can tell them they still have a
+        // working one. The text this replaced named an internal plan phase as
+        // what would enable forwarding — which shipped, without changing this
+        // answer, leaving a public response body promising something untrue.
+        // Asserting on the part that has to stay true (that it points at the
+        // relay) rather than on the whole sentence, so rewording is free.
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("relay"),
+            "the refusal must name the route that does work: {body}"
+        );
     }
 }

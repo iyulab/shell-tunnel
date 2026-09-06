@@ -474,7 +474,9 @@ against a later version. Sending a server-shaped message (`output`, `result`,
 ignored.
 
 WebSockets work over a direct connection, through a tunnel, and through the
-relay. Server-sent events do not pass through the relay.
+relay — but not through `connect`'s local port, which refuses an upgrade with
+`501` (§5); reach the device at the relay's own URL for those. Server-sent
+events do not pass through the relay.
 
 **The server does not close an idle connection, and does not ping.** The
 `ping`/`pong` pair above is client-driven: the server answers a ping it is sent
@@ -1240,10 +1242,11 @@ curl "http://127.0.0.1:<port>/d/build-box/api/v1/execute" ...
 
 It attaches to the same relay as an unnamed device of its own, which lets it try a **direct
 socket to the peer** for filesystem API traffic (`/api/v1/fs/...`) instead of taking every byte
-through the relay's bandwidth-limited hop. Every other route — `/execute`, sessions, WebSocket
-upgrades — always takes the relay path above; direct is attempted for filesystem transfers
-specifically because those are the requests a relay's per-chunk deadline and body ceiling bind
-the hardest (§10).
+through the relay's bandwidth-limited hop. Every other route it forwards — `/execute`, sessions —
+always takes the relay path above; direct is attempted for filesystem transfers specifically
+because those are the requests a relay's per-chunk deadline and body ceiling bind the hardest
+(§10). A WebSocket upgrade is not among them at all: `connect` refuses it outright (`501`, see
+below) rather than forwarding it by either route.
 
 The attempt is automatic and fails safe: `connect` asks the relay to signal the peer, the two
 sides open a TCP connection to each other at the same moment — no port forwarding is configured
@@ -1262,9 +1265,23 @@ its own control connection, not one the peer reports about itself. If the relay 
 behind a reverse proxy or load balancer — the situation "TLS without a proxy" (§5) exists to
 let an operator avoid — every attached device's observed address collapses to the proxy's, and
 a direct attempt to any of them cannot succeed — every filesystem request then falls back to
-the relay path, silently and correctly, exactly as it would for any other reason direct is
-unavailable. There is nothing to configure around this; it is a property of what a relay behind
-a proxy can see.
+the relay path, correctly and without failing the request, exactly as it would for any other
+reason direct is unavailable. There is nothing to configure around this; it is a property of
+what a relay behind a proxy can see.
+
+**What a fallback looks like in the log.** Because the request still succeeds, the log is the
+only place the lost fast path is reported at all — so each of the three ways it can be lost
+says so at the default level, naming the peer and how long direct is paused:
+
+```
+INFO connect: direct connect to build-box timed out; using the relay for this request and pausing direct attempts for 60s
+INFO connect: direct connect to build-box failed (<reason>); using the relay for this request and pausing direct attempts for 60s
+INFO connect: direct connection to build-box broke mid-request; using the relay for this request and pausing direct attempts for 60s
+```
+
+A run of these against one peer is the symptom of the known limitation above, or of NATs that
+will not open to each other — not of anything failing. A `WARN connect:` line is a different
+thing: that is the relay itself being unreachable, and the request it names returned `502`.
 
 It refuses a WebSocket upgrade (`501`) rather than forwarding it. It exits on Ctrl-C/SIGTERM, or
 on its own after an hour with nothing forwarded through it.

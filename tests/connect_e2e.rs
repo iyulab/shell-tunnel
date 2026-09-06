@@ -389,3 +389,73 @@ async fn a_request_for_an_unattached_peer_gets_the_relays_own_502() {
         http_get(&format!("http://{connect_addr}/d/nobody-attached/health")).await;
     assert_eq!(status, 502);
 }
+
+/// Every path that puts the direct route on cooldown says so at a level the
+/// default filter shows.
+///
+/// The gap this pins was measured, not imagined: `connect` dispatches with
+/// `RUST_LOG` set to a bare `info` (`main.rs`), which is a global level
+/// directive — so a `debug!` on any target is dropped, and three of the four
+/// ways a connect-mode request can lose its fast path announced nothing an
+/// operator would ever see. Two were `debug!`; the third (a cached direct
+/// connection breaking mid-request) had no log at all, which made the failure
+/// that appears *after* everything looked healthy the quietest of the set.
+///
+/// Structural rather than behavioural, and deliberately so. Observing these
+/// lines for real needs a relay, a peer, a direct negotiation that fails on
+/// purpose, and a subscriber installed process-wide — the last of which fights
+/// every other test in the binary, since a `tracing` subscriber is global. The
+/// repo already has this trade in
+/// `executor_integration::execution_takes_its_deadline_from_one_bounded_place`,
+/// and this follows its shape.
+///
+/// Lives in this feature-gated file because it is about `connect`; the check
+/// itself needs no feature (it reads text), so it runs under `cargo test-all`,
+/// which this project treats as the complete command.
+#[test]
+fn every_direct_cooldown_path_announces_itself_at_the_default_log_level() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let connect = std::fs::read_to_string(root.join("src/connect.rs")).expect("readable");
+    let client = std::fs::read_to_string(root.join("src/relay/client.rs")).expect("readable");
+
+    let cooldowns = connect.matches("cooldown_until = Some(").count();
+    let announcements = connect
+        .matches("tracing::info!(target: \"connect\"")
+        .count();
+    assert_eq!(
+        cooldowns, announcements,
+        "src/connect.rs puts the direct route on cooldown {cooldowns} time(s) but announces \
+         it {announcements} time(s). A cooldown an operator cannot see is the whole defect \
+         this guards: the request still succeeds over the relay, so nothing else in the \
+         system reports that the fast path was dropped"
+    );
+    assert_eq!(
+        cooldowns, 3,
+        "the three cooldown paths are: negotiation reported a failure, negotiation timed \
+         out, and a reused connection broke mid-request. A fourth means a new way to lose \
+         the direct route — give it a line too, and update this count"
+    );
+
+    assert!(
+        client.contains("tracing::warn!(target: \"connect\", \"{reason}\")"),
+        "relay_unreachable's 502 body is generic on purpose, so this log line is the only \
+         place the actual cause (bad host name, TLS handshake, refused connection) is \
+         named. Demoted below the default level, an operator sees the failure and never \
+         the reason for it. `warn!` rather than the `info!` above because this request \
+         failed, while those describe one that succeeded over the other route"
+    );
+
+    // What this does not cover, stated rather than implied.
+    //
+    // Both halves count text, so a doc comment that quotes one of these
+    // literals will break them. That direction is loud rather than silent,
+    // which is the acceptable one, and it is the same trade the executor's
+    // deadline guard makes.
+    //
+    // The first pair proves that as many announcements exist as cooldowns —
+    // not that each announcement sits next to the cooldown it describes. A
+    // rearrangement that logged one path twice and another not at all would
+    // still pass. Pairing them positionally would mean parsing Rust, and the
+    // failure it would catch has never happened here; the demotion this
+    // catches is the one that did.
+}

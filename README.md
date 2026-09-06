@@ -111,6 +111,20 @@ curl -X POST https://relay.example.com:8443/d/<name>/api/v1/execute \
 To list what is attached without logging into any target:
 `curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com:8443/relay/v1/devices`.
 
+**Or give one device a local port** — the same API, at a shorter URL:
+
+```bash
+shell-tunnel connect --relay https://relay.example.com:8443 --enroll-token st_… --peer <name>
+```
+
+Everything then answers on `http://127.0.0.1:<port>/d/<name>/...`, and file transfers get
+one thing calling the relay directly does not: `connect` also asks the relay to introduce
+the two machines, and when their networks allow it the bytes go **straight to the device**
+instead of through the relay's hop. It falls back to the relay whenever that does not work,
+so it is never a thing to configure — only a thing that makes large transfers faster when
+it can. Sessions and `/execute` always take the relay path; a WebSocket upgrade is refused
+here (`501`) rather than forwarded, so call the relay URL directly for those.
+
 No public relay of your own? `shell-tunnel --tunnel --preset operator` runs `cloudflared` and
 prints a `trycloudflare.com` URL instead — quick to try, but Cloudflare documents it as
 testing-only. See [docs/USAGE.md](docs/USAGE.md) for both paths in full.
