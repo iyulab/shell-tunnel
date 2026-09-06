@@ -127,6 +127,41 @@ fn audit_log_inside_the_fs_root_refuses_to_start() {
     );
 }
 
+/// The refusal must quote the bound the code actually enforces, not a number
+/// that agreed with it once.
+///
+/// `resolve_chunk_size` rejects `size >= MAX_CHUNK_SIZE`, so the highest
+/// accepted value is one below it — and the sentence an operator reads used to
+/// spell that out as a literal, decoupled from the constant it was describing.
+/// Nothing would have caught the two drifting apart: the check and the
+/// explanation were independent facts and only the check was enforced. This
+/// asserts the bound the *library* declares appears in the message, so moving
+/// `MAX_CHUNK_SIZE` fails here rather than shipping a confidently wrong range.
+///
+/// Both out-of-range inputs share one branch, and both are passed, because
+/// "between 1 and N" is a claim about each end.
+#[test]
+fn an_out_of_range_chunk_size_is_refused_and_names_the_enforced_bound() {
+    let highest = (shell_tunnel::fs::MAX_CHUNK_SIZE - 1).to_string();
+
+    for size in ["0", "99999999"] {
+        let (code, _stdout, stderr) =
+            run_with_timeout(&["--fs-chunk-size", size], Duration::from_secs(10));
+
+        assert_eq!(
+            code,
+            Some(2),
+            "--fs-chunk-size {size} must be refused at startup; stderr was: {stderr}"
+        );
+        assert!(
+            stderr.contains(&highest),
+            "the refusal must name {highest}, the largest value the code accepts, \
+             since that is the only number that tells an operator what to pass \
+             instead; stderr was: {stderr}"
+        );
+    }
+}
+
 /// Kill a server that is expected to keep running, on the way out of a test.
 struct Killed(Child);
 
@@ -694,6 +729,71 @@ fn connect_without_relay_client_feature_refuses_with_a_rebuild_hint() {
     );
 }
 
+/// The one line `connect` prints is the only place a caller learns where to
+/// send requests, and nothing asserted it.
+///
+/// `connect` serves no banner of flags the way the gateway does; it prints a
+/// single line naming the local URL and the peer behind it. A caller that
+/// cannot read the port off that line has no other way to get it — the port
+/// may have been chosen by the caller, but the *shape* of the URL
+/// (`/d/<peer>/...`, which is the relay's path preserved rather than stripped)
+/// is not guessable, and getting it wrong is a 404 from this process rather
+/// than an error from the device.
+///
+/// Asserted against the real binary because the string is assembled in
+/// `main.rs`'s dispatch from a port that only exists once the listener is
+/// bound — the same reason the posture banner above is an e2e test and not a
+/// unit test of the function that formats it.
+///
+/// No relay is started. The banner is printed once the local listener binds,
+/// which happens whether or not the relay is reachable; a relay that is not
+/// there costs only some `WARN relay-client:` lines on stderr, which this test
+/// does not read. Measured directly while writing this: the binary prints the
+/// banner immediately and retries the relay in the background for as long as
+/// it is left running.
+#[test]
+#[cfg(feature = "relay-client")]
+fn the_connect_banner_names_the_url_a_caller_should_use() {
+    let port = reserved_port();
+    // Nothing is listening here — see the doc comment. Taken from the same
+    // helper so it cannot collide with the port under test.
+    let nowhere = reserved_port();
+
+    let mut connect = Killed(
+        Command::new(BIN)
+            .args([
+                "connect",
+                "--relay",
+                &format!("ws://127.0.0.1:{nowhere}"),
+                "--enroll-token",
+                "t",
+                "--peer",
+                "box1",
+                "--port",
+                &port.to_string(),
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("binary should start"),
+    );
+
+    let line = wait_for_line(&mut connect, Duration::from_secs(20), |line| {
+        line.starts_with("connect:")
+    });
+
+    assert!(
+        line.contains(&format!("http://127.0.0.1:{port}/d/box1/")),
+        "the banner must carry the bound port and the peer's path, since that \
+         URL is what a caller has to build requests from: {line}"
+    );
+    assert!(
+        line.contains("box1"),
+        "the banner must name the peer it forwards to — more than one connect \
+         process may be running: {line}"
+    );
+}
+
 /// The gateway shares the translation, because it had the identical screen.
 ///
 /// Fixing only the relay would have left `Error: Io(Os { code: 10048, ... })`
@@ -1141,6 +1241,68 @@ fn a_relay_joined_banner_names_the_chunk_size_it_will_advertise() {
     assert!(
         line.contains("262144"),
         "the banner must name the relay-path size the server will actually advertise: {line}"
+    );
+}
+
+/// An explicit chunk size above the relay-safe one is honoured, and warned
+/// about — and the warning is the whole point, so something has to check it
+/// appears.
+///
+/// This is a deviation signal, the kind `CHANGELOG.md` records 0.21.1 adding
+/// after two defaults were being reversed in silence: the flag wins (an
+/// operator may know their link is fast), which means the only thing standing
+/// between them and an upload that fails at zero bytes with `504` on a slow
+/// relay leg is this line being printed. A signal that exists to be seen and
+/// is verified by nobody is the same shape as no signal.
+///
+/// Both numbers are read from the library rather than typed, for the reason
+/// `an_out_of_range_chunk_size_is_refused_and_names_the_enforced_bound` gives:
+/// a warning that quotes a stale relay-safe size sends an operator to a
+/// value that is no longer the safe one.
+///
+/// Gated for the same reason as the test above — it drives the binary with
+/// `--relay`.
+#[cfg(feature = "relay-client")]
+#[test]
+fn an_oversized_chunk_size_on_a_relay_joined_device_is_warned_about() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let safe = shell_tunnel::fs::RELAY_CHUNK_SIZE;
+    let oversized = safe + 1;
+
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "--relay",
+            // Unreachable on purpose, as above: the warning is printed while
+            // resolving flags, long before anything dials out.
+            "wss://127.0.0.1:59999",
+            "--enroll-token",
+            "t",
+            "--port",
+            "0",
+            "--fs-chunk-size",
+            &oversized.to_string(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+
+    let lines = wait_for_stderr_lines(&mut server, Duration::from_secs(30), |l| {
+        l.contains("--fs-chunk-size")
+    });
+    let warning = lines.last().expect("the match is the last line");
+
+    assert!(
+        warning.contains(&oversized.to_string()),
+        "the warning must name the size it was given, since an operator running \
+         more than one device needs to know which one this is about: {warning}"
+    );
+    assert!(
+        warning.contains(&safe.to_string()),
+        "the warning must name the relay-safe size too — without it the operator \
+         is told they are wrong and not what to pass instead: {warning}"
     );
 }
 

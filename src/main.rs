@@ -1299,8 +1299,14 @@ fn resolve_chunk_size(args: &shell_tunnel::cli::Args) -> usize {
     };
 
     if size == 0 || size >= shell_tunnel::fs::MAX_CHUNK_SIZE {
+        // Derived, not spelled out. The bound the check applies and the bound
+        // the message quotes were two independent facts, and only one of them
+        // is enforced by anything: `MAX_CHUNK_SIZE` moving would have left this
+        // line confidently naming a number that is no longer the limit, in the
+        // reassuring direction (a range wider or narrower than the real one).
+        let highest = shell_tunnel::fs::MAX_CHUNK_SIZE - 1;
         eprintln!("--fs-chunk-size {size} is out of range.");
-        eprintln!("It must be between 1 and 8388607 bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
+        eprintln!("It must be between 1 and {highest} bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
         eprintln!("Size is not the only relay constraint — a relayed chunk must also finish inside the relay's 120s request deadline, which is why a request that crosses a relay is advertised a smaller size than this ceiling allows.");
         std::process::exit(2);
     }
