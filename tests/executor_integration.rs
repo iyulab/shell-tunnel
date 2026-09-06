@@ -303,19 +303,43 @@ async fn a_consumer_that_stops_receiving_cannot_park_the_executor() {
 async fn a_short_stream_still_reports_the_true_output_size() {
     let exec = executor();
     // Primed with an `echo` that the shell itself runs, so the command has
-    // produced *something* the instant it starts. Without it this test depends
-    // on the emitter's interpreter booting inside the two-second deadline —
+    // produced *something* the instant the shell is up. Without it this test
+    // depends on the emitter's interpreter booting inside the deadline —
     // PowerShell on a loaded machine does not, the command is killed having
     // written nothing, and the final assertion then fails over interpreter
     // startup rather than over what it is testing. Observed failing four times
     // out of four that way. The flood after it is what the rest of the test
     // needs; the priming byte is what makes the precondition hold.
+    //
+    // Note what the priming does *not* cover, which is why the deadline below
+    // also had to move: it removes the second process from the precondition,
+    // never the first. Until the shell itself is spawned there is no builtin
+    // to run.
     #[cfg(windows)]
     let line = format!("echo primed & {}", emit_bytes_command(4 * 1024 * 1024));
     #[cfg(unix)]
     let line = format!("echo primed; {}", emit_bytes_command(4 * 1024 * 1024));
 
-    let cmd = Command::new(line).timeout(Duration::from_secs(2));
+    // Ten seconds, not the two this used to take. The priming `echo` above
+    // removed the *interpreter's* startup from the precondition, but not the
+    // shell's own: `cmd`/`sh` still has to be spawned before it can run a
+    // builtin, and process creation on this project's own machines varies by
+    // an order of magnitude with load. At two seconds the command was killed
+    // having spawned nothing at all, `total_bytes` was 0, and the final
+    // assertion failed over the host rather than over the executor. Measured:
+    // green 3/3 alone and 3/3 for this binary, failing only under the full
+    // suite — and reproduced on a stashed, unmodified tree, so it was the
+    // test, not a change.
+    //
+    // Widening is the right move *here* and is not the move the roadmap warns
+    // against. That warning is about the four tests whose assertion **is** an
+    // elapsed-time bound, where a wider bound lets a real hang through. This
+    // test asserts nothing about time. The deadline is setup — it exists only
+    // so that it elapses while the consumer is not reading — so buying margin
+    // in it costs no discriminating power at all: both assertions below are
+    // exactly as strict at ten seconds as at two.
+    let deadline = Duration::from_secs(10);
+    let cmd = Command::new(line).timeout(deadline);
 
     let (mut rx, handle) = exec
         .execute_async(&cmd)
@@ -323,17 +347,25 @@ async fn a_short_stream_still_reports_the_true_output_size() {
         .expect("execute_async failed");
 
     // Alive, holding the receiver, reading nothing until past the deadline.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    let mut streamed = 0u64;
-    while let Some(chunk) = rx.recv().await {
-        streamed += chunk.raw.len() as u64;
-    }
-    let result = tokio::time::timeout(Duration::from_secs(30), handle)
+    //
+    // Waiting on the executor rather than sleeping a fixed span past the
+    // deadline: the executor returning *is* the deadline having passed, so
+    // there is no second duration to keep in step with the first, and nothing
+    // to re-tune if the deadline above ever moves again. That this returns at
+    // all with a full channel and no reader is the sibling guarantee
+    // `a_consumer_that_stops_reading_does_not_stall_the_executor` pins.
+    let result = tokio::time::timeout(deadline * 3, handle)
         .await
         .expect("the executor never finished")
         .expect("join failed")
         .expect("execute failed");
+
+    // Whatever the channel buffered before the executor gave up on it. The
+    // sender is dropped by now, so this terminates on its own.
+    let mut streamed = 0u64;
+    while let Some(chunk) = rx.recv().await {
+        streamed += chunk.raw.len() as u64;
+    }
 
     assert!(
         result.total_bytes >= streamed,
@@ -437,10 +469,26 @@ fn execution_takes_its_deadline_from_one_bounded_place() {
 async fn a_command_that_leaves_a_background_process_still_returns_promptly() {
     let exec = executor();
 
+    // Sixty seconds, and the bound below is twenty. Both moved together, and
+    // the ratio between them is the whole point: what separates "returned on
+    // the collection grace" from "waited on the surviving process" is the gap
+    // between those two numbers, and the old pair (ten and five) left only
+    // four and a half seconds of it once `COLLECT_GRACE` is subtracted. This
+    // machine's process spawn varies by an order of magnitude with load, which
+    // is enough to eat a gap that size — measured at 5.17s against the old
+    // five-second bound while the rest of the suite was running.
+    //
+    // This is the roadmap's rule applied rather than sidestepped: the margin
+    // is bought in the *command*, by making the surviving process outlive the
+    // bound by three times rather than two, so the bound could be relaxed
+    // without buying that slack out of discriminating power. A regression that
+    // actually waited on the grandchild would now take a minute against a
+    // twenty-second bound — a wider gap than the old five against ten, not a
+    // narrower one.
     #[cfg(windows)]
-    let cmd_line = "start /b ping -n 10 127.0.0.1 >nul 2>nul";
+    let cmd_line = "start /b ping -n 60 127.0.0.1 >nul 2>nul";
     #[cfg(unix)]
-    let cmd_line = "sleep 10 >/dev/null 2>&1 &";
+    let cmd_line = "sleep 60 >/dev/null 2>&1 &";
 
     let start = Instant::now();
     let result = exec
@@ -459,10 +507,11 @@ async fn a_command_that_leaves_a_background_process_still_returns_promptly() {
         "the shell reported the background start as successful: {:?}",
         result.text_output
     );
-    // Well under the grandchild's ten seconds. The bound is the collection
-    // grace, not the lifetime of whatever the command left running.
+    // Well under the grandchild's minute. The bound is the collection grace,
+    // not the lifetime of whatever the command left running — twenty seconds
+    // is still forty short of the failure it exists to catch.
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(20),
         "returning waited on the surviving process rather than on the grace period: {elapsed:?}"
     );
 }
