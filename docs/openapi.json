@@ -1734,7 +1734,7 @@
           },
           "chunk_size": {
             "type": "integer",
-            "description": "Largest chunk the caller may send, in bytes. Advertised rather than assumed: read it from this response instead of hard-coding one. A device started with --relay advertises 262144, because a relayed chunk must also finish inside the relay's 120s request deadline; otherwise 4194304. Always below the relay's 8 MiB body ceiling, and overridable with --fs-chunk-size.",
+            "description": "Largest chunk the caller may send, in bytes. Advertised rather than assumed: read it from this response instead of hard-coding one. A property of this request, not of the device: a request that crossed a relay is told 262144, because a relayed chunk must also finish inside the relay's 120s request deadline; a request that reached the device directly (including over a connect-mode direct socket) is told 4194304. Always below the relay's 8 MiB body ceiling, and --fs-chunk-size overrides both to the same value.",
             "example": 4194304
           }
         }

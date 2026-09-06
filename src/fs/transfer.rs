@@ -25,8 +25,8 @@ pub const DEFAULT_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// every relayed transfer would 413, and the symptom looks like a server bug.
 pub const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Chunk size advertised instead of [`DEFAULT_CHUNK_SIZE`] when this device
-/// reached its operator through a relay.
+/// Chunk size advertised instead of [`DEFAULT_CHUNK_SIZE`] for a request that
+/// reached this device through a relay.
 ///
 /// **`DEFAULT_CHUNK_SIZE` was chosen against the wrong constraint.** Its
 /// reasoning (above) weighs the relay's *size* ceiling, `relay::MAX_BODY`, and
@@ -57,13 +57,20 @@ pub const MAX_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 /// deadline on any link sustaining ~2.2 KB/s, which is far below the slowest
 /// link anyone has reported this failing on.
 ///
-/// Deliberately *not* applied per request. The relay injects no marker header
-/// and replays the caller's own headers verbatim, so a handler cannot tell a
-/// relayed request from a direct one; what the device does know is whether it
-/// joined a relay at all. A directly-reached caller on a relay-joined device
-/// is therefore told a smaller size than it strictly needs — an extra round
-/// trip, in the fail-safe direction — which is the honest trade for not
-/// inventing a signal that does not exist.
+/// Applied per request, not per device. `relay::mod`'s device-forwarding
+/// handler injects `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` on every
+/// request it forwards (`download`'s early-rejection check was the first
+/// consumer; `UploadStore::chunk_size`'s `via_relay` flag is the second) —
+/// absent on a request that reached this device directly, present on one that
+/// crossed the relay. A comment here once claimed the opposite ("the relay
+/// injects no marker header"), which was true before that header existed and
+/// stopped being true the moment it shipped; the claim was never re-checked
+/// against the header it now contradicts. A direct-connect socket
+/// (`relay::direct`) never carries the marker either, so a caller reaching a
+/// relay-joined device through one is told this device's direct size, not the
+/// relay-safe one — the whole reason a direct socket exists is to avoid the
+/// relay's constraints, and a chunk size still sized for them would waste
+/// that.
 pub const RELAY_CHUNK_SIZE: usize = {
     let ceiling = RELAY_FLOOR_THROUGHPUT * REQUEST_TIMEOUT_SECS / RELAY_DEADLINE_FRACTION;
     // Round down to a power of two, so the advertised number is one a client
@@ -291,7 +298,11 @@ pub struct UploadStore {
     /// the cap and then both insert, because the check and the insert share
     /// one critical section.
     claimed: Mutex<HashMap<String, Claim>>,
-    chunk_size: usize,
+    /// Advertised and enforced for a request that reached this device
+    /// directly — see [`Self::chunk_size`].
+    direct_chunk_size: usize,
+    /// Advertised and enforced for a request that crossed a relay.
+    relayed_chunk_size: usize,
     counter: std::sync::atomic::AtomicU64,
 }
 
@@ -303,26 +314,48 @@ struct Claim {
 }
 
 impl UploadStore {
-    pub fn new(chunk_size: usize) -> Self {
+    /// `direct_chunk_size` governs a request that reached this device
+    /// directly (including a Phase 3 direct-connect socket); `relayed_chunk_size`
+    /// governs one that arrived through a relay. Equal values are a normal
+    /// input, not a special case — an operator's explicit `--fs-chunk-size`
+    /// applies to both (`main.rs::resolve_chunk_size`'s "explicit wins" rule),
+    /// and a library consumer that does not care about the distinction can
+    /// simply pass the same value twice.
+    pub fn new(direct_chunk_size: usize, relayed_chunk_size: usize) -> Self {
+        // Upper bound one *less* than `MAX_CHUNK_SIZE`, matching what
+        // `--fs-chunk-size`'s own startup check enforces (`main.rs` exits for
+        // `size >= MAX_CHUNK_SIZE`). Clamping to `MAX_CHUNK_SIZE` itself (an
+        // earlier version did) is not reachable through the CLI today, but it
+        // is worse than unreachable: it would silently *accept* exactly the
+        // value the CLI's own check exists to refuse, for any future caller
+        // that constructs a store directly rather than through the CLI.
+        let clamp = |size: usize| size.clamp(1, MAX_CHUNK_SIZE - 1);
         Self {
             sessions: RwLock::new(HashMap::new()),
             claimed: Mutex::new(HashMap::new()),
-            // Upper bound one *less* than `MAX_CHUNK_SIZE`, matching what
-            // `--fs-chunk-size`'s own startup check enforces (`main.rs`
-            // exits for `size >= MAX_CHUNK_SIZE`). Clamping to
-            // `MAX_CHUNK_SIZE` itself (an earlier version did) is not
-            // reachable through the CLI today, but it is worse than
-            // unreachable: it would silently *accept* exactly the value the
-            // CLI's own check exists to refuse, for any future caller that
-            // constructs a store directly rather than through the CLI.
-            chunk_size: chunk_size.clamp(1, MAX_CHUNK_SIZE - 1),
+            direct_chunk_size: clamp(direct_chunk_size),
+            relayed_chunk_size: clamp(relayed_chunk_size),
             counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
-    /// The chunk size clients are told to use.
-    pub fn chunk_size(&self) -> usize {
-        self.chunk_size
+    /// The chunk size clients are told to use, and the ceiling [`Self::append`]
+    /// enforces against — the same field for both, so advertising one value
+    /// while enforcing another can never happen.
+    ///
+    /// `via_relay` is a property of the *request*, not of this device: pass
+    /// whether `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` was present on it
+    /// (`api::fs::via_relay`), which is `true` only for a request that
+    /// travelled through `relay::mod`'s device-forwarding handler. A direct
+    /// caller — including one that reached this device over a Phase 3
+    /// direct-connect socket even though the device is relay-joined — always
+    /// passes `false`.
+    pub fn chunk_size(&self, via_relay: bool) -> usize {
+        if via_relay {
+            self.relayed_chunk_size
+        } else {
+            self.direct_chunk_size
+        }
     }
 
     /// Where staging files live for an upload landing at `dest_abs`.
@@ -575,8 +608,14 @@ impl UploadStore {
     /// not the same argument: `seek` and `write_all` report failure through
     /// `Result`, propagated with `?` rather than unwound, so nothing in that
     /// critical section can panic either.
-    pub fn append(&self, id: &str, offset: u64, bytes: &[u8]) -> Result<u64, UploadError> {
-        if bytes.len() > self.chunk_size {
+    pub fn append(
+        &self,
+        id: &str,
+        offset: u64,
+        bytes: &[u8],
+        via_relay: bool,
+    ) -> Result<u64, UploadError> {
+        if bytes.len() > self.chunk_size(via_relay) {
             return Err(UploadError::TooLarge);
         }
 
@@ -818,7 +857,8 @@ impl UploadStore {
 impl std::fmt::Debug for UploadStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("UploadStore")
-            .field("chunk_size", &self.chunk_size)
+            .field("direct_chunk_size", &self.direct_chunk_size)
+            .field("relayed_chunk_size", &self.relayed_chunk_size)
             .finish_non_exhaustive()
     }
 }
@@ -972,7 +1012,7 @@ mod tests {
     fn store() -> (tempfile::TempDir, FsRoot, UploadStore) {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = FsRoot::new(dir.path()).expect("root");
-        let store = UploadStore::new(DEFAULT_CHUNK_SIZE);
+        let store = UploadStore::new(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE);
         (dir, root, store)
     }
 
@@ -1020,8 +1060,8 @@ mod tests {
     fn a_store_at_the_relay_size_enforces_it() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = FsRoot::new(dir.path()).expect("root");
-        let store = UploadStore::new(RELAY_CHUNK_SIZE);
-        assert_eq!(store.chunk_size(), RELAY_CHUNK_SIZE);
+        let store = UploadStore::new(DEFAULT_CHUNK_SIZE, RELAY_CHUNK_SIZE);
+        assert_eq!(store.chunk_size(true), RELAY_CHUNK_SIZE);
 
         let id = store
             .create_rel(
@@ -1032,7 +1072,10 @@ mod tests {
             )
             .expect("create");
         let oversized = vec![0_u8; RELAY_CHUNK_SIZE + 1];
-        assert_eq!(store.append(&id, 0, &oversized), Err(UploadError::TooLarge));
+        assert_eq!(
+            store.append(&id, 0, &oversized, true),
+            Err(UploadError::TooLarge)
+        );
     }
 
     /// 트리 삭제가 진행 중인 업로드를 지우지 않으려면, 어떤 디렉터리 아래에
@@ -1158,8 +1201,8 @@ mod tests {
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
 
-        assert_eq!(store.append(&id, 0, b"hello ").expect("first"), 6);
-        assert_eq!(store.append(&id, 6, b"world").expect("second"), 11);
+        assert_eq!(store.append(&id, 0, b"hello ", false).expect("first"), 6);
+        assert_eq!(store.append(&id, 6, b"world", false).expect("second"), 11);
     }
 
     #[test]
@@ -1168,10 +1211,10 @@ mod tests {
         let id = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
-        store.append(&id, 0, b"hello ").expect("first");
+        store.append(&id, 0, b"hello ", false).expect("first");
 
         assert_eq!(
-            store.append(&id, 0, b"again"),
+            store.append(&id, 0, b"again", false),
             Err(UploadError::OffsetMismatch { expected: 6 })
         );
     }
@@ -1250,7 +1293,7 @@ mod tests {
         let id = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
-        store.append(&id, 0, b"hello world").expect("append");
+        store.append(&id, 0, b"hello world", false).expect("append");
 
         let finished = store.take_for_complete(&id).expect("complete");
         assert_eq!(finished.bytes, 11);
@@ -1265,7 +1308,7 @@ mod tests {
         let id = store
             .create_rel(&root, "out.bin", 11, wrong.clone())
             .expect("create");
-        store.append(&id, 0, b"hello world").expect("append");
+        store.append(&id, 0, b"hello world", false).expect("append");
 
         match store.take_for_complete(&id) {
             Err(UploadError::Checksum {
@@ -1290,7 +1333,10 @@ mod tests {
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
         let oversized = vec![0_u8; DEFAULT_CHUNK_SIZE + 1];
-        assert_eq!(store.append(&id, 0, &oversized), Err(UploadError::TooLarge));
+        assert_eq!(
+            store.append(&id, 0, &oversized, false),
+            Err(UploadError::TooLarge)
+        );
     }
 
     #[test]
@@ -1302,7 +1348,7 @@ mod tests {
             .create_rel(&root, "out.bin", 5, HELLO_DIGEST.into())
             .expect("create");
         assert_eq!(
-            store.append(&id, 0, b"hello world"),
+            store.append(&id, 0, b"hello world", false),
             Err(UploadError::SizeExceeded)
         );
         // Refused before anything was written: the offset must not have moved.
@@ -1318,7 +1364,10 @@ mod tests {
         // Exactly 11 bytes against a declared size of 11 — the boundary
         // `a_chunk_that_would_exceed_the_declared_size_is_refused` does not
         // cover, and the one `>` (not `>=`) in the check depends on.
-        assert_eq!(store.append(&id, 0, b"hello world").expect("append"), 11);
+        assert_eq!(
+            store.append(&id, 0, b"hello world", false).expect("append"),
+            11
+        );
     }
 
     #[test]
@@ -1327,7 +1376,7 @@ mod tests {
         let id = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
-        store.append(&id, 0, b"hello ").expect("append");
+        store.append(&id, 0, b"hello ", false).expect("append");
 
         let (destination, bytes) = store.cancel(&id).expect("session existed");
         assert_eq!(destination, "out.bin");
@@ -1406,7 +1455,7 @@ mod tests {
         let root_dir = outer.path().join("root");
         std::fs::create_dir_all(&root_dir).expect("mkdir root");
         let root = FsRoot::new(&root_dir).expect("root");
-        let store = UploadStore::new(DEFAULT_CHUNK_SIZE);
+        let store = UploadStore::new(DEFAULT_CHUNK_SIZE, DEFAULT_CHUNK_SIZE);
 
         let secret = outer.path().join("secret.txt");
         std::fs::write(&secret, b"outside-secret").expect("write secret");
@@ -1468,7 +1517,7 @@ mod tests {
         let id = store
             .create_rel(&root, "out.bin", 11, HELLO_DIGEST.into())
             .expect("create");
-        store.append(&id, 0, b"hello world").expect("append");
+        store.append(&id, 0, b"hello world", false).expect("append");
         let finished = store.take_for_complete(&id).expect("complete");
 
         // The caller has not renamed the staging file into place yet (has not

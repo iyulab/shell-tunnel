@@ -107,6 +107,40 @@ async fn http_get(url: &str) -> (u16, Vec<u8>) {
     (status, body.to_vec())
 }
 
+/// Minimal HTTP/1.1 client with a JSON body, same shape as `http_get` above.
+async fn http_post_json(url: &str, body: &str) -> (u16, Vec<u8>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rest = url.strip_prefix("http://").expect("http url");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let mut stream = tokio::net::TcpStream::connect(authority).await.unwrap();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(body.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut raw))
+        .await
+        .expect("connect proxy should answer")
+        .unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(raw.len());
+    let (head, body) = raw.split_at(split);
+    let status = String::from_utf8_lossy(head)
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, body.to_vec())
+}
+
 #[tokio::test]
 async fn a_caller_reaches_the_peer_device_through_connect_mode() {
     let relay_addr = start_relay().await;
@@ -215,6 +249,71 @@ async fn a_caller_reaches_an_fs_endpoint_through_connect_mode_twice() {
     let (status2, body2) = http_get(&list_url).await;
     assert_eq!(status2, 200, "body: {}", String::from_utf8_lossy(&body2));
     assert!(String::from_utf8_lossy(&body2).contains("hello.txt"));
+}
+
+/// `chunk_size` is a property of the request that reached the peer, not of
+/// `connect`'s own relay attach — a request that punched a direct socket to
+/// the peer must be told the peer's *direct* default (4 MiB), because that
+/// leg is never bound by the relay's deadline. 262144 here would mean the
+/// relay's marker header leaked onto a request that never actually crossed
+/// the relay (`api::fs::via_relay`, `fs::UploadStore::chunk_size`).
+#[tokio::test]
+async fn a_direct_connect_upload_session_gets_the_direct_chunk_size() {
+    let relay_addr = start_relay().await;
+    let (_dir, peer_addr) = start_peer_device_with_fs_root().await;
+    attach_peer(relay_addr, peer_addr, "box1");
+
+    let connect_config = RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: "secret".to_string(),
+        local: "127.0.0.1:1".parse().unwrap(), // overwritten by serve()
+        label: None,
+        device_name: None,
+        fingerprint: None,
+        ca_file: None,
+        enrolled: None,
+        serve_direct_requests: false,
+        direct_events: None,
+    };
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(shell_tunnel::connect::serve(
+        connect_config,
+        "box1".to_string(),
+        0,
+        Duration::from_secs(3600),
+        Some(bound_tx),
+        std::future::pending(),
+    ));
+    let connect_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .expect("connect should bind promptly")
+        .expect("connect should report its bound address");
+
+    let create_url = format!("http://{connect_addr}/d/box1/api/v1/fs/uploads");
+    // SHA-256 of b"hello world", matching `fs::transfer`'s own test fixture.
+    let create_body = serde_json::json!({
+        "path": "direct-chunk-check.bin",
+        "size": 11,
+        "sha256": "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    })
+    .to_string();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (status, body) = loop {
+        let (status, body) = http_post_json(&create_url, &create_body).await;
+        if status == 201 || tokio::time::Instant::now() > deadline {
+            break (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status, 201, "body: {}", String::from_utf8_lossy(&body));
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).expect("upload creation returns json");
+    assert_eq!(
+        json["chunk_size"], 4_194_304,
+        "the peer never joined a relay itself, so its direct default (4 MiB) is what a \
+         direct-connect socket must be told: {json}"
+    );
 }
 
 #[tokio::test]

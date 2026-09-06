@@ -1093,16 +1093,17 @@ fn the_audit_trail_path_is_announced_once() {
     );
 }
 
-/// A relay-joined device advertises a smaller upload chunk than a directly
-/// reached one, and it does so *silently* unless the banner says otherwise —
-/// an operator comparing two deployments would find no line explaining why
-/// one hands out 262144 and the other 4194304.
+/// A relay-forwarded request is held to a smaller upload chunk than one that
+/// reaches this device directly, and the banner says so *silently* unless it
+/// names both numbers — an operator comparing two deployments would find no
+/// line explaining why one hands out 262144 and the other 4194304.
 ///
-/// Only the real binary can prove this. `resolve_chunk_size` is a pure
-/// function and could be unit-tested green while `async_main` printed the
-/// banner from a second, stale copy of the same decision — which is exactly
-/// the shape the resolution was factored out to prevent. The line has to be
-/// read off the process that also serves the value.
+/// Only the real binary can prove this. `resolve_chunk_size` and
+/// `resolve_relayed_chunk_size` are pure functions and could be unit-tested
+/// green while `async_main` printed the banner from a second, stale copy of
+/// the same decision — which is exactly the shape the resolution was factored
+/// out to prevent. The line has to be read off the process that also serves
+/// the value.
 ///
 /// Gated because it drives the binary with `--relay`, which a build without
 /// this feature refuses outright ("this build has no relay client"). Ungated,

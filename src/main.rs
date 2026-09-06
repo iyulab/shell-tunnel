@@ -533,6 +533,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // that is about to die. It was decided after the banner until the banner
     // needed to name it.
     let chunk_size = resolve_chunk_size(&args);
+    let relayed_chunk_size = resolve_relayed_chunk_size(&args, chunk_size);
 
     // Above the file-API block rather than below it, so that the block's last
     // line is still the last line of the banner. An absence assertion has to
@@ -542,18 +543,26 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         outln!("{line}");
     }
     outln!("File API:    {}", fs_root.describe());
-    // Only when it is not the plain default. A device joined to a relay
-    // advertises a smaller chunk than a directly-reached one, and cycle-64
-    // made that substitution *silently* — an operator comparing two
-    // deployments would have found no line explaining why one hands out
-    // 262144 and the other 4194304. Printing it unconditionally would put a
-    // constant on every run instead; the deviation is the signal, which is
-    // the same rule the generated-key line already follows.
-    if chunk_size != shell_tunnel::fs::DEFAULT_CHUNK_SIZE {
-        outln!("             upload chunk size: {chunk_size} bytes");
+    // Only when there is something to explain. A relay-forwarded request is
+    // now held to a different chunk size than a direct one (Phase 3: a direct
+    // caller reaches this device without the relay's fixed request deadline
+    // in the way, including over a direct-connect socket on a relay-joined
+    // device), so "the plain default" is no longer one number to compare
+    // against — cycle-64 made the single-number version of this substitution
+    // *silently*, and an operator comparing two deployments found no line
+    // explaining why one hands out 262144 and the other 4194304. Printing it
+    // unconditionally would put a constant on every run instead; the
+    // deviation is the signal, which is the same rule the generated-key line
+    // already follows.
+    if relayed_chunk_size != chunk_size {
+        outln!(
+            "             upload chunk size: {chunk_size} bytes direct, {relayed_chunk_size} bytes via relay"
+        );
         if args.fs_chunk_size.is_none() {
-            outln!("             (a relayed chunk must finish inside the relay's request deadline; pass --fs-chunk-size to override)");
+            outln!("             (a relayed chunk must finish inside the relay's request deadline; pass --fs-chunk-size to raise both)");
         }
+    } else if chunk_size != shell_tunnel::fs::DEFAULT_CHUNK_SIZE {
+        outln!("             upload chunk size: {chunk_size} bytes");
     }
     // The one combination the lines above describe truthfully and still leave
     // an operator to assemble for themselves. For `operator` or `full-control`
@@ -587,7 +596,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         .with_kill_orphans(args.kill_orphans)
         .with_fs_root(fs_root);
 
-    let state = state.with_chunk_size(chunk_size);
+    let state = state.with_chunk_size(chunk_size, relayed_chunk_size);
 
     // Sessions never survive a restart, so any `.part` staging file still
     // present is unreachable — nothing can resume it and nothing will
@@ -1263,14 +1272,22 @@ fn narrows_something(listed: &[String]) -> bool {
 /// and with `auth.enabled: false` alongside a preset in a config file; an
 /// exposed server cannot reach it, since the posture turns authentication on
 /// and refuses `--no-auth`.
-/// The upload chunk size this server will advertise.
+/// The upload chunk size this server will advertise to a caller that reached
+/// it directly — including over a Phase 3 direct-connect socket, which never
+/// carries `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` even on a relay-joined
+/// device. See [`resolve_relayed_chunk_size`] for the size a relay-forwarded
+/// request gets instead.
 ///
-/// Three inputs, in precedence order: an explicit `--fs-chunk-size`, then
-/// whether this device joined a relay, then the direct default. Gathered into
-/// one function rather than left inline because two places now need the
-/// answer — the banner reports it and `AppState` is built from it — and a
-/// second copy of this decision is a second place for the two to disagree
-/// about what the server is actually advertising.
+/// Two inputs, in precedence order: an explicit `--fs-chunk-size`, then the
+/// direct default. Whether this device joined a relay no longer enters this
+/// decision — that used to be the only signal available, before
+/// `relay::mod`'s device-forwarding handler started marking a forwarded
+/// request as such (`VIA_RELAY_FRAME_LIMIT_HEADER`, added for `download`'s
+/// early-rejection check and reused here). Gathered into one function rather
+/// than left inline because two places now need the answer — the banner
+/// reports it and `AppState` is built from it — and a second copy of this
+/// decision is a second place for the two to disagree about what the server
+/// is actually advertising.
 ///
 /// Exits the process for an out-of-range explicit value rather than clamping:
 /// a chunk at or above the relay's body ceiling makes every relayed transfer
@@ -1278,20 +1295,13 @@ fn narrows_something(listed: &[String]) -> bool {
 /// misconfiguration it is.
 fn resolve_chunk_size(args: &shell_tunnel::cli::Args) -> usize {
     let Some(size) = args.fs_chunk_size else {
-        // Nothing explicit: a relay-joined device advertises the relay-safe
-        // size instead of the direct default, because the relay's fixed
-        // request deadline — not its body-size ceiling — is what bounds a
-        // chunk once a relay is in the path. See `fs::RELAY_CHUNK_SIZE`.
-        return match args.relay_url.is_some() {
-            true => shell_tunnel::fs::RELAY_CHUNK_SIZE,
-            false => shell_tunnel::fs::DEFAULT_CHUNK_SIZE,
-        };
+        return shell_tunnel::fs::DEFAULT_CHUNK_SIZE;
     };
 
     if size == 0 || size >= shell_tunnel::fs::MAX_CHUNK_SIZE {
         eprintln!("--fs-chunk-size {size} is out of range.");
         eprintln!("It must be between 1 and 8388607 bytes: a relayed request body is capped at 8 MiB, so a larger chunk fails with 413 on every relayed transfer.");
-        eprintln!("Size is not the only relay constraint — a relayed chunk must also finish inside the relay's 120s request deadline, which is why a relay-joined device advertises a smaller size than this ceiling allows.");
+        eprintln!("Size is not the only relay constraint — a relayed chunk must also finish inside the relay's 120s request deadline, which is why a request that crosses a relay is advertised a smaller size than this ceiling allows.");
         std::process::exit(2);
     }
 
@@ -1303,11 +1313,29 @@ fn resolve_chunk_size(args: &shell_tunnel::cli::Args) -> usize {
     // the relay->device leg is slow, and this process cannot see that leg.
     if args.relay_url.is_some() && size > shell_tunnel::fs::RELAY_CHUNK_SIZE {
         let safe = shell_tunnel::fs::RELAY_CHUNK_SIZE;
-        errln!("warning: --fs-chunk-size {size} is larger than the {safe} bytes this device would advertise over a relay.");
+        errln!("warning: --fs-chunk-size {size} is larger than the {safe} bytes this device would otherwise advertise over a relay.");
         errln!("         A relayed request body is forwarded whole and must complete inside the relay's 120s deadline, so an oversized chunk fails at 0 bytes with 504 on a slow link rather than transferring slowly.");
-        errln!("         Drop the flag to use the relay-safe size.");
+        errln!("         Drop the flag to use the relay-safe size for a relayed request.");
     }
     size
+}
+
+/// The upload chunk size advertised to a caller whose request crossed a relay
+/// (`relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` present) — see
+/// [`resolve_chunk_size`] for the direct-caller size `chunk_size` names here.
+///
+/// Explicit wins, same as `resolve_chunk_size`: `--fs-chunk-size` sets the
+/// ceiling for both a direct and a relayed request alike, so the warning that
+/// function prints for an oversized explicit value stays true rather than
+/// becoming a lie once this function silently capped it back down. Only the
+/// *default* (no `--fs-chunk-size`) differs by path — `RELAY_CHUNK_SIZE`
+/// instead of `DEFAULT_CHUNK_SIZE`, because only the relayed leg is bound by
+/// `relay::proxy::REQUEST_TIMEOUT`.
+fn resolve_relayed_chunk_size(args: &shell_tunnel::cli::Args, chunk_size: usize) -> usize {
+    match args.fs_chunk_size {
+        Some(_) => chunk_size,
+        None => shell_tunnel::fs::RELAY_CHUNK_SIZE,
+    }
 }
 
 fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&CapabilitySet>) -> bool {

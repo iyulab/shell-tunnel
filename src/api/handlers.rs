@@ -46,7 +46,10 @@ impl AppState {
             executor,
             audit: Arc::new(crate::audit::AuditSink::Disabled),
             fs: None,
-            uploads: Arc::new(crate::fs::UploadStore::new(crate::fs::DEFAULT_CHUNK_SIZE)),
+            uploads: Arc::new(crate::fs::UploadStore::new(
+                crate::fs::DEFAULT_CHUNK_SIZE,
+                crate::fs::DEFAULT_CHUNK_SIZE,
+            )),
         }
     }
 
@@ -71,9 +74,14 @@ impl AppState {
         self
     }
 
-    /// Advertise a different chunk size to upload clients.
-    pub fn with_chunk_size(mut self, chunk_size: usize) -> Self {
-        self.uploads = Arc::new(crate::fs::UploadStore::new(chunk_size));
+    /// Advertise a different chunk size to upload clients — `direct_chunk_size`
+    /// for a request that reached this device directly, `relayed_chunk_size`
+    /// for one that arrived through a relay (see `fs::UploadStore::chunk_size`).
+    pub fn with_chunk_size(mut self, direct_chunk_size: usize, relayed_chunk_size: usize) -> Self {
+        self.uploads = Arc::new(crate::fs::UploadStore::new(
+            direct_chunk_size,
+            relayed_chunk_size,
+        ));
         self
     }
 }

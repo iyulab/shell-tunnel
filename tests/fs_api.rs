@@ -2788,6 +2788,73 @@ async fn an_upload_round_trips_and_publishes_atomically() {
     );
 }
 
+/// The plumbing the unit tests in `fs::transfer` and the connect e2e test
+/// cannot reach on their own: a request carrying the relay's own marker
+/// header must be advertised *and* enforced at `RELAY_CHUNK_SIZE`, not just
+/// `UploadStore::chunk_size(true)` in isolation. Discriminating power matters
+/// here — a `via_relay` that always returned `false` would still pass every
+/// other chunk-size test in this crate, since none of them set this header.
+#[tokio::test]
+async fn a_request_carrying_the_relay_marker_gets_the_relayed_chunk_size() {
+    use shell_tunnel::fs::{DEFAULT_CHUNK_SIZE, RELAY_CHUNK_SIZE};
+    use shell_tunnel::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER;
+
+    let (_dir, mut state) = state_with_files(&[]);
+    state = state.with_chunk_size(DEFAULT_CHUNK_SIZE, RELAY_CHUNK_SIZE);
+
+    let created = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/fs/uploads")
+                .header("content-type", "application/json")
+                .header(VIA_RELAY_FRAME_LIMIT_HEADER, "16777216")
+                .body(Body::from(
+                    serde_json::json!({
+                        "path": "app/relayed.bin",
+                        "size": RELAY_CHUNK_SIZE as u64 + 1,
+                        "sha256": HELLO_DIGEST,
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let json = body_json(created).await;
+    let id = json["upload_id"].as_str().expect("upload_id").to_string();
+    assert_eq!(
+        json["chunk_size"], RELAY_CHUNK_SIZE,
+        "the marker header must be enough to advertise the relayed size, \
+         with no `--relay` on this process at all"
+    );
+
+    let oversized = vec![0_u8; RELAY_CHUNK_SIZE + 1];
+    let patched = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/v1/fs/uploads/{id}"))
+                .header(
+                    "content-range",
+                    format!("bytes 0-{}/{}", RELAY_CHUNK_SIZE, RELAY_CHUNK_SIZE + 1),
+                )
+                .header(VIA_RELAY_FRAME_LIMIT_HEADER, "16777216")
+                .body(Body::from(oversized))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(
+        patched.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "the same marker must be enforced, not just advertised — a chunk one byte \
+         over the relayed size must be refused even though it fits comfortably \
+         under this device's own direct default"
+    );
+}
+
 #[tokio::test]
 async fn a_resumed_upload_continues_from_the_reported_offset() {
     let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);

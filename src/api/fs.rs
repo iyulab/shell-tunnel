@@ -113,6 +113,22 @@ pub fn fs_error_response(error: FsError) -> Response {
 /// changes is when it is caught. Suggests `Range` because that is the escape
 /// hatch this codebase already documents (`docs/USAGE.md` §8) for exactly
 /// this ceiling.
+/// Whether this request arrived through a relay.
+///
+/// `relay::mod`'s device-forwarding handler injects
+/// `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` on every request it forwards
+/// — unconditionally, not only for `download` — so its mere presence already
+/// means "this travelled through a relay" regardless of the numeric value it
+/// carries. Absent on a request that reached this device directly, including
+/// one that arrived over a Phase 3 direct-connect socket on a relay-joined
+/// device: that socket is a separate TCP connection straight to this
+/// process's own local server, never routed through `proxy_handler`.
+fn via_relay(headers: &axum::http::HeaderMap) -> bool {
+    headers.contains_key(axum::http::HeaderName::from_static(
+        crate::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
+    ))
+}
+
 fn refuse_if_over_relay_limit(limit: Option<u64>, response_len: u64) -> Option<Response> {
     let limit = limit?;
     if response_len <= limit {
@@ -1518,20 +1534,23 @@ pub struct UploadState {
     pub offset: u64,
     /// Largest chunk the caller may send.
     ///
-    /// Advertised rather than assumed: the ceiling depends on how this device
-    /// is reachable, and a client that guesses will guess wrong on one of
-    /// them. A relay-joined device advertises `fs::RELAY_CHUNK_SIZE`, which
-    /// fits the relay's fixed request deadline; otherwise
-    /// `fs::DEFAULT_CHUNK_SIZE`. `--fs-chunk-size` overrides both.
+    /// Advertised rather than assumed: the ceiling depends on how *this
+    /// request* reached the device, and a client that guesses will guess
+    /// wrong on one of them. A request that arrived through a relay is told
+    /// `fs::RELAY_CHUNK_SIZE`, which fits the relay's fixed request deadline;
+    /// one that reached this device directly — including over a Phase 3
+    /// direct-connect socket, even on a relay-joined device — is told
+    /// `fs::DEFAULT_CHUNK_SIZE`. `--fs-chunk-size` overrides both to the same
+    /// value (`main.rs::resolve_chunk_size`/`resolve_relayed_chunk_size`).
     ///
-    /// **This is a property of the device, not of the request.** An earlier
-    /// version of this comment said the ceiling "depends on the path the
-    /// request travelled", which was never true and could not have been: the
-    /// relay injects no marker and replays the caller's headers verbatim
-    /// (`relay::client::serve_one`), so a handler cannot tell a relayed
-    /// request from a direct one. The value is chosen once, at startup, from
-    /// whether `--relay` was given — which means a direct caller on a
-    /// relay-joined device is told the smaller number too. Say what it does.
+    /// **This is a property of the request, not of the device.** An earlier
+    /// version of this comment said the opposite — that the relay injects no
+    /// marker, so a handler cannot tell a relayed request from a direct one —
+    /// which was true before `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER`
+    /// existed and stopped being true the moment `relay::mod`'s
+    /// device-forwarding handler started injecting it on every forwarded
+    /// request. `via_relay` (this module) reads that header's presence per
+    /// request; see `fs::UploadStore::chunk_size`.
     pub chunk_size: usize,
 }
 
@@ -1651,6 +1670,7 @@ fn upload_error_response(error: crate::fs::UploadError) -> Response {
 pub async fn create_upload(
     State(state): State<AppState>,
     identity: Option<axum::Extension<crate::audit::Identity>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CreateUpload>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
@@ -1659,9 +1679,10 @@ pub async fn create_upload(
     let uploads = state.uploads.clone();
     let audit = state.audit.clone();
     let identity = identity.map(|axum::Extension(id)| id);
+    let via_relay = via_relay(&headers);
 
     match tokio::task::spawn_blocking(move || {
-        create_upload_blocking(&root, &uploads, &audit, identity, body)
+        create_upload_blocking(&root, &uploads, &audit, identity, body, via_relay)
     })
     .await
     {
@@ -1687,6 +1708,7 @@ fn create_upload_blocking(
     audit: &crate::audit::AuditSink,
     identity: Option<crate::audit::Identity>,
     body: CreateUpload,
+    via_relay: bool,
 ) -> Response {
     // Validate the destination before claiming anything, so a bad path cannot
     // leave a staging file or a claim behind.
@@ -1823,7 +1845,7 @@ fn create_upload_blocking(
                 Json(UploadState {
                     upload_id,
                     offset: 0,
-                    chunk_size: uploads.chunk_size(),
+                    chunk_size: uploads.chunk_size(via_relay),
                 }),
             )
                 .into_response()
@@ -1917,6 +1939,7 @@ fn upload_error_code(error: &crate::fs::UploadError) -> &'static str {
 pub async fn upload_status(
     State(state): State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     if state.fs.is_none() {
         return fs_not_enabled();
@@ -1925,7 +1948,7 @@ pub async fn upload_status(
         Some(offset) => Json(UploadState {
             upload_id: id,
             offset,
-            chunk_size: state.uploads.chunk_size(),
+            chunk_size: state.uploads.chunk_size(via_relay(&headers)),
         })
         .into_response(),
         None => upload_error_response(crate::fs::UploadError::NotFound),
@@ -1968,9 +1991,12 @@ pub async fn append_chunk(
         }
     };
 
+    let via_relay = via_relay(&headers);
     let uploads = state.uploads.clone();
-    match tokio::task::spawn_blocking(move || append_chunk_blocking(&uploads, &id, offset, &body))
-        .await
+    match tokio::task::spawn_blocking(move || {
+        append_chunk_blocking(&uploads, &id, offset, &body, via_relay)
+    })
+    .await
     {
         Ok(response) => response,
         Err(_) => error_response(
@@ -1989,12 +2015,13 @@ fn append_chunk_blocking(
     id: &str,
     offset: u64,
     body: &[u8],
+    via_relay: bool,
 ) -> Response {
-    match uploads.append(id, offset, body) {
+    match uploads.append(id, offset, body, via_relay) {
         Ok(next) => Json(UploadState {
             upload_id: id.to_string(),
             offset: next,
-            chunk_size: uploads.chunk_size(),
+            chunk_size: uploads.chunk_size(via_relay),
         })
         .into_response(),
         Err(error) => upload_error_response(error),

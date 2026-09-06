@@ -695,6 +695,10 @@ caller gets `504` — but the device may already have received the chunk and wri
 Treating that as failure discards a transfer that actually succeeded, and a consumer
 who did exactly that lost 12 MB of a 16 MB upload before resuming instead.
 
+A `504` is only reachable through a relay, so `$BASE` here is `https://relay.example.com/d/<device>`,
+not the local `$BASE` from §3.1 — which is also why the session below advertises `262144`
+rather than the 4 MiB direct default (§10).
+
 The session is the authority on what it holds. Two ways to ask, both fine:
 
 ```bash
@@ -1234,11 +1238,36 @@ forwards still crosses the relay path above, just through a shorter URL: swap th
 curl "http://127.0.0.1:<port>/d/build-box/api/v1/execute" ...
 ```
 
-It attaches to the same relay as an unnamed device of its own — reserved for a future
-direct-connectivity path, not yet built, and not used by this version — while every request it
-forwards still takes the relay path above. It refuses a WebSocket upgrade (`501`) rather than
-forwarding it. It exits on Ctrl-C/SIGTERM, or on its own after an hour with nothing forwarded
-through it.
+It attaches to the same relay as an unnamed device of its own, which lets it try a **direct
+socket to the peer** for filesystem API traffic (`/api/v1/fs/...`) instead of taking every byte
+through the relay's bandwidth-limited hop. Every other route — `/execute`, sessions, WebSocket
+upgrades — always takes the relay path above; direct is attempted for filesystem transfers
+specifically because those are the requests a relay's per-chunk deadline and body ceiling bind
+the hardest (§10).
+
+The attempt is automatic and fails safe: `connect` asks the relay to signal the peer, the two
+sides open a TCP connection to each other at the same moment — no port forwarding is configured
+on either side, but whether the open actually succeeds still depends on the NATs and firewalls
+between them, and when it does not the request simply falls back — and verify each other with a
+certificate fingerprint exchanged over the relay, never a certificate authority, since there is
+no hostname to verify against. If
+signaling, the socket open, or the TLS handshake does not complete within a few seconds, or the
+peer has no direct route to it at all, the request falls back to the relay path exactly as
+before and `connect` waits roughly a minute before trying that peer directly again. A successful
+direct connection is reused for subsequent requests to the same peer rather than reopened each
+time, but it carries one request at a time — there is no pipelining or multiplexing over it.
+
+**Known limitation:** the peer's address for the direct attempt is the one the relay observed on
+its own control connection, not one the peer reports about itself. If the relay itself sits
+behind a reverse proxy or load balancer — the situation "TLS without a proxy" (§5) exists to
+let an operator avoid — every attached device's observed address collapses to the proxy's, and
+a direct attempt to any of them cannot succeed — every filesystem request then falls back to
+the relay path, silently and correctly, exactly as it would for any other reason direct is
+unavailable. There is nothing to configure around this; it is a property of what a relay behind
+a proxy can see.
+
+It refuses a WebSocket upgrade (`501`) rather than forwarding it. It exits on Ctrl-C/SIGTERM, or
+on its own after an hour with nothing forwarded through it.
 
 ### What decides how fast a relayed request is
 
@@ -1405,7 +1434,7 @@ is involved to spend anything further.
 | `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation); `0` never rotates | `67108864` (64 MiB) |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
-| `--fs-chunk-size <N>` | Upload chunk size advertised to callers, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it | `4194304` (4 MiB); `262144` (256 KiB) when `--relay` is given |
+| `--fs-chunk-size <N>` | Upload chunk size, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it. Sets the size for both a direct and a relayed request; without it, a relay-forwarded request is advertised a smaller size than a direct one (§10) | `4194304` (4 MiB) direct; `262144` (256 KiB) for a request that crossed a relay |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
 The gateway's own socket is plaintext, and `--tls-cert`/`--tls-key`/
@@ -1664,13 +1693,17 @@ documented here.
   buffers a request body whole and forwards it as one frame, and gives the device 120s
   for the whole round trip. So the time a chunk needs grows with its size while the
   budget does not, and a chunk too large for the link fails **at zero bytes** with `504`
-  rather than transferring slowly. A device started with `--relay` therefore advertises
-  **256 KiB** instead of 4 MiB; that size clears the deadline on a link sustaining about
-  2 KB/s. Passing `--fs-chunk-size` explicitly overrides this and warns if the value is
-  larger — the override is honoured because only the operator can know the relay↔device
-  link is fast. **The startup banner names the size whenever it is not the plain
-  default**, under `File API:`, so a deployment that hands out a different number says
-  so rather than leaving it to be discovered from a response body.
+  rather than transferring slowly. This is a property of **the request**, not of the
+  device: a device advertises **256 KiB** instead of 4 MiB only for an upload request
+  that actually crossed a relay, so that size clears the deadline on a link sustaining
+  about 2 KB/s. A caller reaching a relay-joined device directly — including over a
+  direct-connect socket (§11) — is told the plain 4 MiB default, since that leg is never
+  bound by the relay's deadline at all. Passing `--fs-chunk-size` explicitly overrides
+  both to the same value and warns if it is larger than the relay-safe size — the
+  override is honoured because only the operator can know the relay↔device link is
+  fast. **The startup banner names both sizes whenever they differ**, under `File API:`,
+  so a deployment that hands out different numbers by path says so rather than leaving
+  it to be discovered from a response body.
 - Quick tunnels change URL on every restart and are documented by Cloudflare as
   testing-only.
 - Command content is not filtered; capability scoping is the control.
