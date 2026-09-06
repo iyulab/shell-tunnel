@@ -351,8 +351,10 @@ async fn a_device_reports_its_public_url_to_whoever_started_it() {
         fingerprint: None,
         ca_file: None,
         enrolled: Some(tx),
+        serve_direct_requests: true,
+        direct_events: None,
     };
-    tokio::spawn(run(config));
+    tokio::spawn(run(config, None));
 
     let url = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
@@ -410,14 +412,25 @@ async fn a_device_can_request_a_direct_connection_to_another() {
         &mut b,
         &DeviceMessage::DirectReady {
             to: "device-a".into(),
+            fingerprint: Some("aa:bb:cc".into()),
         },
     )
     .await;
-    let RelayMessage::PeerReady { from, from_addr } = recv(&mut a).await else {
+    let RelayMessage::PeerReady {
+        from,
+        from_addr,
+        fingerprint,
+    } = recv(&mut a).await
+    else {
         panic!("expected a peer-ready message");
     };
     assert_eq!(from, "device-b");
     assert_eq!(from_addr, b_addr);
+    assert_eq!(
+        fingerprint.as_deref(),
+        Some("aa:bb:cc"),
+        "the relay must carry the fingerprint through, not just the address"
+    );
 }
 
 #[tokio::test]

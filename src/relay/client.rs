@@ -36,7 +36,11 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Backoff bounds for reconnecting after the control channel drops.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
-const BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Also `connect.rs`'s cooldown after a failed direct-connect attempt to a
+/// peer — the same "how long before retrying this remote" question the
+/// control-channel reconnect backoff already answers, reused rather than
+/// inventing a second value for the same axis (Phase 3 plan §4.5).
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Settings for attaching to a relay.
 #[derive(Debug, Clone)]
@@ -80,6 +84,28 @@ pub struct RelayClientConfig {
     /// attach" from "re-attached after a drop" is the caller's decision, and
     /// the client cannot make it without also deciding how each should read.
     pub enrolled: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Whether this process answers a `RelayMessage::DirectRequested` at all.
+    ///
+    /// An internal role distinction, not a user-facing toggle — this is not
+    /// the `--no-direct` flag the Phase 3 plan considered and declined (every
+    /// real device auto-participates, plan §4.5 decision P3-L1-2). It exists
+    /// because `connect`'s own local proxy shares this same `run()` loop and
+    /// attaches to the relay as a device in its own right (Phase 2); without
+    /// this, another attached device could ask `connect`'s ephemeral identity
+    /// to punch and pipe traffic into `connect`'s own listener, which routes
+    /// straight back to the relay. `true` for a real device (`main.rs`'s
+    /// plain `--relay` path); `false` for `connect` (`connect.rs::serve`).
+    pub serve_direct_requests: bool,
+    /// Reports the outcome of a direct-connect attempt this process asked
+    /// `run()` to make (via the `direct_requests` parameter of
+    /// [`run`]/[`attach`]) — a peer's direct socket becoming ready and
+    /// pinned, or the attempt failing.
+    ///
+    /// `None` for a process that never asks for one — a real device only
+    /// *answers* `DirectRequested`, it never sends `RequestDirect` itself, so
+    /// this is always `None` on the plain `--relay` path and always `Some`
+    /// on `connect`'s.
+    pub direct_events: Option<tokio::sync::mpsc::UnboundedSender<super::direct::DirectEvent>>,
 }
 
 impl RelayClientConfig {
@@ -191,7 +217,7 @@ fn sanitize_device_name(raw: &str) -> Option<String> {
 /// error. Installing it explicitly (rather than relying on feature unification
 /// to leave exactly one provider enabled) keeps that failure impossible no
 /// matter what else ends up in the dependency graph.
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         // An error here means a provider was already installed, which is fine.
@@ -204,8 +230,21 @@ fn install_crypto_provider() {
 /// Reconnects with exponential backoff: unlike a spawned tunnel, the device's
 /// public URL is stable across reconnects (the relay keeps addressing it by the
 /// same id), so recovering silently is the honest behaviour here.
-pub async fn run(config: RelayClientConfig) -> Result<()> {
+///
+/// `direct_requests` is this process's own channel for asking to try a
+/// direct connection to a peer — `Some` only for `connect` (`connect.rs`
+/// owns both ends: it keeps the sender, `run` consumes the receiver). A real
+/// device never initiates one, only answers `RelayMessage::DirectRequested`
+/// (gated by `config.serve_direct_requests`), so its call site passes `None`.
+pub async fn run(
+    config: RelayClientConfig,
+    mut direct_requests: Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+) -> Result<()> {
     install_crypto_provider();
+    // Generated once per process, not per attach — a reconnect must not
+    // invalidate a fingerprint a peer may still be holding from an earlier
+    // `DirectReady` (plan §4.5).
+    let identity = super::direct::DirectIdentity::generate()?;
     let mut backoff = BACKOFF_MIN;
     // The reason a dial failed is explained in full once, then referred to.
     //
@@ -217,7 +256,7 @@ pub async fn run(config: RelayClientConfig) -> Result<()> {
     // paragraph explaining it.
     let mut explained: Option<String> = None;
     loop {
-        match attach(&config).await {
+        match attach(&config, &identity, &mut direct_requests).await {
             Ok(()) => {
                 tracing::warn!(target: "relay-client", "relay connection closed; reconnecting");
                 backoff = BACKOFF_MIN;
@@ -266,19 +305,35 @@ fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -
 /// One attachment: enroll, then serve pool requests until the channel drops.
 ///
 /// Returns `Ok(())` when the relay closed the channel cleanly.
-pub async fn attach(config: &RelayClientConfig) -> Result<()> {
+///
+/// Dials the control connection through an explicitly bound local socket
+/// (`direct::dial_with_local_port`) rather than letting
+/// `tokio_tungstenite::connect_async_tls_with_config` pick an ephemeral port
+/// itself — `local_port` below is that socket's port, and it is what every
+/// direct-connect punch during this attachment reuses (cycle-132's spike:
+/// bind-while-`ESTABLISHED` port reuse for a *different* remote holds on
+/// Windows and Linux). A fresh attach after a reconnect gets a fresh port,
+/// same as it would get a fresh ephemeral one before this change.
+pub(crate) async fn attach(
+    config: &RelayClientConfig,
+    identity: &super::direct::DirectIdentity,
+    direct_requests: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+) -> Result<()> {
     install_crypto_provider();
     // Built before the dial so the failure path can read what the verifier
     // recorded: a rejected certificate's fingerprint is the one thing an
     // operator needs and the one thing rustls cannot carry out in its error.
     let (tls, seen) = connector(config)?;
-    let (mut control, _) = tokio_tungstenite::connect_async_tls_with_config(
+    let (tcp_stream, local_port) = super::direct::dial_with_local_port(&config.dial_target())
+        .await
+        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
+    let (mut control, _) = tokio_tungstenite::client_async_tls_with_config(
         config
             .control_url()
             .into_client_request()
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
+        tcp_stream,
         None,
-        false,
         tls,
     )
     .await
@@ -324,6 +379,14 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await; // the first tick is immediate
 
+    // Which peer this attachment is waiting on a `PeerReady`/`DirectUnavailable`
+    // for, if any. Reset on every fresh `attach()` — a request pending across
+    // a control-channel drop is simply lost, exactly like every other
+    // in-flight state here (`spawn_data_connection`'s requests included), and
+    // `connect.rs`'s own deadline on its `direct_events` wait is what turns a
+    // lost request into a relay fallback rather than a hang.
+    let mut pending_direct: Option<String> = None;
+
     loop {
         tokio::select! {
             incoming = control.next() => {
@@ -336,14 +399,184 @@ pub async fn attach(config: &RelayClientConfig) -> Result<()> {
                         }
                     }
                     Ok(RelayMessage::HeartbeatAck) => {}
+                    Ok(RelayMessage::DirectRequested { from, from_addr }) => {
+                        if config.serve_direct_requests {
+                            // Answer immediately, *before* punching — the
+                            // requester cannot start its own simultaneous
+                            // open until it has this fingerprint (plan §4.5:
+                            // the original draft deadlocked by punching
+                            // first).
+                            send(&mut control, &DeviceMessage::DirectReady {
+                                to: from.clone(),
+                                fingerprint: Some(identity.fingerprint().to_string()),
+                            }).await?;
+                            spawn_direct_server_role(
+                                identity.server_config(),
+                                local_port,
+                                from_addr,
+                                config.local,
+                            );
+                        }
+                    }
+                    Ok(RelayMessage::PeerReady { from, from_addr, fingerprint }) => {
+                        if pending_direct.as_deref() == Some(from.as_str()) {
+                            pending_direct = None;
+                            spawn_direct_client_role(
+                                local_port,
+                                from_addr,
+                                fingerprint,
+                                config.direct_events.clone(),
+                            );
+                        }
+                    }
+                    Ok(RelayMessage::DirectUnavailable { target, reason }) => {
+                        if pending_direct.as_deref() == Some(target.as_str()) {
+                            pending_direct = None;
+                            if let Some(tx) = &config.direct_events {
+                                let _ = tx.send(super::direct::DirectEvent::Failed(reason));
+                            }
+                        }
+                    }
                     _ => continue,
                 }
             }
             _ = heartbeat.tick() => {
                 send(&mut control, &DeviceMessage::Heartbeat).await?;
             }
+            Some(peer) = recv_direct_request(direct_requests) => {
+                send(&mut control, &DeviceMessage::RequestDirect { target: peer.clone() }).await?;
+                pending_direct = Some(peer);
+            }
         }
     }
+}
+
+/// Await the next outgoing direct-connect request, or never resolve when
+/// there is no such channel — letting this sit as one more
+/// [`tokio::select!`] branch in [`attach`] without an `if let` around the
+/// whole `select!` (which would have to duplicate the other two branches).
+async fn recv_direct_request(
+    rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+) -> Option<String> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Server role: `from_addr` asked to reach this device directly. Punch
+/// toward it from `local_port` (reused from the control connection, plan
+/// §4.5), accept TLS with this process's own generated identity, then pipe
+/// the socket to the local server exactly as an inbound connection would be
+/// — no HTTP parsing needed on this side, `config.local` already speaks
+/// plain HTTP/1.1 the same way `replay_locally`'s target always has.
+fn spawn_direct_server_role(
+    server_config: std::sync::Arc<rustls::ServerConfig>,
+    local_port: u16,
+    from_addr: String,
+    local: SocketAddr,
+) {
+    tokio::spawn(async move {
+        let Ok(target) = from_addr.parse::<SocketAddr>() else {
+            tracing::debug!(target: "relay-client", "direct-requested peer address does not parse: {from_addr}");
+            return;
+        };
+        let tcp = match super::direct::punch(local_port, target, super::direct::PUNCH_DEADLINE)
+            .await
+        {
+            Ok(tcp) => tcp,
+            Err(e) => {
+                tracing::debug!(target: "relay-client", "direct punch to {from_addr} (server role) did not connect: {e}");
+                return;
+            }
+        };
+        let mut tls = match tokio_rustls::TlsAcceptor::from(server_config)
+            .accept(tcp)
+            .await
+        {
+            Ok(tls) => tls,
+            Err(e) => {
+                tracing::debug!(target: "relay-client", "direct TLS accept from {from_addr} failed: {e}");
+                return;
+            }
+        };
+        let mut upstream = match tokio::net::TcpStream::connect(local).await {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::debug!(target: "relay-client", "direct socket from {from_addr}: local server unreachable: {e}");
+                return;
+            }
+        };
+        if let Err(e) = tokio::io::copy_bidirectional(&mut tls, &mut upstream).await {
+            tracing::debug!(target: "relay-client", "direct socket from {from_addr} ended: {e}");
+        }
+    });
+}
+
+/// Client role: this process asked to reach `from_addr` and the peer answered.
+/// Punch toward it from `local_port`, pin the peer's certificate by the
+/// fingerprint it sent, and hand the finished TLS stream back to whoever
+/// asked (`connect.rs`, via `events`) — or report why it did not work out.
+///
+/// A missing `fingerprint` is not attempted at all: an old relay on the path
+/// drops the field on re-serialize, and the only correct response to "I
+/// cannot verify what I would be connecting to" is to stay on the relay path
+/// (protocol.rs's own safety invariant on `PeerReady`).
+fn spawn_direct_client_role(
+    local_port: u16,
+    from_addr: String,
+    fingerprint: Option<String>,
+    events: Option<tokio::sync::mpsc::UnboundedSender<super::direct::DirectEvent>>,
+) {
+    tokio::spawn(async move {
+        let fail = |reason: String| {
+            if let Some(tx) = &events {
+                let _ = tx.send(super::direct::DirectEvent::Failed(reason));
+            }
+        };
+        let Some(fingerprint) = fingerprint else {
+            fail(
+                "the peer offered no certificate fingerprint (an old relay or device is on \
+                 the path); staying on the relay path rather than connecting unpinned"
+                    .to_string(),
+            );
+            return;
+        };
+        let Ok(target) = from_addr.parse::<SocketAddr>() else {
+            fail(format!("peer address does not parse: {from_addr}"));
+            return;
+        };
+        let expected = match crate::fingerprint::parse(&fingerprint) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(format!("peer sent a malformed fingerprint: {e}"));
+                return;
+            }
+        };
+        let tcp =
+            match super::direct::punch(local_port, target, super::direct::PUNCH_DEADLINE).await {
+                Ok(tcp) => tcp,
+                Err(e) => {
+                    fail(format!("no direct connection to {from_addr}: {e}"));
+                    return;
+                }
+            };
+        let (tls_config, _seen) = pinned_client_config(expected);
+        let server_name =
+            rustls::pki_types::ServerName::try_from(super::direct::DIRECT_SERVER_NAME)
+                .expect("the placeholder direct-connect server name is a valid DNS name");
+        match tokio_rustls::TlsConnector::from(tls_config)
+            .connect(server_name, tcp)
+            .await
+        {
+            Ok(tls) => {
+                if let Some(tx) = &events {
+                    let _ = tx.send(super::direct::DirectEvent::Connected(Box::new(tls)));
+                }
+            }
+            Err(e) => fail(format!("direct TLS handshake with {from_addr} failed: {e}")),
+        }
+    });
 }
 
 /// Open one data connection and serve a single request on it.
@@ -715,7 +948,7 @@ struct PinnedCertificate {
 }
 
 /// Where a rejected certificate's fingerprint is left for the error message.
-type SeenCertificate = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+pub(crate) type SeenCertificate = std::sync::Arc<std::sync::Mutex<Option<String>>>;
 
 impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
     fn verify_server_cert(
@@ -774,6 +1007,35 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertificate {
     }
 }
 
+/// Build a `ClientConfig` that trusts exactly one certificate, identified by
+/// its already-parsed SHA-256 digest — the verifier [`send_to_relay`]'s relay
+/// dial uses, and the same one a Phase 3 direct-connect dial pins the peer's
+/// certificate with (`relay::direct`). Shared rather than duplicated: the
+/// verification logic (`PinnedCertificate`) is the same "is this the exact
+/// certificate I was told to expect?" question in both places, only the
+/// fingerprint's origin differs (`--relay-fingerprint` vs. a `PeerReady`
+/// message) — parsing and its error message stay with each caller so a
+/// `--relay-fingerprint` typo and a malformed `PeerReady` fingerprint are
+/// reported as what they actually are.
+pub(crate) fn pinned_client_config(
+    expected: Vec<u8>,
+) -> (std::sync::Arc<rustls::ClientConfig>, SeenCertificate) {
+    let seen: SeenCertificate = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::ring::default_provider()));
+
+    let tls = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertificate {
+            expected,
+            provider,
+            seen: std::sync::Arc::clone(&seen),
+        }))
+        .with_no_client_auth();
+    (std::sync::Arc::new(tls), seen)
+}
+
 /// Build the TLS trust configuration a relay dial calls for.
 ///
 /// `None` means "use the default public-root trust" — [`connector`] passes
@@ -786,24 +1048,13 @@ fn tls_client_config(
     Option<std::sync::Arc<rustls::ClientConfig>>,
     SeenCertificate,
 )> {
-    let seen: SeenCertificate = std::sync::Arc::new(std::sync::Mutex::new(None));
     if let Some(fingerprint) = &config.fingerprint {
         let expected = crate::fingerprint::parse(fingerprint)
             .map_err(|e| ShellTunnelError::Tunnel(format!("bad --relay-fingerprint: {e}")))?;
-        let provider = rustls::crypto::CryptoProvider::get_default()
-            .cloned()
-            .unwrap_or_else(|| std::sync::Arc::new(rustls::crypto::ring::default_provider()));
-
-        let tls = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(PinnedCertificate {
-                expected,
-                provider,
-                seen: std::sync::Arc::clone(&seen),
-            }))
-            .with_no_client_auth();
-        return Ok((Some(std::sync::Arc::new(tls)), seen));
+        let (tls, seen) = pinned_client_config(expected);
+        return Ok((Some(tls), seen));
     }
+    let seen: SeenCertificate = std::sync::Arc::new(std::sync::Mutex::new(None));
 
     let Some(path) = &config.ca_file else {
         return Ok((None, seen));
@@ -1095,6 +1346,131 @@ where
     parse_response(&raw)
 }
 
+/// Send one HTTP/1.1 request over an already-open stream and read exactly
+/// its framed response, leaving the stream open for the next request.
+///
+/// Unlike [`write_and_read_http1`] — single-shot by design, it sends
+/// `Connection: close` and reads to EOF, which is correct for a fresh dial
+/// per request but cannot be reused — this is what a cached direct-connect
+/// socket needs (`connect.rs`'s `DirectInner::cached`). Plan §5-7 requires
+/// reuse "without renegotiation": re-punching and re-signaling through the
+/// relay for every single fs request would cost two relay round trips and a
+/// fresh TLS handshake per chunk, which is slower than the relay path this
+/// exists to avoid, not merely wasteful.
+///
+/// Refuses anything it does not parse safely — no `content-length`,
+/// `transfer-encoding` of any kind, or a malformed status line — by
+/// returning `Err` with `body` handed back unconsumed, so the caller can
+/// fall back to the relay path for that one request. This also means a
+/// clean `Connection: close` from the peer on an otherwise-valid response is
+/// treated the same as a real failure (the response is discarded and the
+/// caller retries over the relay) — simpler than plumbing a
+/// "answered-but-now-dead" outcome through for what is expected to be a rare
+/// event (an idle keep-alive timeout on the peer's side), at the cost of one
+/// wasted round trip when it happens.
+pub(crate) async fn send_keepalive<S>(
+    stream: &mut S,
+    method: &str,
+    path_and_query: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> std::result::Result<(u16, Vec<(String, String)>, Vec<u8>), Vec<u8>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if body.len() > MAX_FORWARDED_BODY {
+        return Err(body);
+    }
+
+    let mut head = format!(
+        "{method} {path_and_query} HTTP/1.1\r\nHost: {}\r\ncontent-length: {}\r\n",
+        super::direct::DIRECT_SERVER_NAME,
+        body.len()
+    );
+    for (name, value) in headers {
+        if is_forwardable(name) && !name.eq_ignore_ascii_case("content-length") {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+
+    if stream.write_all(head.as_bytes()).await.is_err() {
+        return Err(body);
+    }
+    if !body.is_empty() && stream.write_all(&body).await.is_err() {
+        return Err(body);
+    }
+
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 16 * 1024];
+    let head_end = loop {
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if raw.len() > MAX_FORWARDED_BODY {
+            return Err(body);
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) => return Err(body),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => return Err(body),
+        }
+    };
+
+    let head_text = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let mut lines = head_text.split("\r\n");
+    let Some(status) = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+    else {
+        return Err(body);
+    };
+
+    let mut resp_headers = Vec::new();
+    let mut content_length: Option<usize> = None;
+    let mut peer_wants_close = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.parse().ok();
+        } else if name.eq_ignore_ascii_case("transfer-encoding") {
+            // Chunked (or anything else) is not parsed here — refuse rather
+            // than mis-read a framing this function does not understand.
+            return Err(body);
+        } else if name.eq_ignore_ascii_case("connection") && value.eq_ignore_ascii_case("close") {
+            peer_wants_close = true;
+        }
+        resp_headers.push((name.to_string(), value.to_string()));
+    }
+    let (Some(content_length), false) = (content_length, peer_wants_close) else {
+        return Err(body);
+    };
+
+    let body_start = head_end + 4;
+    while raw.len() < body_start + content_length {
+        if raw.len() > body_start + content_length {
+            return Err(body); // cannot happen; guards against a parsing bug silently truncating
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) => return Err(body),
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+            Err(_) => return Err(body),
+        }
+    }
+
+    Ok((
+        status,
+        resp_headers,
+        raw[body_start..body_start + content_length].to_vec(),
+    ))
+}
+
 /// Cap on a request or response body this function will build or read — the
 /// same figure the relay itself enforces on the other side of this call
 /// (`relay::MAX_RELAY_FRAME`), so a body this crate would refuse to relay
@@ -1320,6 +1696,8 @@ mod tests {
             fingerprint: None,
             ca_file: None,
             enrolled: None,
+            serve_direct_requests: true,
+            direct_events: None,
         }
     }
 
@@ -1379,6 +1757,90 @@ mod tests {
             send_to_relay(&cfg, "GET", "/d/box1/api/v1/health", &[], Vec::new()).await;
         assert_eq!(status, 200);
         assert_eq!(body, b"OK");
+    }
+
+    #[tokio::test]
+    async fn send_keepalive_leaves_the_stream_open_for_a_second_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for _ in 0..2 {
+                let mut buf = vec![0u8; 4096];
+                let n = tokio::io::AsyncReadExt::read(&mut socket, &mut buf)
+                    .await
+                    .unwrap();
+                assert!(n > 0, "the connection must still be open for request 2");
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut socket,
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nOK",
+                )
+                .await
+                .unwrap();
+            }
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (status, _headers, body) =
+            send_keepalive(&mut stream, "GET", "/api/v1/health", &[], Vec::new())
+                .await
+                .expect("first request must succeed");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
+
+        // The whole point: the same stream, unconsumed, answers a second
+        // request — no reconnect, no re-handshake.
+        let (status, _headers, body) =
+            send_keepalive(&mut stream, "GET", "/api/v1/health", &[], Vec::new())
+                .await
+                .expect("second request over the same stream must succeed");
+        assert_eq!(status, 200);
+        assert_eq!(body, b"OK");
+    }
+
+    #[tokio::test]
+    async fn send_keepalive_refuses_chunked_encoding_and_hands_the_body_back() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            tokio::io::AsyncWriteExt::write_all(
+                &mut socket,
+                b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n2\r\nOK\r\n0\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = b"the original request body".to_vec();
+        let err = send_keepalive(&mut stream, "POST", "/api/v1/fs/upload", &[], body.clone())
+            .await
+            .expect_err("chunked responses are not parsed on this path");
+        assert_eq!(
+            err, body,
+            "the caller must get its exact body back to retry over the relay path"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_keepalive_reports_failure_without_a_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            tokio::io::AsyncWriteExt::write_all(&mut socket, b"HTTP/1.1 200 OK\r\n\r\n")
+                .await
+                .unwrap();
+        });
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let result = send_keepalive(&mut stream, "GET", "/api/v1/health", &[], Vec::new()).await;
+        assert!(result.is_err());
     }
 
     #[cfg(feature = "tls")]

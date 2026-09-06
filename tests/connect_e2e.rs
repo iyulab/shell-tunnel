@@ -11,7 +11,7 @@ use std::time::Duration;
 use shell_tunnel::api;
 use shell_tunnel::relay::client::{run, RelayClientConfig};
 use shell_tunnel::relay::{relay_router, RelayConfig, RelayState};
-use shell_tunnel::{AppState, ServerConfig};
+use shell_tunnel::{AppState, FsRoot, ServerConfig};
 
 /// Mirrors `tests/fs_relay_e2e.rs::start_relay` — duplicated per this
 /// project's convention for these small per-file test harnesses.
@@ -41,6 +41,21 @@ async fn start_peer_device() -> SocketAddr {
     local_addr
 }
 
+/// Mirrors `tests/fs_relay_e2e.rs::start_device_server` — a peer with a real
+/// `--fs-root`, for the fs-endpoint test below (the only path Phase 3's
+/// direct connect is eligible for at all, `connect.rs::is_direct_eligible`).
+async fn start_peer_device_with_fs_root() -> (tempfile::TempDir, SocketAddr) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = FsRoot::new(dir.path()).expect("fs root");
+    std::fs::write(dir.path().join("hello.txt"), b"hi from the peer").unwrap();
+    let state = AppState::new().with_fs_root(root);
+    let config = ServerConfig::new("127.0.0.1", 0).without_graceful_shutdown();
+    let listener = api::bind(&config).await.expect("bind local server");
+    let local_addr = listener.local_addr().expect("local addr");
+    tokio::spawn(api::serve_on(listener, config, state));
+    (dir, local_addr)
+}
+
 fn attach_peer(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &str) {
     let config = RelayClientConfig {
         relay_url: format!("ws://{relay_addr}"),
@@ -51,8 +66,10 @@ fn attach_peer(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &str
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: true,
+        direct_events: None,
     };
-    tokio::spawn(run(config));
+    tokio::spawn(run(config, None));
 }
 
 /// Minimal HTTP/1.1 client, same shape as `tests/fs_relay_e2e.rs::http_request`.
@@ -105,6 +122,8 @@ async fn a_caller_reaches_the_peer_device_through_connect_mode() {
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: false,
+        direct_events: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -136,6 +155,68 @@ async fn a_caller_reaches_the_peer_device_through_connect_mode() {
     assert_eq!(&body[..], b"OK");
 }
 
+/// The one path family Phase 3 ever attempts direct for
+/// (`connect.rs::is_direct_eligible`) — `/health` above never exercises
+/// `try_direct`/`send_keepalive` at all. Two requests in a row: the second
+/// proves the cached-stream reuse path (`send_keepalive`, not a fresh
+/// `write_and_read_http1` per call) actually answers correctly, not just the
+/// first-request punch-and-connect path.
+#[tokio::test]
+async fn a_caller_reaches_an_fs_endpoint_through_connect_mode_twice() {
+    let relay_addr = start_relay().await;
+    let (_dir, peer_addr) = start_peer_device_with_fs_root().await;
+    attach_peer(relay_addr, peer_addr, "box1");
+
+    let connect_config = RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: "secret".to_string(),
+        local: "127.0.0.1:1".parse().unwrap(), // overwritten by serve()
+        label: None,
+        device_name: None,
+        fingerprint: None,
+        ca_file: None,
+        enrolled: None,
+        serve_direct_requests: false,
+        direct_events: None,
+    };
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(shell_tunnel::connect::serve(
+        connect_config,
+        "box1".to_string(),
+        0,
+        Duration::from_secs(3600),
+        Some(bound_tx),
+        std::future::pending(),
+    ));
+    let connect_addr = tokio::time::timeout(Duration::from_secs(5), bound_rx)
+        .await
+        .expect("connect should bind promptly")
+        .expect("connect should report its bound address");
+
+    let list_url = format!("http://{connect_addr}/d/box1/api/v1/fs/list?path=.");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let (status, body) = loop {
+        let (status, body) = http_get(&list_url).await;
+        if status == 200 || tokio::time::Instant::now() > deadline {
+            break (status, body);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status, 200, "body: {}", String::from_utf8_lossy(&body));
+    assert!(
+        String::from_utf8_lossy(&body).contains("hello.txt"),
+        "the peer's real fs root must be what answered: {}",
+        String::from_utf8_lossy(&body)
+    );
+
+    // Second request: whether this went direct or fell back, it must still
+    // answer correctly — a cached stream that broke would fail every request
+    // after the first, not just intermittently.
+    let (status2, body2) = http_get(&list_url).await;
+    assert_eq!(status2, 200, "body: {}", String::from_utf8_lossy(&body2));
+    assert!(String::from_utf8_lossy(&body2).contains("hello.txt"));
+}
+
 #[tokio::test]
 async fn a_request_for_a_device_other_than_the_configured_peer_is_404() {
     let relay_addr = start_relay().await;
@@ -151,6 +232,8 @@ async fn a_request_for_a_device_other_than_the_configured_peer_is_404() {
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: false,
+        direct_events: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -186,6 +269,8 @@ async fn a_request_for_an_unattached_peer_gets_the_relays_own_502() {
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: false,
+        direct_events: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(

@@ -103,7 +103,7 @@ default = []
 # In-binary self-update via GitHub Releases (adds a large transitive dependency tree).
 self-update = ["dep:self_update"]
 # Dial out to a self-hosted relay (adds a WebSocket client and a TLS stack).
-relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:ring", "dep:tokio-rustls"]
+relay-client = ["dep:tokio-tungstenite", "dep:rustls", "dep:rustls-pemfile", "dep:webpki-roots", "dep:ring", "dep:tokio-rustls", "dep:rcgen"]
 # Terminate TLS in-process (--tls-cert / --tls-key), no reverse proxy required.
 tls = ["dep:axum-server", "dep:rustls", "dep:rustls-pemfile", "dep:rcgen", "dep:ring"]
 

@@ -80,8 +80,10 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: true,
+        direct_events: None,
     };
-    tokio::spawn(run(config));
+    tokio::spawn(run(config, None));
 }
 
 /// A minimal hand-rolled HTTP/1.1 client — the crate deliberately has no HTTP

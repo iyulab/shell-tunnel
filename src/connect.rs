@@ -1,17 +1,39 @@
 //! `shell-tunnel connect`: a local reverse-proxy to one relay-attached device.
 //!
 //! Unlike the gateway, this process serves no fs/session API of its own —
-//! its one route forwards to the relay's existing public `/d/<device>/...`
-//! path (`relay::client::send_to_relay`), the same path an ordinary HTTP
-//! client could already reach directly. See
-//! `claudedocs/plans/2026-09-04-p2p-direct-transfer-phase2-plan.md`.
+//! its one route forwards to the peer, preferring a direct socket
+//! (`relay::client::send_keepalive`, once the relay has signalled one open)
+//! for fs endpoints and falling back to the relay's existing public
+//! `/d/<device>/...` path (`relay::client::send_to_relay`, the same path an
+//! ordinary HTTP client could already reach directly) for everything else
+//! or when direct is unavailable. See
+//! `claudedocs/plans/2026-09-04-p2p-direct-transfer-phase2-plan.md` (Phase 2)
+//! and `claudedocs/plans/2026-09-05-p2p-direct-transfer-phase3-plan.md`
+//! (Phase 3, direct connectivity).
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 
-use crate::relay::client::{send_to_relay, RelayClientConfig};
+use crate::relay::client::{send_keepalive, send_to_relay, RelayClientConfig};
+use crate::relay::direct::DirectEvent;
+
+/// How long a first fs request to a peer waits for a direct connection
+/// before falling back to the relay path — one budget covering the whole
+/// signal-then-punch sequence (plan §4.5), not stacked on top of
+/// [`crate::relay::direct::PUNCH_DEADLINE`]: that deadline already bounds
+/// the punch itself; this adds only the margin for the relay signaling round
+/// trip and the TLS handshake around it.
+const DIRECT_ATTEMPT_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(crate::relay::direct::PUNCH_DEADLINE.as_secs() + 1);
+
+/// How long to leave a peer alone after a direct attempt fails before trying
+/// again — reusing the control channel's own reconnect ceiling
+/// (`relay::client::BACKOFF_MAX`) rather than inventing a second constant
+/// for the same "how long before retrying this remote" question (plan
+/// §4.5).
+const DIRECT_COOLDOWN: std::time::Duration = crate::relay::client::BACKOFF_MAX;
 
 /// How long `connect` may sit with no forwarded request before it exits on
 /// its own.
@@ -96,27 +118,78 @@ async fn track_activity(
     next.run(request).await
 }
 
+/// The direct-connect side of `connect`'s state — absent (`ConnectState.direct
+/// = None`) for the router built by the plain [`router`] constructor
+/// (every existing unit test in this file, which forwards with no relay
+/// attach behind it at all): trying a direct connection with nothing to
+/// signal over would just be a 5-second hang on every request. Only
+/// [`serve`] builds one, since only it also starts `relay::client::run` with
+/// a `direct_requests` receiver for this to send into.
+struct DirectRoute {
+    /// `connect.rs` → `run()`: "try a direct connection to this peer."
+    request_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Mutex-guarded so at most one caller is ever mid-attempt or mid-request
+    /// on the cached stream at once — plan §4.5's "single stream, sequential
+    /// processing" is this lock, not a separate queue.
+    inner: tokio::sync::Mutex<DirectInner>,
+}
+
+struct DirectInner {
+    /// `run()` → `connect.rs`: the outcome of the last `request_tx` send.
+    events: tokio::sync::mpsc::UnboundedReceiver<DirectEvent>,
+    /// The one live direct socket, if a previous request established one and
+    /// it has not since failed.
+    cached: Option<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>,
+    /// Set after a failed attempt; direct is not retried for this peer until
+    /// this passes (plan §4.5 — reuses `DIRECT_COOLDOWN`, not a fresh value).
+    cooldown_until: Option<tokio::time::Instant>,
+}
+
 #[derive(Clone)]
 struct ConnectState {
     config: std::sync::Arc<RelayClientConfig>,
     peer: std::sync::Arc<str>,
+    direct: Option<std::sync::Arc<DirectRoute>>,
 }
 
 /// Build the router: one catch-all route, forwarding only requests addressed
-/// to `peer` and rejecting a WebSocket upgrade (Phase 3 territory — direct
-/// connectivity is what makes a long-lived upgrade worth piping through this
-/// process; forwarding it over the relay path today would just be another
-/// name for the fallback the design already has).
+/// to `peer` and rejecting a WebSocket upgrade (a long-lived upgrade is not
+/// in Phase 3's scope — §2 of the Phase 3 plan limits direct connectivity to
+/// the fs API; forwarding a WS upgrade over the relay path today would just
+/// be another name for the fallback the design already has).
+///
+/// No direct-connect attempt is ever made through a router built this way —
+/// see [`DirectRoute`]'s doc comment. [`serve`] is what wires one up.
 ///
 /// A bare async function is already a `Handler` for every HTTP method at
 /// once, which is what a catch-all needs — `Router::fallback(forward)`
 /// directly, no `axum::routing::any(...)` wrapper needed.
+///
+/// Test-only: production code (`serve`) builds a [`ConnectState`] with a real
+/// [`DirectRoute`] directly, since a router built without one can never
+/// attempt direct at all (this file's own unit tests want exactly that — a
+/// router with no relay attach behind it, so a request resolves in one
+/// `send_to_relay` call rather than waiting out [`DIRECT_ATTEMPT_BUDGET`]).
+#[cfg(test)]
 pub(crate) fn router(config: RelayClientConfig, peer: String) -> Router {
-    let state = ConnectState {
+    router_with_state(ConnectState {
         config: std::sync::Arc::new(config),
         peer: std::sync::Arc::from(peer.as_str()),
-    };
+        direct: None,
+    })
+}
+
+fn router_with_state(state: ConnectState) -> Router {
     Router::new().fallback(forward).with_state(state)
+}
+
+/// Whether `tail` (the path *after* `/d/<peer>` is stripped, per
+/// [`crate::relay::proxy::split_device_path`]) is in Phase 3's scope for a
+/// direct attempt at all — fs endpoints only (plan §1/§2). Everything else
+/// (`/api/v1/execute`, session streaming, `/health`, …) always goes over the
+/// relay path, unchanged from Phase 2.
+fn is_direct_eligible(tail: &str) -> bool {
+    tail.starts_with("/api/v1/fs/")
 }
 
 async fn forward(State(state): State<ConnectState>, request: Request) -> Response {
@@ -126,7 +199,7 @@ async fn forward(State(state): State<ConnectState>, request: Request) -> Respons
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
 
-    let Some((device_id, _tail)) = crate::relay::proxy::split_device_path(&path_and_query) else {
+    let Some((device_id, tail)) = crate::relay::proxy::split_device_path(&path_and_query) else {
         return StatusCode::NOT_FOUND.into_response();
     };
     if device_id != &*state.peer {
@@ -159,6 +232,15 @@ async fn forward(State(state): State<ConnectState>, request: Request) -> Respons
         Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
     };
 
+    let body = if let (Some(direct), true) = (&state.direct, is_direct_eligible(&tail)) {
+        match try_direct(direct, &state.peer, &method, &tail, &headers, body).await {
+            Ok(response) => return response,
+            Err(body) => body,
+        }
+    } else {
+        body
+    };
+
     let (status, resp_headers, resp_body) =
         send_to_relay(&state.config, &method, &path_and_query, &headers, body).await;
 
@@ -171,19 +253,95 @@ async fn forward(State(state): State<ConnectState>, request: Request) -> Respons
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
+/// Try the direct path for one request. `Ok` is a finished response to
+/// return as-is; `Err` hands `body` back unconsumed so the caller falls
+/// back to `send_to_relay` with it.
+///
+/// Holds `direct.inner`'s lock for the whole attempt (negotiate-if-needed +
+/// send the request) — the documented single-stream, sequential-processing
+/// contract (plan §4.5), not an accident of implementation.
+async fn try_direct(
+    direct: &std::sync::Arc<DirectRoute>,
+    peer: &str,
+    method: &str,
+    tail_path_and_query: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+) -> Result<Response, Vec<u8>> {
+    let mut inner = direct.inner.lock().await;
+
+    if let Some(until) = inner.cooldown_until {
+        if tokio::time::Instant::now() < until {
+            return Err(body);
+        }
+        inner.cooldown_until = None;
+    }
+
+    if inner.cached.is_none() {
+        if direct.request_tx.send(peer.to_string()).is_err() {
+            // `run()` is gone (the relay attach task ended) — nothing to
+            // negotiate with; the relay path will fail informatively on its
+            // own.
+            return Err(body);
+        }
+        let established = tokio::time::timeout(DIRECT_ATTEMPT_BUDGET, inner.events.recv()).await;
+        match established {
+            Ok(Some(DirectEvent::Connected(stream))) => inner.cached = Some(*stream),
+            Ok(Some(DirectEvent::Failed(reason))) => {
+                tracing::debug!(target: "connect", "direct connect to {peer} failed: {reason}");
+                inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
+                return Err(body);
+            }
+            Ok(None) => {
+                // The events channel closed — same as the send failing above.
+                return Err(body);
+            }
+            Err(_elapsed) => {
+                tracing::debug!(target: "connect", "direct connect to {peer} timed out; falling back to the relay");
+                inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
+                return Err(body);
+            }
+        }
+    }
+
+    let Some(stream) = inner.cached.as_mut() else {
+        return Err(body); // unreachable given the block above, but no unwrap
+    };
+    match send_keepalive(stream, method, tail_path_and_query, headers, body).await {
+        Ok((status, resp_headers, resp_body)) => {
+            let mut builder = Response::builder().status(status);
+            for (name, value) in resp_headers {
+                builder = builder.header(name, value);
+            }
+            Ok(builder
+                .body(axum::body::Body::from(resp_body))
+                .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
+        }
+        Err(body) => {
+            // The cached stream is unusable either way now (send_keepalive
+            // never leaves a half-written connection open) — evict it and
+            // let the caller fall back to relay for this one request.
+            inner.cached = None;
+            inner.cooldown_until = Some(tokio::time::Instant::now() + DIRECT_COOLDOWN);
+            Err(body)
+        }
+    }
+}
+
 /// Run `connect` mode until it is told to stop: bind a local listener,
 /// forward everything on it to `peer` via the relay, and attach to the same
 /// relay as an ephemeral, unnamed device.
 ///
-/// The ephemeral attach carries no traffic in this phase — nothing addresses
-/// this device's URL, since nobody but this process itself knows its
-/// identity. It exists now so Phase 3's direct-connectivity signalling has a
-/// control channel to run over without this process's lifecycle needing to
-/// change shape later. Confirmed safe to leave inert: the relay strips the
-/// `/d/<id>` prefix before forwarding anything to an attached device, and
-/// this device's own local listener at `config.local` never receives
-/// anything but Phase 3 candidate-exchange traffic once that exists — Task
-/// 1-3 send it none.
+/// The ephemeral attach carries no inbound traffic — nothing addresses this
+/// device's URL, since nobody but this process itself knows its identity.
+/// It exists so direct-connect signalling (`relay::client::run`'s control
+/// channel) has somewhere to run: `connect` both asks the relay to try a
+/// peer (`RequestDirect`, via `config`'s `direct_requests` channel) and
+/// could in principle be asked back, but never is — `config.serve_direct_requests`
+/// is `false` here, so a `DirectRequested` aimed at this identity is
+/// ignored rather than piped into this process's own local listener. That
+/// local listener only ever serves the caller-facing HTTP this file's
+/// `forward` handles.
 ///
 /// `bound` reports the address actually bound, once it is known — `None`
 /// means nobody's listening, matching `RelayClientConfig::enrolled`'s own
@@ -224,14 +382,34 @@ pub async fn serve(
         let _ = tx.send(local_addr);
     }
 
-    // Cloned before `router` takes ownership of `peer` below — kept only for
-    // the idle-shutdown log line, which is worth naming the peer in ("idle,
-    // stopped forwarding to box1" tells an operator which process just
-    // exited; "idle, shutting down" on its own does not, once more than one
-    // connect process might be running).
+    let (direct_request_tx, direct_request_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (direct_event_tx, direct_event_rx) = tokio::sync::mpsc::unbounded_channel();
+    config.direct_events = Some(direct_event_tx);
+    // `connect` answers no `DirectRequested` of its own — see `serve`'s own
+    // doc comment.
+    config.serve_direct_requests = false;
+    let direct_route = std::sync::Arc::new(DirectRoute {
+        request_tx: direct_request_tx,
+        inner: tokio::sync::Mutex::new(DirectInner {
+            events: direct_event_rx,
+            cached: None,
+            cooldown_until: None,
+        }),
+    });
+
+    // Cloned before `router_with_state` takes ownership of `peer` below —
+    // kept only for the idle-shutdown log line, which is worth naming the
+    // peer in ("idle, stopped forwarding to box1" tells an operator which
+    // process just exited; "idle, shutting down" on its own does not, once
+    // more than one connect process might be running).
     let peer_for_log = peer.clone();
     let clock = IdleClock::new();
-    let router = router(config.clone(), peer).layer(axum::middleware::from_fn_with_state(
+    let router = router_with_state(ConnectState {
+        config: std::sync::Arc::new(config.clone()),
+        peer: std::sync::Arc::from(peer.as_str()),
+        direct: Some(direct_route),
+    })
+    .layer(axum::middleware::from_fn_with_state(
         clock.clone(),
         track_activity,
     ));
@@ -259,7 +437,7 @@ pub async fn serve(
 
     tokio::select! {
         result = server => result.expect("connect server task panicked"),
-        result = crate::relay::client::run(config) => result,
+        result = crate::relay::client::run(config, Some(direct_request_rx)) => result,
     }
 }
 
@@ -324,6 +502,8 @@ mod tests {
             fingerprint: None,
             ca_file: None,
             enrolled: None,
+            serve_direct_requests: false,
+            direct_events: None,
         }
     }
 

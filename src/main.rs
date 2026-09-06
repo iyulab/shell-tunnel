@@ -192,6 +192,11 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 fingerprint: args.relay_fingerprint.clone(),
                 ca_file: args.relay_ca.clone(),
                 enrolled: None,
+                // `connect` is its own role, not a device other devices
+                // should be able to punch into — see the field's own doc
+                // comment on `RelayClientConfig`.
+                serve_direct_requests: false,
+                direct_events: None,
             };
             let local_port = if args.port_explicit { args.port } else { 0 };
 
@@ -1016,6 +1021,11 @@ async fn run_with_relay(
         fingerprint: args.relay_fingerprint.clone(),
         ca_file: args.relay_ca.clone(),
         enrolled: Some(enrolled_tx),
+        // A real device answers another device's direct-connect request —
+        // see the field's own doc comment on `RelayClientConfig`. This path
+        // never initiates one itself, so it has no use for `direct_events`.
+        serve_direct_requests: true,
+        direct_events: None,
     };
 
     for warning in &exposure.warnings {
@@ -1045,7 +1055,7 @@ async fn run_with_relay(
 
     tokio::select! {
         result = server => result.expect("server task panicked"),
-        result = run_relay_client(client_config) => result,
+        result = run_relay_client(client_config, None) => result,
     }
 }
 

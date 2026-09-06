@@ -83,8 +83,10 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         fingerprint: None,
         ca_file: None,
         enrolled: None,
+        serve_direct_requests: true,
+        direct_events: None,
     };
-    tokio::spawn(run(config));
+    tokio::spawn(run(config, None));
 }
 
 /// One response: status plus its headers, lowercased.

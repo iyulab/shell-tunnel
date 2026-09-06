@@ -14,6 +14,8 @@
 
 #[cfg(feature = "relay-client")]
 pub mod client;
+#[cfg(feature = "relay-client")]
+pub mod direct;
 pub mod protocol;
 pub mod proxy;
 pub mod registry;
@@ -615,7 +617,7 @@ async fn control_session(
                                 }
                             }
                         }
-                        Ok(DeviceMessage::DirectReady { to }) => {
+                        Ok(DeviceMessage::DirectReady { to, fingerprint }) => {
                             if let Some(peer_device) = state.devices.get(&to) {
                                 // Unlike `RequestDirect`, there is no clean way
                                 // to notify the *original* requester here (its
@@ -625,6 +627,7 @@ async fn control_session(
                                 if let Err(err) = peer_device.signal(RelayMessage::PeerReady {
                                     from: device_id.clone(),
                                     from_addr: peer.to_string(),
+                                    fingerprint,
                                 }) {
                                     tracing::debug!(
                                         target: "relay",

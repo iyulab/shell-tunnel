@@ -79,6 +79,16 @@ pub enum DeviceMessage {
     DirectReady {
         /// Device id of the peer that requested this direct connection.
         to: String,
+        /// SHA-256 fingerprint of the self-signed certificate this device will
+        /// present on the direct socket, so `to` can pin it before dialling.
+        ///
+        /// `None` only when this device predates Phase 3 direct-connect and has
+        /// no certificate to offer — a relay carrying that absence through must
+        /// never be read as "connect anyway": the requester's only correct
+        /// response to a missing fingerprint is to skip the direct attempt and
+        /// stay on the relay path (see `RelayMessage::PeerReady`'s doc comment).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
     },
 }
 
@@ -153,6 +163,17 @@ pub enum RelayMessage {
         /// That peer's address, as the relay observed it on its own control
         /// connection — never self-reported by the peer.
         from_addr: String,
+        /// Carried straight from the peer's `DeviceMessage::DirectReady` —
+        /// the relay does not generate or inspect this value.
+        ///
+        /// `None` means either the peer predates this field or an
+        /// intermediate relay in the path dropped it on re-serialize (an old
+        /// relay's `RelayMessage` has no such variant field to carry it).
+        /// Either way, **the receiver must treat a missing fingerprint as "do
+        /// not attempt direct" and go straight to the relay path** — nothing
+        /// here should ever open a direct socket it cannot pin.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fingerprint: Option<String>,
     },
 }
 
@@ -293,10 +314,25 @@ mod tests {
     fn direct_ready_roundtrips() {
         let msg = DeviceMessage::DirectReady {
             to: "device-a".into(),
+            fingerprint: Some("aa:bb:cc".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"direct_ready\""));
         assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn direct_ready_without_a_fingerprint_deserializes_as_none() {
+        // A pre-Phase-3 device's `direct_ready` carries no such field at all.
+        let json = r#"{"type":"direct_ready","to":"device-a"}"#;
+        let msg: DeviceMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            msg,
+            DeviceMessage::DirectReady {
+                to: "device-a".into(),
+                fingerprint: None,
+            }
+        );
     }
 
     #[test]
@@ -313,10 +349,27 @@ mod tests {
             RelayMessage::PeerReady {
                 from: "device-b".into(),
                 from_addr: "203.0.113.9:41230".into(),
+                fingerprint: Some("dd:ee:ff".into()),
             },
         ] {
             let json = serde_json::to_string(&msg).unwrap();
             assert_eq!(serde_json::from_str::<RelayMessage>(&json).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn peer_ready_without_a_fingerprint_deserializes_as_none() {
+        // An old relay's `RelayMessage::PeerReady` predates this field and
+        // drops it on re-serialize even if the originating device sent one.
+        let json = r#"{"type":"peer_ready","from":"device-b","from_addr":"203.0.113.9:41230"}"#;
+        let msg: RelayMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            msg,
+            RelayMessage::PeerReady {
+                from: "device-b".into(),
+                from_addr: "203.0.113.9:41230".into(),
+                fingerprint: None,
+            }
+        );
     }
 }
