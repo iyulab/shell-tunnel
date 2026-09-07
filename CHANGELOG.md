@@ -3,6 +3,68 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.23.0 — 2026-09-07
+
+> ⚠ **One behaviour change for an operator running a relay.** The relay now refuses a
+> direct-connect request between two devices whose observed addresses cannot reach each
+> other, instead of signalling an attempt that cannot succeed. Nothing a caller does
+> changes — the request falls back to the relay path exactly as it did — but it falls back
+> in about one relay round trip rather than after the several-second punch deadline, and
+> the log finally says *why*.
+
+### Changed
+
+- **A relay declines a direct connection it can see will never open.** `shell-tunnel
+  connect` asks the relay to introduce it to a device so filesystem traffic can take a
+  direct socket instead of the relay's hop. That introduction hands each side the address
+  the relay observed the other on — and when one of those addresses is private to its own
+  network while the other is outside it, the address is meaningless to the peer receiving
+  it. No packet from the outside peer can ever arrive, so the attempt is not unlikely, it
+  is impossible, and it was being made again every minute for as long as the process ran.
+
+  The relay is the only party that sees both addresses, so it is the only one that can
+  recognise the case. It now answers such a request immediately with
+  `DirectUnavailable { reason: "unroutable-peer-address" }` and signals nothing. For a
+  caller this shows up as the existing fallback line naming the new reason:
+
+  ```
+  INFO connect: direct connect to build-box failed (unroutable-peer-address); using the relay for this request and pausing direct attempts for 60s
+  ```
+
+  and, on the relay, one line saying what would have to change:
+
+  ```
+  INFO relay: declined a direct connection: these two devices are observed on addresses that cannot reach each other. A direct attempt is possible only when this relay sits outside both devices' networks
+  ```
+
+  **What is deliberately not refused**: two devices behind one gateway, which the relay
+  observes at the same address. Whether that opens depends on the gateway turning traffic
+  back on itself, which the relay cannot see — some do, some do not — and refusing a pair
+  that might work is worse than spending the attempt on it. Only the settled impossibility
+  is declined.
+
+  Older devices need no change: `reason` has always been an opaque string on the wire, and
+  a client that does not know this one logs it and falls back exactly as before.
+
+### Documentation
+
+- **`docs/USAGE.md` §5 named only half the reason a direct connection can be impossible.**
+  It described a relay behind a reverse proxy, where every device's observed address
+  collapses to the proxy's. The other cause needs no proxy at all and is the more common
+  way to arrive there: **a relay placed inside the network of the devices it serves**, which
+  is the obvious first place to put one. The section now describes both, and states the
+  condition positively — a direct attempt is possible only when the relay sits outside both
+  peers' networks, the same requirement a STUN server has and for the same reason.
+- **The section that recommends terminating TLS with a reverse proxy now says what that
+  costs.** A reader following it would silently lose direct-connect entirely and find out
+  only from the known-limitation paragraph much further down, if at all.
+- **`README.md` said the direct attempt was "never a thing to configure".** True of
+  `connect` itself, misleading about the deployment: where the relay sits decides whether
+  the introduction can succeed at all.
+- **A performance note in `docs/USAGE.md` §3.1 pointed at "this crate's next release"** for
+  a `fs/list` improvement that 0.22.0 had already shipped, so it read as though paging still
+  re-walked the whole subtree. Pinned to the release that carried it.
+
 ## 0.22.0 — 2026-09-07
 
 > ⚠ **Two behaviour changes for an existing caller.** A relayed `GET /api/v1/fs/file`
