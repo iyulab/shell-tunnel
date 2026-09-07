@@ -618,8 +618,11 @@ would; there is no endpoint that lists uploads in flight, so no follow-up call c
 told you either. Non-zero means **the removal is not final**: wait for those uploads, or
 `DELETE` the sessions if you know them. It is a count and not a list of session ids
 because an id belongs to whoever opened the session, and one caller's delete is not the
-place to hand it to another. Both layouts report it, and it is present on every tree
-answer including a preview, `0` included.
+place to hand it to another. Both layouts report it, and it is on **every delete answer
+that has a body** — tree or single entry, preview or removal, `0` included. (A successful
+single-file removal answers `204` with no body at all, so there is nothing to carry it
+there.) On a single file it counts an upload destined at *that exact path*: removing the
+file is undone just the same when that upload completes.
 
 ```bash
 curl -X DELETE "$BASE/api/v1/fs/file?path=tree2&recursive=true"

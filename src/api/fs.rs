@@ -1433,6 +1433,13 @@ fn delete_file_blocking(
                 // cannot live under something that is not a directory, so the
                 // guard the directory branch runs has nothing to test.
                 "staging_in_tree": false,
+                // *Not* a constant, unlike its neighbour, and the asymmetry is
+                // the point: an upload cannot stage under a file, but it can be
+                // destined at exactly this path — and then removing the file is
+                // undone the moment that upload completes. `starts_with`
+                // answers that here without a special case, because a path
+                // starts with itself.
+                "uploads_into_tree": uploads.live_destinations_under(&named),
             })),
         )
             .into_response();

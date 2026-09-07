@@ -2372,6 +2372,12 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
         body["message"].as_str().is_some_and(|m| !m.is_empty()),
         "message must be present and non-empty: {body}"
     );
+    // The rest of that `required` list, on the branch that builds a *different*
+    // body from the clean one. Nothing checked these here, which is how the
+    // schema managed to require `staging_in_tree` while never declaring it as a
+    // property -- a gap a test on this shape would have shown immediately.
+    assert!(body["staging_in_tree"].is_boolean(), "{body}");
+    assert!(body["uploads_into_tree"].is_u64(), "{body}");
     // dry_run really did not touch anything, including the entries it could
     // enumerate.
     assert!(dir.path().join("app/visible.txt").exists());
@@ -2429,6 +2435,12 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
         body["message"].as_str().is_some_and(|m| !m.is_empty()),
         "message must be present and non-empty: {body}"
     );
+    // The rest of that `required` list, on the branch that builds a *different*
+    // body from the clean one. Nothing checked these here, which is how the
+    // schema managed to require `staging_in_tree` while never declaring it as a
+    // property -- a gap a test on this shape would have shown immediately.
+    assert!(body["staging_in_tree"].is_boolean(), "{body}");
+    assert!(body["uploads_into_tree"].is_u64(), "{body}");
     assert!(dir.path().join("app/visible.txt").exists());
     assert!(dir.path().join("app/locked/secret.txt").exists());
 }
@@ -5235,6 +5247,66 @@ async fn an_upload_headed_elsewhere_is_not_counted_against_this_tree() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/v1/fs/file?path=tree&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["uploads_into_tree"], 0, "{body}");
+}
+
+/// The single-entry preview builds its own body rather than sharing the tree
+/// branch's, so "present on every answer" is a claim two code paths have to
+/// keep and only one of them is exercised by the tests above. That is how
+/// `staging_in_tree` nearly shipped missing from this path, and the comment
+/// there says so; this covers the sibling field the same way.
+///
+/// The value is not the constant `false` its neighbour is: an upload cannot
+/// stage *under* a file, but it can be destined *at* one — and then removing
+/// the file is undone as soon as that upload completes.
+#[tokio::test]
+async fn a_single_file_preview_reports_an_upload_destined_at_that_very_path() {
+    let (_dir, state) = state_with_files(&[("doomed.bin", b"old")]);
+    let _id = create_test_upload(state.clone(), "doomed.bin", b"hello world").await;
+
+    let response = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=doomed.bin&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["removed"], 1, "{body}");
+    assert_eq!(
+        body["staging_in_tree"], false,
+        "nothing can stage under a file: {body}"
+    );
+    assert_eq!(
+        body["uploads_into_tree"], 1,
+        "an upload lands on this exact path: {body}"
+    );
+}
+
+/// And it reports zero rather than nothing when no upload is headed there —
+/// the same absence-never-has-to-be-interpreted rule the tree branch keeps.
+#[tokio::test]
+async fn a_single_file_preview_with_no_upload_headed_at_it_reports_zero() {
+    let (_dir, state) = state_with_files(&[("plain.txt", b"x")]);
+
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=plain.txt&dry_run=true")
                 .body(Body::empty())
                 .expect("request"),
         )

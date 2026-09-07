@@ -62,8 +62,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   count means the removal is not final. It is a count rather than a list of session ids because
   an id belongs to whoever opened the session.
 
-  Present on every tree answer, `0` and previews included, in both layouts. It changes no
-  behaviour: nothing that was refused before is refused now, and nothing that succeeded fails.
+  On every delete answer that has a body — tree or single entry, preview or removal, `0`
+  included, in both layouts. On a single file it counts an upload destined at that exact path.
+  It changes no behaviour: nothing that was refused before is refused now, and nothing that
+  succeeded fails.
 
 - **`PartialDeleteResult` declares `staging_in_tree`.** The schema had it in `required` and never
   among the properties, so a generator following it produced a type missing a field it was told
