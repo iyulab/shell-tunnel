@@ -899,7 +899,14 @@ sent to a running server with a valid token and left the trail empty:
 | a query string carrying one | `400` |
 | a malformed JSON body | `400` |
 | a path parameter that does not parse | `400` |
-| a body over the size limit | `413` |
+| a body over a **route's** size limit — 2 MiB by default, `chunk_size` on a chunk `PATCH` | `413` |
+
+The **server's own 8 MiB ceiling is the exception**, and only since 0.24.0: that
+guard sits outside authentication, so a request it turns away never reaches the
+layer that would have recorded it — before the guard existed the same request was
+a `401` and left a line. It records `denied` with `reason: body-over-ceiling`
+itself rather than shrinking what the trail covers while this section went on
+saying the same words (§10, §8).
 
 A caller probing `?dryRun=true` against `DELETE .../fs/file` therefore leaves no
 trace of having tried — though it also changes nothing, which is the point of
@@ -982,7 +989,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `kind` | Recorded when | Notable fields |
 |---|---|---|
 | `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below) |
-| `denied` | a request was refused | `status`, `reason` |
+| `denied` | a request was refused by the authentication layer, or by the server's own body ceiling | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, …) |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
 | `fs.delete.preview_incomplete` | a preview that hit an enumeration failure — nothing changed on disk | `file`, `bytes`, `entries` (a count — a lower bound here: an entry that could not be enumerated was never counted) |

@@ -194,7 +194,10 @@ pub fn create_router_with_state(state: AppState) -> Router {
         // embedder serving this router answers a refusal on an unread body
         // exactly as the secure one would. A guard that lives in one of two
         // router constructors is a guard nobody can rely on.
-        .layer(middleware::from_fn(drain_request_body_middleware))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.audit),
+            drain_request_body_middleware,
+        ))
         .with_state(state)
 }
 
@@ -381,10 +384,15 @@ async fn capability_auth_middleware(
             // "This layer's" is the whole claim, not modesty. Refusals that
             // happen after this middleware has let a request through — an
             // extractor turning away an unrecognised field, a malformed body, a
-            // path parameter that will not parse, a body over the size limit —
-            // record nothing, so the trail is not a complete list of every
-            // refusal the server issued. `USAGE.md` §4 names that gap and lists
-            // the measured cases; keep the two in step as the layer grows.
+            // path parameter that will not parse, a body over a *route's* size
+            // limit — record nothing, so the trail is not a complete list of
+            // every refusal the server issued. `USAGE.md` §4 names that gap and
+            // lists the measured cases; keep the two in step as the layer grows.
+            //
+            // One refusal happens *before* this layer and is recorded anyway:
+            // `drain_request_body_middleware`, which is outside it on purpose
+            // and would otherwise take requests out of this layer's reach —
+            // and out of the trail — without a word of §4 changing.
             audit
                 .record_async(
                     crate::audit::AuditEvent::new("denied")
@@ -493,16 +501,36 @@ fn host_is_allowed(header: Option<&str>, allowed: &[String]) -> bool {
 /// body past the ceiling is refused here without being read, which is the one
 /// case that still ends in a RST — deliberately, because reading an unbounded
 /// body to be polite is the denial of service the ceiling exists to prevent.
-async fn drain_request_body_middleware(request: Request, next: Next) -> Response {
+async fn drain_request_body_middleware(
+    State(audit): State<Arc<crate::audit::AuditSink>>,
+    request: Request,
+    next: Next,
+) -> Response {
     let (parts, body) = request.into_parts();
     let bytes = match axum::body::to_bytes(body, crate::fs::MAX_CHUNK_SIZE).await {
         Ok(bytes) => bytes,
         Err(_) => {
+            // Recorded, and the reason is specific to being outermost: this
+            // refusal happens *before* the authentication layer, so a request
+            // that would have been turned away there — and written to the trail
+            // there — now never reaches it. Leaving this silent would shrink
+            // what the trail covers without changing a word of what it claims,
+            // which is the shape this repo keeps getting caught by. Probing is
+            // exactly what a trail is asked about afterwards, and a body at the
+            // ceiling is a probe worth having a line for.
+            let route = format!("{} {}", parts.method, parts.uri.path());
+            audit
+                .record_async(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_route(route)
+                        .with_denial(413, "body-over-ceiling"),
+                )
+                .await;
             return (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "request body exceeds the server's ceiling",
             )
-                .into_response()
+                .into_response();
         }
     };
     next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
@@ -680,7 +708,10 @@ pub fn create_secure_router(
 
     // Outside everything that can refuse a request, so no refusal is answered
     // with the body still unread — see `drain_request_body_middleware`.
-    router = router.layer(middleware::from_fn(drain_request_body_middleware));
+    router = router.layer(middleware::from_fn_with_state(
+        Arc::clone(&state.audit),
+        drain_request_body_middleware,
+    ));
 
     let router = router.with_state(state);
 

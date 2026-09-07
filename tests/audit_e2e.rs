@@ -556,3 +556,36 @@ fn the_async_handlers_record_without_blocking_the_runtime() {
         );
     }
 }
+
+/// The outermost refusal — a request body past the server's ceiling — is
+/// recorded, and it has to be for a reason the layer's position creates.
+///
+/// That guard sits *outside* authentication so that no refusal is ever answered
+/// on a request body still arriving. The cost of being outside is that a
+/// request it turns away never reaches the layer that would otherwise have
+/// written it to the trail: before the guard existed, this same request was a
+/// `401 missing-token` and left a line. Silently, the trail would have covered
+/// less while §4 went on claiming exactly what it claims now.
+#[tokio::test]
+async fn a_body_past_the_ceiling_is_recorded_even_though_auth_never_sees_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    // No token at all: without the ceiling this is the `401 missing-token`
+    // the test above pins. One byte past it, and a different layer answers.
+    let past_the_ceiling = "x".repeat(8 * 1024 * 1024 + 1);
+    assert_eq!(
+        post(addr, "/api/v1/execute", None, &past_the_ceiling).await,
+        413
+    );
+
+    let recorded = events(&trail, 1).await;
+    assert_eq!(recorded[0].kind, "denied");
+    assert_eq!(recorded[0].status, Some(413));
+    assert_eq!(recorded[0].reason.as_deref(), Some("body-over-ceiling"));
+    assert_eq!(
+        recorded[0].route.as_deref(),
+        Some("POST /api/v1/execute"),
+        "the route is what makes a probe legible afterwards"
+    );
+}

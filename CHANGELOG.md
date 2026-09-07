@@ -73,6 +73,12 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Changed
 
+- **The audit trail records the body-ceiling refusal**, as `denied` with
+  `reason: body-over-ceiling`. The guard below sits outside authentication, so a request it
+  turns away never reaches the layer that records refusals — the same request was a `401`
+  with a trail entry before the guard existed. Without this the trail would have covered
+  less while §4 of the operating guide went on claiming exactly what it claimed before.
+
 - **A request body over 8 MiB is refused with `413 request body exceeds the server's ceiling`
   on every route**, in plain text, before authentication or any other check. Previously such
   a body was refused by whatever route it reached, at that route's own limit. Bodies under
