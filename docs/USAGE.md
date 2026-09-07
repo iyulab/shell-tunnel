@@ -1319,6 +1319,14 @@ INFO connect: direct connect to build-box failed (<reason>); using the relay for
 INFO connect: direct connection to build-box broke mid-request; using the relay for this request and pausing direct attempts for 60s
 ```
 
+**The relay says its part on its own side**, once per request it declines, naming both
+devices — this is the only place the refusal above is reported to whoever runs the relay,
+since the caller's log is on a different machine:
+
+```
+INFO relay: declined a direct connection: these two devices are observed on addresses that cannot reach each other. A direct attempt is possible only when this relay sits outside both devices' networks device_id=caller peer_device_id=build-box
+```
+
 **Not every relayed request produces one, and that is deliberate.** Each line above announces a
 pause as it starts it; the requests that arrive *during* that pause take the relay without a
 further line, since one per request would say nothing the pause has not already said. So the

@@ -1239,6 +1239,72 @@ mod tests {
         );
     }
 
+    /// The refusal's log line is the only thing that tells an operator *why*
+    /// direct will never work here, and it is quoted in `CHANGELOG.md`. Nothing
+    /// else asserts on it: the refusal needs an asymmetric pair of observed
+    /// addresses, which no test in this repo can produce through a real relay.
+    /// So capture the rendering at the seam instead — a message written but
+    /// never read back is exactly how this repo has shipped wrong user-facing
+    /// text before.
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for CapturedLog {
+        type Writer = Self;
+        fn make_writer(&self) -> Self {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn the_declined_direct_connection_is_logged_with_both_devices_named() {
+        let sink = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            // `logging::try_init` builds the real layer `.compact()` and
+            // `.with_ansi(false)`; the timestamp is dropped here only because
+            // it is the one part that cannot be asserted on.
+            .compact()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(sink.clone())
+            .finish();
+
+        let (registry, _handles) = registry_with(&[("build-box", "198.51.100.7:9000")]);
+        tracing::subscriber::with_default(subscriber, || {
+            direct_request_outcome(
+                &registry,
+                "caller",
+                "10.0.0.5:40000".parse().unwrap(),
+                "build-box",
+            )
+        });
+
+        let logged = String::from_utf8(sink.0.lock().expect("log buffer").clone())
+            .expect("the line is utf-8");
+        // One literal per line, concatenated — a `\` continuation inside a
+        // string literal is folded by `cargo fmt` into a run of spaces, which
+        // is how this repo has mangled user-facing text before.
+        assert_eq!(
+            logged.trim_end(),
+            concat!(
+                " INFO relay: declined a direct connection:",
+                " these two devices are observed on addresses that cannot reach each other.",
+                " A direct attempt is possible only when this relay sits outside both devices' networks",
+                " device_id=caller peer_device_id=build-box",
+            )
+        );
+    }
+
     fn config() -> RelayConfig {
         RelayConfig::new("127.0.0.1:0".parse().unwrap(), "secret")
     }

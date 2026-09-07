@@ -31,10 +31,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   INFO connect: direct connect to build-box failed (unroutable-peer-address); using the relay for this request and pausing direct attempts for 60s
   ```
 
-  and, on the relay, one line saying what would have to change:
+  and, on the relay, one line saying what would have to change, naming both
+  devices:
 
   ```
-  INFO relay: declined a direct connection: these two devices are observed on addresses that cannot reach each other. A direct attempt is possible only when this relay sits outside both devices' networks
+  INFO relay: declined a direct connection: these two devices are observed on addresses that cannot reach each other. A direct attempt is possible only when this relay sits outside both devices' networks device_id=caller peer_device_id=build-box
   ```
 
   **What is deliberately not refused**: two devices behind one gateway, which the relay
