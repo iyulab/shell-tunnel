@@ -9,7 +9,7 @@ use axum::{
     },
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     Router,
 };
@@ -190,6 +190,11 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
         .layer(TraceLayer::new_for_http())
+        // Same guard as `create_secure_router`, and for the same reason: an
+        // embedder serving this router answers a refusal on an unread body
+        // exactly as the secure one would. A guard that lives in one of two
+        // router constructors is a guard nobody can rely on.
+        .layer(middleware::from_fn(drain_request_body_middleware))
         .with_state(state)
 }
 
@@ -456,6 +461,54 @@ fn host_is_allowed(header: Option<&str>, allowed: &[String]) -> bool {
 }
 
 /// Reject requests carrying a `Host` this server does not answer to.
+/// Read every request body off the socket before anything can refuse it.
+///
+/// A server that answers before consuming the request body leaves unread bytes
+/// in flight, and closing on top of them makes the OS send a RST — which
+/// discards whatever the client had not yet read, including the answer just
+/// sent. That is not a hyper defect but its documented position
+/// (`hyperium/hyper#3078`: "if you want to always read request bodies, you
+/// would need to write that logic in your handler"), and this is that logic.
+///
+/// It was found from the other end. A body over a route's limit is refused
+/// with `413`, and the device relaying that request lost the `413` and reported
+/// a synthetic `502 device could not reach its local server` in **109 of 320
+/// requests** on the multi-threaded runtime `main.rs` runs — measured on an
+/// idle host, so not a load artefact. Five client-side variants were measured
+/// against that baseline and the best still lost 55 of 320: the client cannot
+/// win a race whose outcome the peer decides. Two more mechanisms were tried
+/// and disproved by running them — `tokio::net::TcpStream::try_read` is not
+/// driver-free (it answers from readiness the runtime has observed), and
+/// `Expect: 100-continue` does not defer the body, because hyper 1.8 sends
+/// `100 Continue` eagerly, before the handler that would refuse ever runs.
+///
+/// Placed outermost so it also covers a refusal by authentication, the rate
+/// limiter, or the host check — every one of which answers without reading a
+/// body.
+///
+/// **The ceiling is not new exposure.** [`crate::fs::MAX_CHUNK_SIZE`] is what
+/// the chunk-upload route already accepts today, so the largest body this
+/// server will hold is unchanged; what changes is that the other routes can now
+/// hold one that big transiently before their own smaller limit refuses it. A
+/// body past the ceiling is refused here without being read, which is the one
+/// case that still ends in a RST — deliberately, because reading an unbounded
+/// body to be polite is the denial of service the ceiling exists to prevent.
+async fn drain_request_body_middleware(request: Request, next: Next) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, crate::fs::MAX_CHUNK_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the server's ceiling",
+            )
+                .into_response()
+        }
+    };
+    next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
+        .await
+}
+
 async fn host_check_middleware(
     State(allowed): State<Arc<Vec<String>>>,
     request: Request,
@@ -624,6 +677,10 @@ pub fn create_secure_router(
     if let Some(cors) = cors_layer(&security.cors) {
         router = router.layer(cors);
     }
+
+    // Outside everything that can refuse a request, so no refusal is answered
+    // with the body still unread — see `drain_request_body_middleware`.
+    router = router.layer(middleware::from_fn(drain_request_body_middleware));
 
     let router = router.with_state(state);
 

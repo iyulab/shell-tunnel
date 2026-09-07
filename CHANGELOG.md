@@ -3,6 +3,50 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.24.0 — unreleased
+
+> ⚠ **The date is deliberately absent.** This section is written when the change lands, not
+> when it ships; fill it in at release. Every other section here is dated because it was
+> released.
+
+### Fixed
+
+- **A request the server refused now reaches the caller, instead of arriving as
+  `502 device could not reach its local server`.** A body over a route's limit is refused
+  with `413`, an unauthenticated call with `401` — and both were being answered *before* the
+  request body had finished arriving. Closing a connection with bytes still unread makes the
+  operating system send a reset, and a reset discards whatever the peer has not yet read,
+  including the answer just sent. The caller was left with the connecting party's guess at
+  why the exchange stopped, which named the wrong thing entirely: the server was up, it had
+  been reached, and it had answered.
+
+  Measured over a relay on an idle 16-core host, against a body a route refuses: the `413`
+  was lost in **109 of 320 requests**. It is not a rare race — it was near-invisible only
+  because the test covering it drove a single-threaded runtime, where the client's read
+  happens between its own writes, while the server runs a multi-threaded one. On the runtime
+  that actually ships, a third of such refusals were replaced.
+
+  The fix is on the answering side, where the standard puts it (RFC 7230 §6.6) and where the
+  HTTP library this server is built on declines to put it by default: request bodies up to
+  **8 MiB** are now read off the connection before anything can refuse the request, so no
+  refusal is ever answered on top of bytes in flight. Five variants of the opposite fix — on
+  the connecting side, watching for an early answer — were measured against the same
+  baseline; the best still lost 55 of 320, because that side does not decide the outcome.
+
+- **`Expect: 100-continue` is not a way around this, and it was checked rather than assumed.**
+  The server sends `100 Continue` as soon as it sees the header, before the check that would
+  refuse the request ever runs, so the body is sent anyway. Recorded because it is the first
+  thing this problem suggests.
+
+### Changed
+
+- **A request body over 8 MiB is refused with `413 request body exceeds the server's ceiling`
+  on every route**, in plain text, before authentication or any other check. Previously such
+  a body was refused by whatever route it reached, at that route's own limit. Bodies under
+  the ceiling are unaffected: they still meet the same per-route limits, with the same
+  answers. The ceiling is the size the chunk-upload route already accepted, so the largest
+  body this server will hold has not changed.
+
 ## 0.23.0 — 2026-09-07
 
 > ⚠ **One behaviour change for an operator running a relay.** The relay now refuses a

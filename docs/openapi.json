@@ -160,7 +160,7 @@
             "$ref": "#/components/responses/ForbiddenError"
           },
           "413": {
-            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still. A body over 8 MiB is refused earlier still, by a guard outside every route, with the plain-text sentence `request body exceeds the server's ceiling` — that guard reads a body up to 8 MiB off the connection before anything can refuse it, so a refusal is no longer answered on top of unread bytes (which made the client's own connection reset discard it; over a relay that turned this 413 into a synthetic `502` in about a third of requests before 0.24.0).",
             "content": {
               "text/plain": {
                 "schema": {
@@ -323,7 +323,7 @@
             }
           },
           "413": {
-            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still. A body over 8 MiB is refused earlier still, by a guard outside every route, with the plain-text sentence `request body exceeds the server's ceiling` — that guard reads a body up to 8 MiB off the connection before anything can refuse it, so a refusal is no longer answered on top of unread bytes (which made the client's own connection reset discard it; over a relay that turned this 413 into a synthetic `502` in about a third of requests before 0.24.0).",
             "content": {
               "text/plain": {
                 "schema": {
@@ -394,7 +394,7 @@
             "$ref": "#/components/responses/ForbiddenError"
           },
           "413": {
-            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still. A body over 8 MiB is refused earlier still, by a guard outside every route, with the plain-text sentence `request body exceeds the server's ceiling` — that guard reads a body up to 8 MiB off the connection before anything can refuse it, so a refusal is no longer answered on top of unread bytes (which made the client's own connection reset discard it; over a relay that turned this 413 into a synthetic `502` in about a third of requests before 0.24.0).",
             "content": {
               "text/plain": {
                 "schema": {
@@ -960,7 +960,7 @@
             }
           },
           "413": {
-            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still.",
+            "description": "Request body over the 2 MiB limit that applies to routes which do not set their own. Plain text, not the JSON error envelope: the body is refused by the request layer before any handler sees it. Behind a relay the relay's own 8 MiB ceiling answers first for anything larger still. A body over 8 MiB is refused earlier still, by a guard outside every route, with the plain-text sentence `request body exceeds the server's ceiling` — that guard reads a body up to 8 MiB off the connection before anything can refuse it, so a refusal is no longer answered on top of unread bytes (which made the client's own connection reset discard it; over a relay that turned this 413 into a synthetic `502` in about a third of requests before 0.24.0).",
             "content": {
               "text/plain": {
                 "schema": {

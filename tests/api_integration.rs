@@ -1079,3 +1079,80 @@ async fn an_enabled_limiter_reports_its_budget() {
         "one of five requests has been spent"
     );
 }
+
+/// The body ceiling that keeps a refusal from being answered on an unread
+/// request body (`drain_request_body_middleware`) is user-facing twice over:
+/// the status a caller gets past it, and the sentence explaining it. Nothing
+/// asserted on either, and this repo has shipped four user-facing strings that
+/// no test read back.
+///
+/// Both router constructors are checked. The guard lives in each of them
+/// separately — `create_router_with_state` does not go through
+/// `create_secure_router` — so covering one would leave the other free to lose
+/// it in a refactor while the suite stayed green.
+#[tokio::test]
+async fn a_body_past_the_ceiling_is_refused_before_it_is_read_by_either_router() {
+    // One byte past `fs::MAX_CHUNK_SIZE`, the largest body any route accepts.
+    let past_the_ceiling = || vec![0_u8; 8 * 1024 * 1024 + 1];
+
+    for (name, router) in [
+        (
+            "create_router_with_state",
+            create_router_with_state(AppState::new()),
+        ),
+        (
+            "create_secure_router",
+            create_secure_router(AppState::new(), SecurityConfig::default()).0,
+        ),
+    ] {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/execute")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(past_the_ceiling()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{name}");
+        assert_eq!(
+            response_text(response).await,
+            "request body exceeds the server's ceiling",
+            "{name}"
+        );
+    }
+}
+
+/// The other half of the same guard, and the half that actually fixes the
+/// defect: a body *under* the ceiling but over a route's own limit must reach
+/// that route's refusal — the middleware reads it off the socket and hands it
+/// on, rather than short-circuiting it.
+#[tokio::test]
+async fn a_body_under_the_ceiling_still_reaches_the_route_that_refuses_it() {
+    // The no-security constructor on purpose: on the secure one this body is
+    // under the ceiling, so it passes the middleware and is then refused by
+    // authentication — which would prove nothing about the route's own limit.
+    // That it gets that far is itself the point of the test above.
+    let response = create_router_with_state(AppState::new())
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/execute")
+                .header(header::CONTENT_TYPE, "application/json")
+                // Over `/execute`'s 2 MiB default, under the 8 MiB ceiling.
+                .body(Body::from(vec![0_u8; 3 * 1024 * 1024]))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // Not the middleware's sentence: this refusal came from the route.
+    assert_ne!(
+        response_text(response).await,
+        "request body exceeds the server's ceiling"
+    );
+}

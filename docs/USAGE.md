@@ -1646,10 +1646,11 @@ startup rather than serving local-only.
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
+| **502** `device could not reach its local server` | the device could not carry the request out against the server it fronts | check that server is up. **Before 0.24.0 this also appeared when it was up and had answered**: a refusal sent before the request body finished arriving was discarded by the connection reset that followed, and this sentence was reported in its place — measured at about one relayed request in three on the runtime the server actually runs. A body-draining guard now keeps the real answer (§10) |
 | **413** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay. Read-only — always safe to retry, though retrying without `Range` answers the same `413` again |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
 | **504** from a relay URL | device did not answer in 120s | **the outcome is unknown, not failed** — the request may have been carried out in full and only the answer lost. Never treat it as "did not happen". For an upload chunk, ask the session where it is (§3.2) and continue from there; for `/execute`, the command may still be running on the device |
-| **413** | request body over 8 MiB (refused by the relay), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), an upload chunk over `chunk_size`, or a relayed response over the relay's 16 MiB ceiling (row above) | split the request; bulk bytes belong in an upload session, not in a JSON body. For the response-side case, use `Range` instead |
+| **413** | request body over 8 MiB (refused by the relay, and — since 0.24.0 — by the server itself with the plain-text `request body exceeds the server's ceiling`, on every route), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), an upload chunk over `chunk_size`, or a relayed response over the relay's 16 MiB ceiling (row above) | split the request; bulk bytes belong in an upload session, not in a JSON body. For the response-side case, use `Range` instead |
 | **409** `offset-mismatch` on a chunk `PATCH` | chunk does not continue from the session offset | resend from the `offset` in the body. This is also the cheapest way to recover from a `504` — resending the lost chunk unchanged answers with the true offset (§3.2) |
 | **409** `destination-busy` on `POST .../fs/uploads` | a live session already targets this path | the body names it in `upload_id`. Resume it (`GET .../uploads/{upload_id}` for its offset) or abandon it (`DELETE`). An idle session is swept after an hour, but do not wait for that |
 | **422** `checksum-mismatch` on `.../complete` | assembled bytes do not match the declared `sha256` | the session is discarded; open a new one |
@@ -1753,6 +1754,15 @@ documented here.
   buffer instead of streaming.
 - **Relay is single-tenant** (one shared enrol token, no isolation between devices).
 - **8 MiB** request body limit through the relay. Over it, the relay answers **413**.
+  Since 0.24.0 the server enforces the same ceiling itself, on every route and outside
+  every check that can refuse a request, answering **413 `request body exceeds the
+  server's ceiling`** in plain text. It is there for a reason that has nothing to do with
+  size: a body under the ceiling is read off the connection *before* anything refuses the
+  request, because a refusal answered on top of bytes still in flight is discarded by the
+  connection reset that closing then provokes — which is how a route's `413`, or a `401`,
+  used to reach a relayed caller as `502 device could not reach its local server`
+  ([§8](#8-failure-modes)). It is not new exposure: the chunk-upload route already
+  accepted bodies this size, so the largest body the server will hold is unchanged.
 - **2 MiB** request body limit on the server's own routes — the lower of these two, so an
   oversized `POST .../execute` or `POST .../fs/uploads` meets it first, with or without a
   relay, and gets **413**. The `.../fs/uploads/{id}` routes are the ones that set their own

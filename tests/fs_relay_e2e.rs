@@ -494,7 +494,15 @@ async fn an_upload_completes_over_the_relay() {
 /// repeats — a single pass proves nothing here, and a single pass is exactly
 /// what let the defect ship. Found in live verification across a relay, where
 /// the loser of that race is the common case.
-#[tokio::test]
+///
+/// **The runtime flavour is part of the test.** `main.rs` runs a multi-threaded
+/// runtime and this file's default `#[tokio::test]` is single-threaded, which is
+/// not a detail here: on the single-threaded one the client's read happens on the
+/// writer's own thread between chunks, which hides most of the race. Measured on
+/// an idle 16-core host, 320 runs each: 109 failures on `multi_thread` against 2
+/// in 140 on the default. The flavour that reports what a user gets is the one
+/// the program actually runs.
+#[tokio::test(flavor = "multi_thread")]
 async fn a_body_over_the_route_limit_answers_413_not_502() {
     let relay_addr = start_relay().await;
     let (_dir, local_addr) = start_device_server().await;
