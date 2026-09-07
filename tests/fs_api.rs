@@ -5147,3 +5147,101 @@ async fn two_refusals_sharing_a_status_are_recorded_under_different_reasons() {
         "a 409 that is not destination-busy must not be recorded as one"
     );
 }
+
+/// Under `--fs-root` the guard that protects an upload in flight does not fire
+/// on the tree the upload is *destined* into, and it is right not to — staging
+/// lives at the jail root there, so removing that tree destroys none of the
+/// bytes already written. What was missing is that the caller was told nothing
+/// either: the removal answered `200`, `staging_in_tree: false`, and then the
+/// path came back when the upload completed.
+///
+/// Measured on a real binary before this field existed: `DELETE tree2` answered
+/// `{"removed":2,...,"staging_in_tree":false}` and `tree2/sub/x.bin` was
+/// recreated by the subsequent `complete`. There is no API that enumerates
+/// uploads in flight, so nothing else the caller could call would have told
+/// them either.
+#[tokio::test]
+async fn a_jailed_delete_reports_the_uploads_still_destined_into_the_tree() {
+    let (dir, state) = state_with_files(&[("tree/sub/keep.txt", b"xy")]);
+    let _id = create_test_upload(state.clone(), "tree/sub/x.bin", b"hello world").await;
+
+    let response = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=tree&recursive=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    // The guard's own field, and it is correct: the staging file is at the jail
+    // root, outside the tree, so nothing written was destroyed.
+    assert_eq!(
+        body["staging_in_tree"], false,
+        "staging is outside the tree under a jail: {body}"
+    );
+    // The half that was silent.
+    assert_eq!(
+        body["uploads_into_tree"], 1,
+        "the removal is not final and the answer must say so: {body}"
+    );
+    assert!(
+        !dir.path().join("tree").exists(),
+        "the removal still happens — this field observes, it does not refuse"
+    );
+}
+
+/// The field is on every tree answer, not only where it is non-zero — a field
+/// that appears just when it is interesting is one a client learns to skip.
+/// The sibling `staging_in_tree` is asserted the same way for the same reason.
+#[tokio::test]
+async fn a_delete_with_nothing_headed_for_it_reports_zero_rather_than_nothing() {
+    let (_dir, state) = state_with_files(&[("tree/sub/keep.txt", b"xy")]);
+
+    for uri in [
+        "/api/v1/fs/file?path=tree&recursive=true&dry_run=true",
+        "/api/v1/fs/file?path=tree&recursive=true",
+    ] {
+        let response = create_router_with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let body = body_json(response).await;
+        assert_eq!(body["uploads_into_tree"], 0, "{uri}: {body}");
+    }
+}
+
+/// An upload headed somewhere else must not be counted. Without this the field
+/// would read as "is any upload in flight anywhere", which is a different
+/// question and one a caller deleting a tree has no use for.
+#[tokio::test]
+async fn an_upload_headed_elsewhere_is_not_counted_against_this_tree() {
+    let (_dir, state) = state_with_files(&[("tree/keep.txt", b"xy"), ("other/keep.txt", b"xy")]);
+    let _id = create_test_upload(state.clone(), "other/x.bin", b"hello world").await;
+
+    let response = create_router_with_state(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=tree&recursive=true&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["uploads_into_tree"], 0, "{body}");
+}

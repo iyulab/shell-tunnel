@@ -1310,6 +1310,13 @@ fn delete_file_blocking(
         // or which upload was holding it. The answer carries `staging_in_tree`
         // so a preview cannot be mistaken for permission to proceed.
         let staging_in_tree = uploads.has_live_part_under(&named);
+        // Asked whatever the layout, and whatever the guard above decides: the
+        // two are orthogonal. `staging_in_tree` is about bytes already written,
+        // and under `--fs-root` it is `false` for every tree but the jail root;
+        // this is about bytes still coming, and it is the only thing that tells
+        // a caller its removal will be undone when an upload destined into the
+        // tree completes.
+        let uploads_into_tree = uploads.live_destinations_under(&named);
         if staging_in_tree && !query.dry_run {
             // The refusal most worth having in the trail: "why did that
             // cleanup not happen" is exactly the question a trail answers
@@ -1370,6 +1377,11 @@ fn delete_file_blocking(
             // On a real removal it is always `false` — the guard above
             // returned otherwise.
             "staging_in_tree": staging_in_tree,
+            // Always present, for the same reason as the field above: one that
+            // appears only when it is interesting is one a client learns to
+            // skip. Unlike that field this one can be non-zero on a completed
+            // removal — it reports what will happen next, not what was refused.
+            "uploads_into_tree": uploads_into_tree,
         });
 
         if outcome.failures.is_empty() {

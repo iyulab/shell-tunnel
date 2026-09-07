@@ -582,7 +582,7 @@ same walk the removal itself uses, without touching anything:
 ```bash
 curl -X DELETE "$BASE/api/v1/fs/file?path=app/build&recursive=true&dry_run=true"
 # {"removed":3,"bytes":142311,"entries":["app/build/index.html","app/build/app.js","app/build"],
-#  "truncated":false,"dry_run":true,"staging_in_tree":false}
+#  "truncated":false,"dry_run":true,"staging_in_tree":false,"uploads_into_tree":0}
 ```
 
 Children are counted before their parent, so a directory follows its own contents in
@@ -607,7 +607,28 @@ that would take a directory an upload is landing in is refused. Under `--fs-root
 staging is one directory at the root of the jail, so **removing a subtree is not refused
 for an upload merely destined inside it** — the removal proceeds, and the upload's later
 `complete` recreates the path it needs and lands the file. Verified by running both.
-Nothing is lost either way; the difference is whether the removal waits. **A preview is not refused there** — it
+Nothing is lost either way; the difference is whether the removal waits.
+
+**`uploads_into_tree` is what tells you that, and it is the only thing that can.** It
+counts the uploads in flight that will land inside the tree you just asked to remove.
+`staging_in_tree` cannot answer this — it is about bytes an upload has *already written*,
+and under `--fs-root` it is `false` for every tree except the jail root. So a removal
+there answered `200` and then quietly came undone, with nothing in the response saying it
+would; there is no endpoint that lists uploads in flight, so no follow-up call could have
+told you either. Non-zero means **the removal is not final**: wait for those uploads, or
+`DELETE` the sessions if you know them. It is a count and not a list of session ids
+because an id belongs to whoever opened the session, and one caller's delete is not the
+place to hand it to another. Both layouts report it, and it is present on every tree
+answer including a preview, `0` included.
+
+```bash
+curl -X DELETE "$BASE/api/v1/fs/file?path=tree2&recursive=true"
+# {"removed":3,"bytes":5,"entries":["tree2/sub/keep.txt","tree2/sub","tree2"],
+#  "truncated":false,"dry_run":false,"staging_in_tree":false,"uploads_into_tree":1}
+#                                     ↑ nothing written was destroyed
+#                                                              ↑ and one upload will put
+#                                                                this tree back
+``` **A preview is not refused there** — it
 touches nothing, so there is no upload to protect it from, and "why can this tree not be
 removed" is the question a preview exists to answer. It answers `200` with
 `staging_in_tree: true`, which is what keeps a successful preview from reading as
@@ -1661,7 +1682,7 @@ startup rather than serving local-only.
 | **400** on `POST /api/v1/sessions` with an empty body | `Content-Type: application/json` was declared and no body sent. The route wants no body at all, but a declared JSON body still has to be one | send no content type and no body, or send `{}`. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
-| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload's staging directory is under this directory — which, under `--fs-root`, is the jail root rather than the destination's parent, so an upload merely *destined* into the tree does not raise this (§3.1) | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |
+| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload's staging directory is under this directory — which, under `--fs-root`, is the jail root rather than the destination's parent, so an upload merely *destined* into the tree does not raise this (§3.1) | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true`. For the case this does *not* refuse, read `uploads_into_tree` in the `200` — a non-zero count means the removal will be undone when those uploads complete (§3.1) |
 | **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |
 
 A relay connection that drops is retried with exponential backoff (1s→60s); the

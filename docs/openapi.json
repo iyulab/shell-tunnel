@@ -1594,7 +1594,8 @@
           "entries",
           "truncated",
           "dry_run",
-          "staging_in_tree"
+          "staging_in_tree",
+          "uploads_into_tree"
         ],
         "properties": {
           "removed": {
@@ -1625,6 +1626,10 @@
           "staging_in_tree": {
             "type": "boolean",
             "description": "An upload's staging directory is under this directory — which is the destination's parent machine-wide and the jail root under `--fs-root`, so in a jail an upload destined into this tree does not set it. Only ever `true` on a preview: a real removal with an upload under it is refused with `409 staging-in-tree` instead, so this field is what keeps a successful preview from reading as permission to proceed. Always present, including when `false`."
+          },
+          "uploads_into_tree": {
+            "type": "integer",
+            "description": "How many uploads in flight will land inside the deleted tree once they complete. Distinct from `staging_in_tree`, and the two are not redundant: that one is about bytes an upload has *already written* (which is what the 409 guard protects), while this is about bytes still coming. Under `--fs-root` staging lives at the jail root, so `staging_in_tree` is false for every tree but that one — and a removal there answers 200 and is then undone when the upload completes and recreates the path. Non-zero means the removal is not final. There is no endpoint that enumerates uploads in flight, so this is the only place a caller learns it; the count rather than the session ids, because an id belongs to whoever opened the session."
           }
         }
       },
@@ -1640,7 +1645,8 @@
           "staging_in_tree",
           "failures",
           "error",
-          "message"
+          "message",
+          "uploads_into_tree"
         ],
         "properties": {
           "removed": {
@@ -1683,6 +1689,14 @@
           },
           "message": {
             "type": "string"
+          },
+          "staging_in_tree": {
+            "type": "boolean",
+            "description": "An upload's staging directory is under this directory — which is the destination's parent machine-wide and the jail root under `--fs-root`, so in a jail an upload destined into this tree does not set it. Only ever `true` on a preview: a real removal with an upload under it is refused with `409 staging-in-tree` instead, so this field is what keeps a successful preview from reading as permission to proceed. Always present, including when `false`."
+          },
+          "uploads_into_tree": {
+            "type": "integer",
+            "description": "How many uploads in flight will land inside the deleted tree once they complete. Distinct from `staging_in_tree`, and the two are not redundant: that one is about bytes an upload has *already written* (which is what the 409 guard protects), while this is about bytes still coming. Under `--fs-root` staging lives at the jail root, so `staging_in_tree` is false for every tree but that one — and a removal there answers 200 and is then undone when the upload completes and recreates the path. Non-zero means the removal is not final. There is no endpoint that enumerates uploads in flight, so this is the only place a caller learns it; the count rather than the session ids, because an id belongs to whoever opened the session."
           }
         }
       },

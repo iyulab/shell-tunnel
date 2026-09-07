@@ -226,6 +226,20 @@ pub struct FinishedUpload {
 /// One in-flight upload.
 struct Session {
     dest_rel: String,
+    /// Absolute path this upload will land at once it completes.
+    ///
+    /// Kept alongside `part_path` because the two answer different questions
+    /// and, under `--fs-root`, have no directory in common: staging lives at
+    /// the jail root there, so `has_live_part_under` is `false` for every tree
+    /// except that one. "Is an upload *destined* into this tree" is the
+    /// question a caller deleting a tree actually has, and only this field can
+    /// answer it.
+    ///
+    /// Not canonicalized, and cannot be: the destination usually does not
+    /// exist yet. Its existing prefix is canonical — it is built from a
+    /// resolved root — which is what `starts_with` against a canonicalized
+    /// ancestor needs.
+    dest_abs: PathBuf,
     /// Absolute canonicalized path to the staging file. Always built from a
     /// canonical prefix (the staging directory derived from an absolute
     /// destination). `has_live_part_under` compares this against caller-supplied
@@ -415,6 +429,43 @@ impl UploadStore {
         })
     }
 
+    /// How many live sessions will land *inside* `dir` when they complete.
+    ///
+    /// The counterpart to [`Self::has_live_part_under`], and deliberately not
+    /// the same question. That one asks whether removing `dir` would destroy
+    /// bytes an upload has already written, which is what the `409` guard
+    /// protects; this one asks whether removing `dir` will be *undone* by an
+    /// upload that is still coming. Under `--fs-root` the first is `false` for
+    /// every tree but the jail root, because that is where staging lives — so
+    /// a caller who deletes a tree there is told nothing at all today, and the
+    /// path reappears when the upload completes.
+    ///
+    /// A count rather than the ids: an id is what a *different* caller would
+    /// need to cancel the upload, and handing one caller's session ids to
+    /// another is not something a delete response should decide to do. The
+    /// number is enough to tell a caller its removal is not final.
+    ///
+    /// Same two conservative answers as `has_live_part_under` for the same
+    /// reasons — a poisoned lock or an uncanonicalizable `dir` reports at least
+    /// one rather than claiming there is none.
+    pub fn live_destinations_under(&self, dir: &Path) -> usize {
+        let Ok(sessions) = self.sessions.read() else {
+            return 1;
+        };
+        let Ok(canonical_dir) = std::fs::canonicalize(dir) else {
+            return 1;
+        };
+        sessions
+            .values()
+            .filter(|session| {
+                session
+                    .lock()
+                    .map(|s| s.dest_abs.starts_with(&canonical_dir))
+                    .unwrap_or(true)
+            })
+            .count()
+    }
+
     /// Open a session for `dest_rel`, which need not exist yet.
     ///
     /// Does *not* sweep expired sessions itself, even opportunistically — an
@@ -516,6 +567,7 @@ impl UploadStore {
 
         let session = Session {
             dest_rel: dest_rel.clone(),
+            dest_abs: dest_abs.to_path_buf(),
             part_path,
             declared_size: size,
             declared_sha256: sha256,
