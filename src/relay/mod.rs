@@ -829,7 +829,34 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
 
     let body = match axum::body::to_bytes(request.into_body(), MAX_BODY).await {
         Ok(body) => body,
-        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        // Says which ceiling, because two different ones answer `413` on this
+        // path — this one, and the device's own route limit behind it — and a
+        // caller that cannot tell them apart cannot tell whether splitting the
+        // request will help. It was a bodyless `413`: measured against a running
+        // relay, `size_download: 0`. Its neighbour three lines down has carried
+        // "no data connection available" since it was written; this line was the
+        // only refusal here that said nothing.
+        //
+        // **No test asserts this string, and that is a finding rather than an
+        // omission.** Delivery depends on the client: this refusal is answered
+        // while the body is still arriving, and closing on top of the unread
+        // remainder draws a reset that discards it. `curl` receives it every
+        // time (measured: `size_download: 37`, the text below) because it polls
+        // the socket between writes; no async client shape in this repo's tests
+        // matches that. Measured on a 9 MiB body — a client that writes then
+        // reads lost it in 36 of 40 runs, one writing from a spawned task lost
+        // it in 40 of 40, and declaring the length while sending only a prefix
+        // does not help either because `to_bytes` waits for the body rather
+        // than refusing on the hint (20s timeout, every run). The string is
+        // verified the way this repo verifies banner text — against a running
+        // binary, quoted — and `USAGE.md` §10 documents the condition.
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body over the relay's ceiling",
+            )
+                .into_response()
+        }
     };
 
     let Some(conn) = device.take(POOL_WAIT).await else {

@@ -79,6 +79,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   with a trail entry before the guard existed. Without this the trail would have covered
   less while §4 of the operating guide went on claiming exactly what it claimed before.
 
+- **The relay's own over-ceiling refusal says which ceiling refused it.** It was a `413`
+  with an empty body — measured against a running relay, `size_download: 0` — on a path where
+  a second `413` with a different remedy (the device's route limit) also lives. Its neighbour
+  in the same function has named itself since it was written; this was the only refusal there
+  that said nothing.
+
+  ⚠ Whether a caller receives it depends on the caller: the relay refuses while the body is
+  still arriving, and the reset that follows discards the answer for a client that writes the
+  whole body before reading. `curl` and every mainstream library read as they write and get
+  it; a naive client sees a dropped connection instead. The operating guide's §10 now says
+  so rather than promising a `413`. Reading the oversized body anyway would fix delivery and
+  reintroduce exactly the denial of service the ceiling exists to prevent.
+
 - **A request body over 8 MiB is refused with `413 request body exceeds the server's ceiling`
   on every route**, in plain text, before authentication or any other check. Previously such
   a body was refused by whatever route it reached, at that route's own limit. Bodies under

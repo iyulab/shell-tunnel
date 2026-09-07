@@ -1788,7 +1788,20 @@ documented here.
 - **Relay proxies request/response HTTP and WebSocket.** Server-sent events
   buffer instead of streaming.
 - **Relay is single-tenant** (one shared enrol token, no isolation between devices).
-- **8 MiB** request body limit through the relay. Over it, the relay answers **413**.
+- **8 MiB** request body limit through the relay. Over it, the relay answers **413
+  `request body over the relay's ceiling`** — naming which ceiling, because the device's
+  own route limit behind it answers `413` too and calls for something different.
+  ⚠ **Whether you receive that answer depends on your client.** The relay refuses while the
+  body is still arriving and then closes, and closing on top of bytes it never read makes
+  the operating system send a reset — which discards whatever your client has not read yet,
+  including the answer. A client that reads the socket while it writes (`curl`, and every
+  mainstream HTTP library) gets it; one that writes the whole body and only then reads
+  usually does not, and sees a dropped connection instead. Measured on a 9 MiB body: `curl`
+  every time, a write-then-read client 4 times in 40. Sending a body this large is a
+  mistake in any case — that is what an upload session is for (§3.1) — so the practical
+  advice is unchanged; what changes is not to expect a tidy `413` to explain it.
+  Deliberately not fixed by reading the oversized body anyway: that is the denial of
+  service the ceiling exists to prevent.
   Since 0.24.0 the server enforces the same ceiling itself, on every route and outside
   every check that can refuse a request, answering **413 `request body exceeds the
   server's ceiling`** in plain text. It is there for a reason that has nothing to do with
