@@ -281,12 +281,35 @@ mod tests {
         // A bound-but-not-listening port refuses immediately on loopback —
         // exactly the `ECONNREFUSED` case the retry loop must keep retrying
         // through until the deadline, not return early on.
-        let dead_end = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .unwrap()
-            .local_addr()
-            .unwrap();
-        drop(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()); // hold nothing; just to vary the port
+        //
+        // `holder` is bound and never `listen`ed, and is held for the whole
+        // test. Both halves matter. Binding is what makes the port *refuse*
+        // rather than accept; holding is what stops a parallel test from
+        // taking it — this test used to bind a listener, drop it, and punch at
+        // the number, which lets any concurrent `:0` bind land there and the
+        // punch **succeed**, failing the assertion for a reason that has
+        // nothing to do with the deadline. Observed once under a full-suite
+        // run. Neither platform lets a second socket bind this address while
+        // it is held (tokio sets `SO_REUSEADDR` on Unix listeners, which
+        // permits rebinding a `TIME_WAIT` address, not stealing a live one,
+        // and does not set it at all on Windows).
+        let holder = TcpSocket::new_v4().unwrap();
+        holder.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let dead_end = holder.local_addr().unwrap();
+
+        // Observe the refusal rather than assume it. Without this, a platform
+        // where a bound-but-unlistened port *drops* the SYN instead of
+        // refusing it would still pass everything below — the deadline would
+        // simply be reached by hanging attempts — and the test would silently
+        // stop covering the case its name and comment claim.
+        assert_eq!(
+            tokio::net::TcpStream::connect(dead_end)
+                .await
+                .expect_err("a bound-but-unlistened port must refuse, not accept")
+                .kind(),
+            std::io::ErrorKind::ConnectionRefused,
+        );
+
         let started = tokio::time::Instant::now();
         let result = punch(0, dead_end, Duration::from_millis(200)).await;
         assert!(result.is_err());

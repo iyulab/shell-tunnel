@@ -329,13 +329,27 @@ fn explain_missing_line(
 
 /// A TCP port nothing is listening on, for a server a test has to connect to.
 ///
-/// Binding `:0` and closing hands back a port the OS had free a moment ago,
-/// which is not the same as reserving it — something else can take it in the
-/// window before the child binds. That race is against the machine's whole
-/// ephemeral range, though, where the fixed numbers this file used to carry
-/// raced against *each other*: two tests in this binary both wanted `39884`
-/// and both bound it, and `#[test]`s in one binary run in parallel by default.
-/// A leftover process from an interrupted run held those numbers too.
+/// **No caller can hold the port for the child**, which is the whole difficulty:
+/// the child has to bind it, so this can only hand back a number and hope it is
+/// still free a moment later. The job is therefore to make that window race
+/// against as little as possible.
+///
+/// Two earlier shapes each lost one half of it. Fixed numbers written into the
+/// tests raced against *each other* — two tests in this binary both wanted
+/// `39884` and both bound it, and `#[test]`s in one binary run in parallel by
+/// default. Binding `:0` and closing fixed that but bought a worse race: the
+/// number handed back is drawn from the machine's **ephemeral range**, which is
+/// exactly the range every other `:0` bind on the machine draws from — including
+/// the ones the rest of this suite makes constantly. That is not a theoretical
+/// window: `the_connect_banner_names_the_url_a_caller_should_use` lost it once
+/// under a full-suite run and the child died with `AddrInUse`.
+///
+/// So take both halves. A cursor hands out distinct numbers (no intra-binary
+/// collision, the fixed-number failure), from a range **no OS allocates for
+/// `:0`** (no collision with the ephemeral churn, the `:0` failure): Windows and
+/// macOS hand out 49152+, Linux 32768+, so the low twenty-thousands is claimed
+/// by neither. The bind is still attempted before returning, which is what
+/// skips a number a leftover process from an interrupted run is still holding.
 ///
 /// The ten spawn sites that only need a port the OS will accept do not need
 /// this — they pass `--port 0` and let it choose, with no window at all. Only
@@ -344,15 +358,34 @@ fn explain_missing_line(
 /// chosen port is announced by a `tracing` line at `info`, and that test exists
 /// to cover `warn`, where the line is not emitted.
 ///
-/// The same bind-`:0` call already appears in the two taken-port tests below,
-/// which keep the listener open instead of dropping it. This is that pattern
-/// with the opposite intent, not a new one.
+/// The same bind call already appears in the two taken-port tests below, which
+/// keep the listener open instead of dropping it. This is that pattern with the
+/// opposite intent, not a new one.
 fn reserved_port() -> u16 {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .expect("a loopback port is available")
-        .local_addr()
-        .expect("a bound listener has an address")
-        .port()
+    /// First port of the window this helper hands out from. Below every
+    /// platform's `:0` range and above the registered-service crowd.
+    const FIRST: u16 = 21_000;
+    /// How many it may walk before giving up. Larger than the number of ports
+    /// this binary can want at once by a wide margin — reaching the end means
+    /// something is holding hundreds of consecutive ports, which is worth a
+    /// panic rather than a wrap-around into numbers already handed out.
+    const SPAN: u16 = 500;
+
+    static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(FIRST);
+
+    loop {
+        let port = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            port < FIRST + SPAN,
+            "no free port in {FIRST}..{}; something is holding the whole window",
+            FIRST + SPAN
+        );
+        // Dropped immediately: this proves the port is free, it cannot reserve
+        // it. See the note above about what that window still races against.
+        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
 }
 
 /// The banner must name the scope `harden_for_public_exposure` actually chose,
