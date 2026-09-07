@@ -278,9 +278,11 @@ mod tests {
 
     #[tokio::test]
     async fn punch_gives_up_at_the_deadline_when_nothing_answers() {
-        // A bound-but-not-listening port refuses immediately on loopback —
-        // exactly the `ECONNREFUSED` case the retry loop must keep retrying
-        // through until the deadline, not return early on.
+        // A bound-but-not-listening port does not answer — on most platforms
+        // by refusing immediately (`ECONNREFUSED`), on the macOS runner by
+        // dropping the SYN (see the probe below). Either way it is a case the
+        // retry loop must keep retrying through until the deadline rather
+        // than return early on.
         //
         // `holder` is bound and never `listen`ed, and is held for the whole
         // test. Both halves matter. Binding is what makes the port *refuse*
@@ -297,18 +299,34 @@ mod tests {
         holder.bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let dead_end = holder.local_addr().unwrap();
 
-        // Observe the refusal rather than assume it. Without this, a platform
-        // where a bound-but-unlistened port *drops* the SYN instead of
-        // refusing it would still pass everything below — the deadline would
-        // simply be reached by hanging attempts — and the test would silently
-        // stop covering the case its name and comment claim.
-        assert_eq!(
-            tokio::net::TcpStream::connect(dead_end)
-                .await
-                .expect_err("a bound-but-unlistened port must refuse, not accept")
-                .kind(),
-            std::io::ErrorKind::ConnectionRefused,
-        );
+        // Observe what the platform actually does rather than assume it —
+        // and note that platforms disagree. Windows and Linux refuse
+        // (`ECONNREFUSED`, immediately). The macOS runner **drops** the SYN
+        // instead, and an unbounded `connect()` there does not return for
+        // 75s: that is how the earlier unconditional `ConnectionRefused`
+        // assertion here first failed, on CI and not locally. So bound the
+        // probe and accept exactly the two ways of not answering — never an
+        // accept, which is the outcome that would gut the test.
+        //
+        // Which of the two a platform gives decides which retry path is
+        // covered *here*: the refusal path where it refuses, the
+        // dropped-SYN path where it drops. `punch` treats them identically
+        // (`Ok(Err(_)) | Err(_)` — one arm), and both are "nothing answers",
+        // which is what this test's name claims and all it claims.
+        match tokio::time::timeout(
+            Duration::from_millis(500),
+            tokio::net::TcpStream::connect(dead_end),
+        )
+        .await
+        {
+            Ok(Ok(_)) => panic!("a bound-but-unlistened port must not accept"),
+            Ok(Err(e)) => assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::ConnectionRefused,
+                "a bound-but-unlistened port refused with an unexpected kind",
+            ),
+            Err(_elapsed) => { /* the SYN is dropped, not refused (macOS) */ }
+        }
 
         let started = tokio::time::Instant::now();
         let result = punch(0, dead_end, Duration::from_millis(200)).await;
