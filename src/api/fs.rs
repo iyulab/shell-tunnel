@@ -555,6 +555,12 @@ type ListedEntry = (String, std::path::PathBuf, std::fs::Metadata);
 /// threshold) for exactly the reason `fs_not_enabled`'s doc comment already
 /// explains — the caller builds the actual `Response` once it knows which
 /// refusal applies.
+///
+/// `Debug` is required by `Result::expect`, and the only caller that unwraps
+/// a walk that way is `#[cfg(unix)]`. Dropping the derive therefore breaks no
+/// build on a Windows host — it breaks every Unix target, and the host sees a
+/// green suite while it does. Keep it whether or not a Windows build needs it.
+#[derive(Debug)]
 enum WalkError {
     Unreadable,
 }
