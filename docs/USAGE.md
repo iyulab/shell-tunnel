@@ -1646,7 +1646,8 @@ startup rather than serving local-only.
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |
 | **502** `device is not connected` | device is not attached | check `/relay/v1/devices`. The request never reached the device — safe to retry |
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
-| **502** `device could not reach its local server` | the device could not carry the request out against the server it fronts | check that server is up. **Before 0.24.0 this also appeared when it was up and had answered**: a refusal sent before the request body finished arriving was discarded by the connection reset that followed, and this sentence was reported in its place — measured at about one relayed request in three on the runtime the server actually runs. A body-draining guard now keeps the real answer (§10) |
+| **502** `device could not reach its local server` | the device never got a connection to the server it fronts | **nothing ran** — safe to retry any request. Check that server is up |
+| **502** `device sent the request to its local server but got no answer` | the device connected and sent the request, and the exchange then ended with nothing coming back | **the outcome is unknown, not failed** — the request may have been carried out in full. Treat it like `504` (below), not like the row above. ⚠ Until 0.24.0 both of these said the row above's sentence, so a request that had been delivered was reported as one that never left; a `502` from an older device cannot be told apart |
 | **413** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay. Read-only — always safe to retry, though retrying without `Range` answers the same `413` again |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
 | **504** from a relay URL | device did not answer in 120s | **the outcome is unknown, not failed** — the request may have been carried out in full and only the answer lost. Never treat it as "did not happen". For an upload chunk, ask the session where it is (§3.2) and continue from there; for `/execute`, the command may still be running on the device |
@@ -1707,13 +1708,16 @@ caller.
 
 ### Which failures are safe to retry
 
-A relay failure does not tell you, on its own, whether the request ran. Two of them do:
+A relay failure does not tell you, on its own, whether the request ran. Some of them do —
+and *which* sentence a `502` carries is the whole of the distinction, so read the body, not
+just the status:
 
 - **`502 device is not connected`** and **`503`** are decided *before* the relay hands the
   request to a device. Nothing ran. Retrying is safe for any request.
-- **`502 device did not answer`** and **`504`** happen *after* the exchange started. The
-  device may have run the command and failed only on the way back. Do not blindly retry a
-  request that is not safe to run twice.
+- **`502 device did not answer`**, **`502 device sent the request to its local server but
+  got no answer`**, and **`504`** happen *after* the exchange started. The device may have
+  run the command and failed only on the way back. Do not blindly retry a request that is
+  not safe to run twice.
 - A relayed **`413`** on `GET .../fs/file` is neither of these — it means the file's whole-file
   response is too big for the relay to carry (above), not that the exchange failed. `GET` has
   no side effect, so it is always safe to retry; retrying without `Range` just answers `413`
@@ -1760,7 +1764,7 @@ documented here.
   size: a body under the ceiling is read off the connection *before* anything refuses the
   request, because a refusal answered on top of bytes still in flight is discarded by the
   connection reset that closing then provokes — which is how a route's `413`, or a `401`,
-  used to reach a relayed caller as `502 device could not reach its local server`
+  used to reach a relayed caller as a `502` claiming the device could not reach it
   ([§8](#8-failure-modes)). It is not new exposure: the chunk-upload route already
   accepted bodies this size, so the largest body the server will hold is unchanged.
 - **2 MiB** request body limit on the server's own routes — the lower of these two, so an

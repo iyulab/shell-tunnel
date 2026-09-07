@@ -33,6 +33,18 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   the connecting side, watching for an early answer — were measured against the same
   baseline; the best still lost 55 of 320, because that side does not decide the outcome.
 
+- **A `502` from a device now says whether the request was sent.** Three different endings
+  reported the same sentence, `device could not reach its local server`, and it was true of
+  only one of them: the device had connected and sent the request in the other two, so a
+  request that may have been carried out in full was reported as one that never left. That is
+  the difference between "nothing happened" and "the outcome is unknown" — the only thing
+  that tells a caller whether repeating a request is safe. Those endings now answer
+  `device sent the request to its local server but got no answer`.
+
+  A fourth ending said nothing at all: a local server that accepted the connection and closed
+  it cleanly produced a `502` with **no body and no content-type**. It now answers the same
+  sentence as the others.
+
 - **`Expect: 100-continue` is not a way around this, and it was checked rather than assumed.**
   The server sends `100 Continue` as soon as it sees the header, before the check that would
   refuse the request ever runs, so the body is sent anyway. Recorded because it is the first

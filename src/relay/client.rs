@@ -1208,7 +1208,7 @@ async fn replay_locally(
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let stream = match tokio::net::TcpStream::connect(local).await {
         Ok(stream) => stream,
-        Err(e) => return bad_gateway(format!("local server unreachable: {e}")),
+        Err(e) => return bad_gateway(NOTHING_WAS_SENT, format!("local server unreachable: {e}")),
     };
 
     let mut head = format!(
@@ -1337,13 +1337,25 @@ where
         return parse_response(&raw);
     }
     if write_failed {
-        return bad_gateway("connection closed before an answer arrived".to_string());
+        return bad_gateway(
+            NO_ANSWER_CAME_BACK,
+            "connection closed before an answer arrived".to_string(),
+        );
     }
     if !read_ok {
-        return bad_gateway("response was cut short".to_string());
+        return bad_gateway(NO_ANSWER_CAME_BACK, "response was cut short".to_string());
     }
 
-    parse_response(&raw)
+    // Nothing failed and nothing arrived: the peer accepted the connection and
+    // closed it cleanly without answering. This used to fall through to
+    // `parse_response` on an empty buffer, which produced a `502` with **no
+    // body and no content-type** — a refusal that declines to say anything at
+    // all, which is worse than the wrong sentence the other two branches used
+    // to carry, because there is nothing for a caller to even misread.
+    bad_gateway(
+        NO_ANSWER_CAME_BACK,
+        "the local server closed the connection without answering".to_string(),
+    )
 }
 
 /// Send one HTTP/1.1 request over an already-open stream and read exactly
@@ -1651,13 +1663,32 @@ fn parse_response(raw: &[u8]) -> (u16, Vec<(String, String)>, Vec<u8>) {
     (status, headers, body.to_vec())
 }
 
+/// What a caller is told when the device never got a connection to the server
+/// it fronts. Nothing ran.
+const NOTHING_WAS_SENT: &str = "device could not reach its local server";
+
+/// What a caller is told when the device did connect and did send the request,
+/// and then the exchange ended with nothing coming back.
+///
+/// Deliberately not [`NOTHING_WAS_SENT`], which is what both of these used to
+/// say. The distinction is not pedantry — it is the difference between "nothing
+/// happened" and **"the outcome is unknown"**, which is the only thing that
+/// tells a caller whether repeating a request is safe. The device had reached
+/// the server; the request may have been carried out in full and only the
+/// answer lost.
+const NO_ANSWER_CAME_BACK: &str = "device sent the request to its local server but got no answer";
+
 /// The response to report when the device's own server could not answer.
-fn bad_gateway(reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
+///
+/// `told` is the caller's half and is one of the two constants above; `reason`
+/// is the operator's half and stays in the log, where it can name which of the
+/// several ways this happened without turning into API surface.
+fn bad_gateway(told: &str, reason: String) -> (u16, Vec<(String, String)>, Vec<u8>) {
     tracing::debug!(target: "relay-client", "{reason}");
     (
         502,
         vec![("content-type".to_string(), "text/plain".to_string())],
-        b"device could not reach its local server".to_vec(),
+        told.as_bytes().to_vec(),
     )
 }
 
@@ -2276,5 +2307,63 @@ mod tests {
     fn a_malformed_response_is_reported_as_a_bad_gateway() {
         let (status, _, _) = parse_response(b"garbage");
         assert_eq!(status, 502);
+    }
+
+    /// The two sentences a caller can get from a `502` here mean opposite
+    /// things about whether the request ran, so nothing may collapse them.
+    ///
+    /// Both used to be the same string, and it was the *unreachable* one — so
+    /// a request that had been delivered, and might have been carried out in
+    /// full, was reported as one that never left. That is the reassuring
+    /// direction: "nothing happened" is the answer a caller would rather hear,
+    /// and it was the one being given without grounds.
+    #[test]
+    fn the_two_gateway_sentences_do_not_say_the_same_thing() {
+        assert_ne!(NOTHING_WAS_SENT, NO_ANSWER_CAME_BACK);
+        assert_eq!(NOTHING_WAS_SENT, "device could not reach its local server");
+        assert_eq!(
+            NO_ANSWER_CAME_BACK,
+            "device sent the request to its local server but got no answer"
+        );
+    }
+
+    /// A local server that accepts the connection and then closes without
+    /// answering has been *reached*. Whatever the caller is told, it must not
+    /// be that the device could not reach it.
+    ///
+    /// Drives `replay_locally` rather than asserting on the constant, because
+    /// the path that used to be silent here is the one where nothing failed:
+    /// the write succeeded, the read reached a clean EOF, and the buffer was
+    /// empty. Which of the empty-buffer branches wins is timing (the peer's
+    /// close may or may not beat the write), and the point of the fix is that
+    /// they no longer disagree — so a race between them cannot make this flake.
+    #[tokio::test]
+    async fn a_local_server_that_closes_without_answering_is_not_called_unreachable() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            drop(socket);
+        });
+
+        let request = ProxyRequest {
+            method: "GET".to_string(),
+            path: "/health".to_string(),
+            headers: Vec::new(),
+            websocket: false,
+        };
+        let (status, headers, body) = replay_locally(addr, &request, Vec::new()).await;
+
+        assert_eq!(status, 502);
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "device sent the request to its local server but got no answer"
+        );
+        // A bodyless 502 was the old outcome of exactly this case; the
+        // content-type is what says the body is meant to be read.
+        assert!(
+            headers.contains(&("content-type".to_string(), "text/plain".to_string())),
+            "{headers:?}"
+        );
     }
 }
