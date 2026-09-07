@@ -1270,14 +1270,20 @@ reason direct is unavailable. There is nothing to configure around this; it is a
 what a relay behind a proxy can see.
 
 **What a fallback looks like in the log.** Because the request still succeeds, the log is the
-only place the lost fast path is reported at all — so each of the three ways it can be lost
-says so at the default level, naming the peer and how long direct is paused:
+only place the lost fast path is reported at all — so the three ways a direct attempt is given
+up on each say so at the default level, naming the peer and how long direct is paused:
 
 ```
 INFO connect: direct connect to build-box timed out; using the relay for this request and pausing direct attempts for 60s
 INFO connect: direct connect to build-box failed (<reason>); using the relay for this request and pausing direct attempts for 60s
 INFO connect: direct connection to build-box broke mid-request; using the relay for this request and pausing direct attempts for 60s
 ```
+
+**Not every relayed request produces one, and that is deliberate.** Each line above announces a
+pause as it starts it; the requests that arrive *during* that pause take the relay without a
+further line, since one per request would say nothing the pause has not already said. So the
+count of these lines is the count of times direct was given up on, not the count of requests
+that went the slow way.
 
 A run of these against one peer is the symptom of the known limitation above, or of NATs that
 will not open to each other — not of anything failing. A `WARN connect:` line is a different
@@ -1430,7 +1436,7 @@ is involved to spend anything further.
 | Option | Description | Default |
 |---|---|---|
 | `-H, --host <ADDR>` | Bind address | `server.host` or `SHELL_TUNNEL_HOST`, else `127.0.0.1` |
-| `-p, --port <PORT>` | Port | `server.port` or `SHELL_TUNNEL_PORT`, else `3000`; OS-chosen with `--relay` |
+| `-p, --port <PORT>` | Port | `server.port` or `SHELL_TUNNEL_PORT`, else `3000`; OS-chosen with `--relay` and in `connect` mode |
 | `-c, --config <FILE>` | JSON config file | - |
 | `-k, --api-key <KEY>` | Key callers present to run commands here. **Adds to** a config file's keys rather than replacing them (§7) — unlike `--capabilities`/`--preset`, which replace | - |
 | `-l, --log-level <LVL>` | error / warn / info / debug / trace | `info` |
@@ -1493,6 +1499,12 @@ takes `--relay`, `--enroll-token`, `--relay-fingerprint` and `--relay-ca` exactl
 |---|---|---|
 | `--peer <DEVICE>` | Forward every request to this device, through the relay named by `--relay` | required |
 
+It also takes `-p` to pin the local port and `-l` for the log level. The three it names above
+are all required, and four flags it does not take are **refused rather than ignored**:
+`-H/--host` (it always binds loopback), `--device-name` (the device it attaches as is unnamed
+and lasts one invocation), `--tunnel`/`--tunnel-command` (it publishes nothing), and a bare
+`relay` (that is the other subcommand). [§8](#8-failure-modes) quotes each refusal.
+
 Environment: `SHELL_TUNNEL_HOST`, `SHELL_TUNNEL_PORT`, `SHELL_TUNNEL_API_KEY`,
 `SHELL_TUNNEL_LOG_LEVEL`, `RUST_LOG`.
 
@@ -1506,7 +1518,9 @@ binds there** — and a non-loopback bind is a reachable posture, so that server
 requires authentication and writes an audit trail; see
 [§2](#what-reachability-changes). Under `--relay` the local port is deliberately
 left for the OS to pick, since nothing outside this machine dials it; passing
-`-p` is what overrides that.
+`-p` is what overrides that. `connect` follows the same rule for the same
+reason, which is why the port it forwards on is one it prints rather than one
+you already know ([§5](#reaching-a-device-through-a-local-port-connect)).
 
 ---
 
@@ -1562,6 +1576,11 @@ startup rather than serving local-only.
 | `did not publish a public URL within 30s` | tunnel client never printed one | check its own output at `-l debug` |
 | `Tunnel closed: the public URL is no longer reachable` | tunnel client died; server exited with it | restart (a new URL is allocated) |
 | `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
+| `Configuration error: connect requires --relay` — likewise `--enroll-token`, `--peer` | `connect` needs all three before it can do anything: which relay to join, the secret to join it with, and which attached device to forward to ([§5](#reaching-a-device-through-a-local-port-connect)) | supply the one it names. It reports them one at a time, in that order |
+| `connect and -H/--host cannot be used together` | `connect` always binds loopback — nothing outside this machine dials the port it opens, so a bind address is not a choice it offers | drop `-H`. `-p` *is* accepted and pins the local port, which is otherwise OS-chosen ([§6](#6-cli-reference)) |
+| `connect and --device-name cannot be used together` | `connect` attaches as an unnamed device that exists for the one invocation; a stable name would name nothing worth addressing later | drop `--device-name`. The name that matters is `--peer`, the device being forwarded to |
+| `connect and --tunnel cannot be used together` — or `--relay and --tunnel …`, whichever conflict is reached first | `connect` reaches a device *through* a relay; it publishes nothing of its own, so there is nothing for a tunnel to publish | drop `--tunnel`/`--tunnel-command` |
+| `connect and relay cannot be used together` | `shell-tunnel connect` and `shell-tunnel relay` are separate modes, and the second was given as a bare word | run one or the other |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this connection: HTTP 429` | the relay is rate limiting this device's **address**, not rejecting the device | transient — the device keeps retrying and attaches once the address is under the limit. If it persists, something else on this outbound address is spending the relay's per-address budget: raise the relay's limit, or give the device an address of its own |
@@ -1714,7 +1733,7 @@ documented here.
   device: a device advertises **256 KiB** instead of 4 MiB only for an upload request
   that actually crossed a relay, so that size clears the deadline on a link sustaining
   about 2 KB/s. A caller reaching a relay-joined device directly — including over a
-  direct-connect socket (§11) — is told the plain 4 MiB default, since that leg is never
+  direct-connect socket (§5) — is told the plain 4 MiB default, since that leg is never
   bound by the relay's deadline at all. Passing `--fs-chunk-size` explicitly overrides
   both to the same value and warns if it is larger than the relay-safe size — the
   override is honoured because only the operator can know the relay↔device link is
