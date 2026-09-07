@@ -199,6 +199,13 @@ pub mod direct_unavailable {
     pub const PEER_GONE: &str = "peer-gone";
     /// A device asked to connect directly to itself.
     pub const SELF_TARGET: &str = "self-target";
+    /// The two devices' observed addresses cannot reach each other: one is
+    /// private to its own network and the other is outside it, so the address
+    /// each would be told to open is meaningless to the other. Unlike every
+    /// other reason here this one does not change on a retry — it is a
+    /// property of where the relay sits relative to the two devices, and the
+    /// answer is the same until one of them moves.
+    pub const UNROUTABLE_PEER_ADDRESS: &str = "unroutable-peer-address";
 }
 
 #[cfg(test)]

@@ -18,6 +18,7 @@ pub mod client;
 pub mod direct;
 pub mod protocol;
 pub mod proxy;
+mod reachability;
 pub mod registry;
 
 use std::net::SocketAddr;
@@ -579,29 +580,12 @@ async fn control_session(
                             }
                         }
                         Ok(DeviceMessage::RequestDirect { target }) => {
-                            // A device asking to connect directly to itself:
-                            // nothing to look up or signal.
-                            let reason = if target == device_id {
-                                Some(direct_unavailable::SELF_TARGET)
-                            } else {
-                                match state.devices.get(&target) {
-                                    Some(peer_device) => {
-                                        match peer_device.signal(RelayMessage::DirectRequested {
-                                            from: device_id.clone(),
-                                            from_addr: peer.to_string(),
-                                        }) {
-                                            Ok(()) => None,
-                                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                                Some(direct_unavailable::PEER_BUSY)
-                                            }
-                                            Err(tokio::sync::mpsc::error::TrySendError::Closed(
-                                                _,
-                                            )) => Some(direct_unavailable::PEER_GONE),
-                                        }
-                                    }
-                                    None => Some(direct_unavailable::NO_SUCH_DEVICE),
-                                }
-                            };
+                            let reason = direct_request_outcome(
+                                &state.devices,
+                                &device_id,
+                                peer,
+                                &target,
+                            );
                             if let Some(reason) = reason {
                                 if send_json(
                                     &mut sink,
@@ -1075,6 +1059,57 @@ where
     let _ = sink.close().await;
 }
 
+/// Decide what a `RequestDirect` gets back, and signal the target when it is
+/// going ahead.
+///
+/// Split out of the control loop for one reason: **inside it, none of this is
+/// reachable from a test.** The loop needs a live WebSocket and, worse, an
+/// observed peer address that a test cannot choose — every test in this repo
+/// drives the relay over loopback, so the refusal below could never be
+/// exercised in place. Here the caller passes both addresses and a registry,
+/// which `attach` already lets a test populate with any address it likes.
+///
+/// Returns the reason to answer `DirectUnavailable` with, or `None` when the
+/// target was signalled and the two sides are now expected to punch.
+fn direct_request_outcome(
+    devices: &registry::DeviceRegistry,
+    requester_id: &str,
+    requester_addr: SocketAddr,
+    target: &str,
+) -> Option<&'static str> {
+    // A device asking to connect directly to itself: nothing to look up or
+    // signal.
+    if target == requester_id {
+        return Some(direct_unavailable::SELF_TARGET);
+    }
+    let Some(peer_device) = devices.get(target) else {
+        return Some(direct_unavailable::NO_SUCH_DEVICE);
+    };
+    // Refuse the pairs that cannot work before signalling anything. The relay
+    // is the only party that sees both addresses, and a requester told now
+    // spends one relay round trip instead of the whole punch deadline — every
+    // time, since this answer does not change on a retry.
+    if reachability::direct_is_impossible(requester_addr, peer_device.reflexive_addr) {
+        tracing::info!(
+            target: "relay",
+            device_id = %requester_id,
+            peer_device_id = %target,
+            "declined a direct connection: these two devices are observed on addresses that cannot reach each other. A direct attempt is possible only when this relay sits outside both devices' networks"
+        );
+        return Some(direct_unavailable::UNROUTABLE_PEER_ADDRESS);
+    }
+    match peer_device.signal(RelayMessage::DirectRequested {
+        from: requester_id.to_string(),
+        from_addr: requester_addr.to_string(),
+    }) {
+        Ok(()) => None,
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Some(direct_unavailable::PEER_BUSY),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Some(direct_unavailable::PEER_GONE)
+        }
+    }
+}
+
 /// Serialize and send one protocol message.
 async fn send_json<S, T>(sink: &mut S, message: &T) -> Result<(), ()>
 where
@@ -1101,6 +1136,108 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The refusal these cover cannot be reached through the control loop in a
+    /// test: it needs the relay to observe one device on a private address and
+    /// the other on a public one, and every relay a test starts here is reached
+    /// over loopback. `attach` takes the observed address as an argument, which
+    /// is what makes the pair constructible at this seam.
+    fn registry_with(
+        devices: &[(&str, &str)],
+    ) -> (registry::DeviceRegistry, Vec<registry::DeviceHandles>) {
+        let registry = registry::DeviceRegistry::new();
+        let handles = devices
+            .iter()
+            .map(|(id, addr)| registry.attach(*id, None, addr.parse().expect("test address")))
+            .collect();
+        (registry, handles)
+    }
+
+    #[test]
+    fn a_direct_request_between_addresses_that_cannot_reach_each_other_is_refused_without_signalling(
+    ) {
+        let (registry, mut handles) = registry_with(&[("target", "198.51.100.7:9000")]);
+        let outcome = direct_request_outcome(
+            &registry,
+            "requester",
+            "10.0.0.5:40000".parse().unwrap(),
+            "target",
+        );
+        assert_eq!(outcome, Some(direct_unavailable::UNROUTABLE_PEER_ADDRESS));
+        // The point of refusing here rather than after the fact: the target is
+        // never woken, so neither side spends the punch deadline.
+        assert!(handles[0].signal_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_direct_request_between_two_public_addresses_signals_the_target() {
+        let (registry, mut handles) = registry_with(&[("target", "198.51.100.7:9000")]);
+        let outcome = direct_request_outcome(
+            &registry,
+            "requester",
+            "203.0.113.5:40000".parse().unwrap(),
+            "target",
+        );
+        assert_eq!(outcome, None);
+        assert!(matches!(
+            handles[0].signal_rx.try_recv(),
+            Ok(RelayMessage::DirectRequested { from, from_addr })
+                if from == "requester" && from_addr == "203.0.113.5:40000"
+        ));
+    }
+
+    #[test]
+    fn a_loopback_pair_is_still_signalled() {
+        // Both sides private is not a refusal — and it is the shape every
+        // relay test in this repository has, so a wider rule would silently
+        // disable direct-connect for all of them.
+        let (registry, mut handles) = registry_with(&[("target", "127.0.0.1:9000")]);
+        let outcome = direct_request_outcome(
+            &registry,
+            "requester",
+            "127.0.0.1:40000".parse().unwrap(),
+            "target",
+        );
+        assert_eq!(outcome, None);
+        assert!(handles[0].signal_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn the_other_refusals_are_unchanged_by_the_reachability_check() {
+        let (registry, handles) = registry_with(&[("target", "198.51.100.7:9000")]);
+        // Self-target is answered before any address is looked at — including
+        // when the requester's own address would pair badly with its entry.
+        assert_eq!(
+            direct_request_outcome(
+                &registry,
+                "target",
+                "10.0.0.5:40000".parse().unwrap(),
+                "target"
+            ),
+            Some(direct_unavailable::SELF_TARGET)
+        );
+        assert_eq!(
+            direct_request_outcome(
+                &registry,
+                "requester",
+                "203.0.113.5:40000".parse().unwrap(),
+                "absent"
+            ),
+            Some(direct_unavailable::NO_SUCH_DEVICE)
+        );
+        // A target whose control session has ended still reports that, rather
+        // than being masked by the new check.
+        drop(handles);
+        assert_eq!(
+            direct_request_outcome(
+                &registry,
+                "requester",
+                "203.0.113.5:40000".parse().unwrap(),
+                "target"
+            ),
+            Some(direct_unavailable::PEER_GONE)
+        );
+    }
 
     fn config() -> RelayConfig {
         RelayConfig::new("127.0.0.1:0".parse().unwrap(), "secret")
