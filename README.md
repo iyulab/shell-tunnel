@@ -121,8 +121,9 @@ Everything then answers on `http://127.0.0.1:<port>/d/<name>/...`, and file tran
 one thing calling the relay directly does not: `connect` also asks the relay to introduce
 the two machines, and when their networks allow it the bytes go **straight to the device**
 instead of through the relay's hop. It falls back to the relay whenever that does not work,
-so it is never a thing to configure — only a thing that makes large transfers faster when
-it can. Sessions and `/execute` always take the relay path; a WebSocket upgrade is refused
+so nothing about `connect` itself needs configuring — but whether the introduction can
+succeed at all depends on where the relay sits relative to the two machines
+(`docs/USAGE.md` §5). Sessions and `/execute` always take the relay path; a WebSocket upgrade is refused
 here (`501`) rather than forwarded, so call the relay URL directly for those.
 
 No public relay of your own? `shell-tunnel --tunnel --preset operator` runs `cloudflared` and

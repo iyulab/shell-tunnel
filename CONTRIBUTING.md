@@ -16,9 +16,10 @@ cargo clippy-all             # lints the way CI does (alias)
 
 `default = []`, so the suites gated behind the `relay-client` and `tls` features
 compile to **zero tests** under a plain `cargo test --all`. They do not fail —
-they stop existing, and the run still reports `ok`. Measured on one revision:
-651 tests passing under `cargo test --all` against 711 under `cargo test-all`,
-the same test binaries either way.
+they stop existing, and the run still reports `ok`. Measured 2026-09-07:
+721 tests passing under `cargo test --all` against 808 under `cargo test-all` —
+22 test binaries run either way, and four of them contain no tests at all
+without the features. Both numbers only grow; read them for the gap.
 
 The `test-all` and `clippy-all` aliases in `.cargo/config.toml` carry the
 complete feature list, and `tests/ci_feature_gates.rs` holds those aliases and
@@ -51,3 +52,13 @@ sentence there ships silently and is read as the contract. If you change a flag,
 an endpoint, a status code, or a default, change what says so — and prefer
 verifying against a running binary, since `--help` output and response bodies are
 quoted in those files verbatim.
+
+Two more that a release pass keeps forgetting:
+
+- **`CHANGELOG.md`** is the one public artifact that says what changed *for a
+  consumer*. Anything observable from outside belongs in it.
+- **Grep for anything that names a release, not only for version numbers.** A
+  performance note here once pointed at "this crate's next release" for an
+  improvement the next release then shipped — false from the day it went out,
+  and matching no search for a version number. `next release`, `unreleased`,
+  `upcoming` are the phrases that hide.

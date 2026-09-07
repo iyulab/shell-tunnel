@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells. \n\nScope: these are the paths a device serves — the gateway's own API. The relay and `shell-tunnel connect` are transports that carry this same API rather than surfaces of their own, so their routes (`/d/<device>/...`, `/relay/v1/devices`, and connect's local port) are not listed here; docs/USAGE.md documents those. A status code that only arises when a request crosses a relay is documented on the path it happens to, not separately.",
-    "version": "0.22.0",
+    "version": "0.23.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -865,7 +865,7 @@
             }
           },
           "409": {
-            "description": "`staging-in-tree` — an upload is in flight somewhere under this directory. Refused whole rather than removed around it; cancel the upload or wait for it to finish, then retry. A preview (`dry_run=true`) is not refused here — it touches nothing, and reports `staging_in_tree: true` instead so the caller can see both the size of the tree and what is holding it.",
+            "description": "`staging-in-tree` — an upload's staging directory is under this directory. Staging sits beside the destination when the file API reaches the whole machine, and at the root of the jail under `--fs-root` — so in a jail an upload merely *destined* into this tree does not raise this, and the removal proceeds (the upload's later `complete` recreates the path it needs). Refused whole rather than removed around it; cancel the upload or wait for it to finish, then retry. A preview (`dry_run=true`) is not refused here — it touches nothing, and reports `staging_in_tree: true` instead so the caller can see both the size of the tree and what is holding it.",
             "content": {
               "application/json": {
                 "schema": {
@@ -1624,7 +1624,7 @@
           },
           "staging_in_tree": {
             "type": "boolean",
-            "description": "An upload is in flight somewhere under this directory. Only ever `true` on a preview: a real removal with an upload under it is refused with `409 staging-in-tree` instead, so this field is what keeps a successful preview from reading as permission to proceed. Always present, including when `false`."
+            "description": "An upload's staging directory is under this directory — which is the destination's parent machine-wide and the jail root under `--fs-root`, so in a jail an upload destined into this tree does not set it. Only ever `true` on a preview: a real removal with an upload under it is refused with `409 staging-in-tree` instead, so this field is what keeps a successful preview from reading as permission to proceed. Always present, including when `false`."
           }
         }
       },

@@ -551,7 +551,7 @@ to the cursor, plus each directory a returned entry itself turns out to be — n
 whole tree beneath `path`. Measured on a 20,200-entry tree (200 directories of 100 files
 each): a `limit=1` first page took 1.5 ms, a `limit=10000` first page (the whole tree in
 one response) took 54 ms, and paging all the way through at the default `limit=1000` —
-21 pages, every entry — took 133 ms total. Until this crate's next release every page
+21 pages, every entry — took 133 ms total. Until 0.22.0 every page
 walked and sorted the entire subtree first and only then sliced out its page, so page
 cost tracked the tree's size, not the page's; it does not any more.
 
@@ -599,8 +599,15 @@ it does not.
 
 Drop `dry_run` (or set it to `false`, the default) and the same request performs the
 removal, answering the same body shape. `removed`/`bytes` are exact there — but only when
-nothing failed. A tree holding an upload in flight is refused whole, `409
-staging-in-tree`, rather than partly removed. **A preview is not refused there** — it
+nothing failed. A tree holding an upload's **staging directory** is refused whole, `409
+staging-in-tree`, rather than partly removed. What that covers depends on where staging
+lives, which is not the same in both deployments (see the `.shell-tunnel-uploads` note
+below): reaching the whole machine, staging sits beside the destination, so a removal
+that would take a directory an upload is landing in is refused. Under `--fs-root`,
+staging is one directory at the root of the jail, so **removing a subtree is not refused
+for an upload merely destined inside it** — the removal proceeds, and the upload's later
+`complete` recreates the path it needs and lands the file. Verified by running both.
+Nothing is lost either way; the difference is whether the removal waits. **A preview is not refused there** — it
 touches nothing, so there is no upload to protect it from, and "why can this tree not be
 removed" is the question a preview exists to answer. It answers `200` with
 `staging_in_tree: true`, which is what keeps a successful preview from reading as
@@ -1044,6 +1051,13 @@ The relay derives the URL it advertises from each connection's `Host` /
 `X-Forwarded-*` headers, so nothing else is needed behind a proxy.
 `--public-base https://relay.example.com` pins a canonical one.
 
+**A proxy in front costs one thing.** The relay reads each device's address off
+its own socket, so behind a proxy every device looks like the proxy — and
+`connect`'s direct socket to a device (below) can then never succeed. Nothing
+fails: those requests take the relay path, which is what they would have done
+anyway. Terminating TLS on the relay itself, the next section, is what keeps
+that faster path available.
+
 ### TLS without a proxy
 
 A relay can terminate TLS itself, which is the difference between tokens
@@ -1268,6 +1282,32 @@ a direct attempt to any of them cannot succeed — every filesystem request then
 the relay path, correctly and without failing the request, exactly as it would for any other
 reason direct is unavailable. There is nothing to configure around this; it is a property of
 what a relay behind a proxy can see.
+
+**The same collapse has a second cause, and it needs no proxy at all: a relay
+placed inside the network of some of the devices it serves.** Every device on
+that side is then observed at that network's one outbound address, so a peer
+outside it is handed an address that does not route from where it stands, and
+two devices *inside* it are handed an address they share — which a gateway
+generally will not turn back on itself. This is the more common way to arrive
+here than the proxy above, because putting the relay next to the machines it
+serves is the obvious first thing to try. Unlike the proxy case there is
+something to configure around it: **a direct attempt is possible only when the
+relay sits outside both peers' networks**, which is the same requirement a STUN
+server has and for the same reason. A relay on a host with its own public
+address meets it; one reached through a proxy does not, per the paragraph above.
+
+**One of those two shapes the relay can recognise, and it now says so instead of
+letting the attempt run.** When the address it observed for one device is private
+to its own network and the other's is not, the punch is not unlikely but
+meaningless — no packet from the outside peer can ever arrive — so the relay
+answers the request immediately with the reason `unroutable-peer-address` rather
+than signalling anything. The request then falls back after one relay round trip
+instead of the several seconds a punch attempt is given, and the log line below
+names that reason, which is the difference between "the network was unlucky
+again" and "this can never work here". The other shape — two devices behind one
+gateway, seen at the same address — is *not* refused: whether that opens depends
+on the gateway turning traffic back on itself, which the relay cannot see, and
+refusing a pair that might work is worse than spending the attempt.
 
 **What a fallback looks like in the log.** Because the request still succeeds, the log is the
 only place the lost fast path is reported at all — so the three ways a direct attempt is given
@@ -1611,7 +1651,7 @@ startup rather than serving local-only.
 | **400** on `POST /api/v1/sessions` with an empty body | `Content-Type: application/json` was declared and no body sent. The route wants no body at all, but a declared JSON body still has to be one | send no content type and no body, or send `{}`. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
-| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload is in flight somewhere under this directory | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |
+| **409** `staging-in-tree` on `DELETE .../fs/file` | an upload's staging directory is under this directory — which, under `--fs-root`, is the jail root rather than the destination's parent, so an upload merely *destined* into the tree does not raise this (§3.1) | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true` |
 | **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |
 
 A relay connection that drops is retried with exponential backoff (1s→60s); the

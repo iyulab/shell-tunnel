@@ -2,10 +2,12 @@
 #
 # `cargo test --all` builds this crate with `default = []`, which is the right
 # default for a zero-dependency library and the wrong default for finding out
-# whether your change works: seven integration suites sit behind
-# `relay-client`/`tls`, so they compile to *zero tests*, report `ok`, and are
-# simply absent. Locally that is 9 test binaries instead of 16, and 382 unit
-# tests instead of 419 — all green, with every relay and TLS path unbuilt.
+# whether your change works: the integration suites behind `relay-client`/`tls`
+# compile to *zero tests*, report `ok`, and are simply absent. Measured
+# 2026-09-07: 721 tests instead of 808 — the same 22 test binaries run either
+# way, four of them empty, all green, with every relay and TLS path unbuilt.
+# (`CLAUDE.md` carries the same two numbers; they are measured together so they
+# cannot drift apart.)
 #
 # CI already runs the full set, and `tests/ci_feature_gates.rs` proves CI's
 # command line covers every gate. What that check could not fix is the command
