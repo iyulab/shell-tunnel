@@ -3,6 +3,122 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.22.0 — 2026-09-07
+
+> ⚠ **Two behaviour changes for an existing caller.** A relayed `GET /api/v1/fs/file`
+> whose response is over the relay's 16 MiB ceiling now answers `413` rather than the
+> generic `502` — see *Fixed*. And a caller that reaches a relay-joined device *without*
+> crossing the relay is now advertised the plain 4 MiB upload chunk size rather than the
+> relay-safe 256 KiB — see *Changed*. Both remain values to read from the create-session
+> response rather than assume, which is what they were for.
+
+### Added
+
+- **`shell-tunnel connect`: reach one relay-attached device through a local port.** A third
+  CLI mode beside the gateway and the relay. It attaches to a relay, forwards everything
+  arriving on a local port to exactly one device by name, and prints the port it bound:
+
+  ```
+  shell-tunnel connect --relay https://relay.example.com --enroll-token <secret> --peer build-box
+  connect: forwarding http://127.0.0.1:53114/d/build-box/... to build-box
+  ```
+
+  The path stays `/d/<device>/…`, so the only thing a caller changes is the base URL. It
+  binds loopback and nothing else — `-H/--host` is refused rather than ignored, as are
+  `--device-name` and `--tunnel`, none of which mean anything for a process that exists for
+  one invocation and publishes nothing. `-p` pins the port if you would rather not read it
+  off the banner. It exits on Ctrl-C, or on its own after an hour with nothing forwarded.
+
+  A WebSocket upgrade is refused with `501` rather than forwarded by either route.
+
+- **A direct connection between two attached devices, used for filesystem traffic.** When a
+  `connect` process forwards a request to `/api/v1/fs/…`, it first tries to reach the peer
+  over a TCP connection the two open to each other at the same moment, coordinated through
+  the relay and verified with a certificate fingerprint exchanged over it — never a
+  certificate authority, since there is no hostname to verify against. Bytes that succeed
+  this way never touch the relay's bandwidth or its per-request deadline.
+
+  The attempt is automatic, needs no port forwarding configured on either side, and fails
+  safe: if signaling, the socket open or the TLS handshake does not complete within a few
+  seconds, the request falls back to the relay path and direct attempts pause for a minute.
+  Whether the open succeeds at all still depends on the NATs and firewalls in between, and
+  a relay that itself sits behind a reverse proxy cannot observe an address worth dialling —
+  in which case every request simply takes the relay, correctly. Filesystem routes are
+  singled out because a relay's body ceiling and per-chunk deadline bind those hardest;
+  `/execute` and sessions always take the relay path.
+
+- **The relay tags every request it forwards with the response ceiling it will enforce.**
+  `GET /api/v1/fs/file` reads that tag and refuses an oversized whole-file or `Range`
+  response *before* touching the disk, rather than reading and sending a file only for the
+  relay's own read of the resulting frame to fail afterwards. The tag is absent on a direct
+  request, so a direct download is never held to the relay's limit.
+
+- **`GET /api/v1/sessions` carries `execution_count` and `last_exit_code`.** The per-session
+  detail view had both; the list view had neither, so learning either one about several
+  sessions meant a request per session. They are the same values the detail handler reads
+  off the same in-memory session the list handler was already iterating. `last_exit_code`
+  is omitted rather than sent as `null` before any command has run, matching the detail
+  view — a caller treating "field absent" as "unknown" would otherwise get a false reading.
+
+### Changed
+
+- **The upload chunk size is a property of the request, not of the device.** A relay-joined
+  device advertised its smaller, deadline-safe 256 KiB chunk size to *every* caller,
+  including one that had reached it directly and was therefore never subject to the relay's
+  per-request deadline that size exists to clear. The size a request is told, and held to,
+  is now decided from whether that request actually crossed the relay.
+
+  A request that crossed a relay is still told `262144`. A direct one — including over a
+  direct-connect socket to a relay-joined device — is told the plain `4194304`.
+  `--fs-chunk-size` continues to override both to the same explicit value. When the two
+  differ, the startup banner now names both under `File API:`, so a deployment that hands
+  out different numbers by path says so rather than leaving it to be found in a response.
+
+- **A `connect` process reports a lost direct route at the default log level.** The fallback
+  to the relay always succeeds, so nothing failed and nothing was going to be noticed — but
+  the fast path being gone is exactly the thing an operator investigating a slowdown needs,
+  and it was only visible at `debug`. Each of the three ways a direct attempt is given up on
+  now says so at `info`, naming the peer and how long direct is paused. Requests arriving
+  *during* that pause stay silent deliberately: one line per request would repeat what the
+  pause already announced.
+
+### Fixed
+
+- **A relayed response over the frame limit answered `502`, not `413`.** The relay carries a
+  device's whole response body in one WebSocket frame, and a body over the declared 16 MiB
+  ceiling fails that frame's read. Every read failure, whatever the cause, was folded into
+  one generic `502 device did not answer` — technically true and actively misdirecting: it
+  reads as "the device is unreachable" when the condition is a fixed, known-in-advance size
+  ceiling, and it put a read-only `GET` in the same "the exchange may have partly run, do
+  not blindly retry" bucket as a genuine mid-command failure.
+
+  A response over the limit now answers `413` and names the ceiling in the body; every other
+  read failure still answers `502` unchanged. The two ends run different major versions of
+  the same WebSocket library, so the too-large error cannot be named as a type here — its
+  `Display` text is stable across both, and that is what the relay matches on.
+
+- **`GET /api/v1/fs/list` re-walked and re-sorted the whole tree for every page.** The
+  response was bounded by `limit`; the work behind it was not. Page cost tracked total tree
+  size regardless of page size — measured beforehand, a 20,200-entry tree cost roughly the
+  same per page whether `limit` was 1 or 10000, and paging through it at the default
+  `limit=1000` walked and sorted the same tree once per page. Memory behaved the same way: a
+  single page over a 200,000-entry tree held 93 MB whatever the page size.
+
+  A page now opens only the directories on the way to the cursor plus those a returned entry
+  turns out to be, keeping a frontier ordered by full relative path rather than buffering
+  and sorting afterwards. Full-path order is not directory-first order — `a/b` falls between
+  `a.txt` and `a0` — so the frontier is what keeps that interleave right without holding a
+  subtree in memory to sort it.
+
+- **Relay signaling could block a device's own heartbeats.** Cross-device coordination shared
+  the path a device's control channel uses to keep itself alive, so a device could be judged
+  unresponsive while it was in fact only waiting.
+
+- **`docs/USAGE.md` described a `WebSocket` upgrade over `connect` as both always relayed and
+  always refused**, and its `501` body named an unshipped state of the code rather than what
+  a caller can do instead. Also corrected: a reference to a section that does not exist, and
+  a sentence that presented three log lines as a count of requests that took the slow path.
+
 ## 0.21.2 — 2026-08-14
 
 ### Fixed
