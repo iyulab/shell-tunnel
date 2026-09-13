@@ -720,7 +720,7 @@ also not a dense sequence — a refused `POST /uploads` consumes a serial — so
 is not a count of sessions opened either. Read the id from the response that gives it
 to you; do not generate or enumerate ids.
 
-#### 3.2 Resuming after a timeout — a `504` does not mean the chunk was lost
+#### 3.2 Resuming after a timeout or a dropped connection — neither means the chunk was lost
 
 **A timeout says the outcome is unknown, not that it failed.** The relay forwards a
 whole chunk to the device and waits 120s for the answer; if the answer is late, the
@@ -728,9 +728,18 @@ caller gets `504` — but the device may already have received the chunk and wri
 Treating that as failure discards a transfer that actually succeeded, and a consumer
 who did exactly that lost 12 MB of a 16 MB upload before resuming instead.
 
+**A connection that ends with no status at all is the same case.** A `PATCH` whose
+connection is reset or aborted mid-request — the client library reports a socket error,
+not an HTTP response — has the same three possible endings as a timeout: the chunk never
+arrived, it arrived and was written, or it was written and only the answer was lost. The
+session knows which; the socket error does not. Ask it, exactly as below, rather than
+resending from zero or giving up. A `503` that follows such a drop is different: it is
+decided by the relay before anything is forwarded (§8), so nothing happened and the same
+chunk is simply sent again.
+
 A `504` is only reachable through a relay, so `$BASE` here is `https://relay.example.com/d/<device>`,
 not the local `$BASE` from §3.1 — which is also why the session below advertises `262144`
-rather than the 4 MiB direct default (§10).
+rather than the 4 MiB direct default (§10). A dropped connection can happen on either path.
 
 The session is the authority on what it holds. Two ways to ask, both fine:
 
@@ -1749,6 +1758,11 @@ just the status:
   got no answer`**, and **`504`** happen *after* the exchange started. The device may have
   run the command and failed only on the way back. Do not blindly retry a request that is
   not safe to run twice.
+- **No status at all** — the connection was reset or aborted and the client saw a socket
+  error rather than a response — belongs with the *after* group, on either path, relayed or
+  not. The request may have been delivered in full before the connection went. For an
+  upload chunk the session says where it stands (§3.2); for anything else, observe the
+  effect before running it again.
 - A relayed **`413`** on `GET .../fs/file` is neither of these — it means the file's whole-file
   response is too big for the relay to carry (above), not that the exchange failed. `GET` has
   no side effect, so it is always safe to retry; retrying without `Range` just answers `413`
