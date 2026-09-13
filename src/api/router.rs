@@ -168,7 +168,23 @@ pub fn create_router() -> Router {
 }
 
 /// Create the API router with custom state (no security).
+///
+/// This "no security" convenience constructor uses the restrictive CORS
+/// default (no permissive CORS headers emitted).
 pub fn create_router_with_state(state: AppState) -> Router {
+    seal(routes().layer(TraceLayer::new_for_http()), state)
+}
+
+/// Every route this server has, and nothing else — no layers, no state.
+///
+/// The one place the route table is written. Both public constructors build
+/// on it: [`create_router_with_state`] adds tracing and seals; [`create_secure_router`]
+/// adds authentication, rate limiting, and the optional guards between them and
+/// seals. Until 0.25.0 each constructor spelled the table out itself, and the
+/// two copies could only be kept equal by reading both — `RequiredCapability::for_route`
+/// below maps *matched-path strings*, so a route present in one copy and not the
+/// other would authenticate in one router and 404 in the other, silently.
+fn routes() -> Router<AppState> {
     // Session routes
     let session_routes = Router::new()
         .route("/", get(list_sessions).post(create_session))
@@ -184,16 +200,22 @@ pub fn create_router_with_state(state: AppState) -> Router {
         .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
-    // Build main router. This "no security" convenience constructor uses the
-    // restrictive CORS default (no permissive CORS headers emitted).
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
-        .layer(TraceLayer::new_for_http())
-        // Same guard as `create_secure_router`, and for the same reason: an
-        // embedder serving this router answers a refusal on an unread body
-        // exactly as the secure one would. A guard that lives in one of two
-        // router constructors is a guard nobody can rely on.
+}
+
+/// Put the outermost guard on a router and give it its state.
+///
+/// The last step of both constructors, and the only place
+/// [`drain_request_body_middleware`] is attached: it has to sit outside
+/// everything that can refuse a request, so no refusal is answered with the
+/// body still unread — an embedder serving the plain router answers a refusal
+/// exactly as the secure one would. When this guard lived in each constructor
+/// separately (0.24.0), adding it meant adding it twice, and a guard that
+/// lives in one of two constructors is a guard nobody can rely on.
+fn seal(router: Router<AppState>, state: AppState) -> Router {
+    router
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state.audit),
             drain_request_body_middleware,
@@ -649,27 +671,10 @@ pub fn create_secure_router(
         register_key(&auth_store, key, &security.capabilities);
     }
 
-    // Session routes
-    let session_routes = Router::new()
-        .route("/", get(list_sessions).post(create_session))
-        .route("/{id}", get(get_session).delete(delete_session))
-        .route("/{id}/execute", post(execute_command))
-        .route("/{id}/ws", any(ws_handler));
-
-    // API v1 routes
-    let api_v1 = Router::new()
-        .route("/", get(api_info))
-        .route("/execute", post(execute_oneshot))
-        .route("/ws", any(ws_oneshot_handler))
-        .nest("/fs", fs_routes())
-        .nest("/sessions", session_routes);
-
     let allowed_hosts = security.allowed_hosts.clone();
 
-    // Build main router with security layers
-    let mut router = Router::new()
-        .route("/health", get(health))
-        .nest("/api/v1", api_v1)
+    // The shared route table, with the security layers on top
+    let mut router = routes()
         .layer(middleware::from_fn_with_state(
             (Arc::clone(&auth_store), Arc::clone(&state.audit)),
             capability_auth_middleware,
@@ -706,16 +711,7 @@ pub fn create_secure_router(
         router = router.layer(cors);
     }
 
-    // Outside everything that can refuse a request, so no refusal is answered
-    // with the body still unread — see `drain_request_body_middleware`.
-    router = router.layer(middleware::from_fn_with_state(
-        Arc::clone(&state.audit),
-        drain_request_body_middleware,
-    ));
-
-    let router = router.with_state(state);
-
-    (router, auth_store, rate_limiter)
+    (seal(router, state), auth_store, rate_limiter)
 }
 
 /// Server configuration.

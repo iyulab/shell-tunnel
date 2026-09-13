@@ -1156,3 +1156,42 @@ async fn a_body_under_the_ceiling_still_reaches_the_route_that_refuses_it() {
         "request body exceeds the server's ceiling"
     );
 }
+
+/// The route table and the outermost guard are each written once.
+///
+/// Both public constructors used to spell out every route and attach
+/// `drain_request_body_middleware` themselves. Two copies of a route table can
+/// only be kept equal by reading both, and `RequiredCapability::for_route` maps
+/// matched-path strings — a route present in one copy and not the other would
+/// authenticate in one router and 404 in the other, silently. The guard was
+/// worse: adding it meant adding it twice, and it was added twice (0.24.0).
+///
+/// A structural pin over a rule the compiler cannot see, in the same shape as
+/// `execution_takes_its_deadline_from_one_bounded_place`: counting strings in
+/// source is name-dependent and a doc comment can trip it, but that direction
+/// is loud, and the split this guards against would otherwise compile quietly.
+#[test]
+fn the_route_table_and_the_outermost_guard_are_written_once() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/router.rs");
+    let source = std::fs::read_to_string(&path).expect("source file is readable");
+
+    assert_eq!(
+        source.matches(".route(\"/health\"").count(),
+        1,
+        "the route table is written in one place (`routes()`); a second `/health` \
+         means a constructor grew a table of its own again"
+    );
+    assert_eq!(
+        source.matches(".nest(\"/api/v1\"").count(),
+        1,
+        "same rule for the API mount point"
+    );
+    assert_eq!(
+        source
+            .matches("            drain_request_body_middleware,\n")
+            .count(),
+        1,
+        "the outermost guard is attached in one place (`seal()`); each public \
+         constructor ends by calling it rather than layering the guard itself"
+    );
+}
