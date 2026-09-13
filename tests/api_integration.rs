@@ -1187,9 +1187,12 @@ fn the_route_table_and_the_outermost_guard_are_written_once() {
         "same rule for the API mount point"
     );
     assert_eq!(
-        source
-            .matches("            drain_request_body_middleware,\n")
-            .count(),
+        // No trailing `\n` in the pattern: a source file checked out with
+        // CRLF line endings (every Windows runner, by git's own default)
+        // carries `\r` before that newline, so a pattern ending in a bare
+        // `\n` never matches there and this assertion sees 0 instead of 1 —
+        // discovered when this exact line was the one CI job that failed.
+        source.matches("drain_request_body_middleware,").count(),
         1,
         "the outermost guard is attached in one place (`seal()`); each public \
          constructor ends by calling it rather than layering the guard itself"
