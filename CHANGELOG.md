@@ -3,11 +3,7 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## 0.24.0 — unreleased
-
-> ⚠ **The date is deliberately absent.** This section is written when the change lands, not
-> when it ships; fill it in at release. Every other section here is dated because it was
-> released.
+## 0.24.0 — 2026-09-13
 
 ### Fixed
 
@@ -98,6 +94,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   the ceiling are unaffected: they still meet the same per-route limits, with the same
   answers. The ceiling is the size the chunk-upload route already accepted, so the largest
   body this server will hold has not changed.
+
+### Documentation
+
+- **`docs/USAGE.md` §3.2 and §8 now say what to do when an upload chunk's connection drops
+  with no status at all.** The guide covered `504` — ask the session for its offset rather
+  than assume the chunk was lost — but a connection reset or aborted mid-`PATCH` has the same
+  three possible endings and was not named. It now is, in the same class as `504` and the
+  after-the-exchange `502`s: outcome unknown, ask the session. A `503` that follows such a
+  drop stays where it was — decided before anything is forwarded, nothing happened.
 
 ## 0.23.0 — 2026-09-07
 
