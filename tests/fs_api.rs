@@ -5317,3 +5317,32 @@ async fn a_single_file_preview_with_no_upload_headed_at_it_reports_zero() {
     let body = body_json(response).await;
     assert_eq!(body["uploads_into_tree"], 0, "{body}");
 }
+
+/// The delete response is built from one definition, on both paths.
+///
+/// The tree branch and the single-entry branch each assembled their own
+/// `json!` body, and a field added to one was missed on the other twice —
+/// `staging_in_tree`, then `uploads_into_tree`, with `docs/openapi.json` listing
+/// the field the body lacked both times. `DeleteReport` is that definition now:
+/// a struct literal cannot omit a field, so the compiler is the check. This pin
+/// is for the other direction — a branch quietly going back to `json!` — which
+/// would compile. Same shape as `the_route_table_and_the_outermost_guard_are_written_once`.
+#[test]
+fn the_delete_response_has_one_definition() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api/fs.rs");
+    let source = std::fs::read_to_string(&path).expect("source file is readable");
+
+    assert_eq!(
+        source.matches("DeleteReport {").count(),
+        4,
+        "the struct itself and its two literal sites (tree, single entry); a fourth \
+         is a new path that must also carry every field, a second is a path that \
+         went back to building its own body"
+    );
+    assert_eq!(
+        source.matches("\"uploads_into_tree\":").count(),
+        0,
+        "no branch spells the field out by hand any more — that is how it went \
+         missing"
+    );
+}

@@ -1029,6 +1029,44 @@ fn read_span(path: &std::path::Path, start: u64, length: u64) -> std::io::Result
     Ok(buffer)
 }
 
+/// What `DELETE …/fs/file` reports about a removal or a preview of one.
+///
+/// One definition, serialised on both paths — the tree and the single entry.
+/// They used to build the body separately with `json!`, and a field added to
+/// one was missed on the other twice (`staging_in_tree`, then
+/// `uploads_into_tree`; `docs/openapi.json` listed the field the body lacked).
+/// A struct literal cannot be missing a field: adding one here makes each
+/// path fail to compile until it says what the value is there.
+///
+/// Every field is always present. One that appears only when it is `true`, or
+/// only when it is interesting, is one a client learns to ignore — and then
+/// its absence starts meaning `false` again on the one path that forgot it.
+#[derive(Debug, Serialize)]
+struct DeleteReport {
+    removed: u64,
+    bytes: u64,
+    entries: Vec<String>,
+    truncated: bool,
+    dry_run: bool,
+    /// Bytes already written under the path by an upload in flight. `false`
+    /// on every completed removal — the handler refuses before removing when
+    /// it is `true` — and meaningful on a preview.
+    staging_in_tree: bool,
+    /// Uploads in flight whose destination lies under the path: bytes still
+    /// coming. Orthogonal to the field above, and non-zero on a completed
+    /// removal is the interesting case — it reports what will happen next
+    /// (the tree comes back when they complete), not what was refused.
+    uploads_into_tree: usize,
+}
+
+impl DeleteReport {
+    /// The report as a JSON object, for the path that adds `failures` and an
+    /// `error` to it after the fact.
+    fn into_value(self) -> serde_json::Value {
+        serde_json::to_value(self).expect("a report of plain fields serialises")
+    }
+}
+
 /// `DELETE /api/v1/fs/file` — remove one named entry.
 ///
 /// A *real* directory is refused unless `recursive=true` is given: the threat
@@ -1366,23 +1404,18 @@ fn delete_file_blocking(
         event.entries = Some(outcome.removed);
         audit.record(event);
 
-        let body = serde_json::json!({
-            "removed": outcome.removed,
-            "bytes": outcome.bytes,
-            "entries": outcome.entries,
-            "truncated": outcome.truncated,
-            "dry_run": query.dry_run,
-            // Always present rather than only on a preview: a field that
-            // appears just when it is `true` is one a client learns to ignore.
-            // On a real removal it is always `false` — the guard above
-            // returned otherwise.
-            "staging_in_tree": staging_in_tree,
-            // Always present, for the same reason as the field above: one that
-            // appears only when it is interesting is one a client learns to
-            // skip. Unlike that field this one can be non-zero on a completed
-            // removal — it reports what will happen next, not what was refused.
-            "uploads_into_tree": uploads_into_tree,
-        });
+        let body = DeleteReport {
+            removed: outcome.removed,
+            bytes: outcome.bytes,
+            entries: outcome.entries,
+            truncated: outcome.truncated,
+            dry_run: query.dry_run,
+            // On a real removal always `false` — the guard above returned
+            // otherwise.
+            staging_in_tree,
+            uploads_into_tree,
+        }
+        .into_value();
 
         if outcome.failures.is_empty() {
             return (StatusCode::OK, axum::Json(body)).into_response();
@@ -1420,27 +1453,24 @@ fn delete_file_blocking(
         );
         return (
             StatusCode::OK,
-            axum::Json(serde_json::json!({
-                "removed": 1,
-                "bytes": meta.len(),
-                "entries": [root.relative(&named).unwrap_or_default()],
-                "truncated": false,
-                "dry_run": true,
-                // Constant here, and present for exactly the reason it is
-                // present at all: a client told the field is always there must
-                // find it on every preview, or its absence starts meaning
-                // `false` again on the one path that forgot it. A staging file
-                // cannot live under something that is not a directory, so the
-                // guard the directory branch runs has nothing to test.
-                "staging_in_tree": false,
+            axum::Json(DeleteReport {
+                removed: 1,
+                bytes: meta.len(),
+                entries: vec![root.relative(&named).unwrap_or_default()],
+                truncated: false,
+                dry_run: true,
+                // Constant here: a staging file cannot live under something
+                // that is not a directory, so the guard the directory branch
+                // runs has nothing to test.
+                staging_in_tree: false,
                 // *Not* a constant, unlike its neighbour, and the asymmetry is
                 // the point: an upload cannot stage under a file, but it can be
                 // destined at exactly this path — and then removing the file is
                 // undone the moment that upload completes. `starts_with`
                 // answers that here without a special case, because a path
                 // starts with itself.
-                "uploads_into_tree": uploads.live_destinations_under(&named),
-            })),
+                uploads_into_tree: uploads.live_destinations_under(&named),
+            }),
         )
             .into_response();
     }
