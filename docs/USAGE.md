@@ -1471,10 +1471,12 @@ message and were always reported.
 
 **A proxied request that reaches an attached device is refunded the same way,
 once the device has answered** — unless the answer was `401` or `403`. What
-stays on the caller's tab is exactly what the limit is for: a device name that
-is not attached (`502 device is not connected`, the lookup described below) and
-a credential the device refused. A caller talking to a device with a key it
-accepts spends nothing here, however many requests it makes. Before 0.25.0 every
+stays on the caller's tab: a device name that is not attached (`502 device is
+not connected`, the lookup described below), a credential the device refused,
+a body over the relay's own 8 MiB ceiling (refused before any device is
+involved, §10), and a WebSocket upgrade (one slot per socket, however many
+messages it carries). A caller talking to a device with a key it accepts spends
+nothing here on ordinary requests, however many it makes. Before 0.25.0 every
 proxied request was charged and kept, which made the budget a throughput cap:
 at the relay's default 256 KiB chunk, 100 requests a minute is 26 MiB a minute,
 and a chunked upload hit the ceiling every hundred chunks. It was worse when the
@@ -1484,8 +1486,7 @@ device's replacement data connections were refused by it *before* the enrol
 token they carry could earn their refund, the pool ran dry, and every request
 to that device answered `503 no data connection available` until the window
 slid. The device now logs a `WARN` when a data connection is refused this way;
-it used to say so only at `debug`. A WebSocket upgrade keeps its slot: one
-socket carries any number of messages.
+it used to say so only at `debug`.
 
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
@@ -1498,7 +1499,13 @@ is counted like any other and the header is dropped before any handler sees
 it.) Before 0.25.0 the device counted every relayed caller as one client, and
 its own 100/minute was a second ceiling of the same size on the same upload.
 The relay still sees the real address, and its numbers are the ones a relayed
-caller is told about.
+caller is told about. **A request arriving over a direct-connect socket (§5,
+`connect`) carries no marker**: that path pipes bytes to the device's server
+without parsing them, so the device's limiter still counts it as one loopback
+client — 100 requests a minute shared by every direct peer, which at the direct
+path's 4 MiB chunk is 400 MiB a minute. Nobody has reached that ceiling, because
+a direct connection has not yet been observed to open outside a lab; it is
+recorded here so the sentence above is not read as covering it.
 
 Two limiters therefore sit in series on the proxied path, and a response can
 only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
