@@ -40,7 +40,8 @@ use futures_util::{SinkExt, StreamExt};
 
 use crate::error::ShellTunnelError;
 use crate::security::{
-    generate_api_key, rate_limit_middleware, RateLimitCharge, RateLimitConfig, RateLimiter,
+    constant_time_eq, generate_api_key, rate_limit_middleware, RateLimitCharge, RateLimitConfig,
+    RateLimiter,
 };
 use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
@@ -761,7 +762,32 @@ async fn attach_data_connection(
 }
 
 /// Forward a public request to the addressed device and return its response.
-async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Response {
+///
+/// **What this route costs the caller's rate-limit budget.** The limiter charges
+/// every request on the way in, and this handler gives the slot back once the
+/// request has turned out to be the kind the limit was never for. Kept — so
+/// still accumulating against the address — are the two things the limit
+/// exists to bound on this route (see [`relay_router`]): a miss on the device
+/// name (`502 device is not connected`, the lookup §5 of the operating guide
+/// calls discoverable), and a device answer of `401`/`403`, which is a
+/// credential that did not work. Everything else is refunded after the
+/// exchange: a caller talking to an attached device with a key it accepts is
+/// spending nothing the limiter guards, and until this refund existed it was
+/// capped at a hundred requests a minute — 26 MiB a minute at the relay's
+/// default chunk size, where a single upload hit the ceiling every hundred
+/// chunks. Worse, a device sharing the caller's address had its replacement
+/// data connections refused by the same full bucket, before the enrol token
+/// they carry could earn *their* refund, and every request to it answered
+/// `503` until the window slid. A WebSocket upgrade keeps its slot: one socket
+/// can carry any number of messages, so a slot per socket is already the
+/// generous rate.
+async fn proxy_handler(
+    State(state): State<RelayState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    charge: Option<Extension<RateLimitCharge>>,
+    request: Request,
+) -> Response {
+    let charge = charge.map(|Extension(charge)| charge);
     let path_and_query = request
         .uri()
         .path_and_query()
@@ -861,7 +887,12 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
 
     let Some(conn) = device.take(POOL_WAIT).await else {
         // The device is attached but has no spare connection. 503 with a
-        // Retry-After is the honest answer: try again shortly.
+        // Retry-After is the honest answer: try again shortly — and the retry
+        // it asks for should not be what fills the caller's bucket, so the
+        // slot goes back here too.
+        if let Some(charge) = charge {
+            state.limiter.refund(peer.ip(), charge);
+        }
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [("retry-after", "1")],
@@ -892,6 +923,25 @@ async fn proxy_handler(State(state): State<RelayState>, request: Request) -> Res
     .await;
     device.record_exchange(started.elapsed());
 
+    let response = proxied_response(outcome, &device);
+    let credential_refused = matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    );
+    if let (Some(charge), false) = (charge, credential_refused) {
+        state.limiter.refund(peer.ip(), charge);
+    }
+    response
+}
+
+/// Turn a forwarded exchange's outcome into the response the caller gets.
+fn proxied_response(
+    outcome: std::result::Result<
+        std::result::Result<Response, &'static str>,
+        tokio::time::error::Elapsed,
+    >,
+    device: &Device,
+) -> Response {
     match outcome {
         Ok(Ok(response)) => response,
         Ok(Err("response-frame-too-large")) => {
@@ -1145,19 +1195,6 @@ where
 {
     let json = serde_json::to_string(message).map_err(|_| ())?;
     sink.send(Message::Text(json.into())).await.map_err(|_| ())
-}
-
-/// Compare secrets without leaking their contents through timing.
-///
-/// The token is short and comparisons are rare, but an early-exit `==` on a
-/// shared secret is the kind of detail that is cheap to get right and awkward
-/// to retrofit.
-fn constant_time_eq(a: &str, b: &str) -> bool {
-    let (a, b) = (a.as_bytes(), b.as_bytes());
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

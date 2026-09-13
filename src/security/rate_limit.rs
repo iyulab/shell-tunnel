@@ -5,6 +5,8 @@ use std::net::IpAddr;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use super::constant_time_eq;
+
 use axum::{
     extract::{ConnectInfo, Request, State},
     http::StatusCode,
@@ -23,7 +25,30 @@ pub struct RateLimitConfig {
     pub enabled: bool,
     /// Maximum number of tracked IPs (memory limit).
     pub max_tracked_ips: usize,
+    /// A secret that marks a request as arriving over this process's own
+    /// relay-client hop, which the limiter then does not count.
+    ///
+    /// Behind a relay every proxied request is replayed to this server from
+    /// the relay client *in this same process*, so the peer address is
+    /// `127.0.0.1` for every caller there is. Counting those means one bucket
+    /// for all of them together — and at the relay's default 256 KiB chunk, a
+    /// hundred requests a minute is 26 MiB a minute, which is the ceiling a
+    /// single upload was hitting. Per-caller limiting for that traffic can only
+    /// happen where the caller's address is still visible, which is the relay
+    /// (see `relay::relay_router`); this server exempts the hop rather than
+    /// counting a number that identifies nobody.
+    ///
+    /// The marker travels as [`RELAY_HOP_HEADER`], generated once per process
+    /// and handed to both the router and the relay client, so a local process
+    /// that merely knows the header's name gains nothing by sending it. It is
+    /// stripped before any handler sees the request. `None` means no request
+    /// is exempt, which is every server not attached to a relay.
+    pub trusted_hop_token: Option<String>,
 }
+
+/// Header carrying [`RateLimitConfig::trusted_hop_token`] on a request the
+/// in-process relay client replays to its own server.
+pub const RELAY_HOP_HEADER: &str = "x-shell-tunnel-relay-hop";
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
@@ -32,6 +57,7 @@ impl Default for RateLimitConfig {
             window: Duration::from_secs(60),
             enabled: true,
             max_tracked_ips: 10000,
+            trusted_hop_token: None,
         }
     }
 }
@@ -212,6 +238,26 @@ impl RateLimiter {
         RateLimitDecision::Allowed { remaining, charge }
     }
 
+    /// Requests left in `ip`'s window right now, or `None` when nothing is
+    /// being counted.
+    ///
+    /// Read *after* a handler ran rather than remembered from before it, so a
+    /// slot the handler gave back (`refund`) is reflected in what the response
+    /// advertises. The count `check` computed is one request stale the moment
+    /// a refund lands, and a header built from it would tell a caller they had
+    /// one fewer than they do.
+    pub fn remaining(&self, ip: IpAddr) -> Option<u32> {
+        if !self.config.enabled {
+            return None;
+        }
+        let mut records = self.records.write().ok()?;
+        let count = records
+            .get_mut(&ip)
+            .map(|record| record.clean_and_count(self.config.window))
+            .unwrap_or(0);
+        Some(self.config.max_requests.saturating_sub(count))
+    }
+
     /// Give back the exact slot `charge` took.
     ///
     /// For a request whose legitimacy is only established *after* the limiter
@@ -336,10 +382,31 @@ pub async fn rate_limit_middleware(
         return next.run(request).await;
     }
 
+    // Taken off the request whether or not it matches: the marker is between
+    // this process's relay client and this middleware, and nothing past here
+    // should be able to read it back or forward it.
+    let hop = request.headers_mut().remove(RELAY_HOP_HEADER);
+    let over_own_relay_hop = match (&limiter.config.trusted_hop_token, hop) {
+        (Some(expected), Some(presented)) => presented
+            .to_str()
+            .is_ok_and(|presented| constant_time_eq(presented, expected)),
+        _ => false,
+    };
+    if over_own_relay_hop {
+        // The caller's address is the relay's to count — see
+        // `RateLimitConfig::trusted_hop_token`. No headers either: the relay
+        // fills that gap with its own numbers, the same as for a device
+        // started with `--no-rate-limit`.
+        return next.run(request).await;
+    }
+
     match limiter.check(addr.ip()) {
         // Nothing counted this request, so nothing is advertised about it.
         RateLimitDecision::Unlimited => next.run(request).await,
-        RateLimitDecision::Allowed { remaining, charge } => {
+        RateLimitDecision::Allowed {
+            remaining: _,
+            charge,
+        } => {
             // A handler that can establish, later than this, that the request
             // should not have been charged needs to name the slot to give back.
             // Passing it down the request is the only way it can: by the time
@@ -365,19 +432,25 @@ pub async fn rate_limit_middleware(
             // avoids: refused, with room to continue. A refusal this limiter
             // made takes the branch below and says `0` there.
             let refused_elsewhere = response.status() == StatusCode::TOO_MANY_REQUESTS;
+            // Read now, not remembered from `check`: a handler may have given
+            // this request's slot back in between (`refund`), and the number
+            // on the wire has to be the one that is true after it did.
+            let remaining = limiter.remaining(addr.ip());
             let headers = response.headers_mut();
-            if !refused_elsewhere
-                && !headers.contains_key("X-RateLimit-Limit")
-                && !headers.contains_key("X-RateLimit-Remaining")
-            {
-                headers.insert(
-                    "X-RateLimit-Limit",
-                    limiter.config.max_requests.to_string().parse().unwrap(),
-                );
-                headers.insert(
-                    "X-RateLimit-Remaining",
-                    remaining.to_string().parse().unwrap(),
-                );
+            if let Some(remaining) = remaining {
+                if !refused_elsewhere
+                    && !headers.contains_key("X-RateLimit-Limit")
+                    && !headers.contains_key("X-RateLimit-Remaining")
+                {
+                    headers.insert(
+                        "X-RateLimit-Limit",
+                        limiter.config.max_requests.to_string().parse().unwrap(),
+                    );
+                    headers.insert(
+                        "X-RateLimit-Remaining",
+                        remaining.to_string().parse().unwrap(),
+                    );
+                }
             }
 
             response
@@ -508,6 +581,105 @@ mod tests {
     }
 
     /// A refunded slot goes back into the same window it came out of.
+    /// The hop marker never reaches a handler, matching or not.
+    ///
+    /// It is a secret between this process's relay client and this
+    /// middleware; a handler that could read it could also leak it, and a
+    /// caller who sent one from outside should find no trace of it having
+    /// been considered. The probe handler reports whether the header arrived.
+    #[tokio::test]
+    async fn the_hop_marker_is_stripped_before_any_handler_sees_it() {
+        use axum::extract::connect_info::MockConnectInfo;
+        use axum::{routing::get, Router};
+        use tower::ServiceExt;
+
+        async fn probe(headers: axum::http::HeaderMap) -> &'static str {
+            if headers.contains_key(RELAY_HOP_HEADER) {
+                "leaked"
+            } else {
+                "clean"
+            }
+        }
+
+        let mut config = RateLimitConfig::custom(1, 60);
+        config.trusted_hop_token = Some("hop".to_string());
+        let limiter = std::sync::Arc::new(RateLimiter::new(config));
+        let app = Router::new()
+            .route("/", get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                limiter,
+                rate_limit_middleware,
+            ))
+            .layer(MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                1,
+            ))));
+
+        let body = |response: Response| async move {
+            let bytes = axum::body::to_bytes(response.into_body(), 64)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        };
+
+        // Matching: exempt, and stripped.
+        for _ in 0..3 {
+            let request = axum::http::Request::builder()
+                .uri("/")
+                .header(RELAY_HOP_HEADER, "hop")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "the hop is not counted");
+            assert!(
+                response.headers().get("X-RateLimit-Limit").is_none(),
+                "nothing was counted, so no budget is advertised"
+            );
+            assert_eq!(body(response).await, "clean");
+        }
+
+        // Not matching: counted (budget 1, so the second is refused), and
+        // still stripped on the one that got through.
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .header(RELAY_HOP_HEADER, "not-hop")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body(response).await, "clean");
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .header(RELAY_HOP_HEADER, "not-hop")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "a wrong marker is an ordinary request"
+        );
+    }
+
+    /// `remaining` reads the window as it is now, refunds included.
+    #[test]
+    fn remaining_reflects_a_refund() {
+        let limiter = RateLimiter::new(RateLimitConfig::custom(3, 60));
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert_eq!(limiter.remaining(ip), Some(3), "nothing spent yet");
+
+        let RateLimitDecision::Allowed { charge, .. } = limiter.check(ip) else {
+            panic!("first request is allowed");
+        };
+        assert_eq!(limiter.remaining(ip), Some(2));
+
+        limiter.refund(ip, charge);
+        assert_eq!(limiter.remaining(ip), Some(3), "the refund is visible");
+
+        let disabled = RateLimiter::disabled();
+        assert_eq!(disabled.remaining(ip), None, "nothing is counted");
+    }
+
     #[test]
     fn a_refund_returns_the_slot_it_was_charged() {
         let limiter = RateLimiter::new(RateLimitConfig::custom(2, 60));

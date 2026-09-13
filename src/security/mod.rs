@@ -54,8 +54,22 @@ pub use auth::{auth_middleware, generate_api_key, ApiKeyStore, AuthConfig, Token
 pub use capability::{preset, CapabilitySet, KNOWN_CAPABILITIES, WILDCARD};
 pub use rate_limit::{
     rate_limit_middleware, RateLimitCharge, RateLimitConfig, RateLimitDecision, RateLimitStats,
-    RateLimiter,
+    RateLimiter, RELAY_HOP_HEADER,
 };
 pub use validation::{
     looks_like_injection, sanitize_for_display, CommandValidator, ValidationConfig, ValidationError,
 };
+
+/// Compare secrets without leaking their contents through timing.
+///
+/// The token is short and comparisons are rare, but an early-exit `==` on a
+/// shared secret is the kind of detail that is cheap to get right and awkward
+/// to retrofit. Shared by the relay's enrol-token checks and the rate limiter's
+/// relay-hop marker, which is why it lives here rather than in either.
+pub(crate) fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}

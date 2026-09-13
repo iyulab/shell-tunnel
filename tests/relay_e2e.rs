@@ -353,6 +353,7 @@ async fn a_device_reports_its_public_url_to_whoever_started_it() {
         enrolled: Some(tx),
         serve_direct_requests: true,
         direct_events: None,
+        local_hop_token: None,
     };
     tokio::spawn(run(config, None));
 

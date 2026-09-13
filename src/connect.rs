@@ -517,6 +517,7 @@ mod tests {
             enrolled: None,
             serve_direct_requests: false,
             direct_events: None,
+            local_hop_token: None,
         }
     }
 

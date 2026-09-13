@@ -1469,10 +1469,36 @@ recover (§8); it used to retry in silence. Refusals that come *after* the
 connection is established, a rejected enrol token among them, are a separate
 message and were always reported.
 
+**A proxied request that reaches an attached device is refunded the same way,
+once the device has answered** — unless the answer was `401` or `403`. What
+stays on the caller's tab is exactly what the limit is for: a device name that
+is not attached (`502 device is not connected`, the lookup described below) and
+a credential the device refused. A caller talking to a device with a key it
+accepts spends nothing here, however many requests it makes. Before 0.25.0 every
+proxied request was charged and kept, which made the budget a throughput cap:
+at the relay's default 256 KiB chunk, 100 requests a minute is 26 MiB a minute,
+and a chunked upload hit the ceiling every hundred chunks. It was worse when the
+caller and the device shared an outbound address, which one company network
+behind one gateway gives them: the caller's own chunks filled the bucket, the
+device's replacement data connections were refused by it *before* the enrol
+token they carry could earn their refund, the pool ran dry, and every request
+to that device answered `503 no data connection available` until the window
+slid. The device now logs a `WARN` when a data connection is refused this way;
+it used to say so only at `debug`. A WebSocket upgrade keeps its slot: one
+socket carries any number of messages.
+
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
-limiter sees `127.0.0.1` for every caller and cannot tell them apart. The relay
-still sees the real address.
+limiter sees `127.0.0.1` for every caller and cannot tell them apart — and
+since 0.25.0 it does not try: a request the device's own relay client replays
+carries a marker generated once per process, and the device's limiter steps
+aside for it. (The marker is a secret the two halves of the hop share, not a
+header name anyone can spell — a request from anywhere else carrying the header
+is counted like any other and the header is dropped before any handler sees
+it.) Before 0.25.0 the device counted every relayed caller as one client, and
+its own 100/minute was a second ceiling of the same size on the same upload.
+The relay still sees the real address, and its numbers are the ones a relayed
+caller is told about.
 
 Two limiters therefore sit in series on the proxied path, and a response can
 only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
@@ -1483,8 +1509,11 @@ only carry one set of `X-RateLimit-*` headers. Which set arrives, case by case:
 - **The relay's limiter refused** — the device is never reached and the headers
   are the relay's, `Remaining: 0`.
 - **Neither refused** — the device's numbers if it sent any, otherwise the
-  relay's. A device started with `--no-rate-limit` sends none, and the relay's
-  budget is a real constraint on the caller, so filling the gap is honest.
+  relay's. A device started with `--no-rate-limit` sends none, and neither does
+  one that recognised its own relay client's marker (above) — since 0.25.0 that
+  is every relayed request to a device — and the relay's budget is a real
+  constraint on the caller, so filling the gap is honest. On a request the
+  relay refunded, the count is the one *after* the refund.
 - **The device refused for some other reason** — `too-many-uploads`, say, which
   is also a `429` but carries no limiter headers. No count is added: the relay
   allowed this request, so it has no spare capacity to claim on a refusal that
@@ -1672,6 +1701,7 @@ startup rather than serving local-only.
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this connection: HTTP 429` | the relay is rate limiting this device's **address**, not rejecting the device | transient — the device keeps retrying and attaches once the address is under the limit. If it persists, something else on this outbound address is spending the relay's per-address budget: raise the relay's limit, or give the device an address of its own |
+| `relay refused a data connection: HTTP 429` (device log, `WARN`) | same cause, on a replacement data connection: the device stays attached but cannot refill its pool, so callers get `503` | same remedy. Before 0.25.0 a caller sharing the device's address caused this with nothing but its own upload, and the line was `debug` only |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
@@ -1680,7 +1710,7 @@ startup rather than serving local-only.
 | `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
-| **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead |
+| **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead. Over a relay, a `429` means device-name misses or refused credentials from your address, not volume: a request an attached device accepts is refunded (§5, since 0.25.0). Before 0.25.0 it meant volume too — 100 relayed requests a minute, from either limiter — which is where a chunked upload stopped every 26 MiB |
 | `relay certificate does not match --relay-fingerprint` | the pinned value is not the certificate the relay is serving — a relay that regenerated its certificate has a new one | the message prints both fingerprints; copy the relay's current one from the `Devices join with:` line of its banner ([§5](#tls-without-a-proxy)). Retrying does not help until the pin or that certificate changes |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
 | `invalid peer certificate: certificate not valid for name "<host>"` | certificate does not cover the dialled name — the relay banner says so too, on the line under `Certificate covers:` | delete the certificate and key, then restart the relay with `--public-base <name>`; or join with `--relay-fingerprint`, which does not check the name |

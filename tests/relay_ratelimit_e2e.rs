@@ -62,8 +62,14 @@ async fn start_relay() -> SocketAddr {
 /// No auth and no `--fs-root`: this test is about which limiter's numbers reach
 /// the caller, and `/api/v1/sessions` answers `200` without either.
 async fn start_device_server() -> SocketAddr {
+    start_device_server_trusting(None).await
+}
+
+/// The same server, recognising `hop_token` as its own relay client's marker.
+async fn start_device_server_trusting(hop_token: Option<&str>) -> SocketAddr {
     let mut config = ServerConfig::new("127.0.0.1", 0).without_graceful_shutdown();
     config.security.rate_limit = RateLimitConfig::custom(DEVICE_BUDGET, 60);
+    config.security.rate_limit.trusted_hop_token = hop_token.map(str::to_string);
 
     let listener = api::bind(&config).await.expect("bind local server");
     let local_addr = listener.local_addr().expect("local addr");
@@ -74,6 +80,16 @@ async fn start_device_server() -> SocketAddr {
 
 /// Dial the relay as a real device would, serving `local_addr` behind it.
 fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &str) {
+    spawn_device_marking(relay_addr, local_addr, device_name, None)
+}
+
+/// The same device, marking every request it replays with `hop_token`.
+fn spawn_device_marking(
+    relay_addr: SocketAddr,
+    local_addr: SocketAddr,
+    device_name: &str,
+    hop_token: Option<&str>,
+) {
     let config = RelayClientConfig {
         relay_url: format!("ws://{relay_addr}"),
         enroll_token: "secret".to_string(),
@@ -85,6 +101,7 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         enrolled: None,
         serve_direct_requests: true,
         direct_events: None,
+        local_hop_token: hop_token.map(str::to_string),
     };
     tokio::spawn(run(config, None));
 }
@@ -256,5 +273,70 @@ async fn an_unlimited_device_lets_the_relays_numbers_through() {
         answer.header("x-ratelimit-limit"),
         Some(RELAY_BUDGET.to_string().as_str()),
         "with the device silent, the limit in force is the relay's"
+    );
+}
+
+/// A device does not count the requests its own relay client replays to it.
+///
+/// Every relayed caller reaches the device's server from the same loopback
+/// address, so counting them meant one bucket for all of them — and the
+/// device's default budget, at the relay's default chunk size, capped a single
+/// upload at 26 MiB a minute. With the process's own marker on the hop the
+/// limiter steps aside, and the relay, which still sees each caller's real
+/// address, is the limiter that counts. Its numbers are what the caller gets.
+///
+/// `DEVICE_BUDGET` requests plus two: the ones the device's limiter would
+/// have refused are the ones this asserts on.
+#[tokio::test]
+async fn a_device_does_not_count_its_own_relay_hop() {
+    let relay = start_relay().await;
+    let device = start_device_server_trusting(Some("this-process-only")).await;
+    spawn_device_marking(relay, device, "rl-hop", Some("this-process-only"));
+    let base = format!("http://{relay}/d/rl-hop");
+    wait_until_attached(&base).await;
+
+    for attempt in 1..=DEVICE_BUDGET + 2 {
+        let answer = http_get(&format!("{base}/api/v1/sessions")).await;
+        assert_eq!(
+            answer.status, 200,
+            "request {attempt}: the device's limiter must not count its own hop"
+        );
+        assert_eq!(
+            answer.header("x-ratelimit-limit"),
+            Some(RELAY_BUDGET.to_string().as_str()),
+            "with the device's limiter standing aside, the budget in force is the relay's"
+        );
+    }
+}
+
+/// The marker is a secret, not a header name: the wrong value is counted.
+///
+/// Otherwise any local process — or any caller whose header survived the
+/// relay — could exempt itself by spelling the header. The device here trusts
+/// one token and its client sends another, so the hop is counted like any
+/// caller and the budget empties on schedule.
+#[tokio::test]
+async fn a_hop_with_the_wrong_marker_is_counted() {
+    let relay = start_relay().await;
+    let device = start_device_server_trusting(Some("this-process-only")).await;
+    spawn_device_marking(relay, device, "rl-hop-wrong", Some("some-other-process"));
+    let base = format!("http://{relay}/d/rl-hop-wrong");
+    wait_until_attached(&base).await;
+
+    for _ in 0..DEVICE_BUDGET {
+        assert_eq!(
+            http_get(&format!("{base}/api/v1/sessions")).await.status,
+            200
+        );
+    }
+    let refused = http_get(&format!("{base}/api/v1/sessions")).await;
+    assert_eq!(
+        refused.status, 429,
+        "a marker that does not match buys nothing"
+    );
+    assert_eq!(
+        refused.header("x-ratelimit-limit"),
+        Some(DEVICE_BUDGET.to_string().as_str()),
+        "and it is the device's own limiter that refused"
     );
 }

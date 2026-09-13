@@ -197,6 +197,8 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 // comment on `RelayClientConfig`.
                 serve_direct_requests: false,
                 direct_events: None,
+                // `connect` fronts no local server of its own.
+                local_hop_token: None,
             };
             let local_port = if args.port_explicit { args.port } else { 0 };
 
@@ -1006,6 +1008,13 @@ async fn run_with_relay(
         server_config.port = 0;
     }
 
+    // One secret, born here, shared by the two halves of the loopback hop:
+    // the server's limiter recognises it and does not count the request, and
+    // the relay client sends it with every request it replays. See
+    // `RateLimitConfig::trusted_hop_token` for why the hop is exempt.
+    let hop_token = shell_tunnel::security::generate_api_key();
+    server_config.security.rate_limit.trusted_hop_token = Some(hop_token.clone());
+
     let listener = shell_tunnel::api::bind(&server_config).await?;
     let local = listener
         .local_addr()
@@ -1035,6 +1044,7 @@ async fn run_with_relay(
         // never initiates one itself, so it has no use for `direct_events`.
         serve_direct_requests: true,
         direct_events: None,
+        local_hop_token: Some(hop_token),
     };
 
     for warning in &exposure.warnings {

@@ -68,6 +68,7 @@ fn attach_peer(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &str
         enrolled: None,
         serve_direct_requests: true,
         direct_events: None,
+        local_hop_token: None,
     };
     tokio::spawn(run(config, None));
 }
@@ -158,6 +159,7 @@ async fn a_caller_reaches_the_peer_device_through_connect_mode() {
         enrolled: None,
         serve_direct_requests: false,
         direct_events: None,
+        local_hop_token: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -212,6 +214,7 @@ async fn a_caller_reaches_an_fs_endpoint_through_connect_mode_twice() {
         enrolled: None,
         serve_direct_requests: false,
         direct_events: None,
+        local_hop_token: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -274,6 +277,7 @@ async fn a_direct_connect_upload_session_gets_the_direct_chunk_size() {
         enrolled: None,
         serve_direct_requests: false,
         direct_events: None,
+        local_hop_token: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -333,6 +337,7 @@ async fn a_request_for_a_device_other_than_the_configured_peer_is_404() {
         enrolled: None,
         serve_direct_requests: false,
         direct_events: None,
+        local_hop_token: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(
@@ -370,6 +375,7 @@ async fn a_request_for_an_unattached_peer_gets_the_relays_own_502() {
         enrolled: None,
         serve_direct_requests: false,
         direct_events: None,
+        local_hop_token: None,
     };
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(shell_tunnel::connect::serve(

@@ -3,6 +3,37 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.25.0 — unreleased
+
+### Fixed
+
+- **A chunked upload through a relay no longer stops every 26 MiB.** Two rate limiters sat
+  on the relayed path, both at 100 requests a minute, and both counted every request: the
+  relay's, keyed on the caller's address, and the device's own, which sees every relayed
+  caller as `127.0.0.1`. At the relay's default 256 KiB chunk that is 26 MiB a minute, and
+  the hundredth chunk was refused with `429` — answered before the body had been read, so a
+  caller over a real network saw a reset instead of the status. When the caller and the
+  device shared an outbound address, the caller's own chunks also filled the bucket the
+  device's replacement data connections are checked against, those were refused before
+  the enrol token they carry could earn their refund, and every request to the device
+  answered `503 no data connection available` until the window slid.
+
+  The relay now refunds a proxied request once an attached device has answered it, unless
+  the answer was `401` or `403` — so what accumulates against an address is what the limit
+  exists to bound: device-name misses and refused credentials. The device's own limiter
+  does not count requests its own relay client replays to it, recognising them by a marker
+  generated once per process and stripped before any handler sees it; the relay, which
+  still sees each caller's real address, is the limiter that counts. `X-RateLimit-Remaining`
+  on a refunded request now reports the count after the refund rather than one below it.
+  `docs/USAGE.md` §5 and §8. Each half lives in its own binary: the relay fix in the relay,
+  the device fix in the device, and an upload crossing an older one still meets that one's
+  ceiling.
+
+- **A device says so when the relay refuses one of its data connections.** It was a `debug`
+  line; the control channel's equivalent refusal had warned since 0.19.0. A device starved
+  of replacement connections answers `503` for everything and now logs `WARN` with the
+  reason and the remedy.
+
 ## 0.24.0 — 2026-09-13
 
 ### Fixed

@@ -461,6 +461,9 @@ impl Config {
             max_requests: self.security.rate_limit.requests_per_window,
             window: std::time::Duration::from_secs(self.security.rate_limit.window_secs),
             max_tracked_ips: 10000,
+            // Set by the relay-attach path once it has a token to share with
+            // its client; a file cannot name one, and should not.
+            trusted_hop_token: None,
         };
 
         // Apply CORS settings (restrictive by default)

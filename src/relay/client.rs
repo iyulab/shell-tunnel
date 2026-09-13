@@ -26,6 +26,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 use super::protocol::{DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use super::proxy::{is_forwardable, ProxyRequest, ProxyResponse};
 use crate::error::ShellTunnelError;
+use crate::security::RELAY_HOP_HEADER;
 use crate::Result;
 
 /// How often the device proves it is alive.
@@ -106,6 +107,16 @@ pub struct RelayClientConfig {
     /// this is always `None` on the plain `--relay` path and always `Some`
     /// on `connect`'s.
     pub direct_events: Option<tokio::sync::mpsc::UnboundedSender<super::direct::DirectEvent>>,
+    /// Marker sent with every request replayed to `local`, so that server's
+    /// rate limiter can tell this hop from a caller of its own.
+    ///
+    /// Every relayed request reaches the local server from this process, on
+    /// loopback, so its limiter would otherwise count every relayed caller as
+    /// one address — see `RateLimitConfig::trusted_hop_token`, which is the
+    /// other half of the same secret. `None` sends nothing, and the local
+    /// server then counts the hop like any client; `connect`'s local proxy
+    /// never talks to a server of its own and leaves it unset.
+    pub local_hop_token: Option<String>,
 }
 
 impl RelayClientConfig {
@@ -614,7 +625,25 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
         connector(config)?.0,
     )
     .await
-    .map_err(|e| ShellTunnelError::Tunnel(format!("data connection refused: {e}")))?;
+    .map_err(|e| {
+        // The control channel already says this out loud when *it* is turned
+        // away (see `attach`); a data connection turned away the same way was
+        // a `debug!` line, which left a device starving for replacement
+        // connections — every request to it answering `503` — with nothing at
+        // the default log level saying why. Measured 2026-09-13: a caller
+        // sharing this device's outbound address filled the relay's bucket
+        // with its own requests, and the replacements were refused before
+        // the enrol token they carry could earn their refund.
+        if let tokio_tungstenite::tungstenite::Error::Http(response) = &e {
+            if response.status() == 429 {
+                tracing::warn!(
+                    target: "relay-client",
+                    "relay refused a data connection: HTTP 429 — the relay is rate limiting this address, so requests to this device answer 503 until it is under the limit again. Something sharing this machine's outbound address is spending the relay's per-address budget"
+                );
+            }
+        }
+        ShellTunnelError::Tunnel(format!("data connection refused: {e}"))
+    })?;
 
     let attach = DeviceMessage::Attach {
         device_id: device_id.to_string(),
@@ -661,7 +690,13 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
         Some(Ok(_)) => Vec::new(),
     };
 
-    let (status, headers, body) = replay_locally(config.local, &request, body).await;
+    let (status, headers, body) = replay_locally(
+        config.local,
+        config.local_hop_token.as_deref(),
+        &request,
+        body,
+    )
+    .await;
 
     let head = ProxyResponse { status, headers };
     let json = serde_json::to_string(&head)
@@ -1123,7 +1158,10 @@ async fn pipe_websocket(
     // The capability token lives in these headers; without replaying them the
     // device's own auth would reject its own traffic.
     for (name, value) in &request.headers {
-        if !is_forwardable(name) || name.eq_ignore_ascii_case("sec-websocket-key") {
+        if !is_forwardable(name)
+            || name.eq_ignore_ascii_case("sec-websocket-key")
+            || name.eq_ignore_ascii_case(RELAY_HOP_HEADER)
+        {
             continue;
         }
         if let (Ok(name), Ok(value)) = (
@@ -1131,6 +1169,15 @@ async fn pipe_websocket(
             HeaderValue::from_str(value),
         ) {
             builder.headers_mut().insert(name, value);
+        }
+    }
+    // Same marker as `replay_locally` adds, for the same reason: this upgrade
+    // reaches the local server's limiter over the same loopback hop.
+    if let Some(token) = &config.local_hop_token {
+        if let Ok(value) = HeaderValue::from_str(token) {
+            builder
+                .headers_mut()
+                .insert(HeaderName::from_static(RELAY_HOP_HEADER), value);
         }
     }
 
@@ -1203,6 +1250,7 @@ async fn pipe_websocket(
 /// one localhost request would undo the point of the feature gate.
 async fn replay_locally(
     local: SocketAddr,
+    hop_token: Option<&str>,
     request: &ProxyRequest,
     body: Vec<u8>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
@@ -1220,10 +1268,19 @@ async fn replay_locally(
     );
     for (name, value) in &request.headers {
         // `content-length` is recomputed above; replaying the original would
-        // contradict the body actually being sent.
-        if is_forwardable(name) && !name.eq_ignore_ascii_case("content-length") {
+        // contradict the body actually being sent. The hop marker is this
+        // process's own, never a caller's: one arriving from outside is
+        // dropped here so the only one the local server sees is the one added
+        // below.
+        if is_forwardable(name)
+            && !name.eq_ignore_ascii_case("content-length")
+            && !name.eq_ignore_ascii_case(RELAY_HOP_HEADER)
+        {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
+    }
+    if let Some(token) = hop_token {
+        head.push_str(&format!("{RELAY_HOP_HEADER}: {token}\r\n"));
     }
     head.push_str("\r\n");
 
@@ -1741,6 +1798,7 @@ mod tests {
             enrolled: None,
             serve_direct_requests: true,
             direct_events: None,
+            local_hop_token: None,
         }
     }
 
@@ -2352,7 +2410,7 @@ mod tests {
             headers: Vec::new(),
             websocket: false,
         };
-        let (status, headers, body) = replay_locally(addr, &request, Vec::new()).await;
+        let (status, headers, body) = replay_locally(addr, None, &request, Vec::new()).await;
 
         assert_eq!(status, 502);
         assert_eq!(

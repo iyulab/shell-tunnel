@@ -624,21 +624,23 @@ async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
     let (device_id, _control) = enroll(addr).await;
     let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
 
-    // Public traffic, charged and kept: this is also what proves the data
-    // connection joined the pool, so its refund has certainly run.
+    // Public traffic the device accepted — charged and, since the proxied
+    // route learned to refund too, given back once the device answered. This
+    // is also what proves the data connection joined the pool, so its own
+    // refund has certainly run.
     let (status, _) = http_get(&format!("http://{addr}/d/{device_id}/health"), None).await;
     assert_eq!(status, 200);
     served.await.unwrap();
 
-    // Three left of four. Without the refunds only one would be.
+    // All four still there. Without the refunds only one would be.
     let url = format!("http://{addr}/relay/v1/devices");
     let auth = Some(("authorization", "Bearer secret"));
-    for attempt in 1..=3 {
+    for attempt in 1..=4 {
         let (status, _) = http_get(&url, auth).await;
         assert_eq!(
             status, 200,
-            "request {attempt} should be allowed: the device's own connections \
-             must not have spent the caller's budget"
+            "request {attempt} should be allowed: neither the device's own \
+             connections nor a forwarded request it accepted spend the budget"
         );
     }
 
@@ -659,20 +661,19 @@ async fn a_device_that_proved_the_token_does_not_spend_the_public_budget() {
 async fn a_refusal_the_relay_itself_made_reports_the_relays_budget() {
     let addr = start_throttled_relay(2).await;
     let (device_id, _control) = enroll(addr).await;
-    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
 
-    // Enrolment and the data connection are refunded, so the budget is intact:
-    // two proxied requests, then the refusal.
+    // Enrolment is refunded, so the budget is intact. Spend it on the one kind
+    // of proxied request the relay keeps the charge for: a name that is not
+    // attached. (A request an attached device accepts is refunded — see
+    // `a_forwarded_request_the_device_accepted_is_refunded` — so it could not
+    // empty this bucket however many were sent.)
+    let miss = format!("http://{addr}/d/nobody-here/health");
+    for attempt in 1..=2 {
+        let (status, _) = http_get(&miss, None).await;
+        assert_eq!(status, 502, "miss {attempt} is within budget and kept");
+    }
+
     let url = format!("http://{addr}/d/{device_id}/health");
-    let (status, _) = http_get(&url, None).await;
-    assert_eq!(status, 200, "the first is within budget");
-    served.await.unwrap();
-    let (status, _) = http_get(&url, None).await;
-    assert_eq!(
-        status, 503,
-        "the second is within budget too — 503 is the empty pool, not the limiter"
-    );
-
     let (status, head) = http_head_and_status(&url).await;
     assert_eq!(status, 429, "the third exceeds the relay's own budget");
     let head = head.to_ascii_lowercase();
@@ -685,6 +686,91 @@ async fn a_refusal_the_relay_itself_made_reports_the_relays_budget() {
         "and the limit is the relay's own, not a device's: {head}"
     );
     assert!(head.contains("retry-after:"), "{head}");
+}
+
+/// A forwarded request the device accepted costs the caller nothing.
+///
+/// The relay's limit exists to bound enrolment guessing and device-name
+/// lookups, and a caller an attached device answers `200` is doing neither.
+/// Charging it anyway capped every relayed caller at the budget — 26 MiB a
+/// minute at the relay's default chunk size, where a chunked upload hit the
+/// ceiling every hundred chunks — so the slot goes back once the device has
+/// answered, the same way a data connection's does once its token is proven.
+///
+/// Sized so the old behaviour cannot pass: a budget of two, three accepted
+/// requests. Without the refund the third is `429`.
+#[tokio::test]
+async fn a_forwarded_request_the_device_accepted_is_refunded() {
+    let addr = start_throttled_relay(2).await;
+    let (device_id, _control) = enroll(addr).await;
+    let url = format!("http://{addr}/d/{device_id}/health");
+
+    for attempt in 1..=3 {
+        let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+        let (status, _) = http_get(&url, None).await;
+        served.await.unwrap();
+        assert_eq!(
+            status, 200,
+            "request {attempt}: a request the device accepted must not be what \
+             empties the caller's bucket"
+        );
+    }
+}
+
+/// A credential the device refused is kept on the caller's tab.
+///
+/// The refund above must not become a way to guess a device's API key at line
+/// speed through the relay: a `401` or `403` from the device is exactly the
+/// failed attempt the limit is for, and stays charged. Two refused, the third
+/// never reaches the device.
+#[tokio::test]
+async fn a_credential_the_device_refused_stays_charged() {
+    let addr = start_throttled_relay(2).await;
+    let (device_id, _control) = enroll(addr).await;
+    let url = format!("http://{addr}/d/{device_id}/api/v1/sessions");
+
+    for attempt in 1..=2 {
+        let served = serve_one_request(addr, &device_id, "secret", 401, "no").await;
+        let (status, _) = http_get(&url, None).await;
+        served.await.unwrap();
+        assert_eq!(
+            status, 401,
+            "attempt {attempt} reaches the device and is refused there"
+        );
+    }
+
+    let (status, head) = http_head_and_status(&url).await;
+    assert_eq!(
+        status, 429,
+        "the third is the relay's refusal, not the device's"
+    );
+    assert!(
+        head.to_ascii_lowercase().contains("x-ratelimit-limit: 2"),
+        "and it is the relay's budget that refused: {head}"
+    );
+}
+
+/// The remaining count a refunded request advertises is the count after the
+/// refund.
+///
+/// The middleware used to remember the number it computed before the handler
+/// ran and print that; on a refunded request it was one too low. The relay's
+/// numbers reach the caller here because the fake device sends none.
+#[tokio::test]
+async fn a_refunded_request_advertises_the_budget_it_left_intact() {
+    let addr = start_throttled_relay(5).await;
+    let (device_id, _control) = enroll(addr).await;
+    let served = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    let (status, head) = http_head_and_status(&format!("http://{addr}/d/{device_id}/health")).await;
+    served.await.unwrap();
+
+    assert_eq!(status, 200);
+    let head = head.to_ascii_lowercase();
+    assert!(
+        head.contains("x-ratelimit-remaining: 5"),
+        "the slot was given back before the header was written: {head}"
+    );
 }
 
 /// The device list reports how long a device took to answer — after it has.
