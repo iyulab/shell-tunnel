@@ -34,6 +34,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   of replacement connections answers `503` for everything and now logs `WARN` with the
   reason and the remedy.
 
+### Changed
+
+- **Two library structs gained a field, for embedders building them by literal.**
+  `RateLimitConfig::trusted_hop_token` and `RelayClientConfig::local_hop_token` are the two
+  halves of the marker described above; both are `Option<String>` and `None` keeps the old
+  behaviour (every request counted, no marker sent). `RateLimitConfig` has a `Default`;
+  `RelayClientConfig` does not, so a literal without the new field stops compiling. The
+  binary sets both from one value generated at startup — nothing in the CLI or the config
+  file names it, and nothing should.
+
 ## 0.24.0 — 2026-09-13
 
 ### Fixed
