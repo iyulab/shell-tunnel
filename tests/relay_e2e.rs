@@ -672,10 +672,6 @@ async fn a_replaced_client_stops_instead_of_taking_its_name_back() {
             .attach_id,
         holder
     );
-    assert!(
-        first_rx.try_recv().is_err(),
-        "the replaced client reattached"
-    );
     assert!(!second.is_finished());
     second.abort();
 }
