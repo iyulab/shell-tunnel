@@ -3,7 +3,7 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## 0.26.0 — unreleased
+## 0.26.0 — 2026-09-28
 
 ### Fixed
 

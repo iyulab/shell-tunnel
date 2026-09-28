@@ -1254,8 +1254,9 @@ without anyone naming hosts by hand. `--device-name` overrides that. Names accep
 letters, digits, `-` and `_`, up to 64 characters; anything else is refused
 rather than sanitized, because the name lands in a URL path. Re-attaching under a
 name already held replaces the previous entry, so a device recovers immediately
-after a network drop — two machines sharing a hostname would displace each other,
-which is when to name them explicitly.
+after a network drop. The process it replaced, if still running, is told and exits
+([Surviving a reboot](#surviving-a-reboot)) — so two machines sharing a hostname
+knock each other off in turn, which is when to name them explicitly.
 
 The local port is chosen by the OS unless `-p` says otherwise: behind a relay the
 listener only ever talks to this process, so a port in use elsewhere is no reason
