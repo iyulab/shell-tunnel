@@ -551,9 +551,10 @@ async fn control_session(
         device_id: device_id.clone(),
         public_url,
         reflexive_addr: Some(peer.to_string()),
+        attach_id: Some(device.attach_id.clone()),
     };
     if send_json(&mut sink, &enrolled).await.is_err() {
-        state.devices.detach(&device_id);
+        state.devices.detach(&device);
         return;
     }
 
@@ -562,7 +563,7 @@ async fn control_session(
         count: registry::POOL_TARGET,
     };
     if send_json(&mut sink, &fill).await.is_err() {
-        state.devices.detach(&device_id);
+        state.devices.detach(&device);
         return;
     }
 
@@ -646,11 +647,45 @@ async fn control_session(
                     break;
                 }
             }
+            why = device.retired() => {
+                match why {
+                    registry::Retirement::Superseded => {
+                        tracing::info!(
+                            target: "relay",
+                            device_id = %device_id,
+                            "device replaced by a newer attachment under the same name"
+                        );
+                        let notice = RelayMessage::Rejected {
+                            code: reject::SUPERSEDED.into(),
+                            message: "another device attached under this name and now receives its requests".into(),
+                        };
+                        if send_json(&mut sink, &notice).await.is_ok() {
+                            // Left open for the device to close: one that
+                            // predates the code ignores it, and closing on it
+                            // would make it reconnect and take the name back.
+                            // Nothing it sends is acted on from here — the
+                            // name, and everything routed by it, is no longer
+                            // this session's.
+                            while let Some(Ok(message)) = stream.next().await {
+                                if matches!(message, Message::Close(_)) {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    // Closed so the device reconnects: its connection may be
+                    // perfectly healthy, and a heartbeat that arrived late is
+                    // not a reason to stay unreachable.
+                    registry::Retirement::Evicted => {}
+                }
+                break;
+            }
         }
     }
 
-    state.devices.detach(&device_id);
-    tracing::info!(target: "relay", device_id = %device_id, "device detached");
+    if state.devices.detach(&device) {
+        tracing::info!(target: "relay", device_id = %device_id, "device detached");
+    }
 }
 
 /// List the devices currently attached.
@@ -729,6 +764,7 @@ async fn attach_data_connection(
     let Ok(DeviceMessage::Attach {
         device_id,
         enroll_token,
+        attach_id,
     }) = serde_json::from_str::<DeviceMessage>(&text)
     else {
         let _ = socket.close().await;
@@ -753,6 +789,20 @@ async fn attach_data_connection(
         let _ = socket.close().await;
         return;
     };
+
+    // Opened under an attachment that has since been replaced: joining this
+    // pool would let the replaced process answer requests addressed to the
+    // one that replaced it. Absent from a device that predates the field,
+    // which is matched by name as before.
+    if attach_id.is_some_and(|claimed| claimed != device.attach_id) {
+        tracing::debug!(
+            target: "relay",
+            device_id = %device_id,
+            "data connection refused: opened under a replaced attachment"
+        );
+        let _ = socket.close().await;
+        return;
+    }
 
     // A pool that is already full means the device over-supplied; closing the
     // extra socket is better than holding it open forever.

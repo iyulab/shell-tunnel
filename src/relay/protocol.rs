@@ -47,6 +47,14 @@ pub enum DeviceMessage {
         device_id: String,
         /// Same secret the control channel presented.
         enroll_token: String,
+        /// The `attach_id` from the `Enrolled` this connection was opened
+        /// under. A relay refuses the connection if the name has since been
+        /// taken by another attachment, so a replaced process cannot end up
+        /// answering requests addressed to its replacement. `None` from a
+        /// device that predates the field, which is then matched by name
+        /// alone, as it always was.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_id: Option<String>,
     },
     /// Liveness heartbeat.
     ///
@@ -121,8 +129,20 @@ pub enum RelayMessage {
         /// direct-connect attempt on top of it needs to account for that.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reflexive_addr: Option<String>,
+        /// Identifies this one attachment, as distinct from the name, which
+        /// the next attachment under the same name reuses. The device echoes
+        /// it in every `Attach`. `None` from a relay that predates the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attach_id: Option<String>,
     },
-    /// Enrollment refused; the connection closes afterwards.
+    /// Enrollment refused, or — with [`reject::SUPERSEDED`] — an attachment
+    /// ended because another took its name.
+    ///
+    /// Every other code closes the connection straight afterwards. A
+    /// superseded session is left open until the device closes it: a device
+    /// that predates the code ignores it and reconnects the moment its
+    /// connection drops, which would take the name straight back and turn two
+    /// processes sharing a name into a pair evicting each other in a loop.
     Rejected {
         /// Machine-readable reason (`bad-token`, `unsupported-version`).
         code: String,
@@ -187,6 +207,11 @@ pub mod reject {
     pub const BAD_HANDSHAKE: &str = "bad-handshake";
     /// The requested device name cannot be used as a routing key.
     pub const BAD_DEVICE_NAME: &str = "bad-device-name";
+    /// Another device attached under this one's name and now receives its
+    /// requests. Sent mid-session, not at enrollment; a device receiving it
+    /// must stop rather than reconnect, or the two take the name from each
+    /// other indefinitely.
+    pub const SUPERSEDED: &str = "superseded";
 }
 
 /// Reason codes used in [`RelayMessage::DirectUnavailable`].
@@ -247,6 +272,7 @@ mod tests {
                 device_id: "d-1".into(),
                 public_url: "https://relay.example/d/d-1".into(),
                 reflexive_addr: Some("203.0.113.5:51820".into()),
+                attach_id: Some("a-1".into()),
             },
             RelayMessage::Rejected {
                 code: reject::BAD_TOKEN.into(),
@@ -274,6 +300,7 @@ mod tests {
                 device_id: "d-1".into(),
                 public_url: "https://relay.example/d/d-1".into(),
                 reflexive_addr: None,
+                attach_id: None,
             }
         );
     }
@@ -295,10 +322,26 @@ mod tests {
         let msg = DeviceMessage::Attach {
             device_id: "dev-1".into(),
             enroll_token: "secret".into(),
+            attach_id: Some("a-1".into()),
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"attach\""));
         assert_eq!(serde_json::from_str::<DeviceMessage>(&json).unwrap(), msg);
+    }
+
+    #[test]
+    fn an_old_devices_attach_has_no_attach_id() {
+        // A device that predates the field must still be able to attach its
+        // data connections to a new relay.
+        let json = r#"{"type":"attach","device_id":"dev-1","enroll_token":"s"}"#;
+        assert_eq!(
+            serde_json::from_str::<DeviceMessage>(json).unwrap(),
+            DeviceMessage::Attach {
+                device_id: "dev-1".into(),
+                enroll_token: "s".into(),
+                attach_id: None,
+            }
+        );
     }
 
     #[test]

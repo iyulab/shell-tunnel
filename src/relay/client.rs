@@ -23,7 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 /// The device's side of a relay connection.
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
-use super::protocol::{DeviceMessage, RelayMessage, PROTOCOL_VERSION};
+use super::protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use super::proxy::{is_forwardable, ProxyRequest, ProxyResponse};
 use crate::error::ShellTunnelError;
 use crate::security::RELAY_HOP_HEADER;
@@ -268,10 +268,17 @@ pub async fn run(
     let mut explained: Option<String> = None;
     loop {
         match attach(&config, &identity, &mut direct_requests).await {
-            Ok(()) => {
+            Ok(AttachEnd::Closed) => {
                 tracing::warn!(target: "relay-client", "relay connection closed; reconnecting");
                 backoff = BACKOFF_MIN;
                 explained = None;
+            }
+            // Not retried: reattaching would take the name back from the
+            // process that now holds it, which would do the same in turn.
+            Ok(AttachEnd::Superseded) => {
+                return Err(ShellTunnelError::Tunnel(superseded_message(
+                    config.device_name.as_deref(),
+                )))
             }
             Err(e) => {
                 let reason = e.to_string();
@@ -313,9 +320,32 @@ fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -
     )
 }
 
+/// What to say when another process has taken this device's name.
+///
+/// This process is about to stop, and whoever reads why is looking at a log
+/// with no other trace of the second process — so the line names the cause and
+/// both ways out.
+fn superseded_message(device_name: Option<&str>) -> String {
+    let name = device_name.unwrap_or("this device's name");
+    format!(
+        "another process attached to the relay as '{name}' and now receives this device's requests, so this one has stopped. Stop one of the two, or give them different --device-name values."
+    )
+}
+
+/// How an attachment that enrolled successfully came to an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AttachEnd {
+    /// The relay closed the channel, or the connection dropped. Worth
+    /// reattaching.
+    Closed,
+    /// Another process attached under this device's name
+    /// ([`reject::SUPERSEDED`]). Not worth reattaching — see `run`.
+    Superseded,
+}
+
 /// One attachment: enroll, then serve pool requests until the channel drops.
 ///
-/// Returns `Ok(())` when the relay closed the channel cleanly.
+/// Returns `Ok(AttachEnd::Closed)` when the relay closed the channel cleanly.
 ///
 /// Dials the control connection through an explicitly bound local socket
 /// (`direct::dial_with_local_port`) rather than letting
@@ -329,7 +359,7 @@ pub(crate) async fn attach(
     config: &RelayClientConfig,
     identity: &super::direct::DirectIdentity,
     direct_requests: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
-) -> Result<()> {
+) -> Result<AttachEnd> {
     install_crypto_provider();
     // Built before the dial so the failure path can read what the verifier
     // recorded: a rejected certificate's fingerprint is the one thing an
@@ -361,10 +391,11 @@ pub(crate) async fn attach(
     };
     send(&mut control, &enroll).await?;
 
-    let device_id = match recv(&mut control).await? {
+    let (device_id, attach_id) = match recv(&mut control).await? {
         RelayMessage::Enrolled {
             device_id,
             public_url,
+            attach_id,
             ..
         } => {
             if let Some(enrolled) = &config.enrolled {
@@ -373,7 +404,7 @@ pub(crate) async fn attach(
                 // has work to do either way.
                 let _ = enrolled.send(public_url.clone());
             }
-            device_id
+            (device_id, attach_id)
         }
         RelayMessage::Rejected { code, message } => {
             return Err(ShellTunnelError::Tunnel(format!(
@@ -401,13 +432,20 @@ pub(crate) async fn attach(
     loop {
         tokio::select! {
             incoming = control.next() => {
-                let Some(Ok(message)) = incoming else { return Ok(()) };
+                let Some(Ok(message)) = incoming else { return Ok(AttachEnd::Closed) };
                 let Message::Text(text) = message else { continue };
                 match serde_json::from_str::<RelayMessage>(&text) {
                     Ok(RelayMessage::OpenData { count }) => {
                         for _ in 0..count {
-                            spawn_data_connection(config.clone(), device_id.clone());
+                            spawn_data_connection(
+                                config.clone(),
+                                device_id.clone(),
+                                attach_id.clone(),
+                            );
                         }
+                    }
+                    Ok(RelayMessage::Rejected { code, .. }) if code == reject::SUPERSEDED => {
+                        return Ok(AttachEnd::Superseded);
                     }
                     Ok(RelayMessage::HeartbeatAck) => {}
                     Ok(RelayMessage::DirectRequested { from, from_addr }) => {
@@ -591,16 +629,20 @@ fn spawn_direct_client_role(
 }
 
 /// Open one data connection and serve a single request on it.
-fn spawn_data_connection(config: RelayClientConfig, device_id: String) {
+fn spawn_data_connection(config: RelayClientConfig, device_id: String, attach_id: Option<String>) {
     tokio::spawn(async move {
-        if let Err(e) = serve_one(&config, &device_id).await {
+        if let Err(e) = serve_one(&config, &device_id, attach_id).await {
             tracing::debug!(target: "relay-client", "data connection ended: {e}");
         }
     });
 }
 
 /// Wait for one proxied request, replay it locally, return the response.
-async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
+async fn serve_one(
+    config: &RelayClientConfig,
+    device_id: &str,
+    attach_id: Option<String>,
+) -> Result<()> {
     let (mut conn, _) = tokio_tungstenite::connect_async_tls_with_config(
         config
             .data_url()
@@ -648,6 +690,7 @@ async fn serve_one(config: &RelayClientConfig, device_id: &str) -> Result<()> {
     let attach = DeviceMessage::Attach {
         device_id: device_id.to_string(),
         enroll_token: config.enroll_token.clone(),
+        attach_id,
     };
     send(&mut conn, &attach).await?;
 

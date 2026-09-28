@@ -97,6 +97,7 @@ async fn a_device_enrolls_and_is_registered() {
         device_id,
         public_url,
         reflexive_addr,
+        ..
     } = recv(&mut device).await
     else {
         panic!("expected an enrolled message");
@@ -476,4 +477,205 @@ async fn requesting_direct_to_yourself_is_reported() {
     };
     assert_eq!(target, "device-a");
     assert_eq!(reason, direct_unavailable::SELF_TARGET);
+}
+
+/// Wait for the relay to end this connection, however it chooses to.
+async fn connection_ends(device: &mut Device) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match device.next().await {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => continue,
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A second process attaching under a name the first still holds — the step
+/// between running a device by hand and running it as a service. The first is
+/// told, and its connection ending afterwards must not take the second off the
+/// relay: the second's own connection is still open, so nothing would ever
+/// tell it to reattach.
+#[tokio::test]
+async fn a_replaced_device_closing_leaves_its_replacement_attached() {
+    let (addr, state) = start_relay("secret").await;
+
+    let mut first = connect(addr).await;
+    send(&mut first, &enroll_as("secret", "build-box")).await;
+    let _ = recv(&mut first).await; // Enrolled
+    let _ = recv(&mut first).await; // pool-fill request
+
+    let mut second = connect(addr).await;
+    send(&mut second, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled { attach_id, .. } = recv(&mut second).await else {
+        panic!("expected an enrolled message");
+    };
+    let attach_id = attach_id.expect("this relay names each attachment");
+
+    let RelayMessage::Rejected { code, .. } = recv(&mut first).await else {
+        panic!("the replaced device must be told it was replaced");
+    };
+    assert_eq!(code, reject::SUPERSEDED);
+
+    first.close(None).await.unwrap();
+    drop(first);
+
+    // Removal-by-name happened within milliseconds of the close; a second
+    // of the entry staying put is the observable. Only the reassuring
+    // direction can be lost to a slow host, never a false failure.
+    for _ in 0..20 {
+        let current = state
+            .devices()
+            .get("build-box")
+            .expect("the replacement must stay attached after the replaced one leaves");
+        assert_eq!(current.attach_id, attach_id);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn an_evicted_device_is_disconnected_so_it_reattaches() {
+    let (addr, state) = start_relay("secret").await;
+    let mut device = connect(addr).await;
+    send(&mut device, &enroll_as("secret", "build-box")).await;
+    let _ = recv(&mut device).await; // Enrolled
+    let _ = recv(&mut device).await; // pool-fill request
+
+    state.devices().evict_stale(Duration::ZERO);
+
+    assert!(
+        connection_ends(&mut device).await,
+        "an evicted device left connected is never told to reattach"
+    );
+}
+
+/// A data connection a replaced process was still opening must not join its
+/// replacement's pool, or a request to the name is answered by the process
+/// that no longer holds it.
+#[tokio::test]
+async fn a_data_connection_from_a_replaced_attachment_is_refused() {
+    let (addr, _state) = start_relay("secret").await;
+
+    let mut first = connect(addr).await;
+    send(&mut first, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled {
+        attach_id: replaced,
+        ..
+    } = recv(&mut first).await
+    else {
+        panic!("expected an enrolled message");
+    };
+
+    let mut second = connect(addr).await;
+    send(&mut second, &enroll_as("secret", "build-box")).await;
+    let RelayMessage::Enrolled {
+        attach_id: current, ..
+    } = recv(&mut second).await
+    else {
+        panic!("expected an enrolled message");
+    };
+
+    let open_data = |attach_id: Option<String>| async move {
+        let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+            .await
+            .expect("the data endpoint should accept the upgrade");
+        let attach = DeviceMessage::Attach {
+            device_id: "build-box".into(),
+            enroll_token: "secret".into(),
+            attach_id,
+        };
+        conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+            .await
+            .unwrap();
+        conn
+    };
+
+    let mut stale = open_data(replaced).await;
+    assert!(
+        connection_ends(&mut stale).await,
+        "a connection opened under the replaced attachment must be closed"
+    );
+
+    // The control: the same connection under the current attachment is kept
+    // for the pool, so it hears nothing until a request arrives.
+    let mut kept = open_data(current).await;
+    let heard = tokio::time::timeout(Duration::from_millis(500), kept.next()).await;
+    assert!(
+        heard.is_err(),
+        "a connection under the current attachment must join the pool: {heard:?}"
+    );
+}
+
+/// The device's side of the same exchange: a real client that is told it was
+/// replaced stops, rather than reattaching and taking the name back — which
+/// the other process would then do in turn.
+///
+/// Multi-thread flavour because `main.rs` runs the client on one; the two
+/// clients here race for the same name, and that race is what this measures.
+#[cfg(feature = "relay-client")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_client_stops_instead_of_taking_its_name_back() {
+    use shell_tunnel::relay::client::{run, RelayClientConfig};
+
+    let (relay_addr, state) = start_relay("secret").await;
+    let client = |enrolled| RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: "secret".to_string(),
+        local: "127.0.0.1:1".parse().unwrap(),
+        label: None,
+        device_name: Some("probe".to_string()),
+        fingerprint: None,
+        ca_file: None,
+        enrolled: Some(enrolled),
+        serve_direct_requests: false,
+        direct_events: None,
+        local_hop_token: None,
+    };
+
+    let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();
+    let first = tokio::spawn(run(client(first_tx), None));
+    tokio::time::timeout(Duration::from_secs(10), first_rx.recv())
+        .await
+        .expect("the first client must attach");
+
+    let (second_tx, mut second_rx) = tokio::sync::mpsc::unbounded_channel();
+    let second = tokio::spawn(run(client(second_tx), None));
+    tokio::time::timeout(Duration::from_secs(10), second_rx.recv())
+        .await
+        .expect("the second client must attach");
+    let holder = state
+        .devices()
+        .get("probe")
+        .expect("attached")
+        .attach_id
+        .clone();
+
+    let ended = tokio::time::timeout(Duration::from_secs(10), first)
+        .await
+        .expect("the replaced client must stop")
+        .expect("the client task must not panic");
+    let message = ended
+        .expect_err("stopping is a failure to serve")
+        .to_string();
+    assert!(message.contains("'probe'"), "{message}");
+    assert!(message.contains("--device-name"), "{message}");
+
+    // It stayed stopped: the name is still the second client's.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        state
+            .devices()
+            .get("probe")
+            .expect("still attached")
+            .attach_id,
+        holder
+    );
+    assert!(
+        first_rx.try_recv().is_err(),
+        "the replaced client reattached"
+    );
+    assert!(!second.is_finished());
+    second.abort();
 }

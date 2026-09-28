@@ -92,6 +92,7 @@ async fn serve_one_request(
     let attach = DeviceMessage::Attach {
         device_id: device_id.to_string(),
         enroll_token: token.to_string(),
+        attach_id: None,
     };
     conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
         .await
@@ -244,6 +245,7 @@ async fn a_data_connection_with_a_bad_token_never_joins_the_pool() {
     let attach = DeviceMessage::Attach {
         device_id: device_id.clone(),
         enroll_token: "wrong".to_string(),
+        attach_id: None,
     };
     conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
         .await
@@ -267,6 +269,7 @@ async fn credentials_never_appear_in_a_data_connection_url() {
     let attach = DeviceMessage::Attach {
         device_id: device_id.clone(),
         enroll_token: "secret".to_string(),
+        attach_id: None,
     };
     conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
         .await
@@ -327,6 +330,7 @@ async fn an_idle_pooled_connection_is_recycled_and_replaced() {
     let attach = DeviceMessage::Attach {
         device_id: device_id.clone(),
         enroll_token: "secret".to_string(),
+        attach_id: None,
     };
     conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
         .await
@@ -393,6 +397,7 @@ async fn serve_one_websocket(addr: SocketAddr, device_id: &str, token: &str) {
     let attach = DeviceMessage::Attach {
         device_id: device_id.to_string(),
         enroll_token: token.to_string(),
+        attach_id: None,
     };
     conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
         .await

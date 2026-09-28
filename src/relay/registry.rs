@@ -37,6 +37,15 @@ pub struct Device {
     /// This device's address as the relay observed it on the control
     /// connection — set once at attach time, never mutated afterward.
     pub reflexive_addr: SocketAddr,
+    /// Random, relay-generated, unique to this one attachment.
+    ///
+    /// A named device keeps its `id` across attachments, so the id alone cannot
+    /// say *which* attachment a data connection belongs to. When a second
+    /// process attaches under the same name, a data connection the first one
+    /// was already opening would otherwise join the second one's pool, and a
+    /// request addressed to the device would be answered by the process that
+    /// was replaced. Sent to the device in `Enrolled` and echoed in `Attach`.
+    pub attach_id: String,
     attached_at: Instant,
     last_seen: Mutex<Instant>,
     exchanges: Mutex<Exchanges>,
@@ -44,6 +53,23 @@ pub struct Device {
     pool_rx: tokio::sync::Mutex<mpsc::Receiver<WebSocket>>,
     refill_tx: mpsc::Sender<()>,
     signal_tx: mpsc::Sender<RelayMessage>,
+    retired: Mutex<Option<Retirement>>,
+    retired_notify: tokio::sync::Notify,
+}
+
+/// Why the registry stopped routing to an attachment.
+///
+/// Delivered to the attachment's own control session, which is the only thing
+/// that can tell the device. Without it the registry and the session disagree
+/// silently: the session keeps acknowledging heartbeats for an entry no request
+/// can reach any more, so the device has no reason to reconnect and stays
+/// unreachable for as long as it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Retirement {
+    /// Another attachment took the same name.
+    Superseded,
+    /// Heartbeats stopped arriving for longer than the timeout.
+    Evicted,
 }
 
 /// How long this device has been taking to answer proxied requests.
@@ -84,6 +110,37 @@ impl Device {
             .lock()
             .map(|seen| seen.elapsed() > timeout)
             .unwrap_or(false)
+    }
+
+    /// Wait until the registry stops routing to this attachment.
+    ///
+    /// Resolves at once if that has already happened. Meant for one waiter —
+    /// the control session that owns the attachment.
+    pub async fn retired(&self) -> Retirement {
+        loop {
+            if let Some(why) = self.retirement() {
+                return why;
+            }
+            self.retired_notify.notified().await;
+        }
+    }
+
+    /// Why this attachment was retired, if it has been.
+    pub fn retirement(&self) -> Option<Retirement> {
+        self.retired.lock().ok().and_then(|why| *why)
+    }
+
+    /// Mark this attachment retired and wake its control session. The first
+    /// reason wins; a later one changes nothing.
+    fn retire(&self, why: Retirement) {
+        if let Ok(mut retired) = self.retired.lock() {
+            if retired.is_none() {
+                *retired = Some(why);
+            }
+        }
+        // `notify_one` stores a permit when nobody is waiting yet, so a session
+        // that reaches its `select!` only after this still wakes.
+        self.retired_notify.notify_one();
     }
 
     /// Record that the device is alive.
@@ -217,6 +274,9 @@ impl DeviceRegistry {
     }
 
     /// Attach a device under `id`, replacing any previous entry for it.
+    ///
+    /// A replaced entry is retired as [`Retirement::Superseded`], which is how
+    /// its control session learns that it no longer owns the name.
     pub fn attach(
         &self,
         id: impl Into<String>,
@@ -232,6 +292,7 @@ impl DeviceRegistry {
             id: id.clone(),
             label,
             reflexive_addr,
+            attach_id: crate::security::generate_api_key(),
             attached_at: Instant::now(),
             last_seen: Mutex::new(Instant::now()),
             exchanges: Mutex::new(Exchanges::default()),
@@ -239,10 +300,17 @@ impl DeviceRegistry {
             pool_rx: tokio::sync::Mutex::new(pool_rx),
             refill_tx,
             signal_tx,
+            retired: Mutex::new(None),
+            retired_notify: tokio::sync::Notify::new(),
         });
 
-        if let Ok(mut devices) = self.devices.write() {
-            devices.insert(id, Arc::clone(&device));
+        let replaced = self
+            .devices
+            .write()
+            .ok()
+            .and_then(|mut devices| devices.insert(id, Arc::clone(&device)));
+        if let Some(replaced) = replaced {
+            replaced.retire(Retirement::Superseded);
         }
         DeviceHandles {
             device,
@@ -251,11 +319,24 @@ impl DeviceRegistry {
         }
     }
 
-    /// Detach a device, e.g. when its control connection closes.
-    pub fn detach(&self, id: &str) -> bool {
+    /// Detach this attachment, e.g. when its control connection closes.
+    ///
+    /// Takes the attachment rather than its id, and removes the entry only if
+    /// it is still this one. A name outlives any one attachment: when a second
+    /// process attaches under it, the first one's control session is still
+    /// running, and when that session ends, removing by name would take the
+    /// *second* process off the relay — with nothing telling it so, since its
+    /// own connection is still open.
+    pub fn detach(&self, device: &Arc<Device>) -> bool {
         self.devices
             .write()
-            .map(|mut devices| devices.remove(id).is_some())
+            .map(|mut devices| match devices.get(&device.id) {
+                Some(current) if Arc::ptr_eq(current, device) => {
+                    devices.remove(&device.id);
+                    true
+                }
+                _ => false,
+            })
             .unwrap_or(false)
     }
 
@@ -319,12 +400,17 @@ impl DeviceRegistry {
     /// A half-open connection (the peer vanished without a close frame) is
     /// indistinguishable from an idle one at the socket level, so staleness is
     /// judged from heartbeats.
+    ///
+    /// An evicted attachment is retired as [`Retirement::Evicted`]: a heartbeat
+    /// that was only late would otherwise find its session still open and still
+    /// acknowledging, and the device would never learn it had to reattach.
     pub fn evict_stale(&self, timeout: Duration) -> Vec<String> {
         let mut evicted = Vec::new();
         if let Ok(mut devices) = self.devices.write() {
             devices.retain(|id, device| {
                 let keep = !device.is_stale(timeout);
                 if !keep {
+                    device.retire(Retirement::Evicted);
                     evicted.push(id.clone());
                 }
                 keep
@@ -380,11 +466,52 @@ mod tests {
     #[tokio::test]
     async fn detach_removes_the_device() {
         let registry = DeviceRegistry::new();
-        registry.attach("dev-1", None, addr());
+        let handles = registry.attach("dev-1", None, addr());
 
-        assert!(registry.detach("dev-1"));
-        assert!(!registry.detach("dev-1"));
+        assert!(registry.detach(&handles.device));
+        assert!(!registry.detach(&handles.device));
         assert_eq!(registry.count(), 0);
+    }
+
+    #[tokio::test]
+    async fn detaching_a_replaced_attachment_leaves_its_replacement_attached() {
+        let registry = DeviceRegistry::new();
+        let old = registry.attach("dev-1", None, addr());
+        let new = registry.attach("dev-1", None, addr());
+
+        assert!(
+            !registry.detach(&old.device),
+            "the old attachment no longer owns the name"
+        );
+        let current = registry.get("dev-1").expect("the replacement stays");
+        assert!(Arc::ptr_eq(&current, &new.device));
+    }
+
+    #[tokio::test]
+    async fn a_replaced_attachment_is_told_it_was_superseded() {
+        let registry = DeviceRegistry::new();
+        let old = registry.attach("dev-1", None, addr());
+        let new = registry.attach("dev-1", None, addr());
+
+        let why = tokio::time::timeout(Duration::from_secs(5), old.device.retired())
+            .await
+            .expect("the retirement was signalled before anyone waited");
+        assert_eq!(why, Retirement::Superseded);
+        assert_eq!(new.device.retirement(), None);
+        assert_ne!(old.device.attach_id, new.device.attach_id);
+    }
+
+    #[tokio::test]
+    async fn an_evicted_attachment_is_told_it_was_evicted() {
+        let registry = DeviceRegistry::new();
+        let handles = registry.attach("dev-1", None, addr());
+
+        registry.evict_stale(Duration::ZERO);
+
+        let why = tokio::time::timeout(Duration::from_secs(5), handles.device.retired())
+            .await
+            .expect("the retirement was signalled before anyone waited");
+        assert_eq!(why, Retirement::Evicted);
     }
 
     #[tokio::test]

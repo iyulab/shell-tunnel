@@ -1074,7 +1074,17 @@ async fn run_with_relay(
 
     tokio::select! {
         result = server => result.expect("server task panicked"),
-        result = run_relay_client(client_config, None) => result,
+        // The client only returns once attaching is pointless — another
+        // process has taken this device's name. Said in the program's own
+        // words and ended here, rather than returned to `main` and printed as
+        // a Rust `Debug` value.
+        result = run_relay_client(client_config, None) => {
+            if let Err(e) = result {
+                errln!("{e}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
     }
 }
 
