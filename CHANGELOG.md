@@ -3,6 +3,49 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.26.0 — unreleased
+
+### Fixed
+
+- **A device replaced under its own name no longer takes its replacement off the relay
+  when it disconnects.** When a second process attached with the same `--device-name` —
+  the usual step when moving a device started by hand into a service — the relay routed
+  the name to the new process, but ending the old one removed the name outright. The new
+  process stayed connected and was never told, so its URL answered `502 device is not
+  connected` until it was restarted by hand. The relay now removes an entry only on
+  behalf of the connection that holds it. Relay-side.
+- **A device the relay dropped for missed heartbeats reattaches.** Its connection used to
+  be left open and its heartbeats still acknowledged, so a device whose heartbeats were
+  only late stayed unreachable with nothing telling it so. The relay now closes it, and
+  the device reconnects as it does after any drop. Relay-side.
+- **A data connection the replaced process was still opening no longer joins its
+  replacement's pool**, where it would have answered requests addressed to the process
+  that replaced it. Needs both sides at 0.26.0; an older device's data connections are
+  matched by name, as before.
+- **On Windows, a drive that does not answer no longer keeps the server from starting.**
+  Enumerating the drives a machine-wide file API reaches opened every drive root before
+  the port was bound, and a removable drive with no usable medium, or a network drive
+  whose server is gone, could block that open indefinitely — the server printed nothing
+  past its version line and never listened. Each drive now gets 3 seconds, all at once; one
+  that misses it is left out of the scope, named in the `File API:` banner line and at
+  `WARN`, and answered `403` without being touched again.
+
+### Changed
+
+- **A device replaced under its own name exits** (status 1) with `another process attached
+  to the relay as '<name>' and now receives this device's requests, so this one has
+  stopped`. It used to stay running, connected and unreachable. Two processes that keep
+  one name — two services, or a supervisor restarting the one that exited — now take it
+  from each other in turn instead of one of them going quiet; the line says so.
+- **Relay protocol**: `Enrolled` carries an `attach_id`, which the device echoes in each
+  data connection's `Attach`; a `Rejected` with code `superseded` can now arrive mid-session.
+  Both fields are optional on the wire, so either side works with the other at 0.25.0 —
+  with the older side's behaviour (see `docs/USAGE.md`, *Surviving a reboot*).
+- ⚠ Library: `DeviceRegistry::detach` takes the attachment (`&Arc<Device>`) instead of its
+  id, `fs::platform::filesystem_anchors` returns an `Anchors` value instead of a `Vec`,
+  and `DeviceMessage::Attach` / `RelayMessage::Enrolled` gained a field, so a struct
+  literal of either stops compiling.
+
 ## 0.25.0 — 2026-09-13
 
 ### Fixed

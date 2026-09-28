@@ -154,6 +154,25 @@ break is silent from the server's side:**
 | `--device-name <n>` | defaults to the machine's name, which is stable — but if you set one, keep setting it, or the device URL moves |
 | `--enroll-token <t>` **on the relay** | a new one is generated and stored nowhere, so every attached device's join line stops working. The devices retry quietly in backoff; nothing says why. The relay's own banner warns when it generated one. |
 
+**Moving a device you started by hand into a service.** Start the service with the
+same `--device-name` while the hand-started process is still running: the relay gives
+the name to whichever process attached last, tells the other one, and that one exits
+(`another process attached to the relay as '<name>' …`, exit status 1). Nothing else is
+needed — the device's URL changes hands without a gap. This needs both the relay and the
+device at 0.26.0 or later:
+
+- **An older relay** routes by name alone: once the service has taken the name, ending
+  the hand-started process takes the *service* off the relay too, and it does not notice
+  (`502 device is not connected` until it restarts). Stop the hand-started process
+  first, then start the service.
+- **An older device** that is replaced is not told it was: it stays running and
+  connected, answering nothing. Stop it — with a 0.26.0 relay that no longer disturbs
+  the process that replaced it.
+
+Two processes that both keep one name — two services, or a service manager that
+restarts the one that exited — take it from each other on every restart. The exit line
+above is the sign: give them different names.
+
 Use a relay rather than a tunnel for anything unattended. A quick tunnel gets a
 new URL on every restart, and the server exits when the tunnel client does; a
 relay-attached device keeps one URL.
@@ -523,6 +542,15 @@ By default these reach whatever the account running the server reaches, and `pat
 absolute path (`C:/data/x.bin`, `/srv/deploy/x.bin`; either separator works). Start with
 `--fs-root <dir>` to confine them to one directory instead, and `path` becomes relative
 to it. The startup banner names the effective scope either way.
+
+On Windows the whole machine means the drives that answered when the server started. One
+that appears later is not reached until a restart, and neither is one that did not answer
+within 3 seconds at startup — a removable drive with no usable medium, a network drive
+whose server is gone. The banner names those after the reachable ones (`File API: whole
+machine (C:\, D:\); not reachable, did not answer at startup: E:\`), the log says the same
+at `WARN`, and a request naming one is answered `403` like any path outside the scope,
+without touching the drive. Before 0.26.0 such a drive kept the server from starting at
+all, with nothing in its output saying why.
 
 The confinement is worth something for a token holding `fs.read`/`fs.write` and **not**
 `exec`. It is not a boundary against a token that can run commands, which can already
@@ -1711,6 +1739,7 @@ startup rather than serving local-only.
 | `relay refused a data connection: HTTP 429` (device log, `WARN`) | same cause, on a replacement data connection: the device stays attached but cannot refill its pool, so callers get `503` | same remedy. Before 0.25.0 a caller sharing the device's address caused this with nothing but its own upload, and the line was `debug` only |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
+| `another process attached to the relay as '<name>' and now receives this device's requests, so this one has stopped` (exit status 1) | a second process attached under the same `--device-name`; the relay routes the name to the latest one ([§ Surviving a reboot](#surviving-a-reboot)) | intended when moving a device into a service. Otherwise two processes share a name: stop one, or rename one. Restarting this one takes the name back and stops the other |
 | `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
 | `cannot reach relay: … Nothing answered at <host:port>` | the connection was neither answered nor refused — something between the device and the relay is dropping it | not a flag problem. Check whether the device can open *any* outbound connection to that port; a relay on a port the network already allows out is the usual fix |
 | `cannot reach relay: … <host:port> was reached, and nothing is listening on it` | the address and route are fine; the relay is not serving there | check the relay is running and bound to that port |
