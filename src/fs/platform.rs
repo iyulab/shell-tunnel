@@ -70,19 +70,126 @@ pub fn check_component(component: &str) -> Result<(), &'static str> {
 /// `Path::canonicalize` returns verbatim paths, so an anchor left in its
 /// plain `C:\` form would fail `starts_with` against every resolved path and
 /// the containment check would refuse everything that actually exists.
+///
+/// Each drive gets [`ANCHOR_PROBE_DEADLINE`] to answer, all at once. Opening a
+/// drive root can block without end — a removable drive with no usable medium
+/// answers "is a directory" at once and then never completes the open that
+/// canonicalising needs; a disconnected network drive waits on the network.
+/// This runs before the server binds, so one such drive used to keep the whole
+/// gateway from starting, with nothing in the log saying why. A drive that
+/// misses the deadline is left out of the scope and named in
+/// [`Anchors::unanswered`], for the same reason a drive that appears later is
+/// not picked up: the scope is what answered at startup.
 #[cfg(windows)]
-pub fn filesystem_anchors() -> Vec<std::path::PathBuf> {
-    (b'A'..=b'Z')
+pub fn filesystem_anchors() -> Anchors {
+    let candidates = (b'A'..=b'Z')
         .map(|letter| std::path::PathBuf::from(format!("{}:\\", letter as char)))
-        .filter(|anchor| anchor.is_dir())
-        .filter_map(|anchor| anchor.canonicalize().ok())
-        .collect()
+        .collect();
+    let anchors = probe_anchors(candidates, ANCHOR_PROBE_DEADLINE, |anchor| {
+        if anchor.is_dir() {
+            anchor.canonicalize().ok()
+        } else {
+            None
+        }
+    });
+    for drive in &anchors.unanswered {
+        tracing::warn!(
+            "drive {} did not answer within {}s at startup; the file API will not reach it until the server restarts",
+            drive.display(),
+            ANCHOR_PROBE_DEADLINE.as_secs()
+        );
+    }
+    anchors
 }
 
 /// See the Windows variant: one root, and everything hangs below it.
+///
+/// Not probed: `/` is where this process's own binary was loaded from, so
+/// there is no state in which it fails to answer and the server still runs.
 #[cfg(not(windows))]
-pub fn filesystem_anchors() -> Vec<std::path::PathBuf> {
-    vec![std::path::PathBuf::from("/")]
+pub fn filesystem_anchors() -> Anchors {
+    Anchors {
+        reachable: vec![std::path::PathBuf::from("/")],
+        unanswered: Vec::new(),
+    }
+}
+
+/// How long one drive gets to answer while the scope is enumerated at startup.
+///
+/// Every drive is asked at once, so this bounds startup as a whole, and it is
+/// only ever spent when some drive does not answer. Long enough for a slow
+/// network drive that is actually up; short against the minute a supervisor
+/// or a test harness typically waits for the port to open.
+pub const ANCHOR_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The roots a machine-wide scope reaches, and the ones it could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Anchors {
+    /// Canonical roots, in drive order.
+    pub reachable: Vec<std::path::PathBuf>,
+    /// Roots that did not answer before the deadline, as the plain name
+    /// (`E:\`) — there is no canonical form of something that never opened.
+    pub unanswered: Vec<std::path::PathBuf>,
+}
+
+/// Ask `probe` about every candidate at once, and keep what answers in time.
+///
+/// `probe` returns the anchor a candidate stands for, or `None` when it is not
+/// one (no such drive). A candidate still unanswered at the deadline lands in
+/// [`Anchors::unanswered`]; its thread is left to finish on its own, since an
+/// open blocked in the kernel cannot be cancelled from here, and ends when the
+/// drive finally answers or the process exits.
+///
+/// Separate from [`filesystem_anchors`] and not platform-gated so the deadline
+/// can be tested with a probe that never returns, on every platform, rather
+/// than against whatever drives the test machine happens to have.
+pub fn probe_anchors<F>(
+    candidates: Vec<std::path::PathBuf>,
+    deadline: std::time::Duration,
+    probe: F,
+) -> Anchors
+where
+    F: Fn(&std::path::Path) -> Option<std::path::PathBuf> + Send + Sync + 'static,
+{
+    let probe = std::sync::Arc::new(probe);
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (index, candidate) in candidates.iter().enumerate() {
+        let tx = tx.clone();
+        let probe = std::sync::Arc::clone(&probe);
+        let candidate = candidate.clone();
+        // A thread that cannot be spawned never answers, which is reported the
+        // same way as a drive that never answers — the scope is still built.
+        let _ = std::thread::Builder::new()
+            .name("fs-anchor-probe".into())
+            .spawn(move || {
+                let _ = tx.send((index, probe(&candidate)));
+            });
+    }
+    drop(tx);
+
+    let until = std::time::Instant::now() + deadline;
+    let mut answers: Vec<Option<Option<std::path::PathBuf>>> = vec![None; candidates.len()];
+    let mut outstanding = candidates.len();
+    while outstanding > 0 {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(left) {
+            Ok((index, answer)) => {
+                answers[index] = Some(answer);
+                outstanding -= 1;
+            }
+            Err(_) => break,
+        }
+    }
+
+    let mut anchors = Anchors::default();
+    for (candidate, answer) in candidates.into_iter().zip(answers) {
+        match answer {
+            Some(Some(anchor)) => anchors.reachable.push(anchor),
+            Some(None) => {}
+            None => anchors.unanswered.push(candidate),
+        }
+    }
+    anchors
 }
 
 #[cfg(unix)]
@@ -258,6 +365,61 @@ mod tests {
     #[test]
     fn empty_components_are_refused() {
         assert!(check_component("").is_err());
+    }
+
+    /// A drive whose open never completes must not hold up the rest: it is
+    /// named as unanswered, and every drive that did answer is kept, in order.
+    #[test]
+    fn a_drive_that_never_answers_is_left_out_and_named() {
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, Instant};
+
+        let candidates: Vec<PathBuf> = ["A", "C", "E", "Z"].iter().map(PathBuf::from).collect();
+        let started = Instant::now();
+        let anchors = probe_anchors(candidates, Duration::from_secs(2), |candidate: &Path| {
+            match candidate.to_str() {
+                // Stands in for the removable drive with no medium: the open
+                // blocks for far longer than any deadline.
+                Some("E") => {
+                    std::thread::sleep(Duration::from_secs(600));
+                    None
+                }
+                // No such drive: answers at once, and is not an anchor.
+                Some("A") => None,
+                _ => Some(candidate.join("canonical")),
+            }
+        });
+
+        assert_eq!(
+            anchors,
+            Anchors {
+                reachable: vec![
+                    PathBuf::from("C").join("canonical"),
+                    PathBuf::from("Z").join("canonical"),
+                ],
+                unanswered: vec![PathBuf::from("E")],
+            }
+        );
+        // Bounded by the deadline, not by the drive. The upper bound is loose
+        // on purpose — the deadline is the fact under test, not the host.
+        assert!(started.elapsed() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn drives_that_all_answer_do_not_wait_for_the_deadline() {
+        use std::path::{Path, PathBuf};
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let anchors = probe_anchors(
+            vec![PathBuf::from("C"), PathBuf::from("D")],
+            Duration::from_secs(600),
+            |candidate: &Path| Some(candidate.to_path_buf()),
+        );
+
+        assert_eq!(anchors.reachable.len(), 2);
+        assert!(anchors.unanswered.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(60));
     }
 
     /// Cannot deterministically fill a disk to force a real `ENOSPC` in a

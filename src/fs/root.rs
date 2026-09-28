@@ -60,7 +60,11 @@ enum Scope {
     /// the jail is a real boundary and this shape is the whole machine. See
     /// `KNOWN_CAPABILITIES` in `src/security/capability.rs`, which states both
     /// halves. The startup banner says so on a run that combines the two.
-    Machine(Vec<PathBuf>),
+    ///
+    /// Drives that did not answer at startup are carried too, not only left
+    /// out: a request naming one is refused without touching the drive again,
+    /// and the banner names them.
+    Machine(platform::Anchors),
 }
 
 /// What the filesystem API may touch.
@@ -117,8 +121,24 @@ impl FsRoot {
         match &self.scope {
             Scope::Jailed(root) => Self::displayable(root),
             Scope::Machine(anchors) => {
-                let names: Vec<String> = anchors.iter().map(|a| Self::displayable(a)).collect();
-                format!("whole machine ({})", names.join(", "))
+                let names: Vec<String> = anchors
+                    .reachable
+                    .iter()
+                    .map(|a| Self::displayable(a))
+                    .collect();
+                let mut described = format!("whole machine ({})", names.join(", "));
+                if !anchors.unanswered.is_empty() {
+                    let missing: Vec<String> = anchors
+                        .unanswered
+                        .iter()
+                        .map(|a| Self::displayable(a))
+                        .collect();
+                    described.push_str(&format!(
+                        "; not reachable, did not answer at startup: {}",
+                        missing.join(", ")
+                    ));
+                }
+                described
             }
         }
     }
@@ -143,7 +163,7 @@ impl FsRoot {
     fn contains(&self, resolved: &Path) -> bool {
         match &self.scope {
             Scope::Jailed(root) => resolved.starts_with(root),
-            Scope::Machine(anchors) => anchors.iter().any(|a| resolved.starts_with(a)),
+            Scope::Machine(anchors) => anchors.reachable.iter().any(|a| resolved.starts_with(a)),
         }
     }
 
@@ -159,13 +179,24 @@ impl FsRoot {
             Scope::Jailed(root) => Ok((root.clone(), Self::components(rel)?)),
             Scope::Machine(anchors) => {
                 let (named, rest) = Self::split_absolute(rel)?;
+                // Before `canonicalize`, which opens the drive: one that did
+                // not answer at startup would block this request the same
+                // way, and pin a blocking-pool thread for as long as it does.
+                // Refused in the same words as any drive outside the scope.
+                if anchors
+                    .unanswered
+                    .iter()
+                    .any(|a| a.as_os_str().eq_ignore_ascii_case(named.as_os_str()))
+                {
+                    return Err(FsError::Escapes);
+                }
                 // Canonicalised before the membership check so both sides are
                 // in the same form. On Windows that form is verbatim
                 // (`\\?\C:\`), which is what `canonicalize` returns for every
                 // resolved path further down — comparing a plain `C:\` against
                 // those would fail for everything that exists.
                 let anchor = named.canonicalize().map_err(|_| FsError::Escapes)?;
-                if !anchors.iter().any(|a| a == &anchor) {
+                if !anchors.reachable.iter().any(|a| a == &anchor) {
                     // Not "no such drive" — that would answer differently for a
                     // drive that exists than for one that does not, which is the
                     // same existence oracle the jail is careful to avoid, just
@@ -434,7 +465,10 @@ impl FsRoot {
     fn lexically_within(&self, candidate: &Path) -> bool {
         match &self.scope {
             Scope::Jailed(root) => Self::lexical_within(root, candidate),
-            Scope::Machine(anchors) => anchors.iter().any(|a| Self::lexical_within(a, candidate)),
+            Scope::Machine(anchors) => anchors
+                .reachable
+                .iter()
+                .any(|a| Self::lexical_within(a, candidate)),
         }
     }
 
@@ -502,7 +536,7 @@ mod machine_wide_tests {
     #[test]
     fn every_filesystem_anchor_is_in_scope() {
         let scope = FsRoot::machine_wide();
-        let anchors = platform::filesystem_anchors();
+        let anchors = platform::filesystem_anchors().reachable;
         assert!(!anchors.is_empty(), "a machine has at least one");
 
         for anchor in &anchors {
@@ -627,6 +661,34 @@ mod machine_wide_tests {
     /// — the audit-log containment check, the startup orphan sweep, the
     /// staging directory. Each has to behave differently here, so returning
     /// `None` is load-bearing rather than cosmetic.
+    /// A drive left out because it did not answer at startup is refused like
+    /// any drive outside the scope, and the banner names it.
+    ///
+    /// What this cannot show is the part that matters most — that the refusal
+    /// comes *before* the drive is opened, so a request naming it does not
+    /// hang. Without a drive that hangs there is no observable difference; the
+    /// order is visible in `anchor_and_parts` and nowhere else.
+    #[test]
+    fn a_drive_that_did_not_answer_is_refused_and_named() {
+        let scope = FsRoot {
+            scope: Scope::Machine(platform::Anchors {
+                reachable: platform::filesystem_anchors().reachable,
+                unanswered: vec![PathBuf::from("Q:\\")],
+            }),
+        };
+
+        assert_eq!(scope.resolve_existing("q:/x"), Err(FsError::Escapes));
+        assert_eq!(
+            scope.resolve_for_create("Q:/x").err(),
+            Some(FsError::Escapes)
+        );
+        let described = scope.describe();
+        assert!(
+            described.contains("did not answer at startup: Q:\\"),
+            "{described}"
+        );
+    }
+
     #[test]
     fn machine_wide_scope_has_no_single_path() {
         assert!(FsRoot::machine_wide().jail_path().is_none());
@@ -642,7 +704,7 @@ mod machine_wide_tests {
     fn the_banner_line_names_what_is_reachable() {
         let described = FsRoot::machine_wide().describe();
         assert!(described.contains("whole machine"), "{described}");
-        for anchor in platform::filesystem_anchors() {
+        for anchor in platform::filesystem_anchors().reachable {
             let readable = FsRoot::displayable(&anchor);
             assert!(
                 described.contains(&readable),
