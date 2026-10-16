@@ -1401,3 +1401,55 @@ async fn latch_fails_while_a_request_is_in_flight() {
         "a guard was handed out through a closed latch"
     );
 }
+
+/// An upload is live between requests: the request that created it has
+/// finished, no guard is held, and `Activity::latch` alone would succeed.
+/// `latch_if_idle` must still refuse, and must leave the door open.
+#[tokio::test]
+async fn latch_if_idle_refuses_while_an_upload_is_open() {
+    use shell_tunnel::api::activity::latch_if_idle;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = shell_tunnel::FsRoot::new(dir.path()).expect("root");
+    let state = AppState::new().with_fs_root(root);
+    let app = create_router_with_state(state.clone());
+
+    let payload = b"half an upload";
+    let digest = {
+        let mut hasher = shell_tunnel::fs::sha256::Hasher::new();
+        hasher.update(payload);
+        hasher.finish()
+    };
+    let created = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/fs/uploads",
+            Some(json!({
+                "path": "pending.bin",
+                "size": payload.len() as u64,
+                "sha256": digest,
+            })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+
+    // The premise: nothing is being served, yet an upload is live.
+    assert_eq!(state.activity.in_flight(), 0);
+    assert_eq!(state.uploads.live_count(), 1);
+
+    assert!(!latch_if_idle(&state), "latched over a live upload");
+    assert!(
+        !state.activity.is_latched(),
+        "a refused latch stayed closed"
+    );
+}
+
+#[tokio::test]
+async fn latch_if_idle_latches_a_server_with_nothing_running() {
+    use shell_tunnel::api::activity::latch_if_idle;
+
+    let state = AppState::new();
+    assert!(latch_if_idle(&state));
+    assert!(state.activity.is_latched());
+}

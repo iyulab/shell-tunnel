@@ -12,6 +12,12 @@
 //! each command already gets a fresh shell. What is counted is work that a
 //! restart would destroy: a request being served, a command running in a
 //! session, an upload being assembled, and an open WebSocket.
+//!
+//! Only the request count lives in the latch word. A session command and an
+//! upload are live *between* requests, holding no guard, so [`Activity::latch`]
+//! alone cannot see them: an upload created and acknowledged just before the
+//! latch leaves the count at zero. The primitive to latch with is
+//! [`latch_if_idle`], which closes the door and then checks those two.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -137,6 +143,29 @@ pub fn is_idle(state: &AppState) -> bool {
     state.activity.in_flight() == 0
         && state.store.count_active() == 0
         && state.uploads.live_count() == 0
+}
+
+/// Close the latch only if the whole server is idle, and leave it open if not.
+///
+/// The one function an updater should latch with. [`Activity::latch`] proves
+/// only that no request is in flight; a live upload or a running session
+/// command holds no guard between requests. So this latches first and
+/// re-checks afterwards, undoing the latch if either is non-zero.
+///
+/// Re-checking *after* latching is what makes it sound. Once the latch is
+/// closed and the request count was zero, no request is being served and none
+/// can be admitted, and a session command or an upload can only begin through
+/// a request. So the two counts read next cannot rise, and a zero is final.
+/// Checking before latching would leave a window for one to begin in between.
+pub fn latch_if_idle(state: &AppState) -> bool {
+    if !state.activity.latch() {
+        return false;
+    }
+    if state.store.count_active() == 0 && state.uploads.live_count() == 0 {
+        return true;
+    }
+    state.activity.unlatch();
+    false
 }
 
 /// Count every request while it is served, and refuse all of them once latched.
