@@ -15,13 +15,8 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    # Signing authenticates to Azure Key Vault through OIDC, and the federated
-    # credential matches `repo:iyulab/shell-tunnel:environment:production` — so
-    # only the job that signs declares the environment.
-    environment: ${{ matrix.sign && 'production' || '' }}
     permissions:
       contents: read
-      id-token: write
     strategy:
       matrix:
         include:
@@ -75,57 +70,100 @@ jobs:
         if: ${{ !matrix.cross }}
         run: cargo build --release --features self-update,relay-client,tls --target ${{ matrix.target }}
 
-      # Authenticode-sign the executable before it goes into the zip: the
-      # signing service only signs top-level release assets, and the binary
-      # `--update` installs is the one inside the archive.
-      - name: Sign (Windows)
-        if: matrix.sign
-        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9
-        with:
-          files: target/${{ matrix.target }}/release/${{ matrix.artifact }}
-          description: shell-tunnel
-          description-url: https://github.com/iyulab/shell-tunnel
-
-      # A sign step that reports success is not evidence the file is signed —
-      # refuse to package anything that does not carry a valid signature.
-      - name: Verify signature (Windows)
-        if: matrix.sign
-        shell: pwsh
-        run: |
-          $sig = Get-AuthenticodeSignature "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
-          Write-Host "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)  Timestamp: $($sig.TimeStamperCertificate.Subject)"
-          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status): $($sig.StatusMessage)" }
-          if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
-
-      - name: Create archive (Unix)
-        if: runner.os != 'Windows'
+      - name: Create archive
+        if: ${{ !matrix.sign }}
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../${{ matrix.archive }} ${{ matrix.artifact }}
 
-      - name: Create archive (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.archive }} ${{ matrix.artifact }}
-
       - name: Upload artifact
+        if: ${{ !matrix.sign }}
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
           retention-days: 1
 
+      # The executable to be signed leaves this job unpackaged; `sign-windows`
+      # signs it and builds the zip.
+      - name: Upload unsigned executable
+        if: matrix.sign
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-${{ matrix.archive }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          retention-days: 1
+
+  # Signing is its own job so that the job holding the signing identity — OIDC
+  # to Azure Key Vault, matched by the federated credential
+  # `repo:iyulab/shell-tunnel:environment:production` — runs no build tooling
+  # and no third-party action from the build. Only the composite action from
+  # iyulab/code-sign, pinned by SHA, touches the credential.
+  sign-windows:
+    name: Sign Windows executable
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      EXE: shell-tunnel.exe
+      ARCHIVE: shell-tunnel-windows-x64.zip
+    steps:
+      - name: Download unsigned executable
+        uses: actions/download-artifact@v8
+        with:
+          name: unsigned-shell-tunnel-windows-x64.zip
+          path: bin
+
+      # Signed before it goes into the zip: the binary `--update` installs is
+      # the one inside the archive, not a top-level release asset.
+      - name: Sign
+        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9
+        with:
+          files: bin/shell-tunnel.exe
+          description: shell-tunnel
+          description-url: https://github.com/iyulab/shell-tunnel
+
+      # A sign step that reports success is not evidence the file is signed —
+      # refuse to package anything that does not carry a valid signature.
+      - name: Verify signature
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "bin/$env:EXE"
+          Write-Host "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)  Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status): $($sig.StatusMessage)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
+
+      - name: Create archive
+        shell: pwsh
+        run: |
+          Push-Location bin
+          7z a "../$env:ARCHIVE" $env:EXE
+          Pop-Location
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: shell-tunnel-windows-x64.zip
+          path: shell-tunnel-windows-x64.zip
+          retention-days: 1
+
   release:
     name: Create Release
-    needs: build
+    needs: [build, sign-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 
-      - name: Download all artifacts
+      # Release archives only. The unsigned executable is an artifact too, and
+      # `files: artifacts/**/*` below would attach it to the Release.
+      - name: Download release archives
         uses: actions/download-artifact@v8
         with:
+          pattern: shell-tunnel-*
           path: artifacts
 
       - name: Get version
@@ -148,7 +186,9 @@ jobs:
       - name: Delete build artifacts
         uses: geekyeggo/delete-artifact@v6
         with:
-          name: shell-tunnel-*
+          name: |
+            shell-tunnel-*
+            unsigned-*
           useGlob: true
           failOnError: false
 

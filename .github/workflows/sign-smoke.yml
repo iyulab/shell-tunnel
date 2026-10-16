@@ -1,9 +1,9 @@
 name: Sign smoke test
 
 # Exercises the signing path of release.yml without publishing anything.
-# Pushing a `v*` tag *is* the publish, and nothing else runs the sign step, so
+# Pushing a `v*` tag *is* the publish, and nothing else runs the sign job, so
 # run this by hand after changing signing — and before the first tag that
-# depends on it. Uploads nothing.
+# depends on it. Its only artifact is the unsigned executable, kept one day.
 on:
   workflow_dispatch:
 
@@ -11,54 +11,56 @@ permissions:
   contents: read
 
 jobs:
-  sign:
-    name: Sign ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  build:
+    name: Build Windows executable
+    runs-on: windows-latest
     timeout-minutes: 30
-    # Same expression as release.yml. The ubuntu entry, which does not sign,
-    # is there to show that an empty environment name means "no environment".
-    environment: ${{ matrix.sign && 'production' || '' }}
-    permissions:
-      contents: read
-      id-token: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            sign: true
-          - os: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v7
-        if: matrix.sign
 
       - name: Install Rust
-        if: matrix.sign
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build
-        if: matrix.sign
         run: cargo build --release --features self-update,relay-client,tls
 
+      - name: Upload unsigned executable
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-smoke
+          path: target/release/shell-tunnel.exe
+          retention-days: 1
+
+  # Same shape as release.yml's `sign-windows`: the job holding the signing
+  # identity runs nothing from the build.
+  sign:
+    name: Sign and verify
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Download unsigned executable
+        uses: actions/download-artifact@v8
+        with:
+          name: unsigned-smoke
+          path: bin
+
       - name: Sign
-        if: matrix.sign
         uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9
         with:
-          files: target/release/shell-tunnel.exe
+          files: bin/shell-tunnel.exe
           description: shell-tunnel
           description-url: https://github.com/iyulab/shell-tunnel
 
       - name: Verify signature
-        if: matrix.sign
         shell: pwsh
         run: |
-          $sig = Get-AuthenticodeSignature "target/release/shell-tunnel.exe"
+          $sig = Get-AuthenticodeSignature "bin/shell-tunnel.exe"
           Write-Host "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)  Timestamp: $($sig.TimeStamperCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status): $($sig.StatusMessage)" }
           if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
-          & "target/release/shell-tunnel.exe" --version
-
-      - name: Environment expression
-        if: ${{ !matrix.sign }}
-        run: echo "job started without an environment"
+          & "bin/shell-tunnel.exe" --version
