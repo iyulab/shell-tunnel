@@ -31,6 +31,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   and a Windows service reports it as a clean stop.
 - **A run that ends in an error prints the error in words** (`Error: …`) instead of a
   Rust `Debug` dump of it.
+- **Library: `fs::platform::Anchors::reachable` holds `Anchor { name, canonical }`**
+  instead of bare canonical paths, so a root keeps the name it is addressed by. Breaking
+  for code that reads the field; `canonical` is the value it used to hold.
+- **Library: `ShellTunnelError::Superseded { device_name }`** is what the relay client
+  returns when another process takes the device's name (it was `Tunnel(String)`).
 
 - **The Windows release binary is Authenticode-signed.** `shell-tunnel.exe` inside
   `shell-tunnel-windows-x64.zip` now carries a timestamped iyulab signature, for which
