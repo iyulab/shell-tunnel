@@ -157,7 +157,7 @@ break is silent from the server's side:**
 **Moving a device you started by hand into a service.** Start the service with the
 same `--device-name` while the hand-started process is still running: the relay gives
 the name to whichever process attached last, tells the other one, and that one exits
-(`another process attached to the relay as '<name>' …`, exit status 1). Nothing else is
+(`another process attached to the relay as '<name>' …`, exit status 3). Nothing else is
 needed — the device's URL changes hands without a gap. This needs both the relay and the
 device at 0.26.0 or later:
 
@@ -172,6 +172,13 @@ device at 0.26.0 or later:
 Two processes that both keep one name — two services, or a service manager that
 restarts the one that exited — take it from each other on every restart. The exit line
 above is the sign: give them different names.
+
+**That ending has an exit status of its own, 3, so a service manager can leave it
+alone.** Every other ending of a running device is a failure worth restarting; this one
+is the opposite, since a restarted device takes its name back. The systemd unit below
+says so with `RestartPreventExitStatus=3`. A Windows service reports this ending to the
+service manager as a clean stop, so its restart actions do not fire on it. Before
+0.27.0 this ending exited 1, indistinguishable from a failure.
 
 Use a relay rather than a tunnel for anything unattended. A quick tunnel gets a
 new URL on every restart, and the server exits when the tunnel client does; a
@@ -188,6 +195,8 @@ Wants=network-online.target
 ExecStart=/usr/local/bin/shell-tunnel --relay https://relay.example.com:8443 --enroll-token st_... --relay-fingerprint sha256:... -k <key> --preset operator --audit-log /var/log/shell-tunnel.jsonl
 Restart=always
 RestartSec=5
+# 3: another process took this device's name — restarting would take it back
+RestartPreventExitStatus=3
 User=shell-tunnel
 
 [Install]
@@ -198,7 +207,32 @@ WantedBy=multi-user.target
 # Windows: a service via sc.exe, one line, quoted as one binPath
 sc.exe create shell-tunnel binPath= "\"C:\Program Files\shell-tunnel\shell-tunnel.exe\" --relay https://relay.example.com:8443 --enroll-token st_... --relay-fingerprint sha256:... -k <key> --preset operator" start= auto
 sc.exe failure shell-tunnel reset= 86400 actions= restart/5000
+sc.exe failureflag shell-tunnel 1
 ```
+
+**The Windows service needs 0.27.0 or later.** Earlier binaries never answered the
+service control manager, which kills a service that does not within 30 seconds:
+`sc.exe start` failed with `1053` however the service was defined. The binary now
+notices it was started as a service and answers — the same command line runs in a
+console too, so test it there first, where an error is visible.
+
+Three things differ from a console run:
+
+- **The working directory is the executable's folder**, not `System32` where a
+  service otherwise starts. A relative `--audit-log`, the relay's certificate
+  files, or a config file resolve there — and the default audit trail of an
+  exposed device lands there as well.
+- **`sc.exe stop` ends it within a few seconds** and reports a clean stop. A command
+  still running is given five seconds, then the process ends anyway.
+- **`sc.exe failureflag shell-tunnel 1` is what makes the restart line above apply
+  to a run that ended in an error.** Without it the service manager restarts only a
+  process that crashed, and a device that stopped on an error stays stopped. The one
+  ending it does not restart either way is the replaced device (exit status 3, above).
+
+The banner — the device's URL and any generated key — goes nowhere under a service,
+since there is no console. Set `-k` rather than relying on a generated key, and read
+the device's URL from `/relay/v1/devices` on the relay ([Finding attached
+devices](#finding-attached-devices)).
 
 ```xml
 <!-- launchd: ~/Library/LaunchAgents/com.example.shell-tunnel.plist -->
@@ -1740,7 +1774,7 @@ startup rather than serving local-only.
 | `relay refused a data connection: HTTP 429` (device log, `WARN`) | same cause, on a replacement data connection: the device stays attached but cannot refill its pool, so callers get `503` | same remedy. Before 0.25.0 a caller sharing the device's address caused this with nothing but its own upload, and the line was `debug` only |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
-| `another process attached to the relay as '<name>' and now receives this device's requests, so this one has stopped` (exit status 1) | a second process attached under the same `--device-name`; the relay routes the name to the latest one ([§ Surviving a reboot](#surviving-a-reboot)) | intended when moving a device into a service. Otherwise two processes share a name: stop one, or rename one. Restarting this one takes the name back and stops the other |
+| `another process attached to the relay as '<name>' and now receives this device's requests, so this one has stopped` (exit status 3) | a second process attached under the same `--device-name`; the relay routes the name to the latest one ([§ Surviving a reboot](#surviving-a-reboot)) | intended when moving a device into a service. Otherwise two processes share a name: stop one, or rename one. Restarting this one takes the name back and stops the other |
 | `cannot start the server/relay: <addr> is already in use by another program` | something else holds that port | `-p` with another port, or stop the holder — the message names the command that finds it. Nothing is printed before the port is taken, so a banner means the port is genuinely held |
 | `cannot reach relay: … Nothing answered at <host:port>` | the connection was neither answered nor refused — something between the device and the relay is dropping it | not a flag problem. Check whether the device can open *any* outbound connection to that port; a relay on a port the network already allows out is the usual fix |
 | `cannot reach relay: … <host:port> was reached, and nothing is listening on it` | the address and route are fine; the relay is not serving there | check the relay is running and bound to that port |

@@ -1689,3 +1689,101 @@ fn a_relay_started_without_its_limiter_says_what_that_turned_off() {
         lines.join("\n")
     );
 }
+
+/// A device another process has replaced on the relay exits with status 3,
+/// not 1, and says why on stderr.
+///
+/// The status is the contract here, not the message: a service manager told to
+/// restart on failure restarts a device that exited 1, which takes the name
+/// back, and the two then replace each other for as long as both run. A status
+/// of its own is what lets systemd's `RestartPreventExitStatus=3` (and the
+/// Windows service path, which reports this ending as a clean stop) tell it
+/// apart. Driven through the real binary on both sides because the status is
+/// chosen in `main.rs`, which no library test reaches.
+///
+/// Gated because it drives the binary with `--relay`.
+#[cfg(feature = "relay-client")]
+#[test]
+fn a_replaced_device_exits_with_the_status_reserved_for_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let port = reserved_port().to_string();
+    let relay = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "relay",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port,
+            "--enroll-token",
+            "st_test",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("relay should start");
+    let _relay = Killed(relay);
+
+    let relay_url = format!("ws://127.0.0.1:{port}");
+    let device = |name: &str| {
+        Command::new(BIN)
+            .current_dir(dir.path())
+            .args([
+                "--relay",
+                &relay_url,
+                "--enroll-token",
+                "st_test",
+                "--device-name",
+                name,
+                "--port",
+                "0",
+                "-k",
+                "st_device_key",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("device should start")
+    };
+
+    // The first device has to be attached before the second arrives, or the
+    // second is simply the first holder and nothing is replaced. Its banner is
+    // printed on enrolment, so it is the observable for "attached".
+    let mut first = Killed(device("dup"));
+    wait_for_line(&mut first, Duration::from_secs(30), |l| {
+        l.contains("(via relay)")
+    });
+
+    let second = Killed(device("dup"));
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = first.0.try_wait().expect("child is waitable") {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the replaced device kept running after another attached under its name"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let mut stderr = String::new();
+    first
+        .0
+        .stderr
+        .take()
+        .expect("stderr is piped")
+        .read_to_string(&mut stderr)
+        .expect("stderr is readable");
+
+    assert_eq!(status.code(), Some(3), "stderr: {stderr}");
+    assert!(
+        stderr.contains("another process attached to the relay as 'dup'"),
+        "the reason must be said in words: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Superseded {"),
+        "the error's Debug form must not reach an operator: {stderr}"
+    );
+    drop(second);
+}

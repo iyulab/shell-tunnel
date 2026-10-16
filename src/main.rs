@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use shell_tunnel::config::{Posture, PublicExposure};
@@ -10,6 +11,9 @@ use shell_tunnel::security::CapabilitySet;
 use shell_tunnel::tunnel::{self, TunnelHandle};
 use shell_tunnel::{logging, parse_args, print_help, print_version, Args, Config};
 use tracing::{info, warn};
+
+#[cfg(windows)]
+mod winservice;
 
 /// A banner line, written to stdout without dying if nobody is reading it.
 ///
@@ -57,7 +61,44 @@ macro_rules! errln {
     }};
 }
 
-fn main() -> shell_tunnel::Result<()> {
+/// How a run ended: the process's exit status, and whether the ending was a
+/// failure a service manager should answer by restarting.
+///
+/// The two are separate because one ending is neither success nor failure: a
+/// device another process has replaced exits with [`EXIT_SUPERSEDED`] so its
+/// caller can tell, and must *not* be restarted — a restarted device takes its
+/// name back, and the two then replace each other for as long as both run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exit {
+    pub code: i32,
+    pub failed: bool,
+}
+
+impl Exit {
+    const SUCCESS: Exit = Exit {
+        code: 0,
+        failed: false,
+    };
+    /// The ending of a run that did not do its job.
+    const FAILURE: Exit = Exit {
+        code: 1,
+        failed: true,
+    };
+}
+
+/// The exit status of a device that stopped because another process attached
+/// to the relay under its name.
+///
+/// Distinct from `1` so a service manager can be told not to restart it —
+/// systemd's `RestartPreventExitStatus=3`. `2` is already the startup
+/// refusals' status.
+const EXIT_SUPERSEDED: i32 = 3;
+
+/// How long a stopping runtime may wait for work still in flight — a command
+/// holding a blocking thread — before the process ends anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+fn main() {
     // Parse command-line arguments
     let args = match parse_args() {
         Ok(args) => args,
@@ -71,12 +112,12 @@ fn main() -> shell_tunnel::Result<()> {
     // Handle help and version flags
     if args.help {
         print_help();
-        return Ok(());
+        return;
     }
 
     if args.version {
         print_version();
-        return Ok(());
+        return;
     }
 
     // Handle update commands (only compiled with the `self-update` feature).
@@ -103,7 +144,7 @@ fn main() -> shell_tunnel::Result<()> {
                     std::process::exit(1);
                 }
             }
-            return Ok(());
+            return;
         }
 
         if args.update {
@@ -120,16 +161,77 @@ fn main() -> shell_tunnel::Result<()> {
                     std::process::exit(1);
                 }
             }
-            return Ok(());
+            return;
         }
     }
 
-    // Everything past this point serves connections; the async runtime starts
-    // here, once the blocking update paths above have returned.
-    tokio::runtime::Builder::new_multi_thread()
+    // Started by the Windows service control manager, the process has to
+    // speak its protocol or be killed 30 seconds in; started anywhere else,
+    // this hands the arguments straight back.
+    #[cfg(windows)]
+    let args = match winservice::run_if_service(args, serve) {
+        Ok(exit) => std::process::exit(exit.code),
+        Err(args) => *args,
+    };
+
+    let exit = serve(args, None);
+    if exit.code != 0 {
+        std::process::exit(exit.code);
+    }
+}
+
+/// Serve until the mode's work is done, or until `stop` fires.
+///
+/// Everything past the update paths serves connections, so the async runtime
+/// starts here, once those blocking paths have returned. `stop` is how a
+/// service manager that asks rather than kills ends the process; a console
+/// run has none and ends the way it always has.
+fn serve(args: Args, stop: Option<Arc<tokio::sync::Notify>>) -> Exit {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(async_main(args))
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            errln!("Error: could not start the async runtime: {e}");
+            return Exit::FAILURE;
+        }
+    };
+    let result = runtime.block_on(async move {
+        match stop {
+            Some(stop) => tokio::select! {
+                result = async_main(args) => result,
+                () = stop.notified() => {
+                    info!("stop requested by the service manager");
+                    Ok(())
+                }
+            },
+            None => async_main(args).await,
+        }
+    });
+    runtime.shutdown_timeout(SHUTDOWN_GRACE);
+    exit_for(result)
+}
+
+/// The exit a finished run reports, with its reason written to stderr.
+///
+/// Said in the program's own words — a `Debug` dump of the error enum is what
+/// returning it from `main` used to print.
+fn exit_for(result: shell_tunnel::Result<()>) -> Exit {
+    match result {
+        Ok(()) => Exit::SUCCESS,
+        Err(e @ shell_tunnel::ShellTunnelError::Superseded { .. }) => {
+            errln!("{e}");
+            Exit {
+                code: EXIT_SUPERSEDED,
+                failed: false,
+            }
+        }
+        Err(e) => {
+            errln!("Error: {e}");
+            Exit::FAILURE
+        }
+    }
 }
 
 async fn async_main(args: Args) -> shell_tunnel::Result<()> {
@@ -1075,16 +1177,9 @@ async fn run_with_relay(
     tokio::select! {
         result = server => result.expect("server task panicked"),
         // The client only returns once attaching is pointless — another
-        // process has taken this device's name. Said in the program's own
-        // words and ended here, rather than returned to `main` and printed as
-        // a Rust `Debug` value.
-        result = run_relay_client(client_config, None) => {
-            if let Err(e) = result {
-                errln!("{e}");
-                std::process::exit(1);
-            }
-            Ok(())
-        }
+        // process has taken this device's name. `exit_for` says so and picks
+        // the exit status a service manager can tell apart.
+        result = run_relay_client(client_config, None) => result,
     }
 }
 

@@ -69,10 +69,36 @@ pub enum ShellTunnelError {
     #[error("tunnel error: {0}")]
     Tunnel(String),
 
+    /// Another process attached to the relay under this device's name, and
+    /// the relay now routes the name to it.
+    ///
+    /// Its own variant rather than a [`Tunnel`](Self::Tunnel) message because
+    /// the right response is the opposite of every other relay failure: not
+    /// to try again. Whoever runs the process — a service manager especially —
+    /// needs to tell this ending apart, and a message is not something to
+    /// match on.
+    #[error("{}", superseded_message(device_name.as_deref()))]
+    Superseded {
+        /// The name that was taken, when the device chose one.
+        device_name: Option<String>,
+    },
+
     /// Update error.
     #[cfg(feature = "self-update")]
     #[error("update error: {0}")]
     Update(String),
+}
+
+/// What to say when another process has taken this device's name.
+///
+/// This process is about to stop, and whoever reads why is looking at a log
+/// with no other trace of the second process — so the line names the cause and
+/// both ways out.
+fn superseded_message(device_name: Option<&str>) -> String {
+    let name = device_name.unwrap_or("this device's name");
+    format!(
+        "another process attached to the relay as '{name}' and now receives this device's requests, so this one has stopped. Stop one of the two, or give them different --device-name values."
+    )
 }
 
 /// Convenience Result type for shell-tunnel operations.

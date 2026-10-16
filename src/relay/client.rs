@@ -276,9 +276,9 @@ pub async fn run(
             // Not retried: reattaching would take the name back from the
             // process that now holds it, which would do the same in turn.
             Ok(AttachEnd::Superseded) => {
-                return Err(ShellTunnelError::Tunnel(superseded_message(
-                    config.device_name.as_deref(),
-                )))
+                return Err(ShellTunnelError::Superseded {
+                    device_name: config.device_name.clone(),
+                })
             }
             Err(e) => {
                 let reason = e.to_string();
@@ -317,18 +317,6 @@ fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -
     format!(
         "relay connection failed again: {headline} (unchanged; retrying in {}s)",
         backoff.as_secs()
-    )
-}
-
-/// What to say when another process has taken this device's name.
-///
-/// This process is about to stop, and whoever reads why is looking at a log
-/// with no other trace of the second process — so the line names the cause and
-/// both ways out.
-fn superseded_message(device_name: Option<&str>) -> String {
-    let name = device_name.unwrap_or("this device's name");
-    format!(
-        "another process attached to the relay as '{name}' and now receives this device's requests, so this one has stopped. Stop one of the two, or give them different --device-name values."
     )
 }
 

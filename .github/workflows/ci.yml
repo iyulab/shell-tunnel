@@ -74,11 +74,14 @@ jobs:
       # that skips the code most likely to be written in a hurry is not the lint
       # anyone thinks it is.
       #
-      # The two feature lists are kept identical on purpose. Linting a narrower
-      # set than the tests build leaves feature-gated code — including the code
-      # that only exists when `tls` is on — unlinted.
+      # Never narrower than the test job's set: linting less than the tests
+      # build leaves feature-gated code — including the code that only exists
+      # when `tls` is on — unlinted. It is wider by `self-update`, which gates no
+      # test but is in every release binary; this is the one place that code is
+      # compiled before a tag publishes it. `tests/ci_feature_gates.rs` holds
+      # this line to the release workflow's own `--features`.
       - name: Clippy
-        run: cargo clippy --all-targets --features relay-client,tls -- -D warnings
+        run: cargo clippy --all-targets --features relay-client,tls,self-update -- -D warnings
 
   msrv:
     name: MSRV

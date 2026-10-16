@@ -358,6 +358,95 @@ fn the_local_alias_passes_every_feature_the_test_suites_are_gated_behind() {
     }
 }
 
+/// The `--features` every release binary is built with, read from the release
+/// workflow's own build commands.
+///
+/// Every build line there is checked, and they must agree: a release whose
+/// platforms were built with different features is a different defect, and one
+/// this file would otherwise quietly average over.
+fn release_features() -> BTreeSet<String> {
+    let path = repo_root().join(".github/workflows/release.yml");
+    let workflow = std::fs::read_to_string(&path).expect("the release workflow is readable");
+    let builds: Vec<BTreeSet<String>> = workflow
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.starts_with('#'))
+        .filter(|line| line.contains("build --release"))
+        .map(features_on)
+        .collect();
+    assert!(
+        !builds.is_empty(),
+        "no `build --release` command was found in {}. {}",
+        path.display(),
+        "Either the workflow changed shape or this check stopped recognising it."
+    );
+    assert!(
+        builds.windows(2).all(|pair| pair[0] == pair[1]),
+        "the release builds in {} do not all enable the same features: {builds:?}",
+        path.display()
+    );
+    builds.into_iter().next().expect("checked non-empty")
+}
+
+/// Every feature a release is built with is compiled by CI's lint and by the
+/// local lint alias, before any tag exists.
+///
+/// The test commands only have to cover the features tests are gated behind,
+/// and `self-update` gates none — so for as long as nothing else asked, no
+/// command anywhere compiled it, while every published binary contained it.
+/// A compile error in that code was first reported by the release workflow,
+/// after the tag that publishes had already been pushed. Found when exactly
+/// such an error sat in a working tree whose full suite and lint were green.
+#[test]
+fn ci_and_the_local_alias_compile_every_feature_a_release_ships() {
+    let shipped = release_features();
+    assert!(
+        !shipped.is_empty(),
+        "release builds enable no features, which they never have — suspect the scan"
+    );
+
+    let workflow = std::fs::read_to_string(repo_root().join(".github/workflows/ci.yml"))
+        .expect("the CI workflow is readable");
+    let config = std::fs::read_to_string(repo_root().join(".cargo/config.toml"))
+        .expect(".cargo/config.toml is readable");
+    let lints: [(&str, Vec<String>); 2] = [
+        (
+            "CI",
+            commands_that_build_the_tests(&workflow)
+                .into_iter()
+                .filter(|c| c.contains("cargo clippy"))
+                .collect(),
+        ),
+        (
+            "the local alias",
+            alias_commands(&config)
+                .into_iter()
+                .filter(|c| c.contains("clippy"))
+                .collect(),
+        ),
+    ];
+
+    for (whose, commands) in lints {
+        assert!(
+            !commands.is_empty(),
+            "{whose} has no clippy command, so nothing there compiles the release features"
+        );
+        for command in commands {
+            let missing: Vec<&String> = shipped
+                .iter()
+                .filter(|f| !features_on(&command).contains(*f))
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "{whose}'s lint does not compile every feature a release ships: {command}
+missing: {missing:?}
+{}",
+                "Code behind a missing feature is first compiled by the release workflow, after its tag is pushed."
+            );
+        }
+    }
+}
+
 /// The scan is the part most likely to rot in silence: if it quietly stopped
 /// matching anything, the check above would pass for the wrong reason.
 #[test]

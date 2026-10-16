@@ -5,7 +5,27 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Fixed
+
+- **The binary runs as a Windows service.** It never answered the service control
+  manager, which kills a service that does not within 30 seconds, so the `sc.exe`
+  recipe in the operating guide registered a service that failed to start with `1053`.
+  A process started by the service control manager now reports running, stops on
+  `sc.exe stop` (giving a running command five seconds), and reports an ending in an
+  error as a failure the recovery actions can restart. Started anywhere else it runs
+  exactly as before — no flag is involved. Under a service the working directory is
+  the executable's folder rather than `System32`, so relative paths such as
+  `--audit-log` resolve there.
+
 ### Changed
+
+- **A device replaced on the relay by another process under its name exits with
+  status 3**, not 1. Every other ending of a running device is a failure a service
+  manager should restart; restarting this one takes the name back and replaces the
+  other process in turn. systemd can leave it alone with `RestartPreventExitStatus=3`,
+  and a Windows service reports it as a clean stop.
+- **A run that ends in an error prints the error in words** (`Error: …`) instead of a
+  Rust `Debug` dump of it.
 
 - **The Windows release binary is Authenticode-signed.** `shell-tunnel.exe` inside
   `shell-tunnel-windows-x64.zip` now carries a timestamped iyulab signature, for which
