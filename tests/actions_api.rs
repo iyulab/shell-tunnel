@@ -272,3 +272,28 @@ async fn the_list_names_what_this_token_may_run_and_never_how() {
     let (_, body) = app.call(Method::GET, "/api/v1/actions", None).await;
     assert_eq!(body["actions"], json!([]));
 }
+
+/// What USAGE §3.2 says about a program that is not there: it is not looked
+/// up at startup, and running the action answers `500`.
+#[tokio::test]
+async fn an_action_whose_program_is_missing_answers_500_when_run() {
+    let trail = tempfile::NamedTempFile::new().expect("tempfile");
+    let actions = ActionSet::from_json(
+        &json!({"actions": {"ghost": {"argv": ["shell-tunnel-no-such-program-xyz"]}}}).to_string(),
+    )
+    .expect("valid definitions");
+    let state = AppState::new()
+        .with_audit(Arc::new(AuditSink::file(trail.path()).expect("sink")))
+        .with_actions(actions);
+    let (router, store, _rl) = create_secure_router(state, SecurityConfig::secure());
+    store.add_key_with_capabilities("t", ["action:ghost"].into_iter().collect(), "test");
+    let app = App {
+        router: router.layer(MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            8080,
+        )))),
+        trail,
+    };
+    let (status, _) = app.call(Method::POST, "/api/v1/actions/ghost", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+}
