@@ -9,6 +9,9 @@ use self_update::cargo_crate_version;
 
 use crate::Result;
 
+#[cfg(feature = "relay-client")]
+pub mod state;
+
 /// GitHub repository owner.
 const REPO_OWNER: &str = "iyulab";
 
@@ -163,7 +166,7 @@ pub fn background_update_check() {
 }
 
 /// Compare semantic versions.
-fn is_newer_version(current: &str, latest: &str) -> bool {
+pub(crate) fn is_newer_version(current: &str, latest: &str) -> bool {
     let parse = |v: &str| -> (u32, u32, u32) {
         let v = v.trim_start_matches('v');
         let parts: Vec<&str> = v.split('.').collect();
