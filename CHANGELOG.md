@@ -16,6 +16,12 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   scope is refused at startup. On a reachable server the banner names each key's scope
   on its own line.
 
+### Changed
+
+- **Library: `api::SecurityConfig` gained `named_tokens: Vec<NamedToken>`** (built with
+  `with_named_token`). Breaking for code that builds the struct as a literal; the
+  constructors and `Default` set it empty.
+
 ## 0.27.0 — 2026-10-16
 
 ### Added
