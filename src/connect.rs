@@ -357,7 +357,7 @@ async fn try_direct(
 /// `forward` handles.
 ///
 /// `bound` reports the address actually bound, once it is known — `None`
-/// means nobody's listening, matching `RelayClientConfig::enrolled`'s own
+/// means nobody's listening, matching `RelayClientConfig::events`'s own
 /// "the client used to `println!` the URL itself, which put a piece of the
 /// binary's startup banner inside the library" reasoning (`src/relay/client.rs`):
 /// `outln!`/`errln!` are defined in `src/main.rs`, not exported from this
@@ -514,7 +514,7 @@ mod tests {
             device_name: None,
             fingerprint: None,
             ca_file: None,
-            enrolled: None,
+            events: None,
             serve_direct_requests: false,
             direct_events: None,
             local_hop_token: None,

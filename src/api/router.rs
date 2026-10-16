@@ -805,7 +805,7 @@ pub struct ServerConfig {
     /// embedding consumer a plaintext secret in whatever its logs go to. It now
     /// sends the key here instead: the library reports the fact, the caller
     /// decides where it goes — the arrangement
-    /// [`crate::relay::client::RelayClientConfig`]'s `enrolled` already uses.
+    /// [`crate::relay::client::RelayClientConfig`]'s `events` already uses.
     ///
     /// `None` leaves the key unreported, and [`serve_on`] warns when it lands
     /// there — a key nobody can read authenticates nobody. Register a key with

@@ -79,7 +79,7 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         device_name: Some(device_name.to_string()),
         fingerprint: None,
         ca_file: None,
-        enrolled: None,
+        events: None,
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: None,

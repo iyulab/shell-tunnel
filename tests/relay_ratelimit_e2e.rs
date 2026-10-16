@@ -98,7 +98,7 @@ fn spawn_device_marking(
         device_name: Some(device_name.to_string()),
         fingerprint: None,
         ca_file: None,
-        enrolled: None,
+        events: None,
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: hop_token.map(str::to_string),

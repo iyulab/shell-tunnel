@@ -355,21 +355,94 @@ async fn a_device_reports_its_public_url_to_whoever_started_it() {
         device_name: Some("probe".to_string()),
         fingerprint: None,
         ca_file: None,
-        enrolled: Some(tx),
+        events: Some(tx),
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: None,
     };
     tokio::spawn(run(config, None));
 
-    let url = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
         .await
         .expect("the client must report its enrolment, not just perform it")
         .expect("the sending half is held by the running client");
+    let shell_tunnel::relay::client::AttachEvent::Enrolled {
+        public_url: url, ..
+    } = event
+    else {
+        panic!("expected an enrolment, got {event:?}");
+    };
 
     assert!(
         url.contains("/d/probe"),
         "the reported URL must address the device by the name it asked for: {url:?}"
+    );
+}
+
+/// Build a client config for the event tests; enrolment happens on the control
+/// channel before anything is proxied, so `local` is never dialled.
+#[cfg(feature = "relay-client")]
+fn event_client(
+    relay_addr: SocketAddr,
+    token: &str,
+    tx: tokio::sync::mpsc::UnboundedSender<shell_tunnel::relay::client::AttachEvent>,
+) -> shell_tunnel::relay::client::RelayClientConfig {
+    shell_tunnel::relay::client::RelayClientConfig {
+        relay_url: format!("ws://{relay_addr}"),
+        enroll_token: token.to_string(),
+        local: "127.0.0.1:1".parse().unwrap(),
+        label: None,
+        device_name: Some("probe".to_string()),
+        fingerprint: None,
+        ca_file: None,
+        events: Some(tx),
+        serve_direct_requests: true,
+        direct_events: None,
+        local_hop_token: None,
+    }
+}
+
+/// The version a relay reports at enrolment reaches whoever started the client,
+/// which is how a device can tell what the relay it is attached to runs.
+#[cfg(feature = "relay-client")]
+#[tokio::test]
+async fn enrolment_reports_the_relays_version() {
+    use shell_tunnel::relay::client::{run, AttachEvent};
+
+    let (relay_addr, _state) = start_relay("secret").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run(event_client(relay_addr, "secret", tx), None));
+
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the client must report its enrolment")
+        .expect("the sending half is held by the running client");
+    let AttachEvent::Enrolled { relay_version, .. } = event else {
+        panic!("expected an enrolment, got {event:?}");
+    };
+    assert_eq!(relay_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+}
+
+/// A refused enrolment is reported with the relay's code, so a caller can tell
+/// "the relay said no" from "the relay could not be reached" (no event at all).
+#[cfg(feature = "relay-client")]
+#[tokio::test]
+async fn a_rejected_enrolment_reports_its_code() {
+    use shell_tunnel::relay::client::{run, AttachEvent};
+
+    let (relay_addr, _state) = start_relay("secret").await;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run(event_client(relay_addr, "wrong", tx), None));
+
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .expect("the client must report the refusal")
+        .expect("the sending half is held by the running client");
+    assert_eq!(
+        event,
+        AttachEvent::Rejected {
+            code: "bad-token".to_string()
+        }
     );
 }
 
@@ -632,7 +705,7 @@ async fn a_replaced_client_stops_instead_of_taking_its_name_back() {
         device_name: Some("probe".to_string()),
         fingerprint: None,
         ca_file: None,
-        enrolled: Some(enrolled),
+        events: Some(enrolled),
         serve_direct_requests: false,
         direct_events: None,
         local_hop_token: None,

@@ -293,7 +293,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 device_name: None,
                 fingerprint: args.relay_fingerprint.clone(),
                 ca_file: args.relay_ca.clone(),
-                enrolled: None,
+                events: None,
                 // `connect` is its own role, not a device other devices
                 // should be able to punch into — see the field's own doc
                 // comment on `RelayClientConfig`.
@@ -306,7 +306,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
 
             // serve_until_idle only reports the bound address on this
             // channel — printing the banner is main.rs's job, the same
-            // division `RelayClientConfig::enrolled` already draws for the
+            // division `RelayClientConfig::events` already draws for the
             // relay-attach path (see connect::serve's own doc comment).
             let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
             tokio::spawn(async move {
@@ -1193,7 +1193,7 @@ async fn run_with_relay(
         .map_err(shell_tunnel::ShellTunnelError::Io)?;
     let server = tokio::spawn(shell_tunnel::api::serve_on(listener, server_config, state));
 
-    let (enrolled_tx, mut enrolled_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
     let client_config = RelayClientConfig {
         relay_url,
         enroll_token: args
@@ -1210,7 +1210,7 @@ async fn run_with_relay(
             .or_else(shell_tunnel::relay::client::default_device_name),
         fingerprint: args.relay_fingerprint.clone(),
         ca_file: args.relay_ca.clone(),
-        enrolled: Some(enrolled_tx),
+        events: Some(events_tx),
         // A real device answers another device's direct-connect request —
         // see the field's own doc comment on `RelayClientConfig`. This path
         // never initiates one itself, so it has no use for `direct_events`.
@@ -1234,7 +1234,15 @@ async fn run_with_relay(
     let generated_key = exposure.generated_key.clone();
     tokio::spawn(async move {
         let mut announced = false;
-        while let Some(url) = enrolled_rx.recv().await {
+        while let Some(event) = events_rx.recv().await {
+            // Only an enrolment has a line to print; a refusal ends the client
+            // and is reported by the error it returns.
+            let shell_tunnel::relay::client::AttachEvent::Enrolled {
+                public_url: url, ..
+            } = event
+            else {
+                continue;
+            };
             if announced {
                 info!("re-attached to relay as {url}");
             } else {

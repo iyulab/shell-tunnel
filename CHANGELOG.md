@@ -5,6 +5,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Changed
+
+- **`RelayClientConfig`'s `enrolled` field is now `events`.** It used to carry the device's
+  public URL as a `String`; it now carries an `AttachEvent`: `Enrolled { public_url,
+  relay_version }` for each successful enrolment, or `Rejected { code }` when the relay
+  refuses one. A dial that never reaches the relay still sends nothing. An embedder's
+  struct literal stops compiling, and a receiver that read the URL directly now matches on
+  `AttachEvent::Enrolled`.
+
 ### Added
 
 - **Releases carry a `SHA256SUMS` file.** It lists the SHA-256 of every release archive

@@ -101,8 +101,9 @@ pub struct RelayClientConfig {
     /// correctly, since the alternative is trusting whatever answers. Naming the
     /// authority keeps that check intact instead of disabling it.
     pub ca_file: Option<PathBuf>,
-    /// Receives this device's public URL each time it enrolls, including after
-    /// a reconnect.
+    /// Receives an [`AttachEvent`] for each attach outcome the relay answers:
+    /// this device's public URL and the relay's version each time it enrolls
+    /// (including after a reconnect), or the code of a refused enrolment.
     ///
     /// The client used to `println!` the URL itself, which put a piece of the
     /// binary's startup banner inside the library — so a consumer embedding
@@ -114,7 +115,7 @@ pub struct RelayClientConfig {
     /// Every enrolment is reported, not only the first: distinguishing "first
     /// attach" from "re-attached after a drop" is the caller's decision, and
     /// the client cannot make it without also deciding how each should read.
-    pub enrolled: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    pub events: Option<tokio::sync::mpsc::UnboundedSender<AttachEvent>>,
     /// Whether this process answers a `RelayMessage::DirectRequested` at all.
     ///
     /// An internal role distinction, not a user-facing toggle — this is not
@@ -350,6 +351,28 @@ fn dial_failure_line(reason: &str, already_explained: bool, backoff: Duration) -
     )
 }
 
+/// What the relay answered to this client's enrolment, reported through
+/// [`RelayClientConfig::events`].
+///
+/// A dial that never reached the relay (a refused connection, a TLS failure)
+/// produces no event: the absence of one is how a caller tells "could not reach
+/// the relay" from "the relay said no". A `superseded` rejection that arrives
+/// on an attachment already running is not an event either; it ends that
+/// attachment instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachEvent {
+    /// The relay accepted this device.
+    Enrolled {
+        /// The URL the relay serves this device at.
+        public_url: String,
+        /// The relay's own version, or `None` when it predates reporting one.
+        relay_version: Option<String>,
+    },
+    /// The relay refused the enrolment, with its machine-readable code
+    /// (`bad-token`, `unsupported-version`, ...).
+    Rejected { code: String },
+}
+
 /// How an attachment that enrolled successfully came to an end.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AttachEnd {
@@ -436,18 +459,24 @@ pub(crate) async fn attach_paced(
                 config.relay_url,
                 relay_version.as_deref().unwrap_or("older than 0.28.0 — it does not say")
             );
-            if let Some(enrolled) = &config.enrolled {
+            if let Some(events) = &config.events {
                 // A closed receiver means the caller stopped listening, which
                 // is not this connection's problem: the device is enrolled and
                 // has work to do either way.
-                let _ = enrolled.send(public_url.clone());
+                let _ = events.send(AttachEvent::Enrolled {
+                    public_url: public_url.clone(),
+                    relay_version: relay_version.clone(),
+                });
             }
             (device_id, attach_id)
         }
         RelayMessage::Rejected { code, message } => {
+            if let Some(events) = &config.events {
+                let _ = events.send(AttachEvent::Rejected { code: code.clone() });
+            }
             return Err(ShellTunnelError::Tunnel(format!(
                 "relay refused this device ({code}): {message}"
-            )))
+            )));
         }
         other => {
             return Err(ShellTunnelError::Tunnel(format!(
@@ -1889,7 +1918,7 @@ mod tests {
             device_name: None,
             fingerprint: None,
             ca_file: None,
-            enrolled: None,
+            events: None,
             serve_direct_requests: true,
             direct_events: None,
             local_hop_token: None,
