@@ -24,7 +24,10 @@ without the features. Both numbers only grow; read them for the gap.
 The `test-all` and `clippy-all` aliases in `.cargo/config.toml` carry the
 complete feature list, and `tests/ci_feature_gates.rs` holds those aliases and
 CI's own command lines to the same rule — so a new gate cannot appear without
-turning up in both.
+turning up in both. `clippy-all` also compiles `self-update`: no test is gated
+behind it, but every release binary is built with it, and the lint is the only
+place that code is compiled before a tag publishes it. The same test holds both
+lint commands to the release workflow's `--features`.
 
 Run plain `cargo test --all` too when you touch dependencies. That build is the
 reason `default` stays empty, and CI now runs its tests as well.
