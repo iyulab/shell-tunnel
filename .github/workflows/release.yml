@@ -121,7 +121,7 @@ jobs:
       # Signed before it goes into the zip: the binary `--update` installs is
       # the one inside the archive, not a top-level release asset.
       - name: Sign
-        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9
+        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9 # main @ 2026-10-16
         with:
           files: bin/shell-tunnel.exe
           description: shell-tunnel
