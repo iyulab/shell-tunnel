@@ -91,12 +91,18 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 /// command — and not a containment one, because `exec` already reaches every
 /// file this process can. Both halves matter: the second is why the file API
 /// needs no flag to exist, the first is why `--fs-root` still has a job.
+///
+/// `action:*` stands for every named action, and is listed because `operator`
+/// holds it. The per-action strings (`action:<id>`) are not listed: they name
+/// whatever the device's owner defined, and are checked against the
+/// definitions at startup instead (`src/actions.rs`).
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",
     "session.manage",
     "fs.read",
     "fs.write",
+    crate::actions::ANY_ACTION,
 ];
 
 /// Resolve a role **preset** name to its capability set (spec §6).
@@ -115,6 +121,8 @@ pub fn preset(name: &str) -> Option<CapabilitySet> {
         // `fs.read`/`fs.write` sit alongside `exec` here rather than being
         // withheld from it: this preset already grants command execution, which
         // reaches every file this process can. See `KNOWN_CAPABILITIES` above.
+        // `action:*` likewise: a token that can run any command confines
+        // nothing by being kept from the commands its owner named.
         "operator" => Some(
             [
                 "exec",
@@ -122,6 +130,7 @@ pub fn preset(name: &str) -> Option<CapabilitySet> {
                 "session.manage",
                 "fs.read",
                 "fs.write",
+                crate::actions::ANY_ACTION,
             ]
             .into_iter()
             .collect(),

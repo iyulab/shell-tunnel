@@ -1787,3 +1787,84 @@ fn a_replaced_device_exits_with_the_status_reserved_for_it() {
     );
     drop(second);
 }
+
+/// A definitions file with a mistake in it refuses startup, naming the file
+/// and the action — a server running on a file it could not use would answer
+/// "no such action" to every caller, which reads as "not granted".
+#[test]
+fn a_broken_actions_file_refuses_to_start_naming_the_mistake() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("actions.json");
+    std::fs::write(
+        &file,
+        r#"{"actions": {"restart": {"argv": ["systemctl", "restart", "{svc}"]}}}"#,
+    )
+    .expect("write");
+    let file_arg = file.to_string_lossy().to_string();
+
+    let (code, _stdout, stderr) = run_with_timeout(
+        &["--port", "0", "--actions", &file_arg],
+        Duration::from_secs(15),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("--actions"), "{stderr}");
+    assert!(stderr.contains("action 'restart'"), "{stderr}");
+    assert!(stderr.contains("'{svc}'"), "{stderr}");
+}
+
+/// Granting an action nobody defined issues a token that can do nothing;
+/// said at startup rather than discovered by the first refused caller.
+#[test]
+fn granting_an_undefined_action_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("actions.json");
+    std::fs::write(&file, r#"{"actions": {"ping": {"argv": ["ping"]}}}"#).expect("write");
+    let file_arg = file.to_string_lossy().to_string();
+
+    let (code, _stdout, stderr) = run_with_timeout(
+        &[
+            "--port",
+            "0",
+            "-k",
+            "st_k",
+            "--capabilities",
+            "action:pong",
+            "--actions",
+            &file_arg,
+        ],
+        Duration::from_secs(15),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("`action:pong`"), "{stderr}");
+
+    let (code, _stdout, stderr) = run_with_timeout(
+        &["--port", "0", "-k", "st_k", "--capabilities", "action:*"],
+        Duration::from_secs(15),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("Pass --actions"), "{stderr}");
+}
+
+#[test]
+fn the_banner_says_how_many_actions_were_loaded_and_from_where() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("actions.json");
+    std::fs::write(
+        &file,
+        r#"{"actions": {"a": {"argv": ["a"]}, "b": {"argv": ["b"]}}}"#,
+    )
+    .expect("write");
+    let file_arg = file.to_string_lossy().to_string();
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args(["--port", "0", "--actions", &file_arg])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+    let line = wait_for_line(&mut server, Duration::from_secs(30), |l| {
+        l.starts_with("Actions:")
+    });
+    assert_eq!(line, format!("Actions:     2 defined in {file_arg}"));
+}

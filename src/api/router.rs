@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{
-        connect_info::IntoMakeServiceWithConnectInfo, DefaultBodyLimit, MatchedPath, Request, State,
+        connect_info::IntoMakeServiceWithConnectInfo, DefaultBodyLimit, FromRequestParts,
+        MatchedPath, Request, State,
     },
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
@@ -197,6 +198,8 @@ fn routes() -> Router<AppState> {
         .route("/", get(api_info))
         .route("/execute", post(execute_oneshot))
         .route("/ws", any(ws_oneshot_handler))
+        .route("/actions", get(super::actions::list_actions))
+        .route("/actions/{id}", post(super::actions::run_action))
         .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
@@ -237,6 +240,12 @@ pub enum RequiredCapability {
     Authenticated,
     /// Requires a specific capability string (set membership, or wildcard).
     Capability(&'static str),
+    /// Requires `action:<id>` for the action the path names, or `action:*`.
+    ///
+    /// Its own tier because the capability depends on the request, not only
+    /// on the route: one route runs every action, and each action is granted
+    /// separately.
+    Action,
 }
 
 /// Map a matched route (`method` + axum [`MatchedPath`]) to its required
@@ -283,6 +292,10 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
         ("PATCH", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
         ("POST", "/api/v1/fs/uploads/{id}/complete") => Capability("fs.write"),
         ("DELETE", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
+        // Listing answers "what may this token run", so any token may ask; the
+        // answer is filtered to that token's grant.
+        ("GET", "/api/v1/actions") => Authenticated,
+        ("POST", "/api/v1/actions/{id}") => RequiredCapability::Action,
         _ => Authenticated,
     }
 }
@@ -430,6 +443,8 @@ async fn capability_auth_middleware(
     if let Some(identity) = identity.clone() {
         request.extensions_mut().insert(identity);
     }
+    // And, for the action list, what the token may do.
+    request.extensions_mut().insert(capabilities.clone());
 
     match required {
         // Already handled above, but keep the match exhaustive.
@@ -437,6 +452,31 @@ async fn capability_auth_middleware(
         // Any valid token satisfies an authenticated-only route.
         RequiredCapability::Authenticated => Ok(next.run(request).await),
         // Specific capability: set membership (or wildcard) required, else 403.
+        RequiredCapability::Action => {
+            // The id as the handler will see it — decoded by the same
+            // extractor — so the action authorized is the action that runs.
+            let (mut parts, body) = request.into_parts();
+            let id = axum::extract::Path::<String>::from_request_parts(&mut parts, &())
+                .await
+                .map(|axum::extract::Path(id)| id)
+                .unwrap_or_default();
+            let request = Request::from_parts(parts, body);
+            if super::actions::may_run(&capabilities, &id) {
+                return Ok(next.run(request).await);
+            }
+            // The id is the caller's text; bounded before it goes in the trail.
+            let shown: String = id.chars().take(64).collect();
+            audit
+                .record_async(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_identity(identity)
+                        .with_route(route.clone())
+                        .with_denial(403, format!("missing-capability:action:{shown}")),
+                )
+                .await;
+            tracing::debug!(%method, path = %route, action = %shown, "authorization denied (403): action not granted");
+            Err(StatusCode::FORBIDDEN)
+        }
         RequiredCapability::Capability(cap) => {
             if capabilities.satisfies(cap) {
                 Ok(next.run(request).await)
@@ -1069,6 +1109,16 @@ mod tests {
         assert_eq!(
             required_capability(&Method::DELETE, "/api/v1/sessions/{id}"),
             Capability("session.manage")
+        );
+
+        // Actions: listing needs only a token, running needs the action.
+        assert_eq!(
+            required_capability(&Method::GET, "/api/v1/actions"),
+            Authenticated
+        );
+        assert_eq!(
+            required_capability(&Method::POST, "/api/v1/actions/{id}"),
+            RequiredCapability::Action
         );
     }
 

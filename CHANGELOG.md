@@ -5,6 +5,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Added
+
+- **Named actions: a token that may run only the commands a machine's owner defined.**
+  `--actions <FILE>` reads definitions — an argv per action, with typed parameters —
+  and `GET /api/v1/actions` / `POST /api/v1/actions/{id}` serve them. A token granted
+  `action:<id>` (or `action:*`) runs those and nothing else; `exec` is not needed and
+  not implied. An action runs with no shell, each parameter becomes part of a single
+  argument, and its value must be one its type accepts (`enum`, bounded `integer`, or
+  `name` — a safe token that cannot be an option or a path step). Every run is recorded
+  as an `action` audit event with the accepted parameters; refusals before anything ran
+  are `denied` events. A definitions file with any mistake, or a grant of an action it
+  does not define, refuses startup. `operator` now holds `action:*`.
+
 ### Fixed
 
 - **The binary runs as a Windows service.** It never answered the service control
@@ -34,6 +47,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 - **Library: `fs::platform::Anchors::reachable` holds `Anchor { name, canonical }`**
   instead of bare canonical paths, so a root keeps the name it is addressed by. Breaking
   for code that reads the field; `canonical` is the value it used to hold.
+- **Library: `execution::Command` says how its process is made** — the `command_line`
+  field is replaced by `invocation: Invocation`, which is `Shell(String)` (the platform
+  shell, as before; `Command::new` still builds one) or `Argv(Vec<String>)` (run
+  directly, built with `Command::argv`).
 - **Library: `ShellTunnelError::Superseded { device_name }`** is what the relay client
   returns when another process takes the device's name (it was `Tunnel(String)`).
 

@@ -35,6 +35,8 @@ pub struct AppState {
     pub fs: Option<Arc<crate::fs::FsRoot>>,
     /// In-flight uploads. Always present; useless until `fs` is set.
     pub uploads: Arc<crate::fs::UploadStore>,
+    /// The named actions this server runs. Empty unless `--actions` gave some.
+    pub actions: Arc<crate::actions::ActionSet>,
 }
 
 impl AppState {
@@ -50,7 +52,14 @@ impl AppState {
                 crate::fs::DEFAULT_CHUNK_SIZE,
                 crate::fs::DEFAULT_CHUNK_SIZE,
             )),
+            actions: Arc::new(crate::actions::ActionSet::default()),
         }
+    }
+
+    /// Serve these named actions.
+    pub fn with_actions(mut self, actions: crate::actions::ActionSet) -> Self {
+        self.actions = Arc::new(actions);
+        self
     }
 
     /// Record execution events to `sink`.

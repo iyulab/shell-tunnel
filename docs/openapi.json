@@ -35,6 +35,10 @@
     {
       "name": "Filesystem",
       "description": "List, read, write, and delete files. By default these reach whatever the account running the server reaches, and `path` is absolute (`C:/data/x.bin`, `/srv/deploy/x.bin`; either separator). Starting with --fs-root <dir> confines them to that directory, and `path` becomes relative to it. The startup banner names the effective scope."
+    },
+    {
+      "name": "Actions",
+      "description": "Commands the device's owner defined, which a token can be granted one by one instead of `exec`."
     }
   ],
   "paths": {
@@ -1264,6 +1268,112 @@
           }
         }
       }
+    },
+    "/api/v1/actions": {
+      "get": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "List the named actions this token may run",
+        "description": "The actions defined in the server's `--actions` file that this token may run — those it holds `action:<id>` for, or every one with `action:*`. Never includes an action's argv: how an action is carried out is the device owner's to change. Empty when no `--actions` file was given, or the token holds no action grant.\n\nRequired capability: none beyond a valid token.",
+        "operationId": "listActions",
+        "responses": {
+          "200": {
+            "description": "The actions this token may run, in id order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListActionsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          }
+        }
+      }
+    },
+    "/api/v1/actions/{id}": {
+      "post": {
+        "tags": [
+          "Actions"
+        ],
+        "summary": "Run a named action",
+        "description": "Runs the action `id` as defined on the device: its argv is executed directly, with no shell, and each parameter is substituted inside the argv element that names it, as part of that one argument. Every defined parameter is required, and a parameter the definition does not name is refused.\n\nRequired capability: `action:<id>` or `action:*`. Authorization is decided before the definitions are consulted, so a token that may not run an action gets `403` whether or not it exists.",
+        "operationId": "runAction",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "description": "The action's id, as `GET /api/v1/actions` lists it",
+            "schema": {
+              "type": "string",
+              "maxLength": 64
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The action's parameters. Optional: an action without parameters can be run with no body.",
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RunActionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The action ran. As with `/execute`, a non-zero exit code is still a 200 — `success` and `exit_code` say how it went.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunActionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON, or carries a field other than `params`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`ACTION_NOT_FOUND`: the token may run any action, and none has this id.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`INVALID_PARAMS`: a parameter is missing, unknown, or not a value its type accepts. `details` names the parameter. Nothing ran.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1969,6 +2079,138 @@
                   "ping",
                   "pong"
                 ]
+              }
+            }
+          }
+        ]
+      },
+      "ActionParam": {
+        "description": "The shape a parameter's value must take.",
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "values"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "enum"
+                ]
+              },
+              "values": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "type",
+              "min",
+              "max"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "integer"
+                ]
+              },
+              "min": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "max": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "A JSON whole number within the inclusive range. A string or a fractional number is refused."
+          },
+          {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "name"
+                ]
+              }
+            },
+            "description": "A string of 1-128 letters, digits, `.`, `_`, `-`; not starting with `-`, and not `.` or `..`."
+          }
+        ]
+      },
+      "ActionInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "params"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "params": {
+            "type": "object",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ActionParam"
+            }
+          },
+          "timeout_secs": {
+            "type": "integer",
+            "description": "The deadline the definition set, if it set one. Clamped to 1-300 when the action runs."
+          }
+        }
+      },
+      "ListActionsResponse": {
+        "type": "object",
+        "required": [
+          "actions"
+        ],
+        "properties": {
+          "actions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ActionInfo"
+            }
+          }
+        }
+      },
+      "RunActionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "params": {
+            "type": "object",
+            "description": "Parameter values by name.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "RunActionResponse": {
+        "description": "The `/execute` result fields, plus the action that ran.",
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ExecuteCommandResponse"
+          },
+          {
+            "type": "object",
+            "required": [
+              "action"
+            ],
+            "properties": {
+              "action": {
+                "type": "string"
               }
             }
           }

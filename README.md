@@ -170,6 +170,25 @@ commands, since such a token can already read and write anything the server can.
 `file-*` preset with `--fs-root` — without it the token reaches the whole machine, and
 the startup banner says so.
 
+## Allowing only the commands you named
+
+`exec` is all or nothing. For a caller that should run a few fixed things and nothing
+else — a deploy hook, a health probe, a remediation service — define those commands on
+the machine and grant them one by one:
+
+```json
+{ "actions": { "restart-nginx": { "argv": ["systemctl", "restart", "nginx"] } } }
+```
+
+```bash
+shell-tunnel --require-auth --capabilities action:restart-nginx --actions actions.json
+curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:3000/api/v1/actions/restart-nginx
+```
+
+An action runs its argv directly, with no shell, and a caller's parameters are typed
+values substituted into single arguments — see
+[docs/USAGE.md §3.2](docs/USAGE.md#32-named-actions).
+
 ## A word on exposure
 
 Publishing a shell means anyone holding the token can run commands as the user running
@@ -182,7 +201,7 @@ directory (`--audit-log` puts it elsewhere). Naming a scope yourself still wins 
 it holds every capability this version defines, so it withholds nothing today
 and the difference from the wildcard is only that it will not automatically
 carry capabilities added later. The narrowing presets are `file-read` and
-`file-write`. Keep rate limiting on, and treat the URL and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
+`file-write`, and `action:<id>` grants are narrower still. Keep rate limiting on, and treat the URL and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
 on the relay is one flag, and the fingerprint it prints keeps the connection
 authenticated, not just encrypted. The startup banner states what is actually in force.
 
@@ -198,7 +217,8 @@ authenticated, not just encrypted. The startup banner states what is actually in
 Implemented: sessions, one-shot and streaming execution, WebSocket, capability-scoped auth,
 rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS on the
 relay with self-signed generation and fingerprint pinning, host-header checking, an append-only audit
-trail, and filesystem operations (list, read, write, delete, optionally confined by `--fs-root`). On the
+trail, filesystem operations (list, read, write, delete, optionally confined by `--fs-root`), named
+actions that a token can be granted instead of a shell, and running as a Windows service. On the
 roadmap: native MCP tools.
 
 ## License

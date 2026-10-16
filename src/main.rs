@@ -483,6 +483,25 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         shell_tunnel::FsRoot::machine_wide()
     };
 
+    // Read before anything is served, and refused whole when any definition is
+    // wrong: a server that started on a file it could not read would answer
+    // "no such action" for every one, which reads as "not granted" rather
+    // than "not loaded".
+    let actions = match args.actions.as_ref() {
+        Some(path) => match shell_tunnel::actions::ActionSet::load(path) {
+            Ok(actions) => actions,
+            Err(e) => {
+                eprintln!("--actions {} cannot be used: {e}", path.display());
+                std::process::exit(2);
+            }
+        },
+        None => shell_tunnel::actions::ActionSet::default(),
+    };
+    if let Err(message) = check_action_grants(&config.security.auth.capabilities, &actions) {
+        eprintln!("Configuration error: {message}");
+        std::process::exit(2);
+    }
+
     // Derived once, here. The containment check below and the sink creation
     // after it both read this value — the default path lives in the working
     // directory too, so it can land inside `--fs-root`, and it has to face the
@@ -647,6 +666,13 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         outln!("{line}");
     }
     outln!("File API:    {}", fs_root.describe());
+    if let Some(path) = args.actions.as_ref() {
+        outln!(
+            "Actions:     {} defined in {}",
+            actions.len(),
+            path.display()
+        );
+    }
     // Only when there is something to explain. A relay-forwarded request is
     // now held to a different chunk size than a direct one (Phase 3: a direct
     // caller reaches this device without the relay's fixed request deadline
@@ -698,7 +724,8 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     let state = shell_tunnel::AppState::new()
         .with_audit(audit)
         .with_kill_orphans(args.kill_orphans)
-        .with_fs_root(fs_root);
+        .with_fs_root(fs_root)
+        .with_actions(actions);
 
     let state = state.with_chunk_size(chunk_size, relayed_chunk_size);
 
@@ -1348,6 +1375,37 @@ fn scope_lines(prefix: &str, listed: &[String]) -> Vec<String> {
         );
     }
     lines
+}
+
+/// Refuse an explicit grant of an action that is not defined.
+///
+/// `--capabilities action:restart` with no such action issues a token that can
+/// do nothing, and nothing would say so until a caller was refused — so it is
+/// said at startup instead. `action:*` with no definitions at all is the same
+/// mistake. Only what was written is checked: `operator` holds `action:*`
+/// whether or not anything is defined, which is a preset being complete, not
+/// a grant being wrong.
+fn check_action_grants(
+    explicit: &[String],
+    actions: &shell_tunnel::actions::ActionSet,
+) -> Result<(), String> {
+    for grant in explicit {
+        let Some(id) = grant.strip_prefix("action:") else {
+            continue;
+        };
+        if id == "*" {
+            if actions.is_empty() {
+                return Err(format!(
+                    "`{grant}` grants every named action, and none are defined. Pass --actions <FILE>."
+                ));
+            }
+        } else if actions.get(id).is_none() {
+            return Err(format!(
+                "`{grant}` grants an action that is not defined. Define '{id}' in the --actions file, or correct the name."
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a scope withholds any capability that exists today.

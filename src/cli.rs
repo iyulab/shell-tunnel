@@ -77,6 +77,8 @@ pub struct Args {
     pub audit_log: Option<PathBuf>,
     /// Directory the filesystem API is confined to. `None` disables the API.
     pub fs_root: Option<PathBuf>,
+    /// Named-action definitions to serve under `/api/v1/actions`.
+    pub actions: Option<PathBuf>,
     /// Chunk size advertised to upload clients, in bytes.
     pub fs_chunk_size: Option<usize>,
     /// Rotation limit for the audit trail exactly as the operator wrote it.
@@ -138,6 +140,7 @@ impl Default for Args {
             peer: None,
             allow_hosts: Vec::new(),
             audit_log: None,
+            actions: None,
             audit_max_bytes_raw: None,
             fs_root: None,
             fs_chunk_size: None,
@@ -286,6 +289,9 @@ where
             }
             Long("audit-log") => {
                 result.audit_log = Some(parser.value()?.parse()?);
+            }
+            Long("actions") => {
+                result.actions = Some(parser.value()?.parse()?);
             }
             Long("audit-max-bytes") => {
                 let value: String = parser.value()?.parse()?;
@@ -494,6 +500,9 @@ OPTIONS:
         --cors-allow-any    Allow any CORS origin (opt-in; for browser UIs)
         --fs-root <PATH>    Confine the file API to this directory. Without it
                             the API reaches everything this account can
+        --actions <FILE>    Serve the named actions defined in this JSON file.
+                            A token granted `action:<id>` (or `action:*`) runs
+                            those and nothing else — no shell, typed parameters
         --fs-chunk-size <N> Upload chunk size advertised to callers, in bytes.
                             Default 4194304; 262144 when --relay is given,
                             because a relayed chunk must also finish inside the

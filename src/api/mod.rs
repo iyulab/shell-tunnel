@@ -21,6 +21,10 @@
 //! - `POST /api/v1/execute` - Execute command without session
 //! - `WS /api/v1/ws` - WebSocket for one-shot streaming
 //!
+//! ### Named actions
+//! - `GET /api/v1/actions` - The actions this token may run
+//! - `POST /api/v1/actions/{id}` - Run one, with parameters
+//!
 //! ## Example
 //!
 //! ```no_run
@@ -33,6 +37,7 @@
 //! }
 //! ```
 
+pub mod actions;
 pub mod fs;
 pub mod handlers;
 pub mod router;

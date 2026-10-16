@@ -105,6 +105,13 @@ pub struct AuditEvent {
     /// into one session's story.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload_id: Option<String>,
+    /// The named action that ran, on `action` events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// The parameters it ran with, as accepted — after checking against the
+    /// action's definition, so each value is one the device's owner allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl AuditEvent {
@@ -129,6 +136,8 @@ impl AuditEvent {
             entries: None,
             digest_ok: None,
             upload_id: None,
+            action: None,
+            params: None,
         }
     }
 
@@ -224,6 +233,19 @@ impl AuditEvent {
     /// still surfaces both ends of its story.
     pub fn with_upload_id(mut self, id: impl Into<String>) -> Self {
         self.upload_id = Some(id.into());
+        self
+    }
+
+    /// Name the action an event is about, and the parameters it ran with.
+    pub fn with_action(
+        mut self,
+        id: impl Into<String>,
+        params: std::collections::BTreeMap<String, String>,
+    ) -> Self {
+        self.action = Some(id.into());
+        if !params.is_empty() {
+            self.params = Some(params);
+        }
         self
     }
 }

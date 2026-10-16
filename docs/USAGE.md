@@ -563,6 +563,8 @@ notices, which on default settings is hours.
 | `DELETE` | `/api/v1/fs/file` | `fs.write` |
 | `POST` | `/api/v1/fs/uploads`, `/api/v1/fs/uploads/{id}/complete` | `fs.write` |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/fs/uploads/{id}` | `fs.write` |
+| `GET` | `/api/v1/actions` | *(any valid token — the list is filtered to the token)* |
+| `POST` | `/api/v1/actions/{id}` | `action:{id}` or `action:*` |
 
 `GET /api/v1/fs/uploads/{id}` needs `fs.write`, not `fs.read` — an upload session is a
 write operation end to end, including checking where it left off. See [§3.1](#31-files)
@@ -844,6 +846,87 @@ one caller reach into another's transfer.
 
 ---
 
+### 3.2 Named actions
+
+`exec` is all or nothing: a token holding it runs whatever the account running the
+server can. A named action is the narrower grant — a command the machine's owner
+defined, which a token can be allowed to run without being allowed to run anything
+else. The definitions live on the machine, in a file passed with `--actions`, so the
+caller cannot widen them: whoever runs the server decides what is runnable.
+
+```json
+{
+  "actions": {
+    "restart-nginx": { "argv": ["systemctl", "restart", "nginx"], "timeout_secs": 30 },
+    "tail-log": {
+      "argv": ["tail", "-n", "{lines}", "/var/log/{service}.log"],
+      "params": {
+        "lines":   { "type": "integer", "min": 1, "max": 1000 },
+        "service": { "type": "enum", "values": ["nginx", "app"] }
+      },
+      "timeout_secs": 10,
+      "working_dir": "/var/log"
+    }
+  }
+}
+```
+
+```bash
+shell-tunnel --relay ... -k central-key --capabilities 'action:*' --actions /etc/shell-tunnel/actions.json
+```
+
+**An action never reaches a shell.** `argv[0]` is the program and the rest are its
+arguments, run directly — nothing between the server and the program interprets them.
+A parameter is written `{name}` *inside* an argv element and becomes part of that one
+argument, whatever its value: `/var/log/{service}.log` stays one argument. `argv[0]`
+cannot contain a parameter, so the program is always the owner's choice. `{{` and `}}`
+are literal braces.
+
+**Parameters are typed, and the types are the only shapes a value can take:**
+
+| `type` | Accepts | Notes |
+|---|---|---|
+| `enum` | a JSON string, one of `values` | |
+| `integer` | a JSON whole number from `min` to `max` | both bounds are required. `"5"` and `5.0` are refused |
+| `name` | a JSON string of 1–128 letters, digits, `.`, `_`, `-` | not starting with `-`, so it cannot be read as an option; not `.` or `..`, so it cannot step out of a directory it is joined to. For a file, service, or branch name |
+
+There are no patterns. Every defined parameter is required; one the definition does not
+name is refused rather than ignored, since a misspelt parameter that was silently
+dropped is a call that did something other than what was asked. An action that needs an
+argument only sometimes is two actions.
+
+`timeout_secs` (optional) is clamped to the same 1–300 second range as `/execute`;
+`working_dir` and `env` (a string map) are fixed by the definition — a caller cannot set
+them. The file is read once at startup and refused whole if anything in it is wrong —
+startup ends with exit status 2, naming the file and the action. Change it by restarting.
+
+```bash
+curl -H "Authorization: Bearer $KEY" "$BASE/api/v1/actions"
+# {"actions":[{"id":"tail-log","params":{"lines":{"type":"integer","min":1,"max":1000},
+#   "service":{"type":"enum","values":["nginx","app"]}},"timeout_secs":10}]}
+
+curl -X POST -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  "$BASE/api/v1/actions/tail-log" -d '{"params":{"lines":50,"service":"nginx"}}'
+# {"action":"tail-log","success":true,"exit_code":0,"output":"...","duration_ms":12,
+#  "timed_out":false,"total_bytes":4096,"truncated":false}
+```
+
+The list shows only the actions this token may run, and never their argv — how an
+action is carried out is the owner's to change without breaking whoever calls it. The
+result has the same fields as `/execute`, plus `action`. An action without parameters
+can be run with no body at all.
+
+| Answer | When |
+|---|---|
+| `403` | the token holds neither `action:<id>` nor `action:*` — decided before the definitions are consulted, so a token cannot discover which actions exist by asking for them |
+| `404` `ACTION_NOT_FOUND` | the token may run any action, and none has this id |
+| `422` `INVALID_PARAMS` | a parameter is missing, unknown, or not a value its type accepts; `details` names it. Nothing ran |
+| `400` | the body is not JSON, or carries a field other than `params` |
+
+`--capabilities action:<id>` naming an action the file does not define, and
+`--capabilities action:*` with no `--actions` file, are refused at startup: either would
+issue a token that can do nothing, and nothing would say so until a caller was refused.
+
 ## 4. Authentication and capabilities
 
 Opaque bearer tokens in `Authorization: Bearer <token>`. `/health` never
@@ -860,6 +943,8 @@ Each token carries a set of capabilities; each route declares the one it needs:
 | `session.manage` | create and delete sessions |
 | `fs.read` | `list`, `stat`, read/download a file |
 | `fs.write` | delete a file or a directory tree, and the whole upload-session lifecycle (including reading a session's own resume point) |
+| `action:<id>` | run the named action `<id>` ([§3.2](#32-named-actions)), and nothing else |
+| `action:*` | run every named action this server defines |
 | `*` | everything |
 
 Missing or unknown token → **401**. Valid token without the capability → **403**
@@ -869,14 +954,14 @@ Presets are a convenience, not a wire contract:
 
 | Preset | Capabilities |
 |---|---|
-| `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write` |
+| `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write`, `action:*` |
 | `file-write` | `fs.read`, `fs.write` — no `exec` |
 | `file-read` | `fs.read` — no `exec` |
 | `full-control` | `*` |
 
 The cut line is `exec`. A token holding it reaches every file this process can,
 so withholding the file API from it confines nothing — which is why `operator`
-carries `fs.*`. The `file-*` presets carry no `exec`, and there a `--fs-root`
+carries `fs.*`, and `action:*` for the same reason. The `file-*` presets carry no `exec`, and there a `--fs-root`
 jail is a real boundary rather than a slow path.
 
 `read-only` was removed in 0.14.0: it granted only `session.read`, so it could
@@ -1067,7 +1152,8 @@ capability token is the access control — withhold `exec` to deny execution.
 | `kind` | Recorded when | Notable fields |
 |---|---|---|
 | `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below) |
-| `denied` | a request was refused by the authentication layer, or by the server's own body ceiling | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, …) |
+| `denied` | a request was refused by the authentication layer, by the server's own body ceiling, or by the actions route before anything ran | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, `missing-capability:action:<id>`, `unknown-action:<id>`, `invalid-param:<name>`, `malformed-body`, …) |
+| `action` | a named action ran | `action`, `params` (the values as accepted — each one the definition allowed), `command` (the argv that ran, rendered), `exit_code`, `timed_out`, `duration_ms`, `output_bytes` (as for `execute`) |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
 | `fs.delete.preview_incomplete` | a preview that hit an enumeration failure — nothing changed on disk | `file`, `bytes`, `entries` (a count — a lower bound here: an entry that could not be enumerated was never counted) |
@@ -1651,6 +1737,7 @@ is involved to spend anything further.
 | `--audit-log <FILE>` | Append executions, denied requests, and file operations as JSON lines — [§4](#audit-trail) lists the kinds | off locally; `shell-tunnel-audit.jsonl` when reachable from other machines |
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation); `0` never rotates | `67108864` (64 MiB) |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
+| `--actions <FILE>` | Serve the named actions defined in this JSON file ([§3.2](#32-named-actions)). Read once at startup; any mistake in it ends startup | none |
 | `--fs-chunk-size <N>` | Upload chunk size, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it. Sets the size for both a direct and a relayed request; without it, a relay-forwarded request is advertised a smaller size than a direct one (§10) | `4194304` (4 MiB) direct; `262144` (256 KiB) for a request that crossed a relay |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
@@ -1788,6 +1875,9 @@ startup rather than serving local-only.
 | `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
+| `--actions <FILE> cannot be used: … action '<id>': …` (exit status 2) | a definition is wrong — the message names the action and the field | fix that definition; the whole file is refused, not just the action |
+| `` `action:<id>` grants an action that is not defined `` (exit status 2) | `--capabilities` names an action the `--actions` file does not define | correct the name, or define it |
+| **422** `INVALID_PARAMS` on `/api/v1/actions/{id}` | a parameter is missing, unknown, or the wrong shape; `details` names it | send what `GET /api/v1/actions` lists for that action |
 | **429** | rate limit | wait `Retry-After` seconds. `X-RateLimit-Remaining` is `0` on a refusal, over a relay as well as directly (§5) — before 0.19.0 a relayed one reported the relay's spare budget instead. Over a relay, a `429` means device-name misses or refused credentials from your address, not volume: a request an attached device accepts is refunded (§5, since 0.25.0). Before 0.25.0 it meant volume too — 100 relayed requests a minute, from either limiter — which is where a chunked upload stopped every 26 MiB |
 | `relay certificate does not match --relay-fingerprint` | the pinned value is not the certificate the relay is serving — a relay that regenerated its certificate has a new one | the message prints both fingerprints; copy the relay's current one from the `Devices join with:` line of its banner ([§5](#tls-without-a-proxy)). Retrying does not help until the pin or that certificate changes |
 | `invalid peer certificate: BadSignature` | `--relay-ca` is not the certificate the relay is serving | copy the relay's *current* `shell-tunnel-cert.pem` |
