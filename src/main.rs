@@ -497,7 +497,22 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         },
         None => shell_tunnel::actions::ActionSet::default(),
     };
-    if let Err(message) = check_action_grants(&config.security.auth.capabilities, &actions) {
+    let explicit_grants: Vec<String> = config
+        .security
+        .auth
+        .capabilities
+        .iter()
+        .chain(
+            config
+                .security
+                .auth
+                .tokens
+                .iter()
+                .flat_map(|t| &t.capabilities),
+        )
+        .cloned()
+        .collect();
+    if let Err(message) = check_action_grants(&explicit_grants, &actions) {
         eprintln!("Configuration error: {message}");
         std::process::exit(2);
     }
@@ -626,9 +641,23 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // to avoid: they must describe one token, not two independent guesses at it.
     let resolved = config.resolved_capabilities().ok().flatten();
     let scope = token_scope(config.security.auth.preset.as_deref(), resolved.as_ref());
+    // `to_server_config` already refused a token without a scope, so this
+    // cannot fail here; an empty list is the conservative fallback.
+    let named_tokens = config.named_tokens().unwrap_or_default();
+    let named_scopes: Vec<(String, TokenScope)> = named_tokens
+        .iter()
+        .map(|t| {
+            (
+                t.label.clone(),
+                token_scope(t.preset.as_deref(), Some(&t.capabilities)),
+            )
+        })
+        .collect();
     for line in posture_banner(
         posture,
         &scope,
+        !config.security.auth.api_keys.is_empty(),
+        &named_scopes,
         audit_log.as_deref(),
         !args.allow_hosts.is_empty(),
     ) {
@@ -702,9 +731,23 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // thing that would have narrowed it. A preset name that sounds narrow
     // ("file-read") is precisely how this is reached by accident.
     if fs_root.jail_path().is_none()
+        && !config.security.auth.api_keys.is_empty()
         && file_scope_is_the_whole_grant(config.security.auth.enabled, resolved.as_ref())
     {
         outln!("             this token holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given");
+    }
+    for token in &named_tokens {
+        if fs_root.jail_path().is_none()
+            && file_scope_is_the_whole_grant(
+                config.security.auth.enabled,
+                Some(&token.capabilities),
+            )
+        {
+            outln!(
+                "             token '{}' holds the file API without `exec`, so --fs-root is the only confinement it has — and it was not given",
+                token.label
+            );
+        }
     }
     if fs_root.jail_path().is_none() && audit_log.is_some() {
         // The `exec` clause this line used to carry ("as it already is for
@@ -1421,30 +1464,6 @@ fn narrows_something(listed: &[String]) -> bool {
         .all(|known| listed.iter().any(|held| held == known))
 }
 
-/// Whether the file API is the whole of what a token this server issues holds.
-///
-/// True exactly when authentication is on and the token reaches `fs.read` or
-/// `fs.write` without holding `exec`. That is the one shape for which
-/// `--fs-root` confines anything: with `exec` the file API grants no reach the
-/// token did not already have, so its absence is not a hazard worth a line.
-///
-/// Decided from the *resolved* capability set rather than the preset name, so
-/// it cannot drift from what the router enforces — and so it covers
-/// `--capabilities fs.read` as readily as `--preset file-read`. `None` is the
-/// full-control default, which is the wildcard: `satisfies` answers `true` for
-/// `exec` there, so the wildcard falls out of the same test rather than needing
-/// its own arm.
-///
-/// `auth_enabled` is not a refinement of that test but a precondition for it
-/// meaning anything. With authentication off, `capability_auth_middleware`
-/// (`src/api/router.rs`) returns before a token is ever looked for, so every
-/// route is open — `exec` included — no matter what `--preset` or
-/// `security.auth.preset` says. Describing such a server as holding a scope
-/// without `exec` would be false in the reassuring direction, on the one
-/// surface meant to be trusted. Reachable with `--no-auth --preset file-read`
-/// and with `auth.enabled: false` alongside a preset in a config file; an
-/// exposed server cannot reach it, since the posture turns authentication on
-/// and refuses `--no-auth`.
 /// The upload chunk size this server will advertise to a caller that reached
 /// it directly — including over a Phase 3 direct-connect socket, which never
 /// carries `relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER` even on a relay-joined
@@ -1517,6 +1536,30 @@ fn resolve_relayed_chunk_size(args: &shell_tunnel::cli::Args, chunk_size: usize)
     }
 }
 
+/// Whether the file API is the whole of what a token this server issues holds.
+///
+/// True exactly when authentication is on and the token reaches `fs.read` or
+/// `fs.write` without holding `exec`. That is the one shape for which
+/// `--fs-root` confines anything: with `exec` the file API grants no reach the
+/// token did not already have, so its absence is not a hazard worth a line.
+///
+/// Decided from the *resolved* capability set rather than the preset name, so
+/// it cannot drift from what the router enforces — and so it covers
+/// `--capabilities fs.read` as readily as `--preset file-read`. `None` is the
+/// full-control default, which is the wildcard: `satisfies` answers `true` for
+/// `exec` there, so the wildcard falls out of the same test rather than needing
+/// its own arm.
+///
+/// `auth_enabled` is not a refinement of that test but a precondition for it
+/// meaning anything. With authentication off, `capability_auth_middleware`
+/// (`src/api/router.rs`) returns before a token is ever looked for, so every
+/// route is open — `exec` included — no matter what `--preset` or
+/// `security.auth.preset` says. Describing such a server as holding a scope
+/// without `exec` would be false in the reassuring direction, on the one
+/// surface meant to be trusted. Reachable with `--no-auth --preset file-read`
+/// and with `auth.enabled: false` alongside a preset in a config file; an
+/// exposed server cannot reach it, since the posture turns authentication on
+/// and refuses `--no-auth`.
 fn file_scope_is_the_whole_grant(auth_enabled: bool, capabilities: Option<&CapabilitySet>) -> bool {
     let Some(set) = capabilities.filter(|_| auth_enabled) else {
         return false;
@@ -1601,14 +1644,39 @@ fn orphan_banner(kill_orphans: bool) -> Vec<String> {
 /// The strings come out of a function so that tests can hold them in place.
 /// User-facing text in this repository has broken four times, every one of
 /// them somewhere no test was looking.
+///
+/// `scope` is the shared scope of the `-k` / `api_keys` keys, and `shared_key`
+/// says whether there are any. `named` are the keys from `security.auth.tokens`,
+/// each with its own scope. With none of those the banner says "tokens are
+/// scoped to …", which is then true of every token; with some, that sentence
+/// would describe keys that do not hold it, so each key is named instead.
 fn posture_banner(
     posture: Posture,
     scope: &TokenScope,
+    shared_key: bool,
+    named: &[(String, TokenScope)],
     audit_log: Option<&Path>,
     allow_host_given: bool,
 ) -> Vec<String> {
     if posture == Posture::Local {
         return Vec::new();
+    }
+    if !named.is_empty() {
+        let mut lines =
+            vec!["Reachable:   from other machines — each key holds its own scope:".to_string()];
+        if shared_key {
+            lines.push(format!(
+                "             keys from -k / api_keys: {}",
+                describe_scope(scope)
+            ));
+        }
+        for (label, scope) in named {
+            lines.push(format!(
+                "             token '{label}': {}",
+                describe_scope(scope)
+            ));
+        }
+        return finish_posture_banner(lines, audit_log, allow_host_given);
     }
     // The wildcard line deliberately avoids the word "scoped": the wildcard is
     // the absence of scoping, and this line is the only place a consumer
@@ -1621,7 +1689,7 @@ fn posture_banner(
     // away*, when nothing was: an `operator` token meets no `403` on any route
     // that exists. The capabilities are named instead, which lets a reader see
     // the grant rather than be told a word for it.
-    let mut lines = match scope {
+    let lines = match scope {
         TokenScope::Wildcard => vec!["Reachable:   from other machines — tokens hold the wildcard `*`: every capability, including any added in later versions".to_string()],
         TokenScope::Preset { name, listed } => scope_lines(&format!("`{name}`: "), listed),
         // Each capability is backticked, as the `Preset` arm backticks its
@@ -1638,6 +1706,15 @@ fn posture_banner(
     // traffic. What was wrong is that a flag asking for a defence was
     // discarded in silence. The banner already exists to say what is actually
     // in force; this is one more thing that is not.
+    finish_posture_banner(lines, audit_log, allow_host_given)
+}
+
+/// The lines every exposed banner ends with, whatever it said about scope.
+fn finish_posture_banner(
+    mut lines: Vec<String>,
+    audit_log: Option<&Path>,
+    allow_host_given: bool,
+) -> Vec<String> {
     if allow_host_given {
         lines.push(
             "             --allow-host was not applied — a published server answers to any Host, since it is reached under names it cannot know".to_string(),
@@ -1647,6 +1724,26 @@ fn posture_banner(
         lines.push(format!("Audit trail: {}", path.display()));
     }
     lines
+}
+
+/// One key's scope on one line, for a banner that names keys one by one.
+///
+/// Says "nothing withheld" where that is true, for the reason `scope_lines`
+/// does: a preset name is not a boundary when it holds everything.
+fn describe_scope(scope: &TokenScope) -> String {
+    let (prefix, listed) = match scope {
+        TokenScope::Wildcard => {
+            return "the wildcard `*` — every capability, including any added later".to_string()
+        }
+        TokenScope::Preset { name, listed } => (format!("`{name}`: "), listed),
+        TokenScope::Explicit(listed) => (String::new(), listed),
+    };
+    let quoted: Vec<String> = listed.iter().map(|c| format!("`{c}`")).collect();
+    let mut text = format!("{prefix}{}", quoted.join(", "));
+    if !narrows_something(listed) {
+        text.push_str(" (every capability this version defines — nothing withheld today)");
+    }
+    text
 }
 
 /// The certificate lines of the relay banner.
@@ -1860,13 +1957,42 @@ mod tests {
         shell_tunnel::security::preset(name).expect("preset exists")
     }
 
+    /// With keys scoped one by one, "tokens are scoped to `operator`" would be
+    /// false of every token that is not — so each key is named with its own.
+    #[test]
+    fn named_tokens_are_each_described_and_the_shared_sentence_is_not_used() {
+        let shared = token_scope(Some("operator"), Some(&resolved("operator")));
+        let central: CapabilitySet = ["action:*"].into_iter().collect();
+        let named = vec![("central".to_string(), token_scope(None, Some(&central)))];
+
+        let text = posture_banner(Posture::Exposed, &shared, true, &named, None, false).join(
+            "
+",
+        );
+        assert!(!text.contains("tokens are scoped to"), "{text}");
+        assert!(text.contains("each key holds its own scope"), "{text}");
+        assert!(
+            text.contains("keys from -k / api_keys: `operator`"),
+            "{text}"
+        );
+        assert!(text.contains("nothing withheld today"), "{text}");
+        assert!(text.contains("token 'central': `action:*`"), "{text}");
+
+        // No shared key, no line about one.
+        let text = posture_banner(Posture::Exposed, &shared, false, &named, None, false).join(
+            "
+",
+        );
+        assert!(!text.contains("api_keys"), "{text}");
+    }
+
     #[test]
     fn the_exposed_banner_names_the_scope_and_the_trail() {
         // The default-promoted case: no preset and no capabilities were given,
         // so `harden_for_public_exposure` set `operator`.
         let path = PathBuf::from("shell-tunnel-audit.jsonl");
         let scope = token_scope(Some("operator"), Some(&resolved("operator")));
-        let lines = posture_banner(Posture::Exposed, &scope, Some(&path), false);
+        let lines = posture_banner(Posture::Exposed, &scope, true, &[], Some(&path), false);
         let text = lines.join("\n");
         assert!(text.contains("Reachable:"), "{text}");
         assert!(
@@ -1888,7 +2014,7 @@ mod tests {
     #[test]
     fn a_wildcard_scope_is_never_described_as_scoped() {
         let scope = token_scope(Some("full-control"), Some(&resolved("full-control")));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
         assert!(
             !text.contains("operator"),
             "a wildcard token must not be reported as `operator`: {text}"
@@ -1915,7 +2041,7 @@ mod tests {
     #[test]
     fn a_scope_that_withholds_nothing_says_so() {
         let scope = token_scope(Some("operator"), Some(&resolved("operator")));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
 
         for capability in shell_tunnel::security::KNOWN_CAPABILITIES {
             assert!(
@@ -1937,7 +2063,7 @@ mod tests {
     #[test]
     fn a_scope_that_withholds_something_does_not_say_it_withholds_nothing() {
         let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
 
         assert!(text.contains("fs.read"), "{text}");
         assert!(
@@ -1961,7 +2087,7 @@ mod tests {
     #[test]
     fn an_explicit_preset_is_named_rather_than_the_promoted_one() {
         let scope = token_scope(Some("file-read"), Some(&resolved("file-read")));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
         assert!(text.contains("file-read"), "{text}");
         assert!(
             !text.contains("operator"),
@@ -1973,7 +2099,7 @@ mod tests {
     fn an_explicit_capability_list_is_spelled_out() {
         let caps: CapabilitySet = ["exec", "fs.read"].into_iter().collect();
         let scope = token_scope(None, Some(&caps));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
         assert!(text.contains("exec"), "{text}");
         assert!(text.contains("fs.read"), "{text}");
     }
@@ -1985,7 +2111,7 @@ mod tests {
         let mut caps = resolved("file-read");
         caps.insert("exec");
         let scope = token_scope(Some("file-read"), Some(&caps));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join("\n");
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
         assert!(
             !text.contains("file-read"),
             "naming the preset would hide the `exec` unioned on top of it: {text}"
@@ -2092,7 +2218,7 @@ mod tests {
     #[test]
     fn the_exposed_banner_says_allow_host_did_nothing() {
         let scope = token_scope(Some("operator"), Some(&resolved("operator")));
-        let text = posture_banner(Posture::Exposed, &scope, None, true).join(
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, true).join(
             "
 ",
         );
@@ -2111,7 +2237,7 @@ mod tests {
     #[test]
     fn the_exposed_banner_is_silent_about_an_allow_host_nobody_gave() {
         let scope = token_scope(Some("operator"), Some(&resolved("operator")));
-        let text = posture_banner(Posture::Exposed, &scope, None, false).join(
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join(
             "
 ",
         );
@@ -2143,7 +2269,9 @@ mod tests {
     fn the_local_banner_says_nothing() {
         // Local is zero friction. Nothing was narrowed, so there is nothing
         // to report.
-        assert!(posture_banner(Posture::Local, &TokenScope::Wildcard, None, true).is_empty());
+        assert!(
+            posture_banner(Posture::Local, &TokenScope::Wildcard, true, &[], None, true).is_empty()
+        );
     }
 
     /// The `Err` arm itself: a path whose *parent* cannot be canonicalised

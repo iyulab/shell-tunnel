@@ -3,6 +3,19 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Keys with their own scope: `security.auth.tokens` in the config file.** Every key
+  given with `-k`, `SHELL_TUNNEL_API_KEY` or `api_keys` shares one scope, so a server
+  could not hold a person's `operator` key beside a service's `action:*` key. Each entry
+  here — `key`, `label`, and a `preset` and/or `capabilities` — keeps its own scope,
+  untouched by `--preset`/`--capabilities` and by the reachable-server promotion to
+  `operator`. The label is what the audit trail records for that caller. An entry with no
+  scope is refused at startup. On a reachable server the banner names each key's scope
+  on its own line.
+
 ## 0.27.0 — 2026-10-16
 
 ### Added

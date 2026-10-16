@@ -187,7 +187,9 @@ curl -X POST -H "Authorization: Bearer $KEY" http://127.0.0.1:3000/api/v1/action
 
 An action runs its argv directly, with no shell, and a caller's parameters are typed
 values substituted into single arguments — see
-[docs/USAGE.md §3.2](docs/USAGE.md#32-named-actions).
+[docs/USAGE.md §3.2](docs/USAGE.md#32-named-actions). To keep a person's `operator` key on the same
+server, give each key its own scope in the config file
+([§4](docs/USAGE.md#keys-with-their-own-scope)).
 
 ## A word on exposure
 

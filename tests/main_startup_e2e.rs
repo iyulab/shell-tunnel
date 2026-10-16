@@ -1896,3 +1896,83 @@ fn an_action_whose_working_dir_does_not_exist_refuses_to_start() {
         "the file is named once: {stderr}"
     );
 }
+
+/// Two keys on one server, each with its own scope: a person's `operator` key
+/// runs commands, a service's action key does not — through the real binary,
+/// from a real config file, with the banner naming both.
+#[test]
+fn two_keys_with_their_own_scopes_are_held_apart() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let actions = dir.path().join("actions.json");
+    std::fs::write(&actions, r#"{"actions": {"v": {"argv": ["whoami"]}}}"#).expect("write");
+    let config = dir.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::json!({"security": {"auth": {
+            "api_keys": ["st_person"],
+            "preset": "operator",
+            "tokens": [{"key": "st_service", "label": "central", "capabilities": ["action:v"]}]
+        }}})
+        .to_string(),
+    )
+    .expect("write");
+    let port = reserved_port();
+    let child = Command::new(BIN)
+        .current_dir(dir.path())
+        .args([
+            "-H",
+            "0.0.0.0",
+            "-p",
+            &port.to_string(),
+            "-c",
+            &config.to_string_lossy(),
+            "--actions",
+            &actions.to_string_lossy(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("binary should start");
+    let mut server = Killed(child);
+    let lines = wait_for_stdout_lines(&mut server, Duration::from_secs(30), |l| {
+        l.starts_with("File API:")
+    });
+    let banner = lines.join("\n");
+    assert!(banner.contains("token 'central': `action:v`"), "{banner}");
+    assert!(
+        banner.contains("keys from -k / api_keys: `operator`"),
+        "{banner}"
+    );
+
+    let execute = |key: &str| {
+        get_status_with_headers_post(port, "/api/v1/execute", key, r#"{"command":"echo hi"}"#)
+    };
+    assert_eq!(execute("st_person"), 200);
+    assert_eq!(execute("st_service"), 403);
+    assert_eq!(
+        get_status_with_headers_post(port, "/api/v1/actions/v", "st_service", ""),
+        200
+    );
+}
+
+/// POST `body` to `path` with a bearer `key`, and return the status.
+fn get_status_with_headers_post(port: u16, path: &str, key: &str, body: &str) -> u16 {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {key}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    let _ = stream.read_to_string(&mut response);
+    response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
+}

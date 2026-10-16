@@ -74,6 +74,23 @@ pub struct SecurityConfig {
     /// is what this compares. A published server is deliberately reachable under
     /// a name we may not know, so the check does not apply there.
     pub allowed_hosts: Option<Vec<String>>,
+    /// Keys that each carry their own scope, rather than `capabilities`.
+    ///
+    /// `api_keys` all share one capability set. A key here does not: it is how
+    /// one server holds a person's `operator` key and a service's `action:*`
+    /// key at once.
+    pub named_tokens: Vec<NamedToken>,
+}
+
+/// A key registered with a scope of its own.
+#[derive(Debug, Clone)]
+pub struct NamedToken {
+    /// The secret a caller presents.
+    pub key: String,
+    /// What the audit trail calls whoever presents it.
+    pub label: String,
+    /// What it may do.
+    pub capabilities: CapabilitySet,
 }
 
 impl Default for SecurityConfig {
@@ -85,6 +102,7 @@ impl Default for SecurityConfig {
             capabilities: None, // Full-control by default (legacy-compatible)
             cors: CorsConfig::default(), // Restrictive by default (no permissive CORS)
             allowed_hosts: None,
+            named_tokens: Vec::new(),
         }
     }
 }
@@ -111,6 +129,7 @@ impl SecurityConfig {
             capabilities: None,
             cors: CorsConfig::default(),
             allowed_hosts: None,
+            named_tokens: Vec::new(),
         }
     }
 
@@ -123,7 +142,14 @@ impl SecurityConfig {
             capabilities: None,
             cors: CorsConfig::default(),
             allowed_hosts: None,
+            named_tokens: Vec::new(),
         }
+    }
+
+    /// Register a key with a scope of its own; see [`NamedToken`].
+    pub fn with_named_token(mut self, token: NamedToken) -> Self {
+        self.named_tokens.push(token);
+        self
     }
 
     /// Add an API key.
@@ -709,6 +735,13 @@ pub fn create_secure_router(
     // Register API keys with their configured capabilities.
     for key in &security.api_keys {
         register_key(&auth_store, key, &security.capabilities);
+    }
+    for token in &security.named_tokens {
+        auth_store.add_key_with_capabilities(
+            token.key.clone(),
+            token.capabilities.clone(),
+            token.label.clone(),
+        );
     }
 
     let allowed_hosts = security.allowed_hosts.clone();

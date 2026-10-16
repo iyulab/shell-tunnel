@@ -992,6 +992,46 @@ refused. A key issued without either is full-control unless the server is
 reachable, in which case it is `operator`; either way existing setups never
 start failing with 403.
 
+### Keys with their own scope
+
+Every key given with `-k`, `SHELL_TUNNEL_API_KEY` or `security.auth.api_keys` shares one
+scope — whatever `--preset`/`--capabilities` (or their config keys) say. To hold keys
+with *different* scopes on one server — a person's `operator` key beside a service's
+`action:*` key, say — list them in the config file under `security.auth.tokens`, each
+with its own:
+
+```json
+{
+  "security": {
+    "auth": {
+      "api_keys": ["<person's key>"],
+      "preset": "operator",
+      "tokens": [
+        { "key": "<service's key>", "label": "central", "capabilities": ["action:*"] },
+        { "key": "<deploy key>", "label": "deploy", "preset": "file-write" }
+      ]
+    }
+  }
+}
+```
+
+- **Each entry must name a scope** — `preset`, `capabilities`, or both (unioned, as for
+  the shared scope). An entry with neither is refused at startup rather than given the
+  shared default: that default is for keys nobody scoped.
+- **The shared scope never touches them.** `--preset`/`--capabilities` replace the
+  shared scope only, and the reachable-server promotion to `operator` applies to the
+  shared keys only.
+- **`label`** (default `token-<n>`) is what the audit trail records as the caller's
+  `identity.label`, so the trail says which key ran what.
+- An entry turns authentication on, and no key is generated beside it. `--no-auth`
+  still overrides — except on a reachable server, where it is refused as always.
+- On a reachable server the banner names each key's scope on its own line
+  (`token 'central': `action:*``) instead of the single "tokens are scoped to …" line,
+  which would then be false of every key that does not hold that scope.
+
+There is no flag for these: a scoped key is a secret, and the config file — readable by
+whoever you allow — is where it belongs.
+
 ### Host checking
 
 A loopback-bound server answers only to `localhost`, `127.0.0.1`, and `::1`. This
@@ -1814,7 +1854,8 @@ you already know ([§5](#reaching-a-device-through-a-local-port-connect)).
 {
   "server": { "host": "127.0.0.1", "port": 3000, "graceful_shutdown": true },
   "security": {
-    "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [] },
+    "auth": { "enabled": true, "api_keys": ["key1"], "preset": "operator", "capabilities": [],
+              "tokens": [{ "key": "key2", "label": "central", "capabilities": ["action:*"] }] },
     "rate_limit": { "enabled": true, "requests_per_window": 100, "window_secs": 60 },
     "cors": { "allow_any": false }
   },
@@ -1827,7 +1868,7 @@ you already know ([§5](#reaching-a-device-through-a-local-port-connect)).
 the client to run).
 
 For most keys, passing the matching CLI flag overrides what the file says.
-Three cases do not work that way, and each can surprise you:
+Four cases do not work that way, and each can surprise you:
 
 - **`--api-key` adds to the file rather than replacing it.** A key in the file
   stays valid alongside a key given with `-k`, and alongside
@@ -1837,6 +1878,9 @@ Three cases do not work that way, and each can surprise you:
   flags are one-way.** Passing one sets it; omitting one leaves whatever the
   file said. There is no flag that turns rate limiting back on for a file that
   disabled it.
+- **`--preset` and `--capabilities` replace the shared scope, never a
+  `security.auth.tokens` entry's.** Each of those keeps the scope written beside it
+  ([§4](#keys-with-their-own-scope)).
 - **A file asking for a tunnel or a relay changes the auth keys by itself.**
   `transport.mode` of `cloudflared` or `command` makes the server reachable, and
   a reachable server turns `security.auth.enabled` on and scopes an otherwise

@@ -112,6 +112,24 @@ pub struct AuthSection {
     pub capabilities: Vec<String>,
     /// Role preset scoping the keys (operator/file-write/file-read/full-control).
     pub preset: Option<String>,
+    /// Keys that each carry their own scope. `api_keys` share `preset` and
+    /// `capabilities`; each of these names its own, and is untouched by them.
+    pub tokens: Vec<TokenSection>,
+}
+
+/// One key with its own scope, in `security.auth.tokens`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenSection {
+    /// The secret a caller presents.
+    pub key: String,
+    /// What the audit trail calls this caller. Defaults to `token-<n>`, its
+    /// position in the list counting from 1.
+    pub label: Option<String>,
+    /// A role preset, as `security.auth.preset`.
+    pub preset: Option<String>,
+    /// Capability strings, unioned with `preset` as for the shared scope.
+    pub capabilities: Vec<String>,
 }
 
 /// Rate limiting configuration.
@@ -288,6 +306,13 @@ impl Config {
         if let Some(ref path) = args.config {
             config = Config::from_file(path)?;
         }
+        // A key with a scope of its own is a request for authentication, as a
+        // scope named on the command line is: with auth off it would be
+        // ignored, and the server would start open. Set before the command line
+        // is applied, so an explicit `--no-auth` still wins.
+        if !config.security.auth.tokens.is_empty() {
+            config.security.auth.enabled = true;
+        }
 
         // Apply environment variable overrides
         config.apply_env();
@@ -427,7 +452,10 @@ impl Config {
     /// at `-l warn` while the server still starts and still refuses every
     /// request that does not carry the key nobody was told.
     pub fn ensure_api_key(&mut self) -> Option<String> {
-        if !self.security.auth.enabled || !self.security.auth.api_keys.is_empty() {
+        if !self.security.auth.enabled
+            || !self.security.auth.api_keys.is_empty()
+            || !self.security.auth.tokens.is_empty()
+        {
             return None;
         }
         let key = crate::security::generate_api_key();
@@ -483,6 +511,13 @@ impl Config {
         for key in &self.security.auth.api_keys {
             security = security.with_api_key(key);
         }
+        for token in self.named_tokens()? {
+            security = security.with_named_token(crate::api::NamedToken {
+                key: token.key,
+                label: token.label,
+                capabilities: token.capabilities,
+            });
+        }
 
         let mut server_config = ServerConfig::new(host.to_string(), self.server.port);
         server_config = server_config.with_security(security);
@@ -506,6 +541,40 @@ impl Config {
             self.security.auth.preset.as_deref(),
             &self.security.auth.capabilities,
         )
+    }
+
+    /// The keys in `security.auth.tokens`, each with its scope resolved.
+    ///
+    /// Each must name a scope. One that names neither a preset nor any
+    /// capability is refused rather than given a default: the shared scope's
+    /// default (full control, or `operator` once reachable) is a decision about
+    /// keys nobody scoped, and a key written into this list was written there
+    /// to be scoped.
+    pub fn named_tokens(&self) -> Result<Vec<ResolvedToken>, ConfigError> {
+        self.security
+            .auth
+            .tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                let label = token
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| format!("token-{}", index + 1));
+                if token.key.is_empty() {
+                    return Err(ConfigError::TokenWithoutKey(label));
+                }
+                let capabilities =
+                    resolve_capabilities(token.preset.as_deref(), &token.capabilities)?
+                        .ok_or_else(|| ConfigError::TokenWithoutScope(label.clone()))?;
+                Ok(ResolvedToken {
+                    key: token.key.clone(),
+                    label,
+                    preset: token.preset.clone(),
+                    capabilities,
+                })
+            })
+            .collect()
     }
 
     /// Get the log level filter string.
@@ -536,6 +605,19 @@ fn resolve_capabilities(
         set.insert(capability.clone());
     }
     Ok(Some(set))
+}
+
+/// A key from `security.auth.tokens`, with its scope resolved.
+#[derive(Debug, Clone)]
+pub struct ResolvedToken {
+    /// The secret.
+    pub key: String,
+    /// The label the audit trail records.
+    pub label: String,
+    /// The preset it named, if any — kept so the banner can name it.
+    pub preset: Option<String>,
+    /// What it may do.
+    pub capabilities: CapabilitySet,
 }
 
 /// How far this process is exposed.
@@ -575,6 +657,10 @@ pub enum ConfigError {
     RemoteWithoutAuth,
     /// `transport.mode = "command"` without a command to run.
     MissingTunnelCommand,
+    /// An entry in `security.auth.tokens` names no scope.
+    TokenWithoutScope(String),
+    /// An entry in `security.auth.tokens` has no key.
+    TokenWithoutKey(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -598,6 +684,13 @@ impl std::fmt::Display for ConfigError {
                 "unknown role preset: '{}' (expected operator, file-write, file-read, or full-control)",
                 name
             ),
+            Self::TokenWithoutScope(label) => write!(
+                f,
+                "security.auth.tokens entry '{label}' names no scope: give it a preset or capabilities. A key in that list is there to carry a scope of its own; one without would silently take the shared default"
+            ),
+            Self::TokenWithoutKey(label) => {
+                write!(f, "security.auth.tokens entry '{label}' has no key")
+            }
             Self::MissingTunnelCommand => write!(
                 f,
                 "transport.mode is \"command\" but transport.command is not set (or use --tunnel-command)"
@@ -912,6 +1005,79 @@ mod tests {
             "the file's capability list must not survive a preset named on the command line"
         );
         assert_eq!(config.security.auth.preset, Some("file-read".to_string()));
+    }
+
+    fn token(key: &str, preset: Option<&str>, caps: &[&str]) -> TokenSection {
+        TokenSection {
+            key: key.to_string(),
+            label: None,
+            preset: preset.map(str::to_string),
+            capabilities: caps.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    /// Each entry keeps its own scope, untouched by the shared one — the whole
+    /// reason the list exists.
+    #[test]
+    fn a_named_token_keeps_its_own_scope_beside_the_shared_one() {
+        let mut config = Config::default();
+        config.security.auth.preset = Some("operator".to_string());
+        config.security.auth.tokens = vec![
+            token("k-central", None, &["action:*"]),
+            token("k-files", Some("file-read"), &[]),
+        ];
+
+        let tokens = config.named_tokens().expect("valid");
+        assert_eq!(tokens[0].label, "token-1");
+        assert!(tokens[0].capabilities.satisfies("action:*"));
+        assert!(!tokens[0].capabilities.satisfies("exec"));
+        assert!(tokens[1].capabilities.satisfies("fs.read"));
+        assert!(!tokens[1].capabilities.satisfies("exec"));
+    }
+
+    /// No silent default: the shared default is for keys nobody scoped, and a
+    /// key in this list was put there to be scoped.
+    #[test]
+    fn a_named_token_without_a_scope_or_a_key_is_refused() {
+        let mut config = Config::default();
+        config.security.auth.tokens = vec![token("k", None, &[])];
+        assert!(matches!(
+            config.named_tokens(),
+            Err(ConfigError::TokenWithoutScope(label)) if label == "token-1"
+        ));
+
+        config.security.auth.tokens = vec![token("", Some("operator"), &[])];
+        assert!(matches!(
+            config.named_tokens(),
+            Err(ConfigError::TokenWithoutKey(_))
+        ));
+    }
+
+    /// A named token turns authentication on (it would be ignored otherwise),
+    /// stops a key being generated beside it, and leaves `--no-auth` the last
+    /// word.
+    #[test]
+    fn a_named_token_turns_auth_on_and_no_key_is_generated_beside_it() {
+        let mut file = NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"{{"security": {{"auth": {{"tokens": [{{"key": "k", "capabilities": ["exec"]}}]}}}}}}"#
+        )
+        .unwrap();
+        let args = Args {
+            config: Some(file.path().to_path_buf()),
+            ..Args::default()
+        };
+        let mut config = Config::load(&args).expect("loads");
+        assert!(config.security.auth.enabled);
+        assert_eq!(config.ensure_api_key(), None);
+
+        let config = Config::load(&Args {
+            no_auth: true,
+            ..args
+        })
+        .expect("loads");
+        assert!(!config.security.auth.enabled);
     }
 
     /// Within one source the union stays: both given on one command line is a
