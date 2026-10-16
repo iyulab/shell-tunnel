@@ -58,6 +58,7 @@
 //! }
 //! ```
 
+pub mod actions;
 pub mod api;
 pub mod audit;
 pub mod cli;

@@ -26,7 +26,7 @@ mod executor;
 mod pipe;
 mod result;
 
-pub use command::{Command, CommandBuilder};
+pub use command::{Command, CommandBuilder, Invocation};
 pub use executor::{
     execute_simple, execute_with_timeout, CommandExecutor, DEFAULT_TIMEOUT, MAX_TIMEOUT,
     MIN_TIMEOUT,

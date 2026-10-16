@@ -320,6 +320,24 @@ pub(crate) fn shell_command(command_line: &str) -> OsCommand {
     }
 }
 
+/// Build a command that runs `argv[0]` with the rest of `argv` as its
+/// arguments, with no shell in between.
+///
+/// The counterpart of [`shell_command`] for callers whose arguments must not be
+/// interpreted. Each element reaches the program as one argument: on Unix
+/// unchanged, on Windows through the C-runtime encoding `Command::arg`
+/// applies, which the receiving program's own runtime undoes. That is the
+/// opposite of what [`shell_command`] needs, and correct here, because no
+/// `cmd.exe` stands between the two.
+///
+/// Returns `None` for an empty `argv` — there is no program to run.
+pub(crate) fn direct_command(argv: &[String]) -> Option<OsCommand> {
+    let (program, args) = argv.split_first()?;
+    let mut c = OsCommand::new(program);
+    c.args(args);
+    Some(c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

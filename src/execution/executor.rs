@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::command::Command;
+use super::command::Invocation;
 use super::pipe::PipeDrain;
 use super::result::{ExecutionResult, OutputChunk};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
-use crate::process::{shell_command, KillGroup};
+use crate::process::{direct_command, shell_command, KillGroup};
 use crate::session::{BusySession, SessionStore};
 use crate::Result;
 
@@ -149,7 +150,12 @@ fn run_command_streaming(
     let start = Instant::now();
     let timeout_duration = command.effective_timeout();
 
-    let mut os_cmd = shell_command(&command.command_line);
+    let mut os_cmd = match &command.invocation {
+        Invocation::Shell(line) => shell_command(line),
+        Invocation::Argv(argv) => direct_command(argv).ok_or_else(|| {
+            ShellTunnelError::ExecutionFailed("no program to run: argv is empty".into())
+        })?,
+    };
     os_cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -521,7 +527,7 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .capture_output(true);
 
-        assert_eq!(cmd.command_line, "echo hello");
+        assert_eq!(cmd.invocation, Invocation::Shell("echo hello".into()));
         assert_eq!(cmd.timeout, Some(Duration::from_secs(5)));
     }
 

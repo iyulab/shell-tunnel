@@ -4,11 +4,51 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// A command to be executed in a shell session.
+/// How a command's process is made.
+///
+/// Two shapes because two callers want opposite things. `/execute` hands its
+/// string to the platform shell by definition — that is what holding `exec`
+/// means. A named action must *not* reach a shell: its arguments come from a
+/// caller who was trusted with one action, not with a shell, and the only way
+/// to be sure no argument is interpreted is for nothing to interpret it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Invocation {
+    /// A command line for the platform shell (`cmd /c`, `/bin/sh -c`).
+    Shell(String),
+    /// A program and its arguments, run directly. The first element is the
+    /// program; an empty vector is refused when the command runs.
+    Argv(Vec<String>),
+}
+
+impl Invocation {
+    /// The invocation as one line, for a log or the audit trail.
+    ///
+    /// For `Argv` this is a rendering, not something to run: elements are
+    /// joined with spaces, and one containing a space is quoted so the
+    /// boundaries stay visible.
+    pub fn display(&self) -> String {
+        match self {
+            Invocation::Shell(line) => line.clone(),
+            Invocation::Argv(argv) => argv
+                .iter()
+                .map(|a| {
+                    if a.is_empty() || a.contains(char::is_whitespace) {
+                        format!("{a:?}")
+                    } else {
+                        a.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        }
+    }
+}
+
+/// A command to be executed.
 #[derive(Debug, Clone)]
 pub struct Command {
-    /// The command line to execute.
-    pub command_line: String,
+    /// What to run, and through what.
+    pub invocation: Invocation,
     /// Working directory override (if any).
     pub working_dir: Option<PathBuf>,
     /// Environment variables to set.
@@ -25,10 +65,20 @@ pub struct Command {
 }
 
 impl Command {
-    /// Create a new command with the given command line.
+    /// Create a new command with the given command line, for the platform shell.
     pub fn new(command_line: impl Into<String>) -> Self {
+        Self::with_invocation(Invocation::Shell(command_line.into()))
+    }
+
+    /// Create a command that runs `argv[0]` with the rest as its arguments,
+    /// without a shell.
+    pub fn argv(argv: Vec<String>) -> Self {
+        Self::with_invocation(Invocation::Argv(argv))
+    }
+
+    fn with_invocation(invocation: Invocation) -> Self {
         Self {
-            command_line: command_line.into(),
+            invocation,
             working_dir: None,
             env: HashMap::new(),
             timeout: None,
@@ -163,7 +213,7 @@ impl CommandBuilder {
     /// Returns `None` if no command line was specified.
     pub fn build(self) -> Option<Command> {
         self.command_line.map(|cmd| Command {
-            command_line: cmd,
+            invocation: Invocation::Shell(cmd),
             working_dir: self.working_dir,
             env: self.env,
             timeout: self.timeout,
@@ -231,7 +281,7 @@ mod tests {
     #[test]
     fn test_command_new() {
         let cmd = Command::new("ls -la");
-        assert_eq!(cmd.command_line, "ls -la");
+        assert_eq!(cmd.invocation, Invocation::Shell("ls -la".into()));
         assert!(cmd.working_dir.is_none());
         assert!(cmd.env.is_empty());
         assert!(cmd.timeout.is_none());
@@ -246,7 +296,7 @@ mod tests {
             .timeout(Duration::from_secs(60))
             .capture_output(true);
 
-        assert_eq!(cmd.command_line, "cargo build");
+        assert_eq!(cmd.invocation, Invocation::Shell("cargo build".into()));
         assert_eq!(cmd.working_dir, Some(PathBuf::from("/project")));
         assert_eq!(cmd.env.get("RUST_LOG"), Some(&"debug".to_string()));
         assert_eq!(cmd.timeout, Some(Duration::from_secs(60)));
@@ -271,7 +321,7 @@ mod tests {
 
         assert!(cmd.is_some());
         let cmd = cmd.unwrap();
-        assert_eq!(cmd.command_line, "pwd");
+        assert_eq!(cmd.invocation, Invocation::Shell("pwd".into()));
         assert_eq!(cmd.working_dir, Some(PathBuf::from("/tmp")));
     }
 

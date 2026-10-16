@@ -758,3 +758,47 @@ mod kill_orphans {
         );
     }
 }
+
+/// An argv command reaches its program with each argument intact and nothing
+/// interpreted — the property a named action rests on.
+///
+/// The probe program is this crate's own binary, because it echoes an
+/// argument it does not recognise back verbatim on every platform: Windows
+/// has no `echo` executable (it is a `cmd.exe` builtin), and reaching for a
+/// shell to get one would test the opposite of what this is for. An argument
+/// carrying `&&`, `;`, a quote and `$(...)` comes back as one argument, and
+/// the command after `&&` never runs.
+#[tokio::test]
+async fn an_argv_command_passes_each_argument_through_uninterpreted() {
+    let hostile = r#"--x&&echo INJECTED;$(echo SUBST) "quoted""#;
+    let result = executor()
+        .execute(&Command::argv(vec![
+            env!("CARGO_BIN_EXE_shell-tunnel").to_string(),
+            hostile.to_string(),
+        ]))
+        .await
+        .expect("execute failed");
+
+    assert!(
+        result.text_output.contains(hostile),
+        "the argument must arrive as one, unchanged: {:?}",
+        result.text_output
+    );
+    assert!(
+        !result
+            .text_output
+            .lines()
+            .any(|l| l.trim() == "INJECTED" || l.trim() == "SUBST"),
+        "nothing after the metacharacters may have run: {:?}",
+        result.text_output
+    );
+}
+
+#[tokio::test]
+async fn an_empty_argv_is_refused_rather_than_run() {
+    let err = executor()
+        .execute(&Command::argv(Vec::new()))
+        .await
+        .expect_err("there is no program to run");
+    assert!(err.to_string().contains("argv is empty"), "{err}");
+}
