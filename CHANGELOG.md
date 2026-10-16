@@ -39,6 +39,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Changed
 
+- **Library: `relay::protocol::RelayMessage::Enrolled` gained `relay_version`**, and
+  `relay::registry::Device::signal` returns `SignalRefused` (`Full` / `Closed`) instead of
+  handing the message back. Breaking for code that builds `Enrolled` as a literal or
+  matched on `TrySendError`; the wire format is additive (an older device ignores the field).
 - **Library: `api::SecurityConfig` gained `named_tokens: Vec<NamedToken>`** (built with
   `with_named_token`). Breaking for code that builds the struct as a literal; the
   constructors and `Default` set it empty.
