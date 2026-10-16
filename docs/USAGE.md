@@ -1959,6 +1959,21 @@ A relay connection that drops is retried with exponential backoff (1s→60s); th
 device keeps its URL, so callers need no change. A *tunnel* that dies takes the
 server down instead, because a restart would allocate a different URL.
 
+**A connection that goes quiet is treated as dropped.** Since 0.28.0 a device that
+has heard nothing from the relay for 90 seconds — not even the acknowledgement every
+heartbeat gets — logs `relay has sent nothing for …s …; treating the connection as gone
+and attaching again` at `WARN` and reattaches. Before, a connection that died without a
+close (the relay's side gone, the device's socket still open) was only noticed when the
+operating system gave up on it: callers got `502 device is not connected` for 16 minutes
+and longer while the device considered itself attached, and in one report it never
+noticed at all.
+
+**Which relay a device is attached to, and its version,** is logged on every attach at
+`INFO`: `attached to relay <url> (relay version 0.28.0)`. A relay older than 0.28.0 does
+not say, and the line reads `older than 0.28.0 — it does not say`. Several fixes need
+the relay and the device at the same version; this is how whoever runs a device can tell
+without access to the relay — the relay does not publish its version on `/health`.
+
 ### What many commands at once do to everything else
 
 Commands queue rather than fail. Each one in flight occupies one thread of the

@@ -134,6 +134,13 @@ pub enum RelayMessage {
         /// it in every `Attach`. `None` from a relay that predates the field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach_id: Option<String>,
+        /// The relay's own release (`CARGO_PKG_VERSION`). A device logs it on
+        /// every attach, which is how whoever runs a device learns what the
+        /// relay is running without the relay publishing its version to
+        /// anyone who asks `/health`. `None` from a relay that predates it —
+        /// which says the relay is older than 0.28.0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        relay_version: Option<String>,
     },
     /// Enrollment refused, or — with [`reject::SUPERSEDED`] — an attachment
     /// ended because another took its name.
@@ -273,6 +280,7 @@ mod tests {
                 public_url: "https://relay.example/d/d-1".into(),
                 reflexive_addr: Some("203.0.113.5:51820".into()),
                 attach_id: Some("a-1".into()),
+                relay_version: Some("0.28.0".into()),
             },
             RelayMessage::Rejected {
                 code: reject::BAD_TOKEN.into(),
@@ -301,6 +309,7 @@ mod tests {
                 public_url: "https://relay.example/d/d-1".into(),
                 reflexive_addr: None,
                 attach_id: None,
+                relay_version: None,
             }
         );
     }

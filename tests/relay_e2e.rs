@@ -97,6 +97,7 @@ async fn a_device_enrolls_and_is_registered() {
         device_id,
         public_url,
         reflexive_addr,
+        relay_version,
         ..
     } = recv(&mut device).await
     else {
@@ -104,6 +105,9 @@ async fn a_device_enrolls_and_is_registered() {
     };
 
     assert!(!device_id.is_empty());
+    // How a device's operator learns what the relay runs — the relay does not
+    // publish it anywhere else.
+    assert_eq!(relay_version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
     // The port-less --public-base inherits this relay's ephemeral listen port.
     assert_eq!(
         public_url,

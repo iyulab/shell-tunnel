@@ -552,6 +552,7 @@ async fn control_session(
         public_url,
         reflexive_addr: Some(peer.to_string()),
         attach_id: Some(device.attach_id.clone()),
+        relay_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
     if send_json(&mut sink, &enrolled).await.is_err() {
         state.devices.detach(&device);
@@ -1230,10 +1231,8 @@ fn direct_request_outcome(
         from_addr: requester_addr.to_string(),
     }) {
         Ok(()) => None,
-        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Some(direct_unavailable::PEER_BUSY),
-        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-            Some(direct_unavailable::PEER_GONE)
-        }
+        Err(registry::SignalRefused::Full) => Some(direct_unavailable::PEER_BUSY),
+        Err(registry::SignalRefused::Closed) => Some(direct_unavailable::PEER_GONE),
     }
 }
 

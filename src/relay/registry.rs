@@ -92,6 +92,15 @@ struct Exchanges {
     slowest_ms: u64,
 }
 
+/// Why [`Device::signal`] could not deliver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignalRefused {
+    /// The control session's queue is full — it is not keeping up.
+    Full,
+    /// The control session has ended.
+    Closed,
+}
+
 impl Device {
     /// Record how long one proxied exchange with this device took.
     pub fn record_exchange(&self, elapsed: Duration) {
@@ -157,8 +166,14 @@ impl Device {
     /// owns this device) stall an unrelated device's control session that is
     /// trying to deliver to it. A full or closed channel is reported to the
     /// caller instead, so it can answer with `RelayMessage::DirectUnavailable`.
-    pub fn signal(&self, msg: RelayMessage) -> Result<(), mpsc::error::TrySendError<RelayMessage>> {
-        self.signal_tx.try_send(msg)
+    ///
+    /// The message is not handed back on failure: no caller resends it, and
+    /// carrying it made the error as large as the biggest protocol message.
+    pub fn signal(&self, msg: RelayMessage) -> Result<(), SignalRefused> {
+        self.signal_tx.try_send(msg).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => SignalRefused::Full,
+            mpsc::error::TrySendError::Closed(_) => SignalRefused::Closed,
+        })
     }
 
     /// Offer a freshly opened data connection to the pool.

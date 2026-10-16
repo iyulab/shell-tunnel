@@ -16,8 +16,19 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   scope is refused at startup. On a reachable server the banner names each key's scope
   on its own line.
 
+- **A device logs which relay it attached to and that relay's version**
+  (`attached to relay <url> (relay version X)`, `INFO`), carried in the relay's enrolment
+  reply. Fixes that need both halves at one version could not be checked by whoever runs
+  a device; the relay still does not publish its version on `/health`.
+
 ### Fixed
 
+- **A device notices a relay connection that went quiet.** It sent heartbeats but never
+  looked for their acknowledgements, so on a connection that died without a close — the
+  relay's side gone, the device's socket still open — it stayed "attached" until the
+  operating system gave up on the socket: 16 minutes and longer, and in one report not at
+  all, with callers getting `502 device is not connected` throughout. A device that hears
+  nothing from the relay for 90 seconds now reattaches, with a `WARN` saying so.
 - **A file-API path the server's account cannot open is no longer explained as being
   outside "the configured root".** `403 path-escapes-root` is also the answer for an
   existing entry the account cannot open (a protected system folder), a link that cannot

@@ -35,6 +35,36 @@ use crate::Result;
 /// default to, so an idle control channel is never reaped as dead.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long the control connection may carry nothing from the relay before
+/// this device decides the relay is gone and attaches again.
+///
+/// Every heartbeat is acknowledged, so a live relay is never silent for more
+/// than one interval. A heartbeat *write* succeeding proves nothing: on a
+/// half-open connection — the relay's side gone, this side's socket still
+/// `ESTABLISHED` — the kernel accepts the bytes and only gives up after its
+/// own retransmission timeout, which consumers measured at 16 minutes and
+/// longer, and once not at all in 13 hours. The device sat attached in its own
+/// view while the relay answered `502 device is not connected`. Waiting for
+/// what the relay *sends* is what notices. The same window the relay gives a
+/// device before evicting it ([`super::HEARTBEAT_TIMEOUT`]), so neither side
+/// gives up on the other first by a margin the other cannot see.
+const RELAY_SILENCE_LIMIT: Duration = super::HEARTBEAT_TIMEOUT;
+
+/// The pacing of one attachment's liveness checks — separate from the
+/// constants only so a test can run the same loop in seconds.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Liveness {
+    pub(crate) heartbeat: Duration,
+    pub(crate) silence_limit: Duration,
+}
+
+impl Liveness {
+    pub(crate) const DEFAULT: Liveness = Liveness {
+        heartbeat: HEARTBEAT_INTERVAL,
+        silence_limit: RELAY_SILENCE_LIMIT,
+    };
+}
+
 /// Backoff bounds for reconnecting after the control channel drops.
 const BACKOFF_MIN: Duration = Duration::from_secs(1);
 /// Also `connect.rs`'s cooldown after a failed direct-connect attempt to a
@@ -348,6 +378,16 @@ pub(crate) async fn attach(
     identity: &super::direct::DirectIdentity,
     direct_requests: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
 ) -> Result<AttachEnd> {
+    attach_paced(config, identity, direct_requests, Liveness::DEFAULT).await
+}
+
+/// [`attach`], with the liveness pacing given rather than the constants.
+pub(crate) async fn attach_paced(
+    config: &RelayClientConfig,
+    identity: &super::direct::DirectIdentity,
+    direct_requests: &mut Option<tokio::sync::mpsc::UnboundedReceiver<String>>,
+    liveness: Liveness,
+) -> Result<AttachEnd> {
     install_crypto_provider();
     // Built before the dial so the failure path can read what the verifier
     // recorded: a rejected certificate's fingerprint is the one thing an
@@ -384,8 +424,18 @@ pub(crate) async fn attach(
             device_id,
             public_url,
             attach_id,
+            relay_version,
             ..
         } => {
+            // The only place a device's operator can read what the relay runs
+            // — the relay does not publish it — and the first question when a
+            // fix needs both halves at one version.
+            tracing::info!(
+                target: "relay-client",
+                "attached to relay {} (relay version {})",
+                config.relay_url,
+                relay_version.as_deref().unwrap_or("older than 0.28.0 — it does not say")
+            );
             if let Some(enrolled) = &config.enrolled {
                 // A closed receiver means the caller stopped listening, which
                 // is not this connection's problem: the device is enrolled and
@@ -406,8 +456,11 @@ pub(crate) async fn attach(
         }
     };
 
-    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    let mut heartbeat = tokio::time::interval(liveness.heartbeat);
     heartbeat.tick().await; // the first tick is immediate
+                            // When the relay last sent anything. Any message counts — an ack, a pool
+                            // refill, a direct-connect answer — since each proves the far end is there.
+    let mut last_heard = tokio::time::Instant::now();
 
     // Which peer this attachment is waiting on a `PeerReady`/`DirectUnavailable`
     // for, if any. Reset on every fresh `attach()` — a request pending across
@@ -421,6 +474,7 @@ pub(crate) async fn attach(
         tokio::select! {
             incoming = control.next() => {
                 let Some(Ok(message)) = incoming else { return Ok(AttachEnd::Closed) };
+                last_heard = tokio::time::Instant::now();
                 let Message::Text(text) = message else { continue };
                 match serde_json::from_str::<RelayMessage>(&text) {
                     Ok(RelayMessage::OpenData { count }) => {
@@ -478,6 +532,15 @@ pub(crate) async fn attach(
                 }
             }
             _ = heartbeat.tick() => {
+                let silent = last_heard.elapsed();
+                if silent >= liveness.silence_limit {
+                    tracing::warn!(
+                        target: "relay-client",
+                        "relay has sent nothing for {}s, not even a heartbeat acknowledgement; treating the connection as gone and attaching again",
+                        silent.as_secs()
+                    );
+                    return Ok(AttachEnd::Closed);
+                }
                 send(&mut control, &DeviceMessage::Heartbeat).await?;
             }
             Some(peer) = recv_direct_request(direct_requests) => {
@@ -2454,5 +2517,70 @@ mod tests {
             headers.contains(&("content-type".to_string(), "text/plain".to_string())),
             "{headers:?}"
         );
+    }
+
+    /// A relay that enrolls the device and then sends nothing — no acks — is
+    /// what a half-open connection looks like from the device: every write
+    /// succeeds, nothing comes back. `ack` makes it acknowledge heartbeats
+    /// instead, which is the live relay this must not be mistaken for.
+    async fn relay_that_answers(ack: bool) -> String {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let _enroll = ws.next().await;
+            let enrolled = serde_json::to_string(&RelayMessage::Enrolled {
+                device_id: "d".into(),
+                public_url: "http://relay/d/d".into(),
+                reflexive_addr: None,
+                attach_id: None,
+                relay_version: None,
+            })
+            .unwrap();
+            ws.send(Message::Text(enrolled)).await.unwrap();
+            while let Some(Ok(_)) = ws.next().await {
+                if ack {
+                    let ack = serde_json::to_string(&RelayMessage::HeartbeatAck).unwrap();
+                    if ws.send(Message::Text(ack)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        format!("ws://{addr}")
+    }
+
+    const FAST: Liveness = Liveness {
+        heartbeat: Duration::from_millis(100),
+        silence_limit: Duration::from_millis(600),
+    };
+
+    #[tokio::test]
+    async fn a_relay_that_goes_silent_is_left_and_attached_to_again() {
+        let identity = super::super::direct::DirectIdentity::generate().unwrap();
+        let config = config(&relay_that_answers(false).await);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            attach_paced(&config, &identity, &mut None, FAST),
+        )
+        .await
+        .expect("a silent relay must not hold the device forever");
+        assert_eq!(ended.unwrap(), AttachEnd::Closed);
+    }
+
+    /// The control for the test above: the same loop against a relay that
+    /// acknowledges stays attached well past the silence limit.
+    #[tokio::test]
+    async fn a_relay_that_acknowledges_keeps_the_device_attached() {
+        let identity = super::super::direct::DirectIdentity::generate().unwrap();
+        let config = config(&relay_that_answers(true).await);
+        let still_attached = tokio::time::timeout(
+            FAST.silence_limit * 4,
+            attach_paced(&config, &identity, &mut None, FAST),
+        )
+        .await;
+        assert!(still_attached.is_err(), "ended: {still_attached:?}");
     }
 }
