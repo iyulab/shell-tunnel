@@ -20,7 +20,8 @@
 # `tests/ci_feature_gates.rs` holds this alias to the same rule it holds CI to,
 # so a third gate cannot appear without turning up here.
 [alias]
-test-all = ["test", "--all", "--features", "relay-client,tls"]
+# self-update is here because the update module's tests only compile with it.
+test-all = ["test", "--all", "--features", "relay-client,tls,self-update"]
 clippy-all = [
     "clippy",
     "--all-targets",

@@ -15,6 +15,7 @@ cargo clippy-all             # lints the way CI does (alias)
 ## Why `test-all` rather than `cargo test --all`
 
 `default = []`, so the suites gated behind the `relay-client` and `tls` features
+(and the update module's tests, behind `self-update`)
 compile to **zero tests** under a plain `cargo test --all`. They do not fail —
 they stop existing, and the run still reports `ok`. Measured 2026-09-07:
 721 tests passing under `cargo test --all` against 808 under `cargo test-all` —

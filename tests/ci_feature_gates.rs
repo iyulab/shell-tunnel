@@ -391,9 +391,12 @@ fn release_features() -> BTreeSet<String> {
 /// Every feature a release is built with is compiled by CI's lint and by the
 /// local lint alias, before any tag exists.
 ///
-/// The test commands only have to cover the features tests are gated behind,
-/// and `self-update` gates none — so for as long as nothing else asked, no
-/// command anywhere compiled it, while every published binary contained it.
+/// This scan reads only `tests/`, which holds no `self-update` gate, so the
+/// pins below do not demand it of the test commands. They carry it anyway
+/// (`test-all`, CI's test job): the update module's own unit tests compile only
+/// with `self-update`, and a scan of `tests/` cannot see them. Before that, no
+/// command anywhere compiled the feature, while every published binary
+/// contained it.
 /// A compile error in that code was first reported by the release workflow,
 /// after the tag that publishes had already been pushed. Found when exactly
 /// such an error sat in a working tree whose full suite and lint were green.

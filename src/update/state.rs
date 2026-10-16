@@ -10,12 +10,14 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use super::is_newer_version;
+use crate::relay::protocol::reject;
 
 /// File name of the state, inside the executable's directory.
 pub const STATE_FILE: &str = "shell-tunnel.update.json";
 
 /// A swap that has not yet proved itself.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Pending {
     pub from: String,
     pub to: String,
@@ -26,6 +28,7 @@ pub struct Pending {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UpdateState {
     pub pending: Option<Pending>,
     /// Versions never to follow again.
@@ -85,10 +88,10 @@ pub fn judge(obs: &ProbationObservation) -> Verdict {
     match obs {
         ProbationObservation::Enrolled => Verdict::Applied,
         ProbationObservation::Rejected(reason) => match reason.as_str() {
-            "unsupported-version" | "bad-handshake" => Verdict::RollBackAndAbandon,
+            reject::UNSUPPORTED_VERSION | reject::BAD_HANDSHAKE => Verdict::RollBackAndAbandon,
             // The relay refused the credential over a healthy connection: not
             // the new build's fault, and rolling back would not change it.
-            "bad-token" => Verdict::KeepWaiting,
+            reject::BAD_TOKEN => Verdict::KeepWaiting,
             _ => Verdict::RollBackAndRetry,
         },
         ProbationObservation::Unreachable => Verdict::RollBackAndRetry,
@@ -213,6 +216,21 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(STATE_FILE)]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_state_file_missing_a_field_loads_with_that_field_defaulted() {
+        let d = tmp("partial");
+        std::fs::write(d.join(STATE_FILE), br#"{"abandoned":["0.29.0"]}"#).unwrap();
+        let s = load(&d).unwrap();
+        assert_eq!(s.abandoned, vec!["0.29.0".to_string()]);
+        assert_eq!(s.pending, None);
+        assert_eq!(s.retry_not_before_ms, None);
+        assert!(s.failed_reported.is_empty());
+        std::fs::write(d.join(STATE_FILE), br#"{"pending":{"from":"1","to":"2"}}"#).unwrap();
+        let p = load(&d).unwrap().pending.unwrap();
+        assert_eq!((p.attempts, p.written_at_ms), (0, 0));
         let _ = std::fs::remove_dir_all(&d);
     }
 
