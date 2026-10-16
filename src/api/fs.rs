@@ -87,13 +87,21 @@ pub fn error_response(status: StatusCode, code: &str, message: &str) -> Response
 /// `Escapes` is 403 rather than 404 deliberately, and identically whether or
 /// not the target exists: a split between the two would tell a caller what
 /// lives outside the root.
+///
+/// The message names every way to get here, not just the first. `Escapes` is
+/// also what a link that cannot be followed, a drive that did not answer at
+/// startup, and an existing entry this account cannot open produce — the last
+/// one with no `--fs-root` at all, on a protected system folder. It said "the
+/// configured root" for all of them, which named a cause that was not there
+/// and, machine-wide, a root that does not exist. The code stays: it is the
+/// contract, and the refusal stays uniform.
 pub fn fs_error_response(error: FsError) -> Response {
     match error {
         FsError::Malformed(reason) => error_response(StatusCode::BAD_REQUEST, "bad-path", reason),
         FsError::Escapes => error_response(
             StatusCode::FORBIDDEN,
             "path-escapes-root",
-            "path resolves outside the configured root",
+            "path is outside what the file API reaches, or cannot be resolved inside it (a link that cannot be followed, or an entry this account cannot open)",
         ),
         FsError::NotFound => error_response(
             StatusCode::NOT_FOUND,

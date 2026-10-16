@@ -16,6 +16,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   scope is refused at startup. On a reachable server the banner names each key's scope
   on its own line.
 
+### Fixed
+
+- **A file-API path the server's account cannot open is no longer explained as being
+  outside "the configured root".** `403 path-escapes-root` is also the answer for an
+  existing entry the account cannot open (a protected system folder), a link that cannot
+  be followed, and a drive that did not answer at startup — with no `--fs-root` at all in
+  the first case, where there is no configured root. The code is unchanged; the message
+  now names those causes, and `docs/openapi.json` no longer says the code is reachable
+  only under `--fs-root`.
+
 ### Changed
 
 - **Library: `api::SecurityConfig` gained `named_tokens: Vec<NamedToken>`** (built with

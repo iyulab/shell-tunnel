@@ -559,7 +559,7 @@
             }
           },
           "403": {
-            "description": "`path-escapes-root` (only reachable when `--fs-root` confines the scope) or `unreadable` (directory could not be opened) — a JSON body in either case. Also reached, with an empty body, when the token lacks `fs.read`.",
+            "description": "`path-escapes-root` (the path is outside what the file API reaches, or cannot be resolved inside it — a link that cannot be followed, or an entry this account cannot open, which happens with or without `--fs-root`) or `unreadable` (directory could not be opened) — a JSON body in either case. Also reached, with an empty body, when the token lacks `fs.read`.",
             "content": {
               "application/json": {
                 "schema": {

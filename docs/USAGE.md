@@ -588,6 +588,12 @@ at `WARN`, and a request naming one is answered `403` like any path outside the 
 without touching the drive. Before 0.26.0 such a drive kept the server from starting at
 all, with nothing in its output saying why.
 
+An entry the server's account cannot open — a protected system folder such as
+`C:/System Volume Information` — is answered `403 path-escapes-root`, with or without
+`--fs-root`: the same refusal as a path outside the scope, so that no answer says what
+exists where a caller may not look. Before 0.28.0 its message spoke of "the configured
+root" even when there was none.
+
 A mapped network drive is reached by its letter, and named by it: `Z:/logs/app.log` in,
 `Z:/logs/app.log` back in every `path` a response carries. Before 0.27.0 the names came
 back in the share's own form (`UNC/<host>/<share>/logs/app.log`), which the server then
