@@ -586,6 +586,13 @@ at `WARN`, and a request naming one is answered `403` like any path outside the 
 without touching the drive. Before 0.26.0 such a drive kept the server from starting at
 all, with nothing in its output saying why.
 
+A mapped network drive is reached by its letter, and named by it: `Z:/logs/app.log` in,
+`Z:/logs/app.log` back in every `path` a response carries. Before 0.27.0 the names came
+back in the share's own form (`UNC/<host>/<share>/logs/app.log`), which the server then
+refused as a request path, so nothing listed under a mapped drive could be fetched by
+the name it was listed under. A share is never addressed as `//host/share` directly;
+map it to a letter on the machine running the server.
+
 The confinement is worth something for a token holding `fs.read`/`fs.write` and **not**
 `exec`. It is not a boundary against a token that can run commands, which can already
 read and write anything the server can — see [§4](#4-authentication-and-capabilities).

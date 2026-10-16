@@ -109,7 +109,10 @@ pub fn filesystem_anchors() -> Anchors {
 #[cfg(not(windows))]
 pub fn filesystem_anchors() -> Anchors {
     Anchors {
-        reachable: vec![std::path::PathBuf::from("/")],
+        reachable: vec![Anchor {
+            name: std::path::PathBuf::from("/"),
+            canonical: std::path::PathBuf::from("/"),
+        }],
         unanswered: Vec::new(),
     }
 }
@@ -122,11 +125,29 @@ pub fn filesystem_anchors() -> Anchors {
 /// or a test harness typically waits for the port to open.
 pub const ANCHOR_PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// One filesystem root a machine-wide scope reaches, under both of its names.
+///
+/// The two differ, and both are needed. `canonical` is what every resolved
+/// path is compared against — `canonicalize` is the only form both sides of a
+/// containment check can be put in. `name` is how a caller addresses the root,
+/// and how this API names what is under it. For a local drive they agree once
+/// the verbatim prefix is stripped (`\\?\C:\` and `C:\`); for a mapped network
+/// drive they do not: `Z:\` canonicalises to `\\?\UNC\<host>\<share>`, a name
+/// the API refuses to accept. Naming files by the canonical form handed callers
+/// paths they could not send back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    /// The root as asked for: `C:\`, `Z:\`, `/`.
+    pub name: std::path::PathBuf,
+    /// The root as `canonicalize` resolves it.
+    pub canonical: std::path::PathBuf,
+}
+
 /// The roots a machine-wide scope reaches, and the ones it could not.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Anchors {
-    /// Canonical roots, in drive order.
-    pub reachable: Vec<std::path::PathBuf>,
+    /// Roots that answered, in drive order.
+    pub reachable: Vec<Anchor>,
     /// Roots that did not answer before the deadline, as the plain name
     /// (`E:\`) — there is no canonical form of something that never opened.
     pub unanswered: Vec<std::path::PathBuf>,
@@ -134,8 +155,8 @@ pub struct Anchors {
 
 /// Ask `probe` about every candidate at once, and keep what answers in time.
 ///
-/// `probe` returns the anchor a candidate stands for, or `None` when it is not
-/// one (no such drive). A candidate still unanswered at the deadline lands in
+/// `probe` returns the canonical root a candidate stands for, or `None` when it
+/// is not one (no such drive). A candidate still unanswered at the deadline lands in
 /// [`Anchors::unanswered`]; its thread is left to finish on its own, since an
 /// open blocked in the kernel cannot be cancelled from here, and ends when the
 /// drive finally answers or the process exits.
@@ -184,7 +205,10 @@ where
     let mut anchors = Anchors::default();
     for (candidate, answer) in candidates.into_iter().zip(answers) {
         match answer {
-            Some(Some(anchor)) => anchors.reachable.push(anchor),
+            Some(Some(canonical)) => anchors.reachable.push(Anchor {
+                name: candidate,
+                canonical,
+            }),
             Some(None) => {}
             None => anchors.unanswered.push(candidate),
         }
@@ -394,8 +418,14 @@ mod tests {
             anchors,
             Anchors {
                 reachable: vec![
-                    PathBuf::from("C").join("canonical"),
-                    PathBuf::from("Z").join("canonical"),
+                    Anchor {
+                        name: PathBuf::from("C"),
+                        canonical: PathBuf::from("C").join("canonical"),
+                    },
+                    Anchor {
+                        name: PathBuf::from("Z"),
+                        canonical: PathBuf::from("Z").join("canonical"),
+                    },
                 ],
                 unanswered: vec![PathBuf::from("E")],
             }

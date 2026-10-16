@@ -124,7 +124,7 @@ impl FsRoot {
                 let names: Vec<String> = anchors
                     .reachable
                     .iter()
-                    .map(|a| Self::displayable(a))
+                    .map(|a| Self::displayable(&a.name))
                     .collect();
                 let mut described = format!("whole machine ({})", names.join(", "));
                 if !anchors.unanswered.is_empty() {
@@ -163,7 +163,10 @@ impl FsRoot {
     fn contains(&self, resolved: &Path) -> bool {
         match &self.scope {
             Scope::Jailed(root) => resolved.starts_with(root),
-            Scope::Machine(anchors) => anchors.reachable.iter().any(|a| resolved.starts_with(a)),
+            Scope::Machine(anchors) => anchors
+                .reachable
+                .iter()
+                .any(|a| resolved.starts_with(&a.canonical)),
         }
     }
 
@@ -196,7 +199,7 @@ impl FsRoot {
                 // resolved path further down — comparing a plain `C:\` against
                 // those would fail for everything that exists.
                 let anchor = named.canonicalize().map_err(|_| FsError::Escapes)?;
-                if !anchors.reachable.iter().any(|a| a == &anchor) {
+                if !anchors.reachable.iter().any(|a| a.canonical == anchor) {
                     // Not "no such drive" — that would answer differently for a
                     // drive that exists than for one that does not, which is the
                     // same existence oracle the jail is careful to avoid, just
@@ -433,26 +436,31 @@ impl FsRoot {
     /// Returns `None` for anything outside the scope, so a caller cannot
     /// accidentally publish a path it should not have.
     pub fn relative(&self, abs: &Path) -> Option<String> {
-        let root = match &self.scope {
-            Scope::Jailed(root) => root.as_path(),
-            Scope::Machine(_) => {
-                if !self.contains(abs) {
-                    return None;
-                }
-                // The verbatim prefix is an artefact of `canonicalize` on
-                // Windows, not something a caller sent or could send — the
-                // request that produced this path spelled it `C:/x`, and
-                // echoing back `//?/C:/x` would name the same file a second
-                // way. Stripped so one file has exactly one name on the wire.
-                let text = abs.to_string_lossy();
-                return Some(strip_verbatim(&text).replace('\\', "/"));
+        let (root, mut out) = match &self.scope {
+            Scope::Jailed(root) => (root.as_path(), String::new()),
+            Scope::Machine(anchors) => {
+                // Named after the root a caller addresses it by, not the one
+                // `canonicalize` resolved it to. For a local drive the two
+                // agree once the verbatim prefix — an artefact of
+                // `canonicalize`, never something a caller sent — is gone. For
+                // a mapped network drive they do not: the canonical form is
+                // `\\?\UNC\<host>\<share>`, which this API refuses as a request
+                // path, so naming files by it handed back names that could not
+                // be sent back. The longest match wins, should one root's
+                // canonical form contain another's.
+                let anchor = anchors
+                    .reachable
+                    .iter()
+                    .filter(|a| abs.starts_with(&a.canonical))
+                    .max_by_key(|a| a.canonical.as_os_str().len())?;
+                let name = strip_verbatim(&anchor.name.to_string_lossy()).replace('\\', "/");
+                (anchor.canonical.as_path(), name)
             }
         };
         let rest = abs.strip_prefix(root).ok()?;
-        let mut out = String::new();
         for component in rest.components() {
             if let Component::Normal(part) = component {
-                if !out.is_empty() {
+                if !out.is_empty() && !out.ends_with('/') {
                     out.push('/');
                 }
                 out.push_str(&part.to_string_lossy());
@@ -468,7 +476,7 @@ impl FsRoot {
             Scope::Machine(anchors) => anchors
                 .reachable
                 .iter()
-                .any(|a| Self::lexical_within(a, candidate)),
+                .any(|a| Self::lexical_within(&a.canonical, candidate)),
         }
     }
 
@@ -541,13 +549,13 @@ mod machine_wide_tests {
 
         for anchor in &anchors {
             let named = scope
-                .relative(anchor)
+                .relative(&anchor.canonical)
                 .expect("an anchor is in its own scope");
             assert_eq!(
                 scope.resolve_existing(&named),
-                Ok(anchor.clone()),
-                "anchor {} must resolve to itself",
-                anchor.display()
+                Ok(anchor.canonical.clone()),
+                "anchor {} (named {named}) must resolve to itself",
+                anchor.canonical.display()
             );
         }
     }
@@ -689,6 +697,41 @@ mod machine_wide_tests {
         );
     }
 
+    /// A root whose canonical form is not how it is addressed — a mapped
+    /// network drive, `Z:\` resolving to `\\?\UNC\<host>\<share>` — names what
+    /// is under it by the name a caller can send back.
+    ///
+    /// Before, the name was the canonical path with the verbatim prefix
+    /// stripped, which for a mapped drive is `UNC/<host>/<share>/…`: refused
+    /// by `split_absolute` as not absolute, so every entry `list` returned
+    /// under that drive was a path the API would not accept. Seen first on a
+    /// workstation with a mapped share, where the real-drive test below failed
+    /// and CI's runners — which map nothing — stayed green. A fixture stands in
+    /// for the share so this holds on every platform.
+    #[test]
+    fn a_root_is_named_as_it_is_addressed_not_as_it_resolves() {
+        let share = tempfile::tempdir().expect("tempdir");
+        let canonical = share.path().canonicalize().expect("canonical");
+        let scope = FsRoot {
+            scope: Scope::Machine(platform::Anchors {
+                reachable: vec![platform::Anchor {
+                    name: PathBuf::from("Z:\\"),
+                    canonical: canonical.clone(),
+                }],
+                unanswered: Vec::new(),
+            }),
+        };
+
+        assert_eq!(scope.relative(&canonical).as_deref(), Some("Z:/"));
+        assert_eq!(
+            scope
+                .relative(&canonical.join("logs").join("app.log"))
+                .as_deref(),
+            Some("Z:/logs/app.log")
+        );
+        assert!(scope.describe().contains("Z:\\"), "{}", scope.describe());
+    }
+
     #[test]
     fn machine_wide_scope_has_no_single_path() {
         assert!(FsRoot::machine_wide().jail_path().is_none());
@@ -705,7 +748,7 @@ mod machine_wide_tests {
         let described = FsRoot::machine_wide().describe();
         assert!(described.contains("whole machine"), "{described}");
         for anchor in platform::filesystem_anchors().reachable {
-            let readable = FsRoot::displayable(&anchor);
+            let readable = FsRoot::displayable(&anchor.name);
             assert!(
                 described.contains(&readable),
                 "{described} must name {readable}"

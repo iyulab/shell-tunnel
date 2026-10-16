@@ -16,6 +16,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   exactly as before — no flag is involved. Under a service the working directory is
   the executable's folder rather than `System32`, so relative paths such as
   `--audit-log` resolve there.
+- **Files on a mapped network drive are named by the drive letter.** The file API named
+  them by the share they resolve to — `UNC/<host>/<share>/…` in `list`, `stat` and upload
+  responses — and refused that same name as a request path, so an entry listed under a
+  mapped drive could not be fetched by the name it was listed under. They are now named
+  `Z:/…`, as they are addressed, and the startup banner names the drive as `Z:\`.
 
 ### Changed
 
