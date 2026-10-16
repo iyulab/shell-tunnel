@@ -897,8 +897,11 @@ argument only sometimes is two actions.
 
 `timeout_secs` (optional) is clamped to the same 1–300 second range as `/execute`;
 `working_dir` and `env` (a string map) are fixed by the definition — a caller cannot set
-them. The file is read once at startup and refused whole if anything in it is wrong —
-startup ends with exit status 2, naming the file and the action. Change it by restarting.
+them. The file is read once at startup and refused whole if anything in it is wrong,
+including a `working_dir` that does not exist — startup ends with exit status 2, naming
+the file and the action. The program in `argv[0]` is not looked up then: it is found on
+`PATH` when the action runs, and one that is not there answers `500`. Change the file by
+restarting.
 
 ```bash
 curl -H "Authorization: Bearer $KEY" "$BASE/api/v1/actions"

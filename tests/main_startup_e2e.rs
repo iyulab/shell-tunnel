@@ -1868,3 +1868,31 @@ fn the_banner_says_how_many_actions_were_loaded_and_from_where() {
     });
     assert_eq!(line, format!("Actions:     2 defined in {file_arg}"));
 }
+
+/// A `working_dir` that does not exist is a definition mistake, reported at
+/// startup like the rest — not to the first caller as a `500`. The refusal
+/// names the file once.
+#[test]
+fn an_action_whose_working_dir_does_not_exist_refuses_to_start() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("actions.json");
+    let missing = dir.path().join("no-such-dir");
+    std::fs::write(
+        &file,
+        serde_json::json!({"actions": {"x": {"argv": ["x"], "working_dir": missing}}}).to_string(),
+    )
+    .expect("write");
+    let file_arg = file.to_string_lossy().to_string();
+
+    let (code, _stdout, stderr) = run_with_timeout(
+        &["--port", "0", "--actions", &file_arg],
+        Duration::from_secs(15),
+    );
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("action 'x': working_dir"), "{stderr}");
+    assert_eq!(
+        stderr.matches(file_arg.as_str()).count(),
+        1,
+        "the file is named once: {stderr}"
+    );
+}

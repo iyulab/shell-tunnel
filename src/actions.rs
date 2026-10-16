@@ -409,11 +409,33 @@ impl ActionSet {
         Ok(Self { actions })
     }
 
-    /// Read and parse the definitions file at `path`.
+    /// Read and parse the definitions file at `path`, and check what can only
+    /// be checked against this machine.
+    ///
+    /// A `working_dir` that does not exist is refused here rather than when the
+    /// action runs: it is a definition mistake, and those are reported at
+    /// startup, not to the first caller as a `500`. The program in `argv[0]` is
+    /// not checked — where it resolves depends on `PATH` at the moment it runs,
+    /// which is the operating system's answer to give, not this file's.
+    ///
+    /// The messages do not repeat `path`; whoever reports the error names the
+    /// file once.
     pub fn load(path: &Path) -> Result<Self, DefinitionError> {
         let text = std::fs::read_to_string(path)
-            .map_err(|e| DefinitionError(format!("cannot read {}: {e}", path.display())))?;
-        Self::from_json(&text).map_err(|e| DefinitionError(format!("{}: {e}", path.display())))
+            .map_err(|e| DefinitionError(format!("cannot be read: {e}")))?;
+        let set = Self::from_json(&text)?;
+        for action in set.iter() {
+            if let Some(dir) = &action.working_dir {
+                if !dir.is_dir() {
+                    return Err(DefinitionError(format!(
+                        "action '{}': working_dir {} is not a directory",
+                        action.id,
+                        dir.display()
+                    )));
+                }
+            }
+        }
+        Ok(set)
     }
 
     /// The action `id`, if one is defined.
