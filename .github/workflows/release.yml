@@ -15,6 +15,13 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    # Signing authenticates to Azure Key Vault through OIDC, and the federated
+    # credential matches `repo:iyulab/shell-tunnel:environment:production` — so
+    # only the job that signs declares the environment.
+    environment: ${{ matrix.sign && 'production' || '' }}
+    permissions:
+      contents: read
+      id-token: write
     strategy:
       matrix:
         include:
@@ -31,6 +38,7 @@ jobs:
             target: x86_64-pc-windows-msvc
             artifact: shell-tunnel.exe
             archive: shell-tunnel-windows-x64.zip
+            sign: true
           - os: macos-latest
             target: x86_64-apple-darwin
             artifact: shell-tunnel
@@ -66,6 +74,28 @@ jobs:
       - name: Build
         if: ${{ !matrix.cross }}
         run: cargo build --release --features self-update,relay-client,tls --target ${{ matrix.target }}
+
+      # Authenticode-sign the executable before it goes into the zip: the
+      # signing service only signs top-level release assets, and the binary
+      # `--update` installs is the one inside the archive.
+      - name: Sign (Windows)
+        if: matrix.sign
+        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9
+        with:
+          files: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          description: shell-tunnel
+          description-url: https://github.com/iyulab/shell-tunnel
+
+      # A sign step that reports success is not evidence the file is signed —
+      # refuse to package anything that does not carry a valid signature.
+      - name: Verify signature (Windows)
+        if: matrix.sign
+        shell: pwsh
+        run: |
+          $sig = Get-AuthenticodeSignature "target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          Write-Host "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)  Timestamp: $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status): $($sig.StatusMessage)" }
+          if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
 
       - name: Create archive (Unix)
         if: runner.os != 'Windows'

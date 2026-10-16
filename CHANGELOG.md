@@ -3,6 +3,16 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Changed
+
+- **The Windows release binary is Authenticode-signed.** `shell-tunnel.exe` inside
+  `shell-tunnel-windows-x64.zip` now carries a timestamped iyulab signature, for which
+  `Get-AuthenticodeSignature` reports `Valid`. The release fails rather than ship an
+  unsigned Windows binary. The
+  Linux and macOS archives are unchanged and still unsigned.
+
 ## 0.26.0 — 2026-09-28
 
 ### Fixed
