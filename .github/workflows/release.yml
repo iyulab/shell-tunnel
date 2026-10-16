@@ -159,12 +159,28 @@ jobs:
       - uses: actions/checkout@v7
 
       # Release archives only. The unsigned executable is an artifact too, and
-      # `files: artifacts/**/*` below would attach it to the Release.
+      # a catch-all `files:` glob would attach it to the Release.
       - name: Download release archives
         uses: actions/download-artifact@v8
         with:
           pattern: shell-tunnel-*
           path: artifacts
+
+      # Each archive lands in its own `artifacts/<name>/` directory, named like the
+      # file inside it, so they are moved aside before the directories go. Flatten them
+      # so the Release carries exactly the archives plus `SHA256SUMS`, and hash
+      # from inside the directory so each line names the bare asset file — the
+      # form a device matches a downloaded archive against.
+      - name: Write SHA256SUMS
+        run: |
+          set -euo pipefail
+          mkdir flat
+          find artifacts -type f -exec mv -t flat {} +
+          rm -rf artifacts
+          mv flat artifacts
+          cd artifacts
+          sha256sum shell-tunnel-* > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Get version
         id: version
@@ -177,7 +193,9 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
-          files: artifacts/**/*
+          files: |
+            artifacts/shell-tunnel-*
+            artifacts/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

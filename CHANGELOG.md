@@ -3,6 +3,15 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **Releases carry a `SHA256SUMS` file.** It lists the SHA-256 of every release archive
+  in the GNU `sha256sum` format (`<hex>  <archive name>`, one bare file name per line),
+  so a downloaded archive can be checked with `sha256sum -c SHA256SUMS` before it is
+  unpacked or installed.
+
 ## 0.28.0 — 2026-10-16
 
 ### Added

@@ -277,6 +277,36 @@ mod tests {
     }
 
     #[test]
+    fn release_workflow_publishes_sha256sums() {
+        // A device verifies a downloaded archive against this file, matching each
+        // line by the bare asset name. A line that carried the `artifacts/...`
+        // directory would never match, so the hash must run inside the directory.
+        // Patterns hold no line ending: a CRLF checkout puts `\r` before it.
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/release.yml"
+        ))
+        .expect("release workflow should be readable");
+
+        assert!(
+            workflow.contains("sha256sum shell-tunnel-* > SHA256SUMS"),
+            "the release workflow does not write SHA256SUMS from bare asset names"
+        );
+        assert!(
+            workflow.contains("cd artifacts"),
+            "the hash must run inside the flattened directory so names carry no path"
+        );
+        assert!(
+            workflow.contains("artifacts/SHA256SUMS"),
+            "SHA256SUMS is not attached to the Release"
+        );
+        assert!(
+            !workflow.contains("artifacts/**/*"),
+            "the Release must attach the flattened files, not everything under artifacts/"
+        );
+    }
+
+    #[test]
     fn test_version_comparison() {
         assert!(is_newer_version("0.1.0", "0.2.0"));
         assert!(is_newer_version("0.1.0", "1.0.0"));
