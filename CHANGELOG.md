@@ -3,7 +3,7 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
-## Unreleased
+## 0.27.0 — 2026-10-16
 
 ### Added
 
@@ -38,7 +38,7 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 ### Changed
 
 - **A device replaced on the relay by another process under its name exits with
-  status 3**, not 1. Every other ending of a running device is a failure a service
+  status 3**, not 1 — breaking for a script that matched on 1. Every other ending of a running device is a failure a service
   manager should restart; restarting this one takes the name back and replaces the
   other process in turn. systemd can leave it alone with `RestartPreventExitStatus=3`,
   and a Windows service reports it as a clean stop.
@@ -47,8 +47,8 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 - **Library: `fs::platform::Anchors::reachable` holds `Anchor { name, canonical }`**
   instead of bare canonical paths, so a root keeps the name it is addressed by. Breaking
   for code that reads the field; `canonical` is the value it used to hold.
-- **Library: `execution::Command` says how its process is made** — the `command_line`
-  field is replaced by `invocation: Invocation`, which is `Shell(String)` (the platform
+- **Library: `execution::Command` says how its process is made** — breaking: the
+  `command_line` field is replaced by `invocation: Invocation`, which is `Shell(String)` (the platform
   shell, as before; `Command::new` still builds one) or `Argv(Vec<String>)` (run
   directly, built with `Command::argv`).
 - **Library: `ShellTunnelError::Superseded { device_name }`** is what the relay client
