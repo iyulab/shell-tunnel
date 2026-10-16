@@ -38,6 +38,7 @@
 //! ```
 
 pub mod actions;
+pub mod activity;
 pub mod fs;
 pub mod handlers;
 pub mod router;

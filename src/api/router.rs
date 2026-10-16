@@ -246,6 +246,10 @@ fn routes() -> Router<AppState> {
 fn seal(router: Router<AppState>, state: AppState) -> Router {
     router
         .layer(middleware::from_fn_with_state(
+            Arc::clone(&state.activity),
+            super::activity::activity_middleware,
+        ))
+        .layer(middleware::from_fn_with_state(
             Arc::clone(&state.audit),
             drain_request_body_middleware,
         ))

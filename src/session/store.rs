@@ -138,6 +138,21 @@ impl SessionStore {
         self.sessions.read().map(|s| s.len()).unwrap_or(0)
     }
 
+    /// Sessions with a command running in them right now.
+    ///
+    /// Not `count`: a session that merely exists is `Idle` and loses nothing
+    /// to a restart, so it must not hold an update off.
+    pub fn count_active(&self) -> usize {
+        self.sessions
+            .read()
+            .map(|s| {
+                s.values()
+                    .filter(|session| session.state == SessionState::Active)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
     /// List all session IDs.
     pub fn list_ids(&self) -> Result<Vec<SessionId>> {
         let sessions = self

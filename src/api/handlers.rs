@@ -37,6 +37,8 @@ pub struct AppState {
     pub uploads: Arc<crate::fs::UploadStore>,
     /// The named actions this server runs. Empty unless `--actions` gave some.
     pub actions: Arc<crate::actions::ActionSet>,
+    /// What is in flight, and the latch an update closes the door with.
+    pub activity: Arc<super::activity::Activity>,
 }
 
 impl AppState {
@@ -53,6 +55,7 @@ impl AppState {
                 crate::fs::DEFAULT_CHUNK_SIZE,
             )),
             actions: Arc::new(crate::actions::ActionSet::default()),
+            activity: Arc::new(super::activity::Activity::new()),
         }
     }
 

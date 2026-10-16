@@ -26,7 +26,13 @@ pub async fn ws_handler(
     // Taken here because extensions belong to the upgrade request, not to the
     // socket that outlives it.
     let identity = identity.map(|axum::Extension(id)| id);
-    ws.on_upgrade(move |socket| handle_socket(socket, state, session_id, identity))
+    // The upgrade request's own guard ends when this returns; the socket may
+    // live for hours, and an update must not cut it off.
+    let guard = state.activity.guard();
+    ws.on_upgrade(move |socket| async move {
+        let _guard = guard;
+        handle_socket(socket, state, session_id, identity).await
+    })
 }
 
 /// Handle WebSocket connection.
@@ -297,7 +303,11 @@ pub async fn ws_oneshot_handler(
     identity: Option<axum::Extension<crate::audit::Identity>>,
 ) -> impl IntoResponse {
     let identity = identity.map(|axum::Extension(id)| id);
-    ws.on_upgrade(move |socket| handle_oneshot_socket(socket, state, identity))
+    let guard = state.activity.guard();
+    ws.on_upgrade(move |socket| async move {
+        let _guard = guard;
+        handle_oneshot_socket(socket, state, identity).await
+    })
 }
 
 /// Handle one-shot WebSocket connection.

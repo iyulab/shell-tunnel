@@ -353,6 +353,16 @@ impl UploadStore {
         }
     }
 
+    /// Uploads begun and not yet completed, cancelled or swept.
+    ///
+    /// Read from `claimed` because every live upload holds exactly one claim
+    /// and the claim is released on each way an upload ends — the same fact
+    /// `MAX_CONCURRENT_UPLOADS` is enforced from. A restart discards the
+    /// staged bytes, so a live upload is work an update must wait for.
+    pub fn live_count(&self) -> usize {
+        self.claimed.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
     /// The chunk size clients are told to use, and the ceiling [`Self::append`]
     /// enforces against — the same field for both, so advertising one value
     /// while enforcing another can never happen.

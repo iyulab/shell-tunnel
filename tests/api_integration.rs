@@ -1198,3 +1198,206 @@ fn the_route_table_and_the_outermost_guard_are_written_once() {
          constructor ends by calling it rather than layering the guard itself"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Activity gauge and update latch
+// ---------------------------------------------------------------------------
+
+/// A command long enough that "it is still running" is observed rather than
+/// raced: the margin is bought in the command, not in a tolerance.
+fn long_command() -> &'static str {
+    if cfg!(windows) {
+        "ping -n 9 127.0.0.1"
+    } else {
+        "sleep 8"
+    }
+}
+
+/// Start `long_command` in a fresh one-shot request and return once the
+/// server has had time to begin it.
+async fn start_long_command(app: &axum::Router) -> tokio::task::JoinHandle<StatusCode> {
+    let app = app.clone();
+    let running = tokio::spawn(async move {
+        app.oneshot(json_request(
+            Method::POST,
+            "/api/v1/execute",
+            Some(json!({ "command": long_command() })),
+        ))
+        .await
+        .unwrap()
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    running
+}
+
+#[tokio::test]
+async fn a_running_command_is_activity() {
+    let state = AppState::new();
+    let app = create_router_with_state(state.clone());
+    assert!(shell_tunnel::api::activity::is_idle(&state));
+
+    let running = start_long_command(&app).await;
+    assert!(
+        !shell_tunnel::api::activity::is_idle(&state),
+        "a command in flight did not count as activity"
+    );
+
+    assert_eq!(running.await.unwrap(), StatusCode::OK);
+    assert!(shell_tunnel::api::activity::is_idle(&state));
+}
+
+#[tokio::test]
+async fn an_idle_session_does_not_block_idleness() {
+    let state = AppState::new();
+    let app = create_router_with_state(state.clone());
+
+    let created = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert_eq!(state.store.count(), 1);
+    assert!(
+        shell_tunnel::api::activity::is_idle(&state),
+        "a session with no command running held idleness off"
+    );
+}
+
+#[tokio::test]
+async fn a_session_command_counts_while_it_runs_and_not_after() {
+    let state = AppState::new();
+    let app = create_router_with_state(state.clone());
+    let created = app
+        .clone()
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/sessions",
+            Some(json!({})),
+        ))
+        .await
+        .unwrap();
+    let id = response_json(created).await["session_id"].as_u64().unwrap();
+
+    let executing = app.clone();
+    let running = tokio::spawn(async move {
+        executing
+            .oneshot(json_request(
+                Method::POST,
+                &format!("/api/v1/sessions/{id}/execute"),
+                Some(json!({ "command": long_command() })),
+            ))
+            .await
+            .unwrap()
+            .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(state.store.count_active(), 1);
+    assert!(!shell_tunnel::api::activity::is_idle(&state));
+
+    running.await.unwrap();
+    assert_eq!(state.store.count_active(), 0);
+    assert!(shell_tunnel::api::activity::is_idle(&state));
+}
+
+/// Flavour: multi-thread, because the server this guards runs under
+/// `new_multi_thread`, and a real socket outlives the request that opened it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_websocket_is_activity() {
+    let state = AppState::new();
+    let router = create_router_with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .expect("WebSocket connect failed");
+
+    // Idle on the wire, and still counted: the socket is the work.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !shell_tunnel::api::activity::is_idle(&state),
+        "an open WebSocket did not count as activity"
+    );
+
+    ws.close(None).await.unwrap();
+    drop(ws);
+    for _ in 0..50 {
+        if shell_tunnel::api::activity::is_idle(&state) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("the server stayed busy after its WebSocket closed");
+}
+
+#[tokio::test]
+async fn a_latched_server_answers_503_with_retry_after_except_health() {
+    let state = AppState::new();
+    let app = create_router_with_state(state.clone());
+    assert!(state.activity.latch());
+
+    for (method, uri) in [
+        (Method::GET, "/api/v1"),
+        (Method::POST, "/api/v1/sessions"),
+        (Method::GET, "/no/such/route"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_request(method.clone(), uri, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{method} {uri}"
+        );
+        assert_eq!(response.headers()[header::RETRY_AFTER], "30");
+        assert!(response_text(response).await.contains("retry shortly"));
+    }
+
+    let health = app
+        .clone()
+        .oneshot(json_request(Method::GET, "/health", None))
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    // Health is not counted: a probe must never hold idleness off.
+    assert_eq!(state.activity.in_flight(), 0);
+
+    state.activity.unlatch();
+    let after = app
+        .oneshot(json_request(Method::GET, "/api/v1", None))
+        .await
+        .unwrap();
+    assert_eq!(after.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn latch_fails_while_a_request_is_in_flight() {
+    let state = AppState::new();
+    let app = create_router_with_state(state.clone());
+
+    let running = start_long_command(&app).await;
+    assert!(!state.activity.latch(), "latched over a running command");
+    assert!(
+        !state.activity.is_latched(),
+        "a failed latch left the door closed"
+    );
+
+    running.await.unwrap();
+    assert!(state.activity.latch());
+    assert!(state.activity.is_latched());
+    assert!(
+        state.activity.try_guard().is_none(),
+        "a guard was handed out through a closed latch"
+    );
+}
