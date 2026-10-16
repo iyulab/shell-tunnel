@@ -1944,6 +1944,18 @@ fn two_keys_with_their_own_scopes_are_held_apart() {
         "{banner}"
     );
 
+    // The banner is printed before the listener binds, so reading it says
+    // nothing about whether the port answers yet. A slow runner refused the
+    // first request here (CI's MSRV job, on 0.28.0's first push).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the server never started listening on {port}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
     let execute = |key: &str| {
         get_status_with_headers_post(port, "/api/v1/execute", key, r#"{"command":"echo hi"}"#)
     };
