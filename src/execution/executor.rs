@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 
 use super::command::Command;
 use super::command::Invocation;
-use super::pipe::PipeDrain;
-use super::result::{ExecutionResult, OutputChunk};
+use super::pipe::{PipeDrain, PipeFeed};
+use super::result::{ExecutionResult, OutputChunk, OutputSource};
 use crate::error::ShellTunnelError;
 use crate::output::OutputSanitizer;
 use crate::process::{direct_command, shell_command, KillGroup};
@@ -139,13 +139,19 @@ const DRAIN_BUDGET: usize = 256 * 1024;
 /// wrote is still collected — and every exit path reaps alike, including an
 /// early `?` and the timeout branch.
 ///
-/// `on_chunk` is invoked for every output chunk as it arrives, which is what
-/// lets the streaming (WebSocket) path forward output live; the non-streaming
-/// callers pass a no-op.
+/// A command given input ([`Command::stdin`]) gets it from this same loop, for
+/// the same reason: a thread doing a blocking `write_all` has no exit while the
+/// child is not reading, and a full stdin pipe while this loop sat in a write
+/// would also stop it draining the output the child is blocked on — the classic
+/// pipe deadlock. [`PipeFeed`] writes what the pipe will take and returns.
+///
+/// `on_chunk` is invoked for every output chunk as it arrives, with the stream
+/// it came from, which is what lets the streaming (WebSocket) path forward
+/// output live; the non-streaming callers pass a no-op.
 fn run_command_streaming(
     command: &Command,
     kill_orphans: bool,
-    mut on_chunk: impl FnMut(&[u8]),
+    mut on_chunk: impl FnMut(&[u8], OutputSource),
 ) -> Result<ExecutionResult> {
     let start = Instant::now();
     let timeout_duration = command.effective_timeout();
@@ -157,7 +163,11 @@ fn run_command_streaming(
         })?,
     };
     os_cmd
-        .stdin(Stdio::null())
+        .stdin(if command.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(dir) = &command.working_dir {
@@ -181,8 +191,25 @@ fn run_command_streaming(
     let mut child = os_cmd.spawn().map_err(ShellTunnelError::Io)?;
     kill_group.adopt(&child);
 
-    // stdout and stderr are merged into one output stream. True interleaving is
-    // not guaranteed (nor is it with a TTY), but clients consume a single stream.
+    let mut in_feed = match (child.stdin.take(), &command.stdin) {
+        (Some(pipe), Some(input)) => match PipeFeed::new(pipe, input.clone()) {
+            Ok(feed) => Some(feed),
+            Err(e) => {
+                // A blocking write end would bring back the deadlock the feed
+                // exists to avoid, so the command does not run on it.
+                kill_group.kill();
+                let _ = child.wait();
+                return Err(ShellTunnelError::ExecutionFailed(format!(
+                    "could not prepare the command's stdin: {e}"
+                )));
+            }
+        },
+        _ => None,
+    };
+
+    // stdout and stderr are kept apart, and also merged in arrival order for
+    // `raw_output`. The merge is per drain pass, not per write: true
+    // interleaving is not observable through two pipes (nor through a TTY).
     let mut out_pipe = child.stdout.take().map(PipeDrain::new);
     let mut err_pipe = child.stderr.take().map(PipeDrain::new);
 
@@ -191,7 +218,7 @@ fn run_command_streaming(
         .max_output_bytes
         .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES)
         .min(MAX_OUTPUT_BYTES_CEILING);
-    let mut raw_output = Vec::new();
+    let mut kept = Kept::default();
     let mut total_bytes: u64 = 0;
     let mut exit_status = None;
     let mut timed_out = false;
@@ -204,31 +231,41 @@ fn run_command_streaming(
     // Draining continues after the cap is reached rather than stopping: the
     // pipes must keep being emptied, or a child writing more than the cap would
     // block on a full pipe buffer and never exit.
-    let mut absorb = |chunk: &[u8], raw_output: &mut Vec<u8>, total: &mut u64| {
-        on_chunk(chunk);
+    //
+    // The cap is one budget across both streams, spent in arrival order, so
+    // `stdout` and `stderr` are exactly `raw_output` split by origin.
+    let mut absorb = |chunk: &[u8], source: OutputSource, kept: &mut Kept, total: &mut u64| {
+        on_chunk(chunk, source);
         *total += chunk.len() as u64;
-        let kept = raw_output.len() as u64;
-        if kept < cap {
-            let room = (cap - kept) as usize;
-            let take = room.min(chunk.len());
-            raw_output.extend_from_slice(&chunk[..take]);
+        let held = kept.merged.len() as u64;
+        if held < cap {
+            let room = (cap - held) as usize;
+            let take = &chunk[..room.min(chunk.len())];
+            kept.merged.extend_from_slice(take);
+            match source {
+                OutputSource::Stdout => kept.stdout.extend_from_slice(take),
+                OutputSource::Stderr => kept.stderr.extend_from_slice(take),
+            }
         }
     };
 
-    // Both pipes, one bounded pass each. Returns how many bytes moved, which is
-    // what tells the caller whether there is any point sleeping before the next
-    // pass.
+    // Both pipes, one bounded pass each — and the stdin feed, when there is
+    // one. Returns how many bytes moved, which is what tells the caller whether
+    // there is any point sleeping before the next pass.
     macro_rules! drain_pass {
         () => {{
             let mut moved = 0;
+            if let Some(feed) = in_feed.as_mut() {
+                moved += feed.feed(DRAIN_BUDGET);
+            }
             if let Some(pipe) = out_pipe.as_mut() {
                 moved += pipe.drain(DRAIN_BUDGET, &mut |chunk: &[u8]| {
-                    absorb(chunk, &mut raw_output, &mut total_bytes)
+                    absorb(chunk, OutputSource::Stdout, &mut kept, &mut total_bytes)
                 });
             }
             if let Some(pipe) = err_pipe.as_mut() {
                 moved += pipe.drain(DRAIN_BUDGET, &mut |chunk: &[u8]| {
-                    absorb(chunk, &mut raw_output, &mut total_bytes)
+                    absorb(chunk, OutputSource::Stderr, &mut kept, &mut total_bytes)
                 });
             }
             moved
@@ -291,6 +328,9 @@ fn run_command_streaming(
             break;
         }
         if Instant::now() >= collect_deadline {
+            if let Some(feed) = in_feed.as_mut() {
+                feed.release();
+            }
             if let Some(pipe) = out_pipe.as_mut() {
                 pipe.release();
             }
@@ -305,26 +345,46 @@ fn run_command_streaming(
     }
 
     let duration = start.elapsed();
+    let stdin_written = in_feed.as_ref().map(PipeFeed::written);
+    drop(in_feed);
+    let Kept {
+        merged: raw_output,
+        stdout,
+        stderr,
+    } = kept;
     let text = OutputSanitizer::strip_ansi(&raw_output);
     let truncated = total_bytes > raw_output.len() as u64;
 
     if timed_out {
         return Ok(ExecutionResult::timeout(raw_output, text, duration)
-            .with_output_extent(total_bytes, truncated));
+            .with_output_extent(total_bytes, truncated)
+            .with_streams(stdout, stderr)
+            .with_stdin_written(stdin_written));
     }
 
     let exit_code = exit_status.and_then(|s| s.code());
-    let mut result =
-        ExecutionResult::new(raw_output, text, duration).with_output_extent(total_bytes, truncated);
+    let mut result = ExecutionResult::new(raw_output, text, duration)
+        .with_output_extent(total_bytes, truncated)
+        .with_streams(stdout, stderr)
+        .with_stdin_written(stdin_written);
     if let Some(code) = exit_code {
         result = result.with_exit_code(code);
     }
     Ok(result)
 }
 
+/// The output a result keeps under its cap: the merged view and the same bytes
+/// split by stream.
+#[derive(Default)]
+struct Kept {
+    merged: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
 /// Run a non-interactive command, collecting all output (no streaming).
 fn run_command(command: &Command, kill_orphans: bool) -> Result<ExecutionResult> {
-    run_command_streaming(command, kill_orphans, |_| {})
+    run_command_streaming(command, kill_orphans, |_, _| {})
 }
 
 /// How long to nap between attempts at a full channel.
@@ -345,8 +405,13 @@ const FORWARD_RETRY: Duration = Duration::from_millis(2);
 /// tree anyway. Chunks dropped here are still counted in `total_bytes` and still
 /// collected into the result under its cap; only the live stream loses them, and
 /// only for a consumer that is no longer reading it.
-fn forward_chunk(tx: &mpsc::Sender<OutputChunk>, chunk: &[u8], stop_waiting_at: Instant) {
-    let mut pending = OutputChunk::combined(chunk.to_vec());
+fn forward_chunk(
+    tx: &mpsc::Sender<OutputChunk>,
+    chunk: &[u8],
+    source: OutputSource,
+    stop_waiting_at: Instant,
+) {
+    let mut pending = OutputChunk::new(chunk.to_vec(), source);
     loop {
         match tx.try_send(pending) {
             Ok(()) => return,
@@ -460,8 +525,8 @@ impl CommandExecutor {
             // Past this instant the command is due to be killed anyway, so no
             // chunk is worth waiting on: see `forward_chunk`.
             let stop_waiting_at = Instant::now() + budget;
-            run_command_streaming(&command, kill_orphans, |chunk| {
-                forward_chunk(&tx, chunk, stop_waiting_at);
+            run_command_streaming(&command, kill_orphans, |chunk, source| {
+                forward_chunk(&tx, chunk, source, stop_waiting_at);
             })
         });
 

@@ -1,6 +1,5 @@
 //! REST API handlers.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::{
@@ -13,7 +12,7 @@ use super::types::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ExecuteCommandRequest,
     ExecuteCommandResponse, ListSessionsResponse, SessionStatusResponse, SessionSummary,
 };
-use crate::execution::{Command, CommandExecutor};
+use crate::execution::CommandExecutor;
 use crate::session::{SessionId, SessionState, SessionStore};
 
 /// Shared application state.
@@ -125,6 +124,11 @@ fn execution_event(
             result.duration.as_millis() as u64,
         )
         .with_truncated_output(result.truncated, result.total_bytes);
+    // The size of the input, never its content: what a command is fed may be a
+    // secret where the command line that reads it is not.
+    if let Some(written) = result.stdin_written {
+        event = event.with_bytes(written);
+    }
     if let Some(id) = session_id {
         event = event.with_session(id);
     }
@@ -301,20 +305,7 @@ pub async fn execute_command(
         ));
     }
 
-    // Build command
-    let mut cmd = Command::new(&req.command);
-    if let Some(dir) = &req.working_dir {
-        cmd = cmd.working_dir(PathBuf::from(dir));
-    }
-    if let Some(timeout) = req.timeout() {
-        cmd = cmd.timeout(timeout);
-    }
-    if let Some(bytes) = req.max_output_bytes {
-        cmd = cmd.max_output_bytes(bytes);
-    }
-    for (key, value) in &req.env {
-        cmd = cmd.env(key, value);
-    }
+    let cmd = req.to_command();
 
     // Execute
     let result = state
@@ -356,20 +347,7 @@ pub async fn execute_oneshot(
     identity: Option<axum::Extension<crate::audit::Identity>>,
     Json(req): Json<ExecuteCommandRequest>,
 ) -> Result<Json<ExecuteCommandResponse>, (StatusCode, Json<ErrorResponse>)> {
-    // Build command
-    let mut cmd = Command::new(&req.command);
-    if let Some(dir) = &req.working_dir {
-        cmd = cmd.working_dir(PathBuf::from(dir));
-    }
-    if let Some(timeout) = req.timeout() {
-        cmd = cmd.timeout(timeout);
-    }
-    if let Some(bytes) = req.max_output_bytes {
-        cmd = cmd.max_output_bytes(bytes);
-    }
-    for (key, value) in &req.env {
-        cmd = cmd.env(key, value);
-    }
+    let cmd = req.to_command();
 
     // Execute directly without session (off the async runtime workers)
     let result = state.executor.execute(&cmd).await.map_err(|e| {

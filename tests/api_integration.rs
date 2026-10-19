@@ -1,7 +1,6 @@
 //! API integration tests.
 //!
 //! These tests verify the complete API flow end-to-end using axum's test utilities.
-//! Note: Tests that execute commands are marked as ignored because they require PTY.
 
 use axum::{
     body::Body,
@@ -417,6 +416,103 @@ async fn test_execute_oneshot() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// `stdin` reaches the command, and the response reports stdout and stderr
+/// apart as well as together.
+#[tokio::test]
+async fn an_execute_takes_stdin_and_reports_each_stream() {
+    #[cfg(windows)]
+    let command = r#"findstr "^" & echo to_err 1>&2"#;
+    #[cfg(unix)]
+    let command = "cat; echo to_err 1>&2";
+
+    let app = create_router_with_state(AppState::new());
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/execute",
+            Some(json!({ "command": command, "stdin": "from_stdin
+" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+
+    let stdout = body["stdout"].as_str().expect("stdout is a string");
+    let stderr = body["stderr"].as_str().expect("stderr is a string");
+    assert!(
+        stdout.contains("from_stdin") && !stdout.contains("to_err"),
+        "{body}"
+    );
+    assert!(
+        stderr.contains("to_err") && !stderr.contains("from_stdin"),
+        "{body}"
+    );
+    let output = body["output"].as_str().unwrap();
+    assert!(
+        output.contains("from_stdin") && output.contains("to_err"),
+        "{body}"
+    );
+    assert_eq!(body["stdin_written"], 11, "{body}");
+}
+
+/// The session route reads the same body: `stdin` is not a one-shot-only field.
+#[tokio::test]
+async fn a_session_execute_takes_stdin_too() {
+    let app = create_router_with_state(AppState::new());
+    let created = response_json(
+        app.clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/api/v1/sessions",
+                Some(json!({})),
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    let id = created["session_id"].as_u64().expect("session id");
+
+    #[cfg(windows)]
+    let command = r#"findstr "^""#;
+    #[cfg(unix)]
+    let command = "cat";
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            &format!("/api/v1/sessions/{id}/execute"),
+            Some(json!({ "command": command, "stdin": "session_input
+" })),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response_json(response).await;
+    assert!(
+        body["stdout"].as_str().unwrap().contains("session_input"),
+        "{body}"
+    );
+}
+
+/// Without `stdin` the field is absent rather than zero: zero would claim the
+/// command was given input and took none of it.
+#[tokio::test]
+async fn an_execute_without_stdin_omits_stdin_written() {
+    let app = create_router_with_state(AppState::new());
+    let response = app
+        .oneshot(json_request(
+            Method::POST,
+            "/api/v1/execute",
+            Some(json!({ "command": "echo hi" })),
+        ))
+        .await
+        .unwrap();
+    let body = response_json(response).await;
+    assert!(body.get("stdin_written").is_none(), "{body}");
+    assert!(body["stdout"].as_str().unwrap().contains("hi"), "{body}");
+    assert_eq!(body["stderr"], "", "{body}");
 }
 
 // ============================================================================

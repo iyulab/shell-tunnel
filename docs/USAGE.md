@@ -412,12 +412,43 @@ query string; the codes differ because the body and the query string are parsed
 by different layers, and the message is the same in both.
 
 ```json
-{"success":true,"exit_code":0,"output":"hello\n","duration_ms":5,"timed_out":false,
- "total_bytes":6,"truncated":false}
+{"success":true,"exit_code":0,"output":"hello\n","stdout":"hello\n","stderr":"",
+ "duration_ms":5,"timed_out":false,"total_bytes":6,"truncated":false}
 ```
 
-`output` merges stdout and stderr. On timeout, `timed_out` is `true` and the
+`output` is stdout and stderr together, in the order they arrived; `stdout` and
+`stderr` are the same text split by the pipe it came through, so a program can
+tell a command's result from its warnings and progress lines. Before 0.31.0 only
+`output` existed. The order inside `output` is the order the server read the two
+pipes, not the order the command wrote them — nothing reading two pipes can see
+that (a terminal cannot either). On timeout, `timed_out` is `true` and the
 whole process tree is killed.
+
+**`stdin` gives the command input.** The text is written to the command's
+standard input, which is then closed, so a command that reads to end-of-file —
+`sort`, `jq`, `python -` — finishes on its own. Data passed this way never goes
+through the command line, so it needs no quoting:
+
+```bash
+curl -X POST "$BASE/api/v1/execute" -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"command":"sort","stdin":"pear\napple\n"}'
+# {"success":true,"exit_code":0,"output":"apple\npear\n","stdout":"apple\npear\n",
+#  "stderr":"","duration_ms":24,"timed_out":false,"total_bytes":11,"truncated":false,
+#  "stdin_written":11}
+```
+
+`stdin_written` is how much of the input the command's stdin accepted. It is
+smaller than the input when the command exited, or closed its stdin, before
+taking all of it — a command that never reads stdin takes at most what fits in
+the pipe. It is absent when the request had no `stdin`. Without `stdin` a
+command reads an empty input, as it always has. The field is text: a JSON
+string cannot carry arbitrary bytes, so binary input goes to a background
+process instead (§3.3), whose stdin route takes a raw body. The whole request
+body, `stdin` included, is limited to 2 MiB — larger is refused with `413` before
+anything runs; for more input than that, use a background process. The same
+field works on a session's execute; the WebSocket `execute` message does not
+take it.
 
 A command runs with the server's own environment, passed through unchanged: the
 server adds no variable of its own. Before 0.29.0 it added one — `RUST_LOG`, set
@@ -454,7 +485,10 @@ line.
 
 **Output is capped.** `output` carries at most `max_output_bytes` — 1 MiB unless
 the request says otherwise — and `total_bytes` reports what the command actually
-produced. When the two differ, `truncated` is `true`:
+produced. When the two differ, `truncated` is `true`. The cap is spent once, in
+arrival order, across both streams: `stdout` and `stderr` together hold exactly
+what `output` holds, so a response carries at most twice the cap in text — and a
+command that floods stdout can use the whole cap before its stderr arrives:
 
 ```bash
 curl -X POST "$BASE/api/v1/execute" -H "Authorization: Bearer $KEY" \
@@ -588,7 +622,7 @@ sending the same `Authorization` header. Messages are JSON, tagged by `type`:
 | Direction | Message |
 |---|---|
 | → server | `{"type":"execute","command":"...","timeout_secs":30}` |
-| ← server | `{"type":"output","data":"...","is_final":false}` |
+| ← server | `{"type":"output","data":"...","stream":"stdout","is_final":false}` — `stream` is `stdout` or `stderr` (since 0.31.0) |
 | ← server | `{"type":"result","success":true,"exit_code":0,"duration_ms":5,"timed_out":false,"total_bytes":6}` |
 | ← server | `{"type":"error","code":"...","message":"..."}` |
 | both | `{"type":"ping"}` / `{"type":"pong"}` |
@@ -1376,7 +1410,7 @@ capability token is the access control — withhold `exec` to deny execution.
 
 | `kind` | Recorded when | Notable fields |
 |---|---|---|
-| `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below) |
+| `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below), `bytes` (**only** when the request carried `stdin`: how much its stdin accepted — never the input itself) |
 | `denied` | a request was refused by the authentication layer, by the server's own body ceiling, or by the actions route before anything ran | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, `missing-capability:action:<id>`, `unknown-action:<id>`, `invalid-param:<name>`, `malformed-body`, …) |
 | `action` | a named action ran | `action`, `params` (the values as accepted — each one the definition allowed), `command` (the argv that ran, rendered), `exit_code`, `timed_out`, `duration_ms`, `output_bytes` (as for `execute`) |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |

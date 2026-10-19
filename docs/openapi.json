@@ -2428,6 +2428,17 @@
             "default": 1048576,
             "minimum": 0,
             "maximum": 8388608
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Environment variables set for the command, on top of the server's own environment."
+          },
+          "stdin": {
+            "type": "string",
+            "description": "Text written to the command's stdin, which is then closed. Omitted, stdin is empty and a command reading it sees end-of-file at once. Text only — binary input goes to a background process's stdin route. The whole request body is limited to 2 MiB. Since 0.31.0."
           }
         }
       },
@@ -2436,6 +2447,8 @@
         "required": [
           "success",
           "output",
+          "stdout",
+          "stderr",
           "duration_ms",
           "timed_out",
           "total_bytes",
@@ -2444,7 +2457,20 @@
         "properties": {
           "output": {
             "type": "string",
-            "description": "Command output (stdout + stderr)"
+            "description": "Command output: stdout and stderr together, in the order the server read them."
+          },
+          "stdout": {
+            "type": "string",
+            "description": "The part of `output` that came from stdout. `stdout` and `stderr` together hold exactly what `output` holds — the cap is spent once, across both, in arrival order. Since 0.31.0."
+          },
+          "stderr": {
+            "type": "string",
+            "description": "The part of `output` that came from stderr. See `stdout`. Since 0.31.0."
+          },
+          "stdin_written": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes of `stdin` the command's stdin accepted. Present only when the request carried `stdin`; smaller than the input when the command exited or closed its stdin before taking all of it. Since 0.31.0."
           },
           "exit_code": {
             "type": "integer",
@@ -2858,6 +2884,14 @@
               },
               "data": {
                 "type": "string"
+              },
+              "stream": {
+                "type": "string",
+                "enum": [
+                  "stdout",
+                  "stderr"
+                ],
+                "description": "The pipe this chunk came through. Since 0.31.0; absent from an older server."
               },
               "is_final": {
                 "type": "boolean",

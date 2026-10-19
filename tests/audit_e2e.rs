@@ -589,3 +589,29 @@ async fn a_body_past_the_ceiling_is_recorded_even_though_auth_never_sees_it() {
         "the route is what makes a probe legible afterwards"
     );
 }
+
+/// An execute given `stdin` records how much its stdin took — and not what it
+/// was. The command line is recorded; what a command is fed may be a secret
+/// where the line that reads it is not.
+#[tokio::test]
+async fn an_execute_records_the_size_of_its_stdin_and_never_its_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "audit-key", &["exec"]).await;
+
+    let command = if cfg!(windows) {
+        r#"findstr \"^\""#
+    } else {
+        "cat"
+    };
+    let body = format!(r#"{{"command":"{command}","stdin":"not-for-the-trail\n"}}"#);
+    assert_eq!(
+        post(addr, "/api/v1/execute", Some("audit-key"), &body).await,
+        200
+    );
+
+    let entries = events(&trail, 1).await;
+    assert_eq!(entries[0].kind, "execute");
+    assert_eq!(entries[0].bytes, Some(18));
+    let raw = std::fs::read_to_string(&trail).unwrap();
+    assert!(!raw.contains("not-for-the-trail"), "{raw}");
+}

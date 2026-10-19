@@ -26,7 +26,7 @@
 //! `PeekNamedPipe` on Windows (anonymous pipes are named pipes underneath, so it
 //! applies), `O_NONBLOCK` on Unix.
 
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 
 /// Largest single `read` issued against a pipe.
 const READ_CHUNK: usize = 4096;
@@ -136,6 +136,164 @@ impl<R: PipeSource> PipeDrain<R> {
     }
 }
 
+/// Largest single `write` issued against a child's stdin.
+///
+/// On Windows this is not only a pass size. A pipe in `PIPE_NOWAIT` mode
+/// accepts a write whole or not at all — measured: a 4 MiB write to a pipe
+/// nobody was reading returned zero bytes every time, while the same bytes in
+/// 4 KiB writes filled the 64 KiB buffer and then stopped. A write larger than
+/// the free space never makes progress, so writes stay small enough to fit.
+const WRITE_CHUNK: usize = 4096;
+
+/// A sink this module can feed: a pipe's write end, plus whatever the platform
+/// needs to switch it to non-blocking. `ChildStdin` satisfies both.
+#[cfg(windows)]
+pub(crate) trait PipeSink: Write + std::os::windows::io::AsRawHandle {}
+#[cfg(windows)]
+impl<T: Write + std::os::windows::io::AsRawHandle> PipeSink for T {}
+
+/// A sink this module can feed: a pipe's write end, plus whatever the platform
+/// needs to switch it to non-blocking. `ChildStdin` satisfies both.
+#[cfg(unix)]
+pub(crate) trait PipeSink: Write + std::os::unix::io::AsRawFd {}
+#[cfg(unix)]
+impl<T: Write + std::os::unix::io::AsRawFd> PipeSink for T {}
+
+/// A child's stdin, fed a fixed input from the control loop rather than by a
+/// thread — the same answer [`PipeDrain`] gives for output, for the same reason.
+///
+/// A thread doing a blocking `write_all` has one way out: the input is accepted.
+/// A child that never reads its stdin, or a grandchild that inherited it and
+/// sits on it, means the input is never accepted, and the thread blocks for the
+/// life of the server. Here a full pipe is a pass that moves nothing, and the
+/// loop decides when to stop trying.
+///
+/// The write end is closed as soon as the last byte is accepted, which is the
+/// end-of-file the child reads after its input. It is also closed when the
+/// child stops reading for good (the pipe breaks) and on drop.
+pub(crate) struct PipeFeed<W: PipeSink> {
+    /// `None` once the input is delivered or the pipe is gone.
+    writer: Option<W>,
+    input: Vec<u8>,
+    /// Bytes of `input` the pipe has accepted.
+    written: usize,
+}
+
+impl<W: PipeSink> PipeFeed<W> {
+    /// Take ownership of a pipe's write end and the input it is to carry.
+    ///
+    /// Fails if the pipe cannot be made non-blocking. Unlike a read end, a
+    /// write end that stayed blocking cannot be degraded into "finished": the
+    /// child would be told its input ended when it never arrived.
+    pub(crate) fn new(writer: W, input: Vec<u8>) -> io::Result<Self> {
+        set_write_nonblocking(&writer)?;
+        let mut feed = Self {
+            writer: Some(writer),
+            input,
+            written: 0,
+        };
+        if feed.input.is_empty() {
+            // Nothing to send: close now, so the child reads end-of-file at once.
+            feed.writer = None;
+        }
+        Ok(feed)
+    }
+
+    /// How many bytes of the input the pipe accepted.
+    ///
+    /// Less than the input when the child ended — or closed its stdin — before
+    /// taking all of it. Accepted is not the same as read: the last pipe
+    /// buffer's worth may still be unread when the child exits.
+    pub(crate) fn written(&self) -> u64 {
+        self.written as u64
+    }
+
+    /// Close the write end now, delivered or not.
+    pub(crate) fn release(&mut self) {
+        self.writer = None;
+    }
+
+    /// Write up to `budget` more bytes of the input, returning how many moved.
+    ///
+    /// Never blocks. A full pipe ends the pass; a broken one — the child has
+    /// exited or closed its stdin — ends the feed.
+    pub(crate) fn feed(&mut self, budget: usize) -> usize {
+        let mut moved = 0;
+        while moved < budget {
+            let Some(writer) = self.writer.as_mut() else {
+                break;
+            };
+            let end = self
+                .input
+                .len()
+                .min(self.written + WRITE_CHUNK.min(budget - moved));
+            match writer.write(&self.input[self.written..end]) {
+                // Windows `PIPE_NOWAIT`: no room for this write right now.
+                Ok(0) => break,
+                Ok(n) => {
+                    self.written += n;
+                    moved += n;
+                    if self.written == self.input.len() {
+                        self.writer = None;
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
+                // A broken pipe, or anything else: no further write can land.
+                Err(_) => self.writer = None,
+            }
+        }
+        moved
+    }
+}
+
+/// Switch a pipe's write end to non-blocking.
+#[cfg(windows)]
+fn set_write_nonblocking<W: PipeSink>(writer: &W) -> io::Result<()> {
+    use std::ffi::c_void;
+
+    // Anonymous pipes are named pipes underneath (the reason `PeekNamedPipe`
+    // works on them, above), so the named-pipe mode switch applies too.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetNamedPipeHandleState(
+            handle: *mut c_void,
+            mode: *mut u32,
+            max_collection_count: *mut u32,
+            collect_data_timeout: *mut u32,
+        ) -> i32;
+    }
+
+    /// `PIPE_NOWAIT` — a write returns at once, with the bytes accepted.
+    const PIPE_NOWAIT: u32 = 1;
+
+    let mut mode = PIPE_NOWAIT;
+    // SAFETY: `handle` is a live pipe handle owned by `writer` for this call; the
+    // two collection parameters apply only to remote pipes and may be null.
+    let ok = unsafe {
+        SetNamedPipeHandleState(
+            writer.as_raw_handle(),
+            &mut mode,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Switch a pipe's write end to non-blocking.
+#[cfg(unix)]
+fn set_write_nonblocking<W: PipeSink>(writer: &W) -> io::Result<()> {
+    if set_fd_nonblocking(writer.as_raw_fd()) {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Read whatever is there without waiting for more.
 #[cfg(windows)]
 fn read_available<R: PipeSource>(reader: &mut R, buf: &mut [u8]) -> Outcome {
@@ -216,15 +374,20 @@ fn read_available<R: PipeSource>(reader: &mut R, buf: &mut [u8]) -> Outcome {
     }
 }
 
-/// Switch a descriptor to non-blocking, reporting whether it took.
+/// Switch a read end to non-blocking, reporting whether it took.
 #[cfg(unix)]
 fn set_nonblocking<R: PipeSource>(reader: &R) -> bool {
     // No `use` for `AsRawFd`: the method is in scope through `PipeSource`'s own
     // bound. Importing it as well is an unused import, and `clippy-all` runs
     // with `-D warnings` — which would have failed CI's Lint job on Unix only,
     // where this branch is the one that compiles.
-    let fd = reader.as_raw_fd();
-    // SAFETY: `fd` is owned by `reader` and live for this call; both `fcntl`
+    set_fd_nonblocking(reader.as_raw_fd())
+}
+
+/// Switch a descriptor to non-blocking, reporting whether it took.
+#[cfg(unix)]
+fn set_fd_nonblocking(fd: std::os::unix::io::RawFd) -> bool {
+    // SAFETY: `fd` is owned by the caller's pipe and live for this call; both `fcntl`
     // uses here only read and rewrite that descriptor's own status flags.
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);

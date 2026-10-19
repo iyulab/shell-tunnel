@@ -3,6 +3,42 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.31.0 — unreleased
+
+### Added
+
+- **`stdin` on `POST /api/v1/execute` and a session's execute.** The text is written to the
+  command's standard input, which is then closed, so a program can hand a command its data
+  without putting it on the command line and quoting it. The response's `stdin_written` says
+  how much of it the command's stdin accepted. Text only; binary input goes to a background
+  process. The input is fed without a thread and without blocking, so a command that never
+  reads it, or reads it while writing more output than a pipe holds, cannot stall the server.
+  See `docs/USAGE.md` §3.
+
+- **`stdout` and `stderr` on the execute response.** The same text as `output`, split by the
+  pipe it came through, so a program can tell a command's result from its diagnostics.
+  `output` is unchanged: both streams, in the order they were read. The cap is spent once
+  across both, so the two fields together hold exactly what `output` holds.
+
+- **`stream` on WebSocket `output` messages** — `"stdout"` or `"stderr"`.
+
+- **An `execute` audit entry carries `bytes` when the request had `stdin`** — how much the
+  command's stdin accepted. The input itself is never recorded.
+
+### Changed
+
+- **Library: `OutputSource::Combined` and `OutputChunk::combined` are removed.** Execution now
+  produces `Stdout` and `Stderr` chunks, which the type had carried unused; `Combined` was the
+  only variant ever produced and is no longer produced at all. `ExecutionResult` gained
+  `stdout`, `stderr` and `stdin_written`, and `Command` gained `stdin`; a struct literal of
+  either stops compiling.
+
+### Documentation
+
+- `docs/openapi.json`'s execute request schema now lists `env`. It declares
+  `additionalProperties: false`, so a client validating against it refused a field the server
+  has always accepted.
+
 ## 0.30.0 — 2026-10-19
 
 ### Added

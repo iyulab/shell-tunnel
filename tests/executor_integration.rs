@@ -802,3 +802,163 @@ async fn an_empty_argv_is_refused_rather_than_run() {
         .expect_err("there is no program to run");
     assert!(err.to_string().contains("argv is empty"), "{err}");
 }
+
+/// Copies stdin to stdout. `findstr "^"` matches every line on Windows.
+fn echo_stdin_command() -> &'static str {
+    #[cfg(windows)]
+    {
+        r#"findstr "^""#
+    }
+    #[cfg(unix)]
+    {
+        "cat"
+    }
+}
+
+#[tokio::test]
+async fn stdin_reaches_the_command_and_is_then_closed() {
+    let result = executor()
+        .execute(&Command::new(echo_stdin_command()).stdin("first line\nsecond line\n"))
+        .await
+        .expect("execute failed");
+
+    // The command exiting at all is the "then closed" half: `cat` and
+    // `findstr` read until end-of-file, so an input left open would run them
+    // to the timeout.
+    assert!(!result.timed_out, "stdin was never closed");
+    assert_eq!(result.exit_code, Some(0));
+    let out = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        out.contains("first line") && out.contains("second line"),
+        "stdout was: {out:?}"
+    );
+    assert_eq!(result.stdin_written, Some(23));
+}
+
+/// Input far larger than any pipe buffer, read by a command that writes it all
+/// back. A writer that blocked until the input was accepted would deadlock
+/// here: the child stops reading once its stdout pipe is full, and the
+/// stdout pipe is only emptied by the same loop that would be stuck writing.
+#[tokio::test]
+async fn input_larger_than_a_pipe_buffer_round_trips_without_deadlock() {
+    let line = "0123456789abcdefghijklmnopqrstuvwxyz\n";
+    let lines = 30_000; // ~1.1 MiB, sixteen times a 64 KiB pipe buffer
+    let input = line.repeat(lines);
+
+    let result = executor()
+        .execute(
+            &Command::new(echo_stdin_command())
+                .stdin(input.as_bytes())
+                .timeout(Duration::from_secs(120))
+                .max_output_bytes(8 * 1024 * 1024),
+        )
+        .await
+        .expect("execute failed");
+
+    assert!(!result.timed_out, "the feed and the drain deadlocked");
+    assert_eq!(result.stdin_written, Some(input.len() as u64));
+    let echoed = String::from_utf8_lossy(&result.stdout);
+    assert_eq!(
+        echoed.lines().filter(|l| *l == line.trim_end()).count(),
+        lines,
+        "every line should come back once"
+    );
+}
+
+/// A command that never reads its stdin ends on its own schedule, and the
+/// result says how much of the input was taken.
+#[tokio::test]
+async fn a_command_that_ignores_its_stdin_is_not_held_by_it() {
+    let input = vec![b'x'; 4 * 1024 * 1024];
+    let result = executor()
+        .execute(
+            &Command::new("echo done")
+                .stdin(input.clone())
+                .timeout(Duration::from_secs(60)),
+        )
+        .await
+        .expect("execute failed");
+
+    assert!(!result.timed_out, "an unread stdin held the command");
+    assert_eq!(result.exit_code, Some(0));
+    let written = result.stdin_written.expect("input was given");
+    assert!(
+        written < input.len() as u64,
+        "a command that reads nothing cannot have taken 4 MiB: {written}"
+    );
+}
+
+#[tokio::test]
+async fn stdout_and_stderr_are_reported_apart_and_together() {
+    #[cfg(windows)]
+    let line = "echo to_out& echo to_err 1>&2";
+    #[cfg(unix)]
+    let line = "echo to_out; echo to_err 1>&2";
+
+    let result = executor()
+        .execute(&Command::new(line))
+        .await
+        .expect("execute failed");
+
+    let out = String::from_utf8_lossy(&result.stdout);
+    let err = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        out.contains("to_out") && !out.contains("to_err"),
+        "stdout: {out:?}"
+    );
+    assert!(
+        err.contains("to_err") && !err.contains("to_out"),
+        "stderr: {err:?}"
+    );
+    // `raw_output` is the same bytes, both streams together.
+    assert_eq!(
+        result.raw_output.len(),
+        result.stdout.len() + result.stderr.len()
+    );
+    assert!(result.text_output.contains("to_out") && result.text_output.contains("to_err"));
+    assert_eq!(result.stdin_written, None, "no input was given");
+}
+
+/// The cap is one budget across both streams: the split views never hold more
+/// than the merged one.
+#[tokio::test]
+async fn the_cap_bounds_both_streams_together() {
+    // ~4 KiB across both pipes, from the shell itself rather than an
+    // interpreter that might not start in time on a loaded machine.
+    #[cfg(windows)]
+    let line =
+        "for /L %i in (1,1,100) do @(echo out_line_xxxxxxxxxx& echo err_line_xxxxxxxxxx 1>&2)";
+    #[cfg(unix)]
+    let line =
+        "for i in $(seq 1 100); do echo out_line_xxxxxxxxxx; echo err_line_xxxxxxxxxx 1>&2; done";
+
+    let result = executor()
+        .execute(&Command::new(line).max_output_bytes(1000))
+        .await
+        .expect("execute failed");
+
+    assert!(result.truncated);
+    assert_eq!(result.raw_output.len(), 1000);
+    assert_eq!(result.stdout.len() + result.stderr.len(), 1000);
+}
+
+#[tokio::test]
+async fn streamed_chunks_say_which_pipe_they_came_through() {
+    use shell_tunnel::execution::OutputSource;
+
+    let exec = executor();
+    let (mut rx, handle) = exec
+        .execute_async(&Command::new("echo only_err 1>&2"))
+        .await
+        .expect("execute_async failed");
+    let mut sources = Vec::new();
+    while let Some(chunk) = rx.recv().await {
+        sources.push(chunk.source);
+    }
+    handle.await.expect("join").expect("result");
+    assert!(!sources.is_empty());
+    assert!(
+        sources.iter().all(|s| *s == OutputSource::Stderr),
+        "{sources:?}"
+    );
+}

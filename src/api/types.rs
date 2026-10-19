@@ -115,11 +115,45 @@ pub struct ExecuteCommandRequest {
     /// and `total_bytes` reports what the command actually produced either way.
     #[serde(default)]
     pub max_output_bytes: Option<u64>,
+    /// Text written to the command's stdin, which is then closed.
+    ///
+    /// Omitted, stdin is empty — the command reads end-of-file at once, as it
+    /// always has. Data passed this way never goes through the command line,
+    /// so it needs no quoting. Text only: a JSON string cannot carry arbitrary
+    /// bytes, and binary input goes to a background process's stdin route,
+    /// which takes a raw body.
+    #[serde(default)]
+    pub stdin: Option<String>,
 }
 
 impl ExecuteCommandRequest {
     pub fn timeout(&self) -> Option<Duration> {
         self.timeout_secs.map(Duration::from_secs)
+    }
+
+    /// The command this request asks for.
+    ///
+    /// One place, because the one-shot and session routes take the same body
+    /// and each used to build the command by hand — a field added to one of
+    /// those copies and not the other is a request field one route ignores.
+    pub fn to_command(&self) -> crate::execution::Command {
+        let mut cmd = crate::execution::Command::new(&self.command);
+        if let Some(dir) = &self.working_dir {
+            cmd = cmd.working_dir(dir);
+        }
+        if let Some(timeout) = self.timeout() {
+            cmd = cmd.timeout(timeout);
+        }
+        if let Some(bytes) = self.max_output_bytes {
+            cmd = cmd.max_output_bytes(bytes);
+        }
+        for (key, value) in &self.env {
+            cmd = cmd.env(key, value);
+        }
+        if let Some(input) = &self.stdin {
+            cmd = cmd.stdin(input.as_bytes());
+        }
+        cmd
     }
 }
 
@@ -131,8 +165,17 @@ pub struct ExecuteCommandResponse {
     /// Exit code (if process completed).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
-    /// Cleaned output text.
+    /// Cleaned output text: stdout and stderr together, in the order they
+    /// arrived.
     pub output: String,
+    /// Cleaned text from stdout alone.
+    ///
+    /// `stdout` and `stderr` are `output` split by the pipe each part came
+    /// through — the same bytes, under the same cap — so a caller can tell a
+    /// command's result from its diagnostics.
+    pub stdout: String,
+    /// Cleaned text from stderr alone. See `stdout`.
+    pub stderr: String,
     /// Raw output (base64 encoded if binary content detected).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<String>,
@@ -149,6 +192,13 @@ pub struct ExecuteCommandResponse {
     /// Always present, including when false: a caller must not have to infer
     /// completeness from the absence of a field.
     pub truncated: bool,
+    /// Bytes of `stdin` the command's stdin accepted; present only when the
+    /// request carried `stdin`.
+    ///
+    /// Less than the input's length when the command ended, or closed its
+    /// stdin, before taking all of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdin_written: Option<u64>,
 }
 
 impl ExecuteCommandResponse {
@@ -157,11 +207,14 @@ impl ExecuteCommandResponse {
             success: result.exit_code.map(|c| c == 0).unwrap_or(false) && !result.timed_out,
             exit_code: result.exit_code,
             output: result.text_output.clone(),
+            stdout: crate::output::OutputSanitizer::strip_ansi(&result.stdout),
+            stderr: crate::output::OutputSanitizer::strip_ansi(&result.stderr),
             raw_output: None, // Only include if requested
             duration_ms: result.duration.as_millis() as u64,
             timed_out: result.timed_out,
             total_bytes: result.total_bytes,
             truncated: result.truncated,
+            stdin_written: result.stdin_written,
         }
     }
 
@@ -258,6 +311,12 @@ pub enum WsServerMessage {
     /// One chunk of a running command's output.
     Output {
         data: String,
+        /// The pipe this chunk came through: `"stdout"` or `"stderr"`.
+        ///
+        /// Optional when read, so a consumer built on this type still accepts
+        /// output from a server older than the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<String>,
         /// Whether this is the final chunk.
         #[serde(default)]
         is_final: bool,
@@ -351,10 +410,20 @@ mod tests {
     fn test_ws_message_output() {
         let msg = WsServerMessage::Output {
             data: "hello\n".to_string(),
+            stream: Some("stdout".to_string()),
             is_final: false,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("output"));
+        assert!(json.contains(r#""stream":"stdout""#));
+    }
+
+    /// A message from a server older than `stream` still parses.
+    #[test]
+    fn an_output_message_without_a_stream_still_parses() {
+        let msg: WsServerMessage =
+            serde_json::from_str(r#"{"type":"output","data":"x","is_final":false}"#).unwrap();
+        assert!(matches!(msg, WsServerMessage::Output { stream: None, .. }));
     }
 
     // --- Unknown fields are refused, not dropped. ---

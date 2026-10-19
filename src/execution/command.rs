@@ -62,6 +62,11 @@ pub struct Command {
     /// `None` means [`super::executor::DEFAULT_MAX_OUTPUT_BYTES`]. There is no
     /// value meaning "unbounded" — see that constant.
     pub max_output_bytes: Option<u64>,
+    /// Input written to the command's stdin, after which stdin is closed.
+    ///
+    /// `None` gives the command an empty stdin, which is what it had before
+    /// this field existed: a command that reads stdin sees end-of-file at once.
+    pub stdin: Option<Vec<u8>>,
 }
 
 impl Command {
@@ -84,6 +89,7 @@ impl Command {
             timeout: None,
             capture_output: true,
             max_output_bytes: None,
+            stdin: None,
         }
     }
 
@@ -127,6 +133,12 @@ impl Command {
     /// Cap the output the result keeps.
     pub fn max_output_bytes(mut self, bytes: u64) -> Self {
         self.max_output_bytes = Some(bytes);
+        self
+    }
+
+    /// Give the command this input on its stdin.
+    pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
         self
     }
 
@@ -219,6 +231,7 @@ impl CommandBuilder {
             timeout: self.timeout,
             capture_output: self.capture_output,
             max_output_bytes: self.max_output_bytes,
+            stdin: None,
         })
     }
 }

@@ -88,7 +88,9 @@ pub struct AuditEvent {
     /// Path a file operation touched, relative to the configured root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
-    /// Bytes transferred. Present on terminal transfer events.
+    /// Bytes transferred. Present on terminal transfer events, and on an
+    /// `execute` that was given `stdin` — there, the bytes its stdin accepted.
+    /// The input itself is never recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bytes: Option<u64>,
     /// Entries a tree operation counted or removed. Present on `fs.delete`

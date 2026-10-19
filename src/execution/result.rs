@@ -24,6 +24,17 @@ pub struct ExecutionResult {
     pub total_bytes: u64,
     /// Whether output was discarded because it exceeded the cap.
     pub truncated: bool,
+    /// The part of `raw_output` that came from the command's stdout.
+    ///
+    /// `stdout` and `stderr` are the same kept bytes as `raw_output`, split by
+    /// the pipe they arrived on: the cap is applied once, in arrival order,
+    /// across both, so together they are exactly `raw_output`'s length.
+    pub stdout: Vec<u8>,
+    /// The part of `raw_output` that came from the command's stderr.
+    pub stderr: Vec<u8>,
+    /// Bytes of the command's input its stdin pipe accepted, when it was given
+    /// input; `None` when it was not (stdin was empty).
+    pub stdin_written: Option<u64>,
 }
 
 impl ExecutionResult {
@@ -43,6 +54,9 @@ impl ExecutionResult {
             timed_out: false,
             total_bytes,
             truncated: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdin_written: None,
         }
     }
 
@@ -57,6 +71,9 @@ impl ExecutionResult {
             timed_out: true,
             total_bytes,
             truncated: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdin_written: None,
         }
     }
 
@@ -68,6 +85,19 @@ impl ExecutionResult {
     pub fn with_output_extent(mut self, total_bytes: u64, truncated: bool) -> Self {
         self.total_bytes = total_bytes;
         self.truncated = truncated;
+        self
+    }
+
+    /// Record the kept output split by the stream it arrived on.
+    pub fn with_streams(mut self, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
+        self.stdout = stdout;
+        self.stderr = stderr;
+        self
+    }
+
+    /// Record how much of the command's input its stdin accepted.
+    pub fn with_stdin_written(mut self, written: Option<u64>) -> Self {
+        self.stdin_written = written;
         self
     }
 
@@ -108,6 +138,9 @@ impl Default for ExecutionResult {
             timed_out: false,
             total_bytes: 0,
             truncated: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            stdin_written: None,
         }
     }
 }
@@ -123,28 +156,23 @@ pub struct OutputChunk {
     pub source: OutputSource,
 }
 
-/// Source of output data.
-///
-/// **Execution only ever produces [`Combined`](OutputSource::Combined).** The
-/// executor merges a child's stdout and stderr into one stream before any chunk
-/// is built, so a consumer matching on this will never see the other two from
-/// this crate — do not write a branch that depends on telling them apart, and do
-/// not read the presence of these variants as a promise that separation is
-/// available. The variants and [`OutputChunk::stdout`] exist because separating
-/// the two streams is a standing proposal, not because it happens.
-///
-/// They are kept rather than deleted so the day that proposal lands does not
-/// also change this type's shape. That is a judgement, and it comes with the
-/// cost of this paragraph: a half-built structure reads as a working one unless
-/// it says otherwise.
+/// The pipe a chunk of output arrived on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputSource {
-    /// Standard output. **Not produced by this crate** — see the type's note.
+    /// Standard output.
     Stdout,
-    /// Standard error. **Not produced by this crate** — see the type's note.
+    /// Standard error.
     Stderr,
-    /// Combined output. The only variant execution produces.
-    Combined,
+}
+
+impl OutputSource {
+    /// The name the API uses for this stream: `"stdout"` or `"stderr"`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
 }
 
 impl OutputChunk {
@@ -155,17 +183,13 @@ impl OutputChunk {
     }
 
     /// Create a stdout chunk.
-    ///
-    /// **Nothing in this crate calls this** — execution merges the two streams
-    /// and builds every chunk with [`combined`](Self::combined). See
-    /// [`OutputSource`].
     pub fn stdout(raw: Vec<u8>) -> Self {
         Self::new(raw, OutputSource::Stdout)
     }
 
-    /// Create a combined output chunk.
-    pub fn combined(raw: Vec<u8>) -> Self {
-        Self::new(raw, OutputSource::Combined)
+    /// Create a stderr chunk.
+    pub fn stderr(raw: Vec<u8>) -> Self {
+        Self::new(raw, OutputSource::Stderr)
     }
 }
 
@@ -231,8 +255,9 @@ mod tests {
     }
 
     #[test]
-    fn test_output_chunk_combined() {
-        let chunk = OutputChunk::combined(b"mixed output".to_vec());
-        assert_eq!(chunk.source, OutputSource::Combined);
+    fn test_output_chunk_stderr() {
+        let chunk = OutputChunk::stderr(b"warning".to_vec());
+        assert_eq!(chunk.source, OutputSource::Stderr);
+        assert_eq!(chunk.source.as_str(), "stderr");
     }
 }

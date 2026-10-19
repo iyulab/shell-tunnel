@@ -122,6 +122,7 @@ async fn handle_socket(
                         while let Some(chunk) = rx.recv().await {
                             let output = WsServerMessage::Output {
                                 data: String::from_utf8_lossy(&chunk.raw).to_string(),
+                                stream: Some(chunk.source.as_str().to_string()),
                                 is_final: false,
                             };
                             if let Ok(json) = serde_json::to_string(&output) {
@@ -359,6 +360,7 @@ async fn handle_oneshot_socket(
                         while let Some(chunk) = rx.recv().await {
                             let output = WsServerMessage::Output {
                                 data: String::from_utf8_lossy(&chunk.raw).to_string(),
+                                stream: Some(chunk.source.as_str().to_string()),
                                 is_final: false,
                             };
                             if let Ok(json) = serde_json::to_string(&output) {
