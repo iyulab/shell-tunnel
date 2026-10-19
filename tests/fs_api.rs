@@ -5379,3 +5379,37 @@ async fn an_entry_directly_under_the_unix_root_can_be_named_for_deletion() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     assert!(text.contains("recursive-required"), "{text}");
 }
+
+/// A path that names a filesystem anchor itself (`C:/` on Windows, `/` on
+/// Unix) is not an entry, and delete must not treat the anchor as the target.
+///
+/// The handler splits the request into parent and last component; for an
+/// anchor the last component is empty, and joining an empty name onto the
+/// anchor gives the anchor back — so the drive itself became the entry, and
+/// with `recursive=true` the whole drive the target of `remove_tree`. Asked
+/// without `recursive` here so nothing can be removed whatever the outcome:
+/// `recursive-required` would mean the anchor was taken as the target.
+#[tokio::test]
+async fn delete_refuses_a_path_naming_a_filesystem_anchor() {
+    let (_dir, state, base) = machine_wide_state();
+    let anchor = if cfg!(windows) {
+        format!("{}/", &base[..2])
+    } else {
+        "/".to_string()
+    };
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/v1/fs/file?path={anchor}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let status = response.status();
+    let body = body_json(response).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"], "bad-path", "{body}");
+}

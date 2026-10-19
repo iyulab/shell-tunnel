@@ -1196,6 +1196,18 @@ fn delete_file_blocking(
 
     let (parent_rel, name) = split_last_component(&query.path);
 
+    // An empty last component means the request named a filesystem anchor
+    // (`C:/`, or `/` on Unix) — or ended in a separator, which only an anchor
+    // survives the full resolution above with. Joining `""` onto the parent
+    // gives the parent back, so without this the anchor itself became the
+    // entry, and with `recursive=true` the whole drive went to `remove_tree`.
+    // An anchor is not an entry this route can name.
+    if name.is_empty() {
+        return fs_error_response(FsError::Malformed(
+            "path must name an entry, not a filesystem root",
+        ));
+    }
+
     // `name` can be `..` (`path=app/..` passes the full-path resolution
     // above — `resolve_existing` walks it back up to a real directory, not
     // out of the root, so nothing refuses it there). `named` below is built
