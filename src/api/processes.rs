@@ -16,7 +16,7 @@ use serde::Deserialize;
 use super::fs::error_response;
 use super::handlers::AppState;
 use crate::audit::Identity;
-use crate::execution::processes::{ProcessError, Signal, StartRequest, Stream};
+use crate::execution::processes::{ProcessError, Signal, StartRequest, StdinWrite, Stream};
 
 type Caller = Option<axum::Extension<Identity>>;
 
@@ -48,7 +48,12 @@ fn refusal(error: ProcessError) -> Response {
         ProcessError::StdinUnavailable => error_response(
             StatusCode::CONFLICT,
             "stdin-unavailable",
-            "stdin was not requested at start, has been closed, or another write is in progress",
+            "stdin was not requested at start, or has been closed — by a caller or by the process",
+        ),
+        ProcessError::StdinBacklogFull => error_response(
+            StatusCode::CONFLICT,
+            "stdin-backlog-full",
+            "more input is queued for this process than the server holds; wait for it to read what is queued (stdin_pending) and send again",
         ),
         ProcessError::SignalUnsupported => error_response(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -200,7 +205,15 @@ pub struct StdinQuery {
     /// Close stdin after writing, so the process reads end-of-file.
     #[serde(default)]
     pub close: bool,
+    /// How long to wait for the process to take the input, in milliseconds;
+    /// at most [`MAX_STDIN_WAIT_MS`]. Omitted, the most.
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
+
+/// The longest a stdin write waits for the process to take its input — the
+/// same bound the output long-poll has.
+pub const MAX_STDIN_WAIT_MS: u64 = 25_000;
 
 pub async fn stdin(
     State(state): State<AppState>,
@@ -210,9 +223,25 @@ pub async fn stdin(
     body: axum::body::Bytes,
 ) -> Response {
     let identity = identity.map(|axum::Extension(id)| id);
-    let table = state.processes.clone();
-    match blocking(move || table.write_stdin(id, &body, query.close, identity)).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    let wait = Duration::from_millis(
+        query
+            .wait_ms
+            .unwrap_or(MAX_STDIN_WAIT_MS)
+            .min(MAX_STDIN_WAIT_MS),
+    );
+    match state
+        .processes
+        .write_stdin(id, &body, query.close, identity, wait)
+        .await
+    {
+        // All of it is in the pipe.
+        Ok(StdinWrite { pending: 0 }) => StatusCode::NO_CONTENT.into_response(),
+        // Queued, and still going in: the process has not read it all yet.
+        Ok(StdinWrite { pending }) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({ "pending": pending })),
+        )
+            .into_response(),
         Err(error) => refusal(error),
     }
 }

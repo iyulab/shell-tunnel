@@ -27,11 +27,22 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Changed
 
+- **A background process's stdin write no longer holds a server thread.** `POST
+  /api/v1/processes/{id}/stdin` queues its body, and the server writes it as the pipe takes it.
+  The call answers `204` once all of it is in, or `202 {"pending":N}` when its wait (`wait_ms`,
+  default and at most 25 s) ends first; the input keeps going in, and the handle's new
+  `stdin_pending` says how much is left. At most 4 MiB may be queued (`409 stdin-backlog-full`).
+  Concurrent writes are queued in order rather than refused. Before, a write was a blocking
+  write on a server thread: a body larger than the pipe, sent to a process that did not read
+  it, held that thread for as long as the process ran — and for good, if something the process
+  started kept its stdin open.
+
 - **Library: `OutputSource::Combined` and `OutputChunk::combined` are removed.** Execution now
   produces `Stdout` and `Stderr` chunks, which the type had carried unused; `Combined` was the
   only variant ever produced and is no longer produced at all. `ExecutionResult` gained
   `stdout`, `stderr` and `stdin_written`, and `Command` gained `stdin`; a struct literal of
-  either stops compiling.
+  either stops compiling. `ProcessTable::write_stdin` is async and takes a wait; `ProcessInfo`
+  gained `stdin_pending` and `ProcessError` `StdinBacklogFull`.
 
 ### Documentation
 

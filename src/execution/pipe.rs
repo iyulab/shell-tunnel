@@ -159,8 +159,8 @@ pub(crate) trait PipeSink: Write + std::os::unix::io::AsRawFd {}
 #[cfg(unix)]
 impl<T: Write + std::os::unix::io::AsRawFd> PipeSink for T {}
 
-/// A child's stdin, fed a fixed input from the control loop rather than by a
-/// thread — the same answer [`PipeDrain`] gives for output, for the same reason.
+/// A child's stdin, fed from a polling loop rather than by a thread — the same
+/// answer [`PipeDrain`] gives for output, for the same reason.
 ///
 /// A thread doing a blocking `write_all` has one way out: the input is accepted.
 /// A child that never reads its stdin, or a grandchild that inherited it and
@@ -168,81 +168,137 @@ impl<T: Write + std::os::unix::io::AsRawFd> PipeSink for T {}
 /// life of the server. Here a full pipe is a pass that moves nothing, and the
 /// loop decides when to stop trying.
 ///
-/// The write end is closed as soon as the last byte is accepted, which is the
-/// end-of-file the child reads after its input. It is also closed when the
-/// child stops reading for good (the pipe breaks) and on drop.
+/// Two shapes. [`new`](Self::new) carries a fixed input and closes the write
+/// end as soon as the last byte is accepted — the end-of-file a one-shot
+/// command reads after its input. [`open`](Self::open) starts empty and stays
+/// open: input is [`push`](Self::push)ed as it arrives and the pipe closes only
+/// once [`close_when_drained`](Self::close_when_drained) has been asked for and
+/// everything queued is in. Either way the write end also closes when the child
+/// stops reading for good (the pipe breaks) and on drop.
 pub(crate) struct PipeFeed<W: PipeSink> {
-    /// `None` once the input is delivered or the pipe is gone.
+    /// `None` once closed: delivered and asked to close, or the pipe is gone.
     writer: Option<W>,
+    /// Queued input; `input[offset..]` is what the pipe has not accepted yet.
     input: Vec<u8>,
-    /// Bytes of `input` the pipe has accepted.
-    written: usize,
+    offset: usize,
+    /// Bytes the pipe has accepted, over the feed's life.
+    accepted: u64,
+    close_when_drained: bool,
 }
 
 impl<W: PipeSink> PipeFeed<W> {
-    /// Take ownership of a pipe's write end and the input it is to carry.
+    /// A feed carrying `input`, closed once it is delivered.
     ///
     /// Fails if the pipe cannot be made non-blocking. Unlike a read end, a
     /// write end that stayed blocking cannot be degraded into "finished": the
     /// child would be told its input ended when it never arrived.
     pub(crate) fn new(writer: W, input: Vec<u8>) -> io::Result<Self> {
-        set_write_nonblocking(&writer)?;
-        let mut feed = Self {
-            writer: Some(writer),
-            input,
-            written: 0,
-        };
-        if feed.input.is_empty() {
-            // Nothing to send: close now, so the child reads end-of-file at once.
-            feed.writer = None;
-        }
+        let mut feed = Self::open(writer)?;
+        feed.input = input;
+        feed.close_when_drained();
         Ok(feed)
     }
 
-    /// How many bytes of the input the pipe accepted.
+    /// A feed with nothing queued, left open until asked to close.
+    pub(crate) fn open(writer: W) -> io::Result<Self> {
+        set_write_nonblocking(&writer)?;
+        Ok(Self {
+            writer: Some(writer),
+            input: Vec::new(),
+            offset: 0,
+            accepted: 0,
+            close_when_drained: false,
+        })
+    }
+
+    /// Queue more input behind what is already queued.
+    pub(crate) fn push(&mut self, bytes: &[u8]) {
+        if self.writer.is_some() {
+            self.input.extend_from_slice(bytes);
+        }
+    }
+
+    /// Close the write end once everything queued has been accepted — at once,
+    /// if nothing is.
+    pub(crate) fn close_when_drained(&mut self) {
+        self.close_when_drained = true;
+        self.close_if_done();
+    }
+
+    /// Whether the write end is still open.
+    pub(crate) fn is_open(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    /// Bytes queued that the pipe has not accepted yet. Zero once closed: a
+    /// closed feed can deliver nothing more, and what it held is dropped.
+    pub(crate) fn pending(&self) -> usize {
+        if self.writer.is_some() {
+            self.input.len() - self.offset
+        } else {
+            0
+        }
+    }
+
+    /// Bytes the pipe has accepted over the feed's life.
     ///
-    /// Less than the input when the child ended — or closed its stdin — before
-    /// taking all of it. Accepted is not the same as read: the last pipe
-    /// buffer's worth may still be unread when the child exits.
-    pub(crate) fn written(&self) -> u64 {
-        self.written as u64
+    /// Accepted is not the same as read: the last pipe buffer's worth may still
+    /// be unread when the child exits.
+    pub(crate) fn accepted(&self) -> u64 {
+        self.accepted
     }
 
     /// Close the write end now, delivered or not.
     pub(crate) fn release(&mut self) {
         self.writer = None;
+        self.input = Vec::new();
+        self.offset = 0;
     }
 
-    /// Write up to `budget` more bytes of the input, returning how many moved.
+    fn close_if_done(&mut self) {
+        if self.close_when_drained && self.offset == self.input.len() {
+            self.release();
+        }
+    }
+
+    /// Write up to `budget` more bytes of the queue, returning how many moved.
     ///
     /// Never blocks. A full pipe ends the pass; a broken one — the child has
     /// exited or closed its stdin — ends the feed.
     pub(crate) fn feed(&mut self, budget: usize) -> usize {
         let mut moved = 0;
-        while moved < budget {
+        while moved < budget && self.offset < self.input.len() {
             let Some(writer) = self.writer.as_mut() else {
                 break;
             };
             let end = self
                 .input
                 .len()
-                .min(self.written + WRITE_CHUNK.min(budget - moved));
-            match writer.write(&self.input[self.written..end]) {
+                .min(self.offset + WRITE_CHUNK.min(budget - moved));
+            match writer.write(&self.input[self.offset..end]) {
                 // Windows `PIPE_NOWAIT`: no room for this write right now.
                 Ok(0) => break,
                 Ok(n) => {
-                    self.written += n;
+                    self.offset += n;
+                    self.accepted += n as u64;
                     moved += n;
-                    if self.written == self.input.len() {
-                        self.writer = None;
-                    }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => break,
                 // A broken pipe, or anything else: no further write can land.
-                Err(_) => self.writer = None,
+                Err(_) => {
+                    self.release();
+                    return moved;
+                }
             }
         }
+        if self.offset == self.input.len() {
+            // Everything queued is in: forget it, so a long-lived feed holds
+            // only what is still pending.
+            self.input.clear();
+            self.offset = 0;
+        }
+        self.close_if_done();
         moved
     }
 }

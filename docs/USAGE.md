@@ -1108,7 +1108,7 @@ another connection — for as long as the handle is kept.
 curl -s -X POST "$BASE/api/v1/processes" -H 'Content-Type: application/json'   -d '{"command":"cargo build --release","working_dir":"/srv/app"}'
 # {"id":0,"command":"cargo build --release","pid":4711,"state":"running",
 #  "started_at_ms":…,"stdout_end":0,"stderr_end":0,"stdout_start":0,"stderr_start":0,
-#  "output_complete":false,"stdin_open":false}
+#  "output_complete":false,"stdin_open":false,"stdin_pending":0}
 
 # Read from an offset. wait_ms (at most 25000) waits for output when there is none yet,
 # and answers as soon as some arrives. Ask again from `next`.
@@ -1140,8 +1140,26 @@ started with `--kill-orphans` — the rule `execute` follows.
 hour, then forgotten; at most 64 handles exist at once (`429 too-many-processes`) —
 delete the ones you are done with. **Stopping or restarting the server ends every
 background process** it started, and a running one holds off `--follow-relay-updates`
-(§2). A stdin write returns once the process has read it, so writing more than a pipe
-holds to a process that never reads waits until it ends or is killed.
+(§2).
+
+**A stdin write queues its body and waits for the process to take it.** `POST
+…/stdin` answers `204` once all of it is in the process's stdin pipe, or `202
+{"pending":N}` when its wait ends first — `wait_ms`, at most and by default 25000 — with
+`N` bytes still queued. Queued input keeps going in after the answer; `stdin_pending`
+on the handle says how much is left. Writes are taken in the order they arrive, and at
+most 4 MiB may be queued (`409 stdin-backlog-full` past that — wait for the process to
+read some). `close=true` closes stdin once everything queued is in. Input still queued
+when the process exits, or closes its stdin, is dropped, and a write waiting on it
+answers `409`. Since 0.31.0; before, a write held a server thread until the process had
+read it, so writing more than a pipe holds to a process that never read waited for as
+long as the process ran.
+
+```bash
+curl -s -X POST "$BASE/api/v1/processes" -H 'Content-Type: application/json' \
+  -d '{"command":"sort","stdin":true}'
+curl -s -X POST "$BASE/api/v1/processes/1/stdin?close=true" --data-binary @words.txt
+# 204 — every byte is in; sort has its end-of-file
+```
 
 Through a relay this works as it does locally — each read is an ordinary request, and
 a 25 s wait sits well inside the relay's per-request limit.
@@ -2195,7 +2213,9 @@ startup rather than serving local-only.
 | **409** `destination-busy` on `PUT .../fs/file` or `POST .../fs/move` | an upload in flight names that path, or a path under the tree being moved (§3.1) | cancel the upload or wait for it to finish, then retry |
 | **404** `process-not-found` on `.../processes/{id}` | no such handle: deleted, kept past its hour after exit, or the server restarted | handles do not survive a restart (§3.3) |
 | **429** `too-many-processes` on `POST .../processes` | 64 handles exist | `DELETE` the ones you are done with |
-| **409** `stdin-unavailable` on `POST .../processes/{id}/stdin` | stdin was not requested at start, was closed, or another write is in progress | start with `"stdin": true`; one write at a time |
+| **409** `stdin-unavailable` on `POST .../processes/{id}/stdin` | stdin was not requested at start, or has been closed — by `close=true`, or by the process | start with `"stdin": true` |
+| **409** `stdin-backlog-full` on `POST .../processes/{id}/stdin` | 4 MiB of input is already queued that the process has not read | wait for `stdin_pending` to fall, then send again |
+| **202** `{"pending":N}` on `POST .../processes/{id}/stdin` | the write's wait ended with `N` bytes not yet taken; they stay queued | not an error — read `stdin_pending` on the handle, or send the next write, which waits behind it |
 | **409** `cross-device` on `POST .../fs/move` | source and destination are on different filesystems | a move does not copy: download and upload, or run the copy as a command |
 | **413** `body-too-large` on `PUT .../fs/file` | the body is over one upload chunk (`limit` in the body) | send it through `POST /api/v1/fs/uploads` (§3.1) |
 | **404** on `POST .../fs/mkdir` | the parent does not exist | pass `parents=true` |

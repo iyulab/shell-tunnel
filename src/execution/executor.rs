@@ -345,7 +345,7 @@ fn run_command_streaming(
     }
 
     let duration = start.elapsed();
-    let stdin_written = in_feed.as_ref().map(PipeFeed::written);
+    let stdin_written = in_feed.as_ref().map(PipeFeed::accepted);
     drop(in_feed);
     let Kept {
         merged: raw_output,

@@ -28,13 +28,12 @@
 //! than skipping silently.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::Write;
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
-use super::pipe::PipeDrain;
+use super::pipe::{PipeDrain, PipeFeed};
 use crate::audit::{AuditEvent, AuditSink, Identity};
 use crate::process::{shell_command, KillGroup};
 
@@ -43,6 +42,12 @@ pub const MAX_PROCESSES: usize = 64;
 
 /// Bytes each stream keeps. Older bytes are discarded as new ones arrive.
 pub const RING_BYTES: usize = 1024 * 1024;
+
+/// Most input a handle holds for its stdin that the process has not taken yet.
+///
+/// Twice the largest body the stdin route accepts, so one write can always be
+/// queued behind another that is still going in.
+pub const STDIN_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 
 /// How long a handle is kept after its process ends.
 pub const RETAIN_AFTER_EXIT: Duration = Duration::from_secs(3600);
@@ -118,8 +123,12 @@ pub enum ProcessError {
     TooMany,
     /// The process has already exited.
     NotRunning,
-    /// stdin was not opened at start, has been closed, or another write holds it.
+    /// stdin was not opened at start, or has been closed — by a caller, or by
+    /// the process itself.
     StdinUnavailable,
+    /// More input is queued than [`STDIN_QUEUE_BYTES`] allows; what is queued
+    /// has to be taken by the process first.
+    StdinBacklogFull,
     /// This platform cannot deliver the signal.
     SignalUnsupported,
     /// The OS refused: spawn, write, or signal.
@@ -148,6 +157,16 @@ pub struct ProcessInfo {
     /// Whether no more output can arrive.
     pub output_complete: bool,
     pub stdin_open: bool,
+    /// Input written to stdin that the process has not taken yet.
+    pub stdin_pending: u64,
+}
+
+/// How a stdin write ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StdinWrite {
+    /// Bytes of this write — and of any queued before it — that the process
+    /// had not taken when the wait ended. Zero means all of it is in the pipe.
+    pub pending: u64,
 }
 
 /// One read of a stream.
@@ -185,9 +204,8 @@ struct Proc {
     group: KillGroup,
     stdout_pipe: Option<PipeDrain<ChildStdout>>,
     stderr_pipe: Option<PipeDrain<ChildStderr>>,
-    /// `None` when not requested, closed, or taken by a write in progress.
-    stdin: Option<ChildStdin>,
-    stdin_busy: bool,
+    /// `None` when stdin was not requested. Fed by the watcher.
+    stdin: Option<PipeFeed<ChildStdin>>,
     stdout: Ring,
     stderr: Ring,
 }
@@ -216,7 +234,8 @@ impl Proc {
             stdout_start: self.stdout.start(),
             stderr_start: self.stderr.start(),
             output_complete: !self.running() && self.pipes_done(),
-            stdin_open: self.stdin.is_some() || self.stdin_busy,
+            stdin_open: self.stdin.as_ref().is_some_and(|f| f.is_open()),
+            stdin_pending: self.stdin.as_ref().map_or(0, |f| f.pending() as u64),
         }
     }
 
@@ -346,6 +365,16 @@ impl ProcessTable {
         group.reap_on_drop();
         let mut child = cmd.spawn().map_err(|e| ProcessError::Io(e.to_string()))?;
         group.adopt(&child);
+        let stdin = match child.stdin.take().map(PipeFeed::open).transpose() {
+            Ok(feed) => feed,
+            Err(e) => {
+                // Not run on a blocking write end: that is the thread this
+                // feed exists to avoid.
+                group.kill();
+                let _ = child.wait();
+                return Err(ProcessError::Io(e.to_string()));
+            }
+        };
 
         let id = table.next_id;
         table.next_id += 1;
@@ -359,8 +388,7 @@ impl ProcessTable {
             exit_code: None,
             stdout_pipe: child.stdout.take().map(PipeDrain::new),
             stderr_pipe: child.stderr.take().map(PipeDrain::new),
-            stdin: child.stdin.take(),
-            stdin_busy: false,
+            stdin,
             child: Some(child),
             group,
             stdout: Ring::default(),
@@ -450,42 +478,46 @@ impl ProcessTable {
         }
     }
 
-    /// Write `bytes` to the process's stdin, and close it after if `close`.
+    /// Queue `bytes` for the process's stdin, close it after if `close`, and
+    /// wait up to `wait` for the process to take them.
     ///
-    /// Blocking: a write larger than the pipe's buffer returns once the
-    /// process has read it. Run it off the async runtime.
-    pub fn write_stdin(
+    /// The bytes are written by the watcher, without blocking, as the pipe
+    /// takes them — never by a thread parked in `write`, which a process that
+    /// does not read (or a grandchild holding its stdin) would hold forever.
+    /// The wait is async and costs nothing while it lasts; when it ends with
+    /// input still queued, the input stays queued and [`StdinWrite::pending`]
+    /// says how much.
+    pub async fn write_stdin(
         &self,
         id: u64,
         bytes: &[u8],
         close: bool,
         identity: Option<Identity>,
-    ) -> Result<(), ProcessError> {
-        let mut stdin = {
+        wait: Duration,
+    ) -> Result<StdinWrite, ProcessError> {
+        // Taken through this offset, the process has everything up to and
+        // including this write.
+        let target = {
             let mut table = self.lock();
             let proc = table.procs.get_mut(&id).ok_or(ProcessError::NotFound)?;
             if !proc.running() {
                 return Err(ProcessError::NotRunning);
             }
-            let Some(stdin) = proc.stdin.take() else {
-                return Err(ProcessError::StdinUnavailable);
-            };
-            proc.stdin_busy = true;
-            stdin
-        };
-        // Written with the table unlocked: the watcher must keep draining the
-        // process's output meanwhile, or a process that echoes what it reads
-        // would fill its output pipe and never read the rest of this.
-        let written = stdin.write_all(bytes).and_then(|()| stdin.flush());
-        {
-            let mut table = self.lock();
-            if let Some(proc) = table.procs.get_mut(&id) {
-                proc.stdin_busy = false;
-                if !close && written.is_ok() {
-                    proc.stdin = Some(stdin);
-                }
+            let feed = proc
+                .stdin
+                .as_mut()
+                .filter(|f| f.is_open())
+                .ok_or(ProcessError::StdinUnavailable)?;
+            if feed.pending() + bytes.len() > STDIN_QUEUE_BYTES {
+                return Err(ProcessError::StdinBacklogFull);
             }
-        }
+            feed.push(bytes);
+            let target = feed.accepted() + feed.pending() as u64;
+            if close {
+                feed.close_when_drained();
+            }
+            target
+        };
         self.record(
             AuditEvent::new("process.stdin")
                 .with_identity(identity)
@@ -493,7 +525,38 @@ impl ProcessTable {
                 .with_process(id)
                 .with_bytes(bytes.len() as u64),
         );
-        written.map_err(|e| ProcessError::Io(e.to_string()))
+        self.inner.wake.notify_all();
+
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            // Registered before the check, as in `read_wait`.
+            let notified = self.inner.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let table = self.lock();
+                let proc = table.procs.get(&id).ok_or(ProcessError::NotFound)?;
+                let feed = proc.stdin.as_ref().ok_or(ProcessError::StdinUnavailable)?;
+                let accepted = feed.accepted();
+                if accepted >= target {
+                    return Ok(StdinWrite { pending: 0 });
+                }
+                if !feed.is_open() {
+                    // Closed with this input still queued: it is gone.
+                    return Err(if proc.running() {
+                        ProcessError::StdinUnavailable
+                    } else {
+                        ProcessError::NotRunning
+                    });
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Ok(StdinWrite {
+                        pending: target - accepted,
+                    });
+                }
+            }
+            let _ = tokio::time::timeout_at(deadline, notified).await;
+        }
     }
 
     pub fn signal(
@@ -665,8 +728,15 @@ fn watch(weak: Weak<Inner>) {
                 stderr_pipe,
                 stdout,
                 stderr,
+                stdin: stdin_feed,
                 ..
             } = proc;
+            if let Some(feed) = stdin_feed.as_mut() {
+                let was_open = feed.is_open();
+                // A write waiting on this input is woken by progress, and by
+                // the pipe closing under it.
+                changed |= feed.feed(DRAIN_BUDGET) > 0 || was_open != feed.is_open();
+            }
             if let Some(pipe) = stdout_pipe.as_mut() {
                 changed |= pipe.drain(DRAIN_BUDGET, &mut |chunk| stdout.push(chunk)) > 0;
             }
@@ -682,7 +752,10 @@ fn watch(weak: Weak<Inner>) {
                         proc.exit_code = Some(status.code().unwrap_or(-1));
                         proc.ended = Some(Instant::now());
                         proc.ended_at_ms = Some(now_ms());
-                        proc.stdin = None;
+                        // What is still queued has nobody left to read it.
+                        if let Some(feed) = proc.stdin.as_mut() {
+                            feed.release();
+                        }
                         if kill_orphans {
                             proc.group.kill();
                         } else {

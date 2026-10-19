@@ -1965,7 +1965,7 @@
         ],
         "summary": "Write to stdin",
         "operationId": "processStdin",
-        "description": "Writes the body to the process's stdin; `close=true` closes it after, so the process reads end-of-file. Returns once the process has read what was written. Recorded with the byte count only.\n\nRequired capability: `exec`.",
+        "description": "Queues the body for the process's stdin and waits up to `wait_ms` for the process to take it. The server writes queued input as the pipe takes it, in arrival order, without holding a thread. `close=true` closes stdin once everything queued is in, so the process reads end-of-file. At most 4 MiB may be queued. Recorded with the byte count only.\n\nRequired capability: `exec`.",
         "parameters": [
           {
             "name": "close",
@@ -1973,6 +1973,17 @@
             "schema": {
               "type": "boolean",
               "default": false
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "description": "How long to wait for the process to take the input. Since 0.31.0.",
+            "schema": {
+              "type": "integer",
+              "default": 25000,
+              "minimum": 0,
+              "maximum": 25000
             }
           }
         ],
@@ -1989,7 +2000,26 @@
         },
         "responses": {
           "204": {
-            "description": "Written."
+            "description": "All of it is in the process's stdin pipe."
+          },
+          "202": {
+            "description": "The wait ended with input still queued; it keeps going in. `pending` counts the bytes of this write, and of any queued before it, not yet taken.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "pending"
+                  ],
+                  "properties": {
+                    "pending": {
+                      "type": "integer",
+                      "format": "int64"
+                    }
+                  }
+                }
+              }
+            }
           },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"
@@ -2008,7 +2038,7 @@
             }
           },
           "409": {
-            "description": "`process-not-running`, or `stdin-unavailable` (not requested at start, closed, or another write in progress).",
+            "description": "`process-not-running` (including when the process exited with this input still queued), `stdin-unavailable` (not requested at start, or closed — by a caller or by the process), or `stdin-backlog-full` (4 MiB already queued).",
             "content": {
               "application/json": {
                 "schema": {
@@ -3272,6 +3302,11 @@
           },
           "stdin_open": {
             "type": "boolean"
+          },
+          "stdin_pending": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Input written to stdin that the process has not taken yet. Since 0.31.0."
           }
         }
       },

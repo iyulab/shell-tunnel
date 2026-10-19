@@ -226,6 +226,103 @@ async fn stdin_written_and_closed_reaches_the_process() {
     assert!(entry.get("command").is_none());
 }
 
+/// A process that never reads its stdin cannot hold the write: the input is
+/// queued, the call answers when its wait ends, and says how much is still
+/// going in. Until 0.31.0 the write was a blocking `write_all` on a pool thread,
+/// and this call did not answer until the process exited — here, two minutes.
+#[tokio::test]
+async fn a_process_that_does_not_read_stdin_does_not_hold_the_write() {
+    let api = Api::new();
+    let id = api
+        .start(json!({"command": long_running(), "stdin": true}))
+        .await;
+    let chunk = vec![b'x'; 1536 * 1024];
+
+    let (status, body) = api
+        .call(
+            Method::POST,
+            &format!("/api/v1/processes/{id}/stdin?wait_ms=200"),
+            Body::from(chunk.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let pending = body["pending"].as_u64().expect("pending");
+    assert!(
+        pending > 0 && pending <= chunk.len() as u64,
+        "a pipe nobody reads cannot have taken 1.5 MiB: {body}"
+    );
+    let (_, info) = api
+        .call(
+            Method::GET,
+            &format!("/api/v1/processes/{id}"),
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(info["stdin_open"], true, "{info}");
+    assert!(info["stdin_pending"].as_u64().unwrap() > 0, "{info}");
+
+    // The queue is bounded: a second write still fits, a third does not.
+    let (status, body) = api
+        .call(
+            Method::POST,
+            &format!("/api/v1/processes/{id}/stdin?wait_ms=0"),
+            Body::from(chunk.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let (status, body) = api
+        .call(
+            Method::POST,
+            &format!("/api/v1/processes/{id}/stdin?wait_ms=0"),
+            Body::from(chunk.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"], "stdin-backlog-full");
+
+    // One thread feeds and drains every process. While this stdin is backed
+    // up, another process's output still flows — the feed did not park it.
+    let other = api.start(json!({"command": "echo still_drained"})).await;
+    assert!(api
+        .read_all(other, "stdout")
+        .await
+        .contains("still_drained"));
+
+    api.state.processes.shutdown();
+}
+
+/// Input larger than a pipe buffer, read by a process that writes it back:
+/// the write answers once all of it is in, and every line comes out.
+#[tokio::test]
+async fn queued_input_reaches_a_process_that_reads_it() {
+    let api = Api::new();
+    let command = if cfg!(windows) {
+        r#"findstr "^""#
+    } else {
+        "cat"
+    };
+    let id = api.start(json!({"command": command, "stdin": true})).await;
+    let line = "0123456789abcdefghijklmnopqrstuvwxyz";
+    let lines = 20_000; // ~740 KiB, far past a 64 KiB pipe buffer
+    let input = format!(
+        "{line}
+"
+    )
+    .repeat(lines);
+
+    let (status, body) = api
+        .call(
+            Method::POST,
+            &format!("/api/v1/processes/{id}/stdin?close=true"),
+            Body::from(input),
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let text = api.read_all(id, "stdout").await;
+    assert_eq!(text.lines().filter(|l| *l == line).count(), lines);
+}
+
 #[tokio::test]
 async fn stdin_is_refused_when_it_was_not_asked_for() {
     let api = Api::new();
