@@ -5346,3 +5346,36 @@ fn the_delete_response_has_one_definition() {
          missing"
     );
 }
+
+/// An entry directly under `/` can be named for deletion on a machine-wide
+/// Unix scope.
+///
+/// The handler resolves the parent of what it deletes separately, and the
+/// parent of `/usr` was computed as `""` — refused as an empty path — so every
+/// such delete answered `400` "path is empty" before looking at the entry.
+/// A dry run without `recursive` keeps this harmless: reaching the directory
+/// check (`recursive-required`) is what proves the path was understood.
+/// `/usr` rather than `/tmp`, which is a symlink on macOS.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_entry_directly_under_the_unix_root_can_be_named_for_deletion() {
+    let state = AppState::new().with_fs_root(FsRoot::machine_wide());
+    let response = create_router_with_state(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/v1/fs/file?path=/usr&dry_run=true")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    let text = String::from_utf8_lossy(&bytes);
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    assert!(text.contains("recursive-required"), "{text}");
+}

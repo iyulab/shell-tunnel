@@ -51,6 +51,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **`DELETE /api/v1/fs/file` can name an entry directly under `/`.** With no `--fs-root`
+  on Linux or macOS, every such delete (`?path=/srv`) was refused `400 bad-path` "path is
+  empty" before the entry was looked at; deeper paths were unaffected, and Windows drive
+  paths (`C:/srv`) never were.
+
 - **A command no longer inherits a `RUST_LOG` the server set for itself.** The server
   passed its log level to its logger by writing it into its own `RUST_LOG`, and every
   command `execute`, a session or an action started inherited it — so a Rust tool the

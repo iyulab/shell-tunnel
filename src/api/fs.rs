@@ -1139,8 +1139,14 @@ pub async fn delete_file(
 /// `"."` names the root itself when there is no separator — `resolve_existing`
 /// already gives that string a defined meaning (`src/fs/root.rs:113`), so this
 /// reuses it rather than inventing a second convention for "no parent".
+///
+/// A separator at index 0 (`/srv`, machine-wide on Unix) leaves the anchor
+/// itself, `/`, as the parent. Slicing up to the separator gave `""` instead,
+/// which `resolve_existing` refuses as an empty path — so no entry directly
+/// under `/` could be deleted at all.
 fn split_last_component(rel: &str) -> (&str, &str) {
     match rel.rfind(['/', '\\']) {
+        Some(0) => (&rel[..1], &rel[1..]),
         Some(idx) => (&rel[..idx], &rel[idx + 1..]),
         None => (".", rel),
     }
@@ -2423,6 +2429,14 @@ fn record_orphans(removed: &[(String, u64)], audit: &crate::audit::AuditSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_parent_of_an_entry_directly_under_the_root_is_the_root() {
+        assert_eq!(split_last_component("/srv"), ("/", "srv"));
+        assert_eq!(split_last_component("/srv/app"), ("/srv", "app"));
+        assert_eq!(split_last_component("C:/srv"), ("C:", "srv"));
+        assert_eq!(split_last_component("app"), (".", "app"));
+    }
 
     #[test]
     fn ranges_parse_into_inclusive_bounds() {
