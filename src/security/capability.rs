@@ -96,6 +96,9 @@ impl<S: Into<String>> FromIterator<S> for CapabilitySet {
 /// holds it. The per-action strings (`action:<id>`) are not listed: they name
 /// whatever the device's owner defined, and are checked against the
 /// definitions at startup instead (`src/actions.rs`).
+///
+/// `expose:*` likewise stands for every exposed service, and is the one listed
+/// capability `operator` does **not** hold (`src/expose.rs` says why).
 pub const KNOWN_CAPABILITIES: &[&str] = &[
     "exec",
     "session.read",
@@ -103,6 +106,7 @@ pub const KNOWN_CAPABILITIES: &[&str] = &[
     "fs.read",
     "fs.write",
     crate::actions::ANY_ACTION,
+    crate::expose::ANY_EXPOSE,
 ];
 
 /// Resolve a role **preset** name to its capability set (spec §6).
@@ -131,6 +135,10 @@ pub fn preset(name: &str) -> Option<CapabilitySet> {
                 "fs.read",
                 "fs.write",
                 crate::actions::ANY_ACTION,
+                // Not `expose:*`. A key scoped to `operator` before a service
+                // was exposed must not reach it because the service now is —
+                // exposing opens a door, and who may walk through it is
+                // granted by name, not inherited by a preset written earlier.
             ]
             .into_iter()
             .collect(),

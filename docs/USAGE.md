@@ -683,6 +683,7 @@ notices, which on default settings is hours.
 | `GET`, `DELETE` | `/api/v1/processes/{id}` | `exec` |
 | `GET` | `/api/v1/processes/{id}/output` | `exec` |
 | `POST` | `/api/v1/processes/{id}/stdin`, `/api/v1/processes/{id}/signal` | `exec` |
+| any | `/x/{name}`, `/x/{name}/…` — an exposed service ([§3.4](#34-exposed-services)); key in `X-Shell-Tunnel-Key` | `expose:{name}` or `expose:*` |
 
 `GET /api/v1/fs/uploads/{id}` needs `fs.write`, not `fs.read` — an upload session is a
 write operation end to end, including checking where it left off. See [§3.1](#31-files)
@@ -1165,6 +1166,90 @@ curl -s -X POST "$BASE/api/v1/processes/1/stdin?close=true" --data-binary @words
 Through a relay this works as it does locally — each read is an ordinary request, and
 a 25 s wait sits well inside the relay's per-request limit.
 
+### 3.4 Exposed services
+
+A machine reachable only through this server — behind NAT, through a relay — has no other
+way in for the HTTP services running beside it: an inference API, a notebook, a dashboard,
+a metrics exporter. `--expose` (since 0.32.0) puts one such service behind this server, at
+`/x/<name>/…`, under the same keys, audit trail and relay path as everything else:
+
+```bash
+shell-tunnel --relay wss://relay.example.com:8443 --enroll-token $ENROLL \
+  --device-name gpu-01 -k $KEY --preset operator --capabilities expose:llm \
+  --expose llm=http://127.0.0.1:8080
+```
+
+```bash
+# Through the relay; the same path works on the device's own address.
+curl -s "$RELAY/d/gpu-01/x/llm/v1/models" \
+  -H "X-Shell-Tunnel-Key: $KEY" \
+  -H "Authorization: Bearer $SERVICE_TOKEN"
+```
+
+**What may be exposed.** `<name>=<url>`, repeatable. The URL must be plain `http://` on
+this machine's loopback — `127.0.0.1`, `[::1]` or `localhost` — with an optional port
+(80 if omitted) and an optional path prefix. Anything else ends startup: another host,
+an `https://` upstream, a query in the URL, a name given twice. A name is 1–32
+characters of `a`–`z`, `0`–`9` and `-`. The set is fixed when the server starts: no
+request picks a destination, and nothing at runtime adds one. This is not a general
+proxy.
+
+**The key goes in its own header.** On `/x/…` the server's key is read from
+`X-Shell-Tunnel-Key` — bare, without `Bearer` — and from nowhere else. `Authorization`
+there belongs to the service and is passed to it untouched, so a service with its own
+API key keeps it; a key of this server's sent in `Authorization` is not taken for one
+(`401`). `X-Shell-Tunnel-Key` never reaches the service. An OpenAI-style client adds
+the header with its `default_headers` option, with the base URL set to
+`…/x/<name>/v1`.
+
+**Granted by name.** A key needs `expose:<name>`, or `expose:*` for every exposed
+service; the wildcard `*` covers both. **`operator` does not hold `expose:*`** — a key
+scoped before a service was exposed does not reach it because the service now is — so
+on a reachable server, where an unscoped key is `operator` (§4), add the grant:
+`--preset operator --capabilities expose:<name>`. The startup banner names each
+exposed service and says when the server's keys cannot reach one. A grant of
+`expose:<name>` for a name that is not exposed, or `expose:*` with nothing exposed,
+ends startup, as an undefined action does.
+
+**What the service sees.** The path after `/x/<name>` is appended to the URL's path
+prefix, still encoded as the caller sent it, with the query: `/x/llm/v1/models?x=1`
+with `--expose llm=http://127.0.0.1:8080/api` asks for `/api/v1/models?x=1`. `Host`
+is the upstream's own `host:port`. Hop-by-hop headers, `X-Shell-Tunnel-Key` and this
+server's relay headers are dropped; every other header — `Authorization`,
+`Content-Type`, `Accept`, cookies — is passed on. Each request is a fresh connection
+with `Connection: close`.
+
+**The answer is streamed.** Status and headers come back as the service sent them, and
+the body as it is produced — a server-sent event stream or a model generating tokens
+reaches the caller as it goes, locally and through a relay (both at 0.30.0 or newer;
+see §5). There is no limit on how long a body runs; the service has 120 s to send its
+status line. An answer the service cuts off after its status reaches the caller as a
+broken response — the connection ends without the body's end — never as a short one
+that reads as complete. While a body is still being sent, the server counts as busy and
+an update waits for it (§2).
+
+| Answer | Meaning |
+|---|---|
+| the service's own status | it answered; everything below is this server's |
+| `401` | no key in `X-Shell-Tunnel-Key`, or one this server does not know |
+| `403` | the key holds neither `expose:<name>` nor `expose:*` |
+| `404` `expose-not-found` | nothing is exposed under that name |
+| `502` `expose-upstream-unreachable` | nothing accepted a connection at the service's address within 10 s — it is not running, or not on that port |
+| `502` `expose-upstream-bad-answer` | the service closed the connection before answering, or answered with something that is not HTTP/1.1 |
+| `504` `expose-upstream-timeout` | the service sent no status line within 120 s |
+| `413` | the request body is over the server's 8 MiB ceiling |
+
+Every request is recorded as an `expose` entry (§4): the service's name, method and path
+— never the query — the status, the bytes of the answer's body and how long it took.
+Neither body is recorded.
+
+Not in 0.32.0: WebSocket upstreams (a notebook's kernel channel, for one) — an upgrade
+request is passed on as a plain request and does not become a WebSocket; a key in the
+path for clients that cannot add a header; `https://` upstreams. A service on loopback
+that checks no credential of its own — many do, on the reasoning that only this machine
+can reach them — is guarded by this server's key alone once exposed, and the banner says
+so.
+
 ## 4. Authentication and capabilities
 
 Opaque bearer tokens in `Authorization: Bearer <token>`. `/health` never
@@ -1183,6 +1268,8 @@ Each token carries a set of capabilities; each route declares the one it needs:
 | `fs.write` | delete a file or a directory tree, make a directory, move an entry, write a small file in one request, and the whole upload-session lifecycle (including reading a session's own resume point) |
 | `action:<id>` | run the named action `<id>` ([§3.2](#32-named-actions)), and nothing else |
 | `action:*` | run every named action this server defines |
+| `expose:<name>` | reach the service exposed as `<name>` ([§3.4](#34-exposed-services)), and nothing else |
+| `expose:*` | reach every service this server exposes |
 | `*` | everything |
 
 Missing or unknown token → **401**. Valid token without the capability → **403**
@@ -1192,7 +1279,7 @@ Presets are a convenience, not a wire contract:
 
 | Preset | Capabilities |
 |---|---|
-| `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write`, `action:*` |
+| `operator` | `exec`, `session.read`, `session.manage`, `fs.read`, `fs.write`, `action:*` — not `expose:*` |
 | `file-write` | `fs.read`, `fs.write` — no `exec` |
 | `file-read` | `fs.read` — no `exec` |
 | `full-control` | `*` |
@@ -1200,7 +1287,10 @@ Presets are a convenience, not a wire contract:
 The cut line is `exec`. A token holding it reaches every file this process can,
 so withholding the file API from it confines nothing — which is why `operator`
 carries `fs.*`, and `action:*` for the same reason. The `file-*` presets carry no `exec`, and there a `--fs-root`
-jail is a real boundary rather than a slow path.
+jail is a real boundary rather than a slow path. `expose:*` is the one capability
+`operator` does not carry, since 0.32.0: exposing a service opens a door, and a key
+scoped before the service was exposed does not walk through it unless it is granted by
+name. The banner names what `operator` withholds.
 
 `read-only` was removed in 0.14.0: it granted only `session.read`, so it could
 not read a file despite its name. Use `file-read` to read files, or
@@ -1430,7 +1520,8 @@ capability token is the access control — withhold `exec` to deny execution.
 | `kind` | Recorded when | Notable fields |
 |---|---|---|
 | `execute` | a command ran | `command`, `exit_code`, `timed_out`, `duration_ms`, `session_id` (if not one-shot), `output_bytes` (**only** when the output was capped — see below), `bytes` (**only** when the request carried `stdin`: how much its stdin accepted — never the input itself) |
-| `denied` | a request was refused by the authentication layer, by the server's own body ceiling, or by the actions route before anything ran | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, `missing-capability:action:<id>`, `unknown-action:<id>`, `invalid-param:<name>`, `malformed-body`, …) |
+| `denied` | a request was refused by the authentication layer, by the server's own body ceiling, or by the actions route before anything ran | `status`, `reason` (`missing-token`, `invalid-token`, `body-over-ceiling`, `missing-capability:action:<id>`, `missing-capability:expose:<name>`, `unknown-action:<id>`, `invalid-param:<name>`, `malformed-body`, …) |
+| `expose` | a request for an exposed service was answered, or could not be ([§3.4](#34-exposed-services)) | `expose` (the name), `route` (method and path, never the query), `status` (the service's, or this server's `404`/`502`/`504`), `bytes` (of the answer's body as delivered), `duration_ms` (until the body ended) |
 | `action` | a named action ran | `action`, `params` (the values as accepted — each one the definition allowed), `command` (the argv that ran, rendered), `exit_code`, `timed_out`, `duration_ms`, `output_bytes` (as for `execute`) |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
@@ -2043,6 +2134,7 @@ is involved to spend anything further.
 | `--audit-max-bytes <N>` | Rotate the trail past this size (keeps one generation); `0` never rotates | `67108864` (64 MiB) |
 | `--fs-root <PATH>` | Confine the filesystem API to this directory | the whole machine |
 | `--actions <FILE>` | Serve the named actions defined in this JSON file ([§3.2](#32-named-actions)). Read once at startup; any mistake in it ends startup | none |
+| `--expose <NAME=URL>` | Pass `/x/NAME/…` to a loopback HTTP service ([§3.4](#34-exposed-services)). Repeatable. The URL must be `http://` on `127.0.0.1`, `[::1]` or `localhost`; anything else ends startup | none |
 | `--fs-chunk-size <N>` | Upload chunk size, in bytes. Must stay under the relay's 8 MiB body ceiling — refused at startup at or above it. Sets the size for both a direct and a relayed request; without it, a relay-forwarded request is advertised a smaller size than a direct one (§10) | `4194304` (4 MiB) direct; `262144` (256 KiB) for a request that crossed a relay |
 | `--check-update` / `--update` / `--no-update-check` | *(self-update builds)* | - |
 
@@ -2187,6 +2279,8 @@ startup rather than serving local-only.
 | `… is set, and this client does not use it` | a proxy environment variable is set, and the device dials the relay directly | on a network that requires a proxy for outbound connections, that alone explains the failure — there is no proxy support to turn on |
 | **401** on an API call | missing or unknown token | supply `Authorization: Bearer …` |
 | **403** on an API call | token lacks the capability | issue with `--preset`/`--capabilities` |
+| `--expose cannot be used: …` (exit status 2) | an `--expose` value is not `<name>=<url>`, the URL is not plain `http://` on loopback, or a name is given twice — the message names which | fix the value; no service is exposed until every one is valid |
+| `Configuration error: `expose:<name>` grants a service that is not exposed` — or `expose:*` with nothing exposed (exit status 2) | a grant names a service no `--expose` defines | expose it, or correct the grant |
 | `--actions <FILE> cannot be used: … action '<id>': …` (exit status 2) | a definition is wrong — the message names the action and the field | fix that definition; the whole file is refused, not just the action |
 | `` `action:<id>` grants an action that is not defined `` (exit status 2) | `--capabilities` names an action the `--actions` file does not define | correct the name, or define it |
 | **422** `INVALID_PARAMS` on `/api/v1/actions/{id}` | a parameter is missing, unknown, or the wrong shape; `details` names it | send what `GET /api/v1/actions` lists for that action |

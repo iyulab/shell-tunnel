@@ -36,6 +36,9 @@ pub struct AppState {
     pub uploads: Arc<crate::fs::UploadStore>,
     /// The named actions this server runs. Empty unless `--actions` gave some.
     pub actions: Arc<crate::actions::ActionSet>,
+    /// The services this server exposes at `/x/<name>/…`. Empty unless
+    /// `--expose` gave some.
+    pub exposes: Arc<crate::expose::ExposeSet>,
     /// What is in flight, and the latch an update closes the door with.
     pub activity: Arc<super::activity::Activity>,
     /// Background processes (`/api/v1/processes`).
@@ -86,6 +89,7 @@ impl AppState {
                 crate::fs::DEFAULT_CHUNK_SIZE,
             )),
             actions: Arc::new(crate::actions::ActionSet::default()),
+            exposes: Arc::new(crate::expose::ExposeSet::default()),
             activity: Arc::new(super::activity::Activity::new()),
             processes: crate::execution::processes::ProcessTable::new(),
             relay: Arc::new(std::sync::RwLock::new(None)),
@@ -95,6 +99,12 @@ impl AppState {
     /// Serve these named actions.
     pub fn with_actions(mut self, actions: crate::actions::ActionSet) -> Self {
         self.actions = Arc::new(actions);
+        self
+    }
+
+    /// Expose these services at `/x/<name>/…`.
+    pub fn with_exposes(mut self, exposes: crate::expose::ExposeSet) -> Self {
+        self.exposes = Arc::new(exposes);
         self
     }
 

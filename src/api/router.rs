@@ -230,9 +230,21 @@ fn routes() -> Router<AppState> {
         .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
+    // Exposed services. The body limit is raised to the outermost layer's
+    // ceiling so a request for a service is refused for size only there, the
+    // same for every route; axum's 2 MiB default would otherwise cut in first.
+    let expose_routes = Router::new()
+        .route("/x/{name}", any(super::expose::proxy))
+        // A catch-all matches one character or more, so the service's root
+        // with its trailing slash needs a route of its own.
+        .route("/x/{name}/", any(super::expose::proxy))
+        .route("/x/{name}/{*rest}", any(super::expose::proxy))
+        .route_layer(DefaultBodyLimit::max(crate::fs::MAX_CHUNK_SIZE));
+
     Router::new()
         .route("/health", get(health))
         .nest("/api/v1", api_v1)
+        .merge(expose_routes)
 }
 
 /// Put the outermost guard on a router and give it its state.
@@ -277,6 +289,10 @@ pub enum RequiredCapability {
     /// on the route: one route runs every action, and each action is granted
     /// separately.
     Action,
+    /// Requires `expose:<name>` for the service the path names, or
+    /// `expose:*` — with the key read from `X-Shell-Tunnel-Key`, not
+    /// `Authorization`, which on these paths belongs to the service.
+    Expose,
 }
 
 /// Map a matched route (`method` + axum [`MatchedPath`]) to its required
@@ -335,6 +351,7 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
         // answer is filtered to that token's grant.
         ("GET", "/api/v1/actions") => Authenticated,
         ("POST", "/api/v1/actions/{id}") => RequiredCapability::Action,
+        (_, "/x/{name}" | "/x/{name}/" | "/x/{name}/{*rest}") => RequiredCapability::Expose,
         _ => Authenticated,
     }
 }
@@ -432,11 +449,25 @@ async fn capability_auth_middleware(
 
     // Extract the bearer token and resolve its capabilities.
     // Missing header, wrong prefix, or unregistered token → 401.
-    let token = request
-        .headers()
-        .get(AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|header| store.extract_key(header));
+    //
+    // An exposed service's path takes the key from its own header, bare:
+    // `Authorization` there is the service's, passed through untouched, and is
+    // never read as this server's key — a service credential that happened to
+    // equal a key here must not be taken for one.
+    let token = if required == RequiredCapability::Expose {
+        request
+            .headers()
+            .get(crate::expose::KEY_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+    } else {
+        request
+            .headers()
+            .get(AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|header| store.extract_key(header))
+    };
 
     let identity = token.as_deref().and_then(|t| store.identity(t));
 
@@ -514,6 +545,35 @@ async fn capability_auth_middleware(
                 )
                 .await;
             tracing::debug!(%method, path = %route, action = %shown, "authorization denied (403): action not granted");
+            Err(StatusCode::FORBIDDEN)
+        }
+        RequiredCapability::Expose => {
+            // The name as the handler will see it, by the same extractor.
+            let (mut parts, body) = request.into_parts();
+            let name = axum::extract::Path::<std::collections::HashMap<String, String>>::from_request_parts(
+                &mut parts,
+                &(),
+            )
+            .await
+            .ok()
+            .and_then(|axum::extract::Path(params)| params.get("name").cloned())
+            .unwrap_or_default();
+            let request = Request::from_parts(parts, body);
+            if capabilities.satisfies(&crate::expose::capability_for(&name))
+                || capabilities.satisfies(crate::expose::ANY_EXPOSE)
+            {
+                return Ok(next.run(request).await);
+            }
+            let shown: String = name.chars().take(64).collect();
+            audit
+                .record_async(
+                    crate::audit::AuditEvent::new("denied")
+                        .with_identity(identity)
+                        .with_route(route.clone())
+                        .with_denial(403, format!("missing-capability:expose:{shown}")),
+                )
+                .await;
+            tracing::debug!(%method, path = %route, expose = %shown, "authorization denied (403): service not granted");
             Err(StatusCode::FORBIDDEN)
         }
         RequiredCapability::Capability(cap) => {

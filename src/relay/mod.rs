@@ -20,8 +20,9 @@ pub mod protocol;
 pub mod proxy;
 mod reachability;
 pub mod registry;
-#[cfg(feature = "relay-client")]
-mod replay;
+// Not behind `relay-client`: `--expose` reads its upstream's answers with the
+// same reader, in every build.
+pub(crate) mod replay;
 
 use std::net::SocketAddr;
 use std::sync::Arc;

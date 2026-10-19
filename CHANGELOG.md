@@ -5,6 +5,31 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## 0.32.0 — unreleased
 
+### Added
+
+- **`--expose <name>=<url>`: an HTTP service on this machine's loopback, reachable through
+  this server at `/x/<name>/…`.** An inference API, a notebook or a dashboard beside a device
+  that is reachable only through this server — behind NAT, through a relay — had no way in
+  but a second tunnel outside the authorization and the audit trail. Now it is behind the
+  same keys, trail and relay path. The key travels in `X-Shell-Tunnel-Key`, so the service's
+  own `Authorization` reaches it untouched; the key header never does. Granted by
+  `expose:<name>` or `expose:*`. The answer is streamed as the service produces it, and a
+  body still streaming holds off an update. Only `http://` on `127.0.0.1`, `[::1]` or
+  `localhost` may be exposed, fixed at startup. Every request is recorded as an `expose`
+  audit entry. Not in this release: WebSocket upstreams, a key in the path, `https://`
+  upstreams. See `docs/USAGE.md` §3.4.
+
+### Changed
+
+- **`operator` does not hold `expose:*`**, the one capability it does not carry. A key scoped
+  to `operator` — the default for a key on a reachable server — reaches an exposed service
+  only once granted it: `--preset operator --capabilities expose:<name>`. The banner says so
+  when the server's keys cannot reach a service it exposes, and its scope line now names
+  what `operator` withholds instead of saying nothing is withheld.
+
+- Library: `AuditEvent` gained `expose`, and `AppState` `exposes`; a struct literal of
+  either stops compiling.
+
 ### Fixed
 
 - **A `HEAD` request through a relay answered `502`.** A response to `HEAD` declares the length

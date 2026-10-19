@@ -39,6 +39,7 @@
 
 pub mod actions;
 pub mod activity;
+pub mod expose;
 pub mod fs;
 pub mod fs_edit;
 pub mod handlers;

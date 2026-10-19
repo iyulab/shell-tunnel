@@ -552,6 +552,20 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         eprintln!("Configuration error: {message}");
         std::process::exit(2);
     }
+    // Refused whole, like `--actions`: a server that started without one of
+    // the services it was told to expose would answer `404` for it, which
+    // reads as "not exposed" rather than "misconfigured".
+    let exposes = match shell_tunnel::expose::ExposeSet::parse(&args.expose) {
+        Ok(exposes) => exposes,
+        Err(e) => {
+            eprintln!("--expose cannot be used: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(message) = check_expose_grants(&explicit_grants, &exposes) {
+        eprintln!("Configuration error: {message}");
+        std::process::exit(2);
+    }
 
     // Derived once, here. The containment check below and the sink creation
     // after it both read this value — the default path lives in the working
@@ -741,6 +755,9 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             path.display()
         );
     }
+    for line in expose_banner(&exposes, config.security.auth.enabled, resolved.as_ref()) {
+        outln!("{line}");
+    }
     // Only when there is something to explain. A relay-forwarded request is
     // now held to a different chunk size than a direct one (Phase 3: a direct
     // caller reaches this device without the relay's fixed request deadline
@@ -807,7 +824,8 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
         .with_audit(audit)
         .with_kill_orphans(args.kill_orphans)
         .with_fs_root(fs_root)
-        .with_actions(actions);
+        .with_actions(actions)
+        .with_exposes(exposes);
 
     let state = state.with_chunk_size(chunk_size, relayed_chunk_size);
 
@@ -1455,9 +1473,9 @@ enum TokenScope {
     /// A named preset, holding exactly what that name grants.
     ///
     /// The capabilities travel with the name because the name alone cannot say
-    /// whether anything was narrowed — `operator` holds every capability this
-    /// version defines, and a banner that only printed the name presented that
-    /// as a boundary.
+    /// whether anything was narrowed — `operator` held every capability until
+    /// 0.32.0 and withholds only `expose:*` since, and a banner that printed
+    /// the name alone presented the first as a boundary and hid the second.
     Preset { name: String, listed: Vec<String> },
     /// An explicit set of capability strings, in a stable order.
     Explicit(Vec<String>),
@@ -1513,8 +1531,31 @@ fn scope_lines(prefix: &str, listed: &[String]) -> Vec<String> {
         lines.push(
             "             that is every capability this version defines, so nothing is withheld today; the wildcard differs only for capabilities added later".to_string(),
         );
+    } else if let Some(withheld) = withheld_beside_exec(listed) {
+        lines.push(format!(
+            "             every capability this version defines except {withheld}"
+        ));
     }
     lines
+}
+
+/// What a scope holding `exec` still withholds, quoted, if anything.
+///
+/// A scope with `exec` reaches every command and file, so the few things it
+/// does not hold are the whole of its boundary — and `operator` has one since
+/// 0.32.0 (`expose:*`). Listing the grant alone would leave a reader to find
+/// the missing item by comparing lists. A scope without `exec` is a real
+/// boundary, and its list already says what it is.
+fn withheld_beside_exec(listed: &[String]) -> Option<String> {
+    if !listed.iter().any(|c| c == "exec") {
+        return None;
+    }
+    let withheld: Vec<String> = shell_tunnel::security::KNOWN_CAPABILITIES
+        .iter()
+        .filter(|known| !listed.iter().any(|held| held == *known))
+        .map(|c| format!("`{c}`"))
+        .collect();
+    (!withheld.is_empty()).then(|| withheld.join(", "))
 }
 
 /// Refuse an explicit grant of an action that is not defined.
@@ -1548,13 +1589,96 @@ fn check_action_grants(
     Ok(())
 }
 
+/// Refuse an explicit grant of a service that is not exposed — the pair of
+/// [`check_action_grants`], for the same reason.
+fn check_expose_grants(
+    explicit: &[String],
+    exposes: &shell_tunnel::expose::ExposeSet,
+) -> Result<(), String> {
+    for grant in explicit {
+        let Some(name) = grant.strip_prefix("expose:") else {
+            continue;
+        };
+        if name == "*" {
+            if exposes.is_empty() {
+                return Err(format!(
+                    "`{grant}` grants every exposed service, and none are exposed. Pass --expose <NAME=URL>."
+                ));
+            }
+        } else if exposes.get(name).is_none() {
+            return Err(format!(
+                "`{grant}` grants a service that is not exposed. Expose '{name}' with --expose, or correct the name."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The `Exposed:` lines: each service, where it goes, and the one thing an
+/// operator has to know before relying on it.
+fn expose_banner(
+    exposes: &shell_tunnel::expose::ExposeSet,
+    auth_enabled: bool,
+    shared: Option<&CapabilitySet>,
+) -> Vec<String> {
+    if exposes.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = exposes
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = if i == 0 {
+                "Exposed:     "
+            } else {
+                "             "
+            };
+            format!("{label}/x/{}/ -> {}", e.name, e.url())
+        })
+        .collect();
+    // Many local services take no credential of their own, on the reasoning
+    // that only this machine can reach them. Exposed, this server's key is
+    // the only door they have — and without auth, there is none.
+    lines.push(if auth_enabled {
+        "             the key goes in X-Shell-Tunnel-Key; a service that checks no credential of its own is guarded by that key alone".to_string()
+    } else {
+        "             no key is checked on this server, so anything that reaches it reaches these services".to_string()
+    });
+    // The shared keys' scope may not reach them at all: `operator` — the
+    // default on a reachable server — does not hold `expose:*`, on purpose.
+    // Said here, at startup, rather than discovered as a 403 by the caller.
+    if let Some(set) = shared.filter(|_| auth_enabled) {
+        let unreached: Vec<&str> = exposes
+            .iter()
+            .filter(|e| {
+                !set.satisfies(&shell_tunnel::expose::capability_for(&e.name))
+                    && !set.satisfies(shell_tunnel::expose::ANY_EXPOSE)
+            })
+            .map(|e| e.name.as_str())
+            .collect();
+        if !unreached.is_empty() {
+            lines.push(format!(
+                "             keys from -k / api_keys cannot reach {} — add the grant: --preset operator --capabilities expose:{}",
+                unreached
+                    .iter()
+                    .map(|n| format!("`{n}`"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                if unreached.len() == 1 { unreached[0] } else { "*" }
+            ));
+        }
+    }
+    lines
+}
+
 /// Whether a scope withholds any capability that exists today.
 ///
-/// `operator` does not: it holds all five of `KNOWN_CAPABILITIES`, so a token
-/// scoped to it reaches every route a wildcard token does and there is no
-/// `403` anywhere behind it. That was verified by issuing one and walking the
-/// routes, not by reading the table. The only difference from the wildcard is
-/// forward-compatible — a capability added in a later version.
+/// Until 0.32.0 `operator` did not: it held every one of `KNOWN_CAPABILITIES`,
+/// so a token scoped to it reached every route a wildcard token did — verified
+/// then by issuing one and walking the routes. Since 0.32.0 it withholds
+/// `expose:*`, and the banner names that one thing
+/// ([`withheld_beside_exec`]) rather than letting the preset name stand for a
+/// boundary or for the lack of one.
 fn narrows_something(listed: &[String]) -> bool {
     !shell_tunnel::security::KNOWN_CAPABILITIES
         .iter()
@@ -1930,6 +2054,10 @@ fn describe_scope(scope: &TokenScope) -> String {
     let mut text = format!("{prefix}{}", quoted.join(", "));
     if !narrows_something(listed) {
         text.push_str(" (every capability this version defines — nothing withheld today)");
+    } else if let Some(withheld) = withheld_beside_exec(listed) {
+        text.push_str(&format!(
+            " (every capability this version defines except {withheld})"
+        ));
     }
     text
 }
@@ -2215,7 +2343,7 @@ mod tests {
             text.contains("keys from -k / api_keys: `operator`"),
             "{text}"
         );
-        assert!(text.contains("nothing withheld today"), "{text}");
+        assert!(text.contains("defines except `expose:*`"), "{text}");
         assert!(text.contains("token 'central': `action:*`"), "{text}");
 
         // No shared key, no line about one.
@@ -2280,7 +2408,11 @@ mod tests {
     /// this repository has been wrong in every time.
     #[test]
     fn a_scope_that_withholds_nothing_says_so() {
-        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let everything: CapabilitySet = shell_tunnel::security::KNOWN_CAPABILITIES
+            .iter()
+            .map(|c| c.to_string())
+            .collect();
+        let scope = token_scope(None, Some(&everything));
         let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join("\n");
 
         for capability in shell_tunnel::security::KNOWN_CAPABILITIES {
@@ -2293,6 +2425,84 @@ mod tests {
             text.contains("nothing is withheld today"),
             "the banner must say outright that this scope takes nothing away: {text}"
         );
+    }
+
+    /// A grant naming a service nobody exposed is a key that can reach
+    /// nothing; it is refused at startup, like an undefined action.
+    #[test]
+    fn a_grant_of_a_service_that_is_not_exposed_is_refused() {
+        let exposes =
+            shell_tunnel::expose::ExposeSet::parse(&["llm=http://127.0.0.1:8080"]).unwrap();
+        let none = shell_tunnel::expose::ExposeSet::default();
+        let grants = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert!(check_expose_grants(&grants(&["expose:llm", "exec"]), &exposes).is_ok());
+        assert!(check_expose_grants(&grants(&["expose:*"]), &exposes).is_ok());
+        let err = check_expose_grants(&grants(&["expose:llmm"]), &exposes).unwrap_err();
+        assert!(err.contains("'llmm'"), "{err}");
+        let err = check_expose_grants(&grants(&["expose:*"]), &none).unwrap_err();
+        assert!(err.contains("--expose"), "{err}");
+    }
+
+    /// The banner says where each name goes, and — the part an operator needs
+    /// before trusting it — what guards a service that checks nothing itself.
+    #[test]
+    fn the_expose_banner_names_each_service_and_what_guards_it() {
+        let exposes = shell_tunnel::expose::ExposeSet::parse(&[
+            "llm=http://127.0.0.1:8080/v1",
+            "nb=http://localhost:8888",
+        ])
+        .unwrap();
+        let text = expose_banner(&exposes, true, None).join(" | ");
+        assert!(
+            text.starts_with("Exposed:     /x/llm/ -> http://127.0.0.1:8080/v1"),
+            "{text}"
+        );
+        assert!(text.contains("/x/nb/ -> http://localhost:8888"), "{text}");
+        assert!(text.contains("X-Shell-Tunnel-Key"), "{text}");
+        assert!(text.contains("guarded by that key alone"), "{text}");
+
+        let open = expose_banner(&exposes, false, None).join(" | ");
+        assert!(
+            !open.contains("guarded by that key"),
+            "no key is checked: {open}"
+        );
+        assert!(open.contains("no key is checked"), "{open}");
+        assert!(expose_banner(&shell_tunnel::expose::ExposeSet::default(), true, None).is_empty());
+
+        // `operator` — the default on a reachable server — does not reach
+        // them, and the banner says how to grant it rather than leaving the
+        // caller to find a 403.
+        let operator = shell_tunnel::security::preset("operator").unwrap();
+        let text = expose_banner(&exposes, true, Some(&operator)).join(" | ");
+        assert!(text.contains("cannot reach `llm`, `nb`"), "{text}");
+        assert!(
+            text.contains("--preset operator --capabilities expose:*"),
+            "{text}"
+        );
+        let granted: CapabilitySet = ["exec", "expose:llm"].into_iter().collect();
+        let text = expose_banner(&exposes, true, Some(&granted)).join(" | ");
+        assert!(
+            text.contains(
+                "cannot reach `nb` — add the grant: --preset operator --capabilities expose:nb"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `operator` withholds exactly one thing since 0.32.0, and says which.
+    ///
+    /// It holds `exec`, so the banner's list alone would read as "everything";
+    /// the one item it lacks is its whole boundary and has to be named.
+    #[test]
+    fn operator_names_the_one_capability_it_withholds() {
+        let scope = token_scope(Some("operator"), Some(&resolved("operator")));
+        let text = posture_banner(Posture::Exposed, &scope, true, &[], None, false).join(" | ");
+        assert!(
+            text.contains("every capability this version defines except `expose:*`"),
+            "{text}"
+        );
+        assert!(!text.contains("nothing is withheld"), "{text}");
     }
 
     /// And a scope that *does* narrow must not carry that qualifier.

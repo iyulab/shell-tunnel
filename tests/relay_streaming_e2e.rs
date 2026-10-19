@@ -210,6 +210,9 @@ async fn a_response_broken_midway_is_delivered_broken() {
 }
 
 /// Decode an HTTP/1.1 chunked body; panics on anything malformed.
+///
+/// Gated with its only caller, so a default build has no dead code to warn on.
+#[cfg(feature = "relay-client")]
 fn dechunk(mut body: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     loop {

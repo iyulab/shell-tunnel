@@ -84,6 +84,8 @@ pub struct Args {
     pub fs_root: Option<PathBuf>,
     /// Named-action definitions to serve under `/api/v1/actions`.
     pub actions: Option<PathBuf>,
+    /// Loopback HTTP services to expose at `/x/<name>/…`, as `<name>=<url>`.
+    pub expose: Vec<String>,
     /// Chunk size advertised to upload clients, in bytes.
     pub fs_chunk_size: Option<usize>,
     /// Rotation limit for the audit trail exactly as the operator wrote it.
@@ -147,6 +149,7 @@ impl Default for Args {
             allow_hosts: Vec::new(),
             audit_log: None,
             actions: None,
+            expose: Vec::new(),
             audit_max_bytes_raw: None,
             fs_root: None,
             fs_chunk_size: None,
@@ -298,6 +301,9 @@ where
             }
             Long("audit-log") => {
                 result.audit_log = Some(parser.value()?.parse()?);
+            }
+            Long("expose") => {
+                result.expose.push(parser.value()?.parse()?);
             }
             Long("actions") => {
                 result.actions = Some(parser.value()?.parse()?);
@@ -521,6 +527,11 @@ OPTIONS:
         --actions <FILE>    Serve the named actions defined in this JSON file.
                             A token granted `action:<id>` (or `action:*`) runs
                             those and nothing else — no shell, typed parameters
+        --expose <NAME=URL> Pass /x/NAME/... to a loopback HTTP service, e.g.
+                            llm=http://127.0.0.1:8080. Repeatable. The caller
+                            sends this server's key in X-Shell-Tunnel-Key;
+                            Authorization goes to the service untouched. Needs
+                            `expose:NAME` or `expose:*`, which `operator` lacks
         --fs-chunk-size <N> Upload chunk size advertised to callers, in bytes.
                             Default 4194304; 262144 when --relay is given,
                             because a relayed chunk must also finish inside the

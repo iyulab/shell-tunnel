@@ -211,9 +211,9 @@ refuses `--no-auth`, scopes the issued token to `operator` instead of the
 wildcard, and appends an audit trail to `shell-tunnel-audit.jsonl` in the working
 directory (`--audit-log` puts it elsewhere). Naming a scope yourself still wins —
 `--preset full-control` keeps the wildcard. Note what `operator` is and is not:
-it holds every capability this version defines, so it withholds nothing today
-and the difference from the wildcard is only that it will not automatically
-carry capabilities added later. The narrowing presets are `file-read` and
+it holds every capability this version defines except `expose:*` — reaching a service
+exposed with `--expose` is granted by name — and it will not automatically carry
+capabilities added later. The narrowing presets are `file-read` and
 `file-write`, and `action:<id>` grants are narrower still. Keep rate limiting on, and treat the URL and token as credentials. TLS is not optional over the internet — `--tls-self-signed`
 on the relay is one flag, and the fingerprint it prints keeps the connection
 authenticated, not just encrypted. The startup banner states what is actually in force.
@@ -233,7 +233,8 @@ relay with self-signed generation and fingerprint pinning, host-header checking,
 trail, filesystem operations (list, read, write, make directories, move, delete, optionally
 confined by `--fs-root`), background processes read by offset after they start, named actions
 that a token can be granted instead of a shell, responses streamed through the relay, a device
-following its relay's version, and running as a Windows service. On the roadmap: native MCP tools.
+following its relay's version, running as a Windows service, and HTTP services on the device's
+loopback exposed behind the same keys and audit trail (`--expose`). On the roadmap: native MCP tools.
 
 ## License
 

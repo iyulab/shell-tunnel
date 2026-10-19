@@ -128,6 +128,9 @@ pub struct AuditEvent {
     /// `file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
+    /// The exposed service an `expose` event is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose: Option<String>,
 }
 
 impl AuditEvent {
@@ -158,6 +161,7 @@ impl AuditEvent {
             to_version: None,
             process_id: None,
             target: None,
+            expose: None,
         }
     }
 
@@ -250,6 +254,25 @@ impl AuditEvent {
     /// Attach where a move put its entry.
     pub fn with_target(mut self, path: impl Into<String>) -> Self {
         self.target = Some(path.into());
+        self
+    }
+
+    /// Name the exposed service this event is about.
+    pub fn with_expose(mut self, name: impl Into<String>) -> Self {
+        self.expose = Some(name.into());
+        self
+    }
+
+    /// Record the status a request was answered with, when it was not a
+    /// refusal ([`Self::with_denial`] records those, with a reason).
+    pub fn with_status(mut self, status: u16) -> Self {
+        self.status = Some(status);
+        self
+    }
+
+    /// Record how long something took, with no exit status to go with it.
+    pub fn with_duration(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
         self
     }
 

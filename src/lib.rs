@@ -67,6 +67,7 @@ pub mod config;
 pub mod connect;
 pub mod error;
 pub mod execution;
+pub mod expose;
 #[cfg(any(feature = "tls", feature = "relay-client"))]
 pub mod fingerprint;
 pub mod fs;
