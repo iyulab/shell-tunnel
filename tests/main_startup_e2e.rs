@@ -2051,3 +2051,95 @@ fn get_status_with_headers_post(port: u16, path: &str, key: &str, body: &str) ->
         .and_then(|s| s.parse().ok())
         .unwrap_or(0)
 }
+
+/// Run `command` through a running server's `/api/v1/execute` and return the
+/// raw HTTP response. Retries the connect for the reason `get_status` gives.
+fn execute_raw(port: u16, command: &str) -> String {
+    use std::io::Write;
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("server on port {port} never accepted a connection: {e}"),
+        }
+    };
+    let body = serde_json::json!({ "command": command }).to_string();
+    let request = format!(
+        "POST /api/v1/execute HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("write request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read response");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// The `RUST_LOG` a command sees, as the server's shell reports it — `None`
+/// when the variable is absent from the command's environment.
+fn rust_log_seen_by_a_command(server_env: Option<&str>, level_flag: &str) -> Option<String> {
+    let port = reserved_port();
+    let port_arg = port.to_string();
+    let mut command = Command::new(BIN);
+    command
+        .args(["--port", &port_arg, "-l", level_flag])
+        .env_remove("SHELL_TUNNEL_LOG_LEVEL")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    match server_env {
+        Some(value) => command.env("RUST_LOG", value),
+        None => command.env_remove("RUST_LOG"),
+    };
+    let _server = Killed(command.spawn().expect("binary should start"));
+
+    // `set` (Windows) and `env` (Unix) both print `NAME=value` per line.
+    let lister = if cfg!(windows) { "set" } else { "env" };
+    let response = execute_raw(port, lister);
+    assert!(
+        response.starts_with("HTTP/1.1 200"),
+        "execute should succeed: {response}"
+    );
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default();
+    let json: serde_json::Value =
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("execute answers JSON ({e}): {body}"));
+    let output = json["output"]
+        .as_str()
+        .expect("an output field")
+        .to_string();
+    output.lines().find_map(|line| {
+        let (name, value) = line.trim_end_matches('\r').split_once('=')?;
+        name.eq_ignore_ascii_case("RUST_LOG")
+            .then(|| value.to_string())
+    })
+}
+
+/// A server does not hand the commands it runs a `RUST_LOG` of its own.
+///
+/// It used to: the binary resolved its log level and wrote it into its own
+/// `RUST_LOG` before installing the subscriber, so every command `execute`
+/// started inherited `RUST_LOG=info` — set by nobody the caller could see —
+/// and any Rust tool among them logged at that level into the output the
+/// caller asked for. Found as three `INFO fnm::…` lines on every login shell
+/// run through a device.
+///
+/// Two halves, because each catches a way the fix could be half-done:
+/// with no `RUST_LOG` in the server's environment the command must see none,
+/// and with one present the command must see *that* value — not the level
+/// `-l` gave the server, which is what an overwrite would leave behind.
+#[test]
+fn a_command_inherits_the_callers_rust_log_and_never_the_servers() {
+    assert_eq!(
+        rust_log_seen_by_a_command(None, "debug"),
+        None,
+        "no RUST_LOG was set for the server, so a command must not see one"
+    );
+    assert_eq!(
+        rust_log_seen_by_a_command(Some("shell_tunnel=warn"), "debug"),
+        Some("shell_tunnel=warn".to_string()),
+        "the server's own environment passes through untouched, whatever -l says"
+    );
+}

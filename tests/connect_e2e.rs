@@ -400,7 +400,7 @@ async fn a_request_for_an_unattached_peer_gets_the_relays_own_502() {
 /// default filter shows.
 ///
 /// The gap this pins was measured, not imagined: `connect` dispatches with
-/// `RUST_LOG` set to a bare `info` (`main.rs`), which is a global level
+/// its log filter set to a bare `info` (`main.rs`), which is a global level
 /// directive — so a `debug!` on any target is dropped, and three of the four
 /// ways a connect-mode request can lose its fast path announced nothing an
 /// operator would ever see. Two were `debug!`; the third (a cached direct

@@ -417,6 +417,11 @@ by different layers, and the message is the same in both.
 `output` merges stdout and stderr. On timeout, `timed_out` is `true` and the
 whole process tree is killed.
 
+A command runs with the server's own environment, passed through unchanged: the
+server adds no variable of its own. Before 0.29.0 it added one — `RUST_LOG`, set
+to the server's log level whether or not the server was started with it — so
+Rust tools a command ran logged into its `output` at that level.
+
 **A process the command leaves running is left running, unless the server was
 started with `--kill-orphans`.** `some-daemon &`, or `start /b …` on Windows,
 returns as soon as the shell itself does: the call does not wait for what the

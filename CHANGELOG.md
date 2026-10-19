@@ -7,6 +7,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Changed
 
+- **`logging::init` takes the filter as an argument** (`init("info")`) instead of reading
+  `RUST_LOG`. `logging::try_init()` still reads `RUST_LOG` and is unchanged; an embedder
+  calling `init()` stops compiling and either passes its filter or calls `try_init()`.
+
 - **`RelayClientConfig`'s `enrolled` field is now `events`.** It used to carry the device's
   public URL as a `String`; it now carries an `AttachEvent`: `Enrolled { public_url,
   relay_version }` for each successful enrolment, or `Rejected { code }` when the relay
@@ -44,6 +48,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   in the GNU `sha256sum` format (`<hex>  <archive name>`, one bare file name per line),
   so a downloaded archive can be checked with `sha256sum -c SHA256SUMS` before it is
   unpacked or installed.
+
+### Fixed
+
+- **A command no longer inherits a `RUST_LOG` the server set for itself.** The server
+  passed its log level to its logger by writing it into its own `RUST_LOG`, and every
+  command `execute`, a session or an action started inherited it — so a Rust tool the
+  command ran (`fnm`, anything built on `tracing` or `env_logger`) logged at `info` into
+  the command's output, though nobody had set `RUST_LOG`. A `RUST_LOG` the server was
+  started with still reaches its commands, unchanged.
 
 ## 0.28.0 — 2026-10-16
 

@@ -313,8 +313,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
             // / connect's idle-shutdown watchdog would be silently dropped —
             // no subscriber installed, nothing panics, nothing prints —
             // unless this dispatch installs one itself first.
-            std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
-            logging::init();
+            logging::init(args.log_level.as_deref().unwrap_or("info"));
 
             let config = shell_tunnel::relay::client::RelayClientConfig {
                 relay_url,
@@ -447,8 +446,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     }
 
     // Initialize logging with configured level
-    std::env::set_var("RUST_LOG", config.log_filter());
-    logging::init();
+    logging::init(config.log_filter());
 
     info!("shell-tunnel v{}", env!("CARGO_PKG_VERSION"));
 
@@ -1043,8 +1041,7 @@ async fn run_relay(args: &Args) -> shell_tunnel::Result<()> {
         eprintln!("Rebuild with `--features tls`, or put a reverse proxy in front.");
         std::process::exit(1);
     }
-    std::env::set_var("RUST_LOG", args.log_level.as_deref().unwrap_or("info"));
-    logging::init();
+    logging::init(args.log_level.as_deref().unwrap_or("info"));
 
     // The gateway path says this through `PublicExposure`, whose comment gives
     // the reason: a defence the consumer explicitly turned off is not something

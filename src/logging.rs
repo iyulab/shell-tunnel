@@ -33,10 +33,19 @@
 
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-/// Initialize the logging system.
+/// Initialize the logging system with an explicit filter.
 ///
-/// Uses the `RUST_LOG` environment variable for filtering. If not set,
-/// defaults to `shell_tunnel=info`.
+/// `filter` is an `EnvFilter` directive string (`info`, `shell_tunnel=debug`,
+/// …). One that does not parse falls back to `shell_tunnel=info`, the same
+/// default [`try_init`] uses when `RUST_LOG` is unset.
+///
+/// The binary calls this rather than [`try_init`], and that is not a
+/// convenience. It used to hand its resolved level to the subscriber by
+/// writing it into its own `RUST_LOG` first — and every command `execute`
+/// starts inherits the server's environment, so each one ran with a
+/// `RUST_LOG` the caller never set, and every Rust tool among them logged at
+/// that level into the output the caller asked for. A filter passed as an
+/// argument reaches the subscriber and nothing else.
 ///
 /// Diagnostics go to stderr, which leaves stdout for the things a caller wants
 /// to read: the public URL, the API key, the command to try. Sharing one stream
@@ -46,23 +55,30 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 ///
 /// Panics if called more than once, or if another tracing subscriber
 /// has already been set.
-pub fn init() {
-    try_init().expect("logging is initialized once, before any other subscriber is set");
+pub fn init(filter: &str) {
+    install(EnvFilter::try_new(filter).unwrap_or_else(|_| default_filter()))
+        .expect("logging is initialized once, before any other subscriber is set");
 }
 
-/// Try to initialize the logging system.
+/// Try to initialize the logging system from the environment.
 ///
-/// Returns `Ok(())` if successful, or `Err` if logging has already been
-/// initialized.
-///
-/// This is the whole implementation; `init` is this plus a panic. The two used
-/// to assemble the same filter and the same layer separately, and a change to
-/// either had to be made twice — the `with_ansi(false)` above is there because
-/// that is exactly what happened once already.
+/// Filters by `RUST_LOG`, or `shell_tunnel=info` when it is unset or does not
+/// parse. Returns `Err` if logging has already been initialized. This is the
+/// entry point for a program embedding the library, which owns its own
+/// environment; the binary uses [`init`].
 pub fn try_init() -> Result<(), tracing_subscriber::util::TryInitError> {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("shell_tunnel=info"));
+    install(EnvFilter::try_from_default_env().unwrap_or_else(|_| default_filter()))
+}
 
+fn default_filter() -> EnvFilter {
+    EnvFilter::new("shell_tunnel=info")
+}
+
+/// The one place the subscriber is assembled. `init` and `try_init` used to
+/// build the same layer separately, and a change to it had to be made twice —
+/// the `with_ansi(false)` below is there because that is exactly what happened
+/// once already.
+fn install(filter: EnvFilter) -> Result<(), tracing_subscriber::util::TryInitError> {
     tracing_subscriber::registry()
         .with(filter)
         .with(
