@@ -141,12 +141,12 @@ async fn a_response_reaches_the_caller_as_the_device_sends_it() {
     let device = tokio::spawn(async move {
         read_request(&mut conn).await;
         send_head(&mut conn).await;
-        conn.send(Message::Binary(b"data: first\n\n".to_vec().into()))
+        conn.send(Message::Binary(b"data: first\n\n".to_vec()))
             .await
             .unwrap();
         // Only once the caller has the first event does the second exist.
         first_seen_rx.await.unwrap();
-        conn.send(Message::Binary(b"data: second\n\n".to_vec().into()))
+        conn.send(Message::Binary(b"data: second\n\n".to_vec()))
             .await
             .unwrap();
         conn.close(None).await.unwrap();
@@ -185,7 +185,7 @@ async fn a_response_broken_midway_is_delivered_broken() {
     let device = tokio::spawn(async move {
         read_request(&mut conn).await;
         send_head(&mut conn).await;
-        conn.send(Message::Binary(b"partial".to_vec().into()))
+        conn.send(Message::Binary(b"partial".to_vec()))
             .await
             .unwrap();
         first_seen_rx.await.unwrap();
