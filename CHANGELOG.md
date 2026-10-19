@@ -23,7 +23,7 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   or `interrupt` to its process group; `DELETE` ends it. Output is drained by one thread
   for every process, never by a thread per pipe and never from the blocking pool `execute`
   uses. Handles live in memory: kept an hour after exit, at most 64, and stopping the server
-  ends every process they started. A running one holds off `--follow-relay-updates`. All
+  ends every process they started. A running one holds off `--follow-relay-updates`, recorded once as `update.waiting`. All
   routes need `exec`; recorded as `process.start`, `process.exit`, `process.stdin` (byte
   count only), `process.signal` and `process.delete`. See `docs/USAGE.md` §3.3.
 

@@ -337,8 +337,8 @@ An update waits for running commands, open uploads and running background proces
 until it ends — but it is still a restart: a
 session that exists without a command running in it is gone afterwards, exactly as
 after a reboot (above). With an audit trail configured, each step is recorded:
-`update.available`, `update.applying`, `update.applied`, `update.rolled-back`,
-`update.failed` ([Audit trail](#audit-trail)).
+`update.available`, `update.waiting`, `update.applying`, `update.applied`,
+`update.rolled-back`, `update.failed` ([Audit trail](#audit-trail)).
 
 ---
 
@@ -1409,6 +1409,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `session.expired` | a shell session was swept automatically after an hour idle | `session_id` (no `file` or `command` — a swept session is named by nothing else, and what it last ran is already in its own `execute` entries) |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
 | `update.available` | the relay runs a newer version than this device and the device will follow it ([Following the relay's version](#following-the-relays-version)) — once per version per process | `from_version`, `to_version` |
+| `update.waiting` | a running background process (§3.3) is holding off an update it found — recorded once per attempt, so a device that stays on its old version says why | `from_version`, `to_version`, `reason` (`processes-running`) |
 | `update.applying` | the device was idle, latched itself shut, and is about to swap its binary | `from_version`, `to_version` |
 | `update.applied` | the new binary attached to the relay within its probation | `from_version`, `to_version` |
 | `update.rolled-back` | the new binary did not prove itself and the previous one was put back | `from_version`, `to_version`, `reason` |

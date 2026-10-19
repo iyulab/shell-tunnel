@@ -358,7 +358,7 @@ pub async fn follow(
             }
         };
 
-        wait_until_latched(&state, &cfg).await;
+        wait_until_latched(&state, &cfg, &current, &relay).await;
         state
             .audit
             .record_async(AuditEvent::new("update.applying").with_update(&current, &relay))
@@ -413,11 +413,30 @@ pub async fn follow(
 
 /// Wait until the server has been idle for `cfg.quiet` without a break, then
 /// the random delay, then latch it. Loops until a latch succeeds.
-async fn wait_until_latched(state: &AppState, cfg: &FollowConfig) {
+///
+/// A running background process holds this off for as long as it runs, which
+/// can be days — a dev server started through `/api/v1/processes` never ends on
+/// its own. That wait is deliberate (a restart would end the process), but it
+/// must not be silent: the first time one is seen holding the update, an
+/// `update.waiting` line says why the device is still on its old version.
+async fn wait_until_latched(state: &AppState, cfg: &FollowConfig, from: &str, to: &str) {
+    let mut told = false;
     loop {
         let mut idle_since: Option<tokio::time::Instant> = None;
         loop {
             let now = tokio::time::Instant::now();
+            if !told && state.processes.running_count() > 0 {
+                told = true;
+                info!("update to {to} is waiting for background processes to end");
+                state
+                    .audit
+                    .record_async(
+                        AuditEvent::new("update.waiting")
+                            .with_update(from, to)
+                            .with_reason("processes-running"),
+                    )
+                    .await;
+            }
             if is_idle(state) {
                 let since = *idle_since.get_or_insert(now);
                 if now - since >= cfg.quiet {
@@ -478,4 +497,70 @@ fn restart(exe: &Path) -> ShellTunnelError {
     #[cfg(debug_assertions)]
     std::env::remove_var("SHELL_TUNNEL_UPDATE_PRETEND_VERSION");
     swap::restart(exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::execution::processes::StartRequest;
+
+    /// A running background process holds the latch off, and says so once —
+    /// then the update proceeds the moment it ends.
+    ///
+    /// Multi-thread on purpose: the binary runs on `new_multi_thread`, and the
+    /// watcher thread reaping the process is what lets the latch close.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_process_holds_off_the_update_and_says_so_once() {
+        let trail = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::new().with_audit(Arc::new(
+            crate::audit::AuditSink::file(trail.path()).unwrap(),
+        ));
+        let long = if cfg!(windows) {
+            "ping -n 120 127.0.0.1 >nul"
+        } else {
+            "sleep 120"
+        };
+        let id = state
+            .processes
+            .start(
+                &StartRequest {
+                    command: long.into(),
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap()
+            .id;
+        let cfg = FollowConfig {
+            quiet: Duration::from_millis(20),
+            jitter_max: Duration::ZERO,
+            probation: Duration::from_secs(1),
+            base_url: String::new(),
+        };
+
+        let waiting = {
+            let state = state.clone();
+            tokio::spawn(async move { wait_until_latched(&state, &cfg, "0.1.0", "0.2.0").await })
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!waiting.is_finished(), "the latch waits for the process");
+        assert!(!state.activity.is_latched());
+
+        state.processes.delete(id, None).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the latch closes once the process is gone")
+            .unwrap();
+        assert!(state.activity.is_latched());
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(trail.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|e: &serde_json::Value| e["kind"] == "update.waiting")
+            .collect();
+        assert_eq!(lines.len(), 1, "once, however long it waited: {lines:?}");
+        assert_eq!(lines[0]["reason"], "processes-running");
+        assert_eq!(lines[0]["to_version"], "0.2.0");
+    }
 }
