@@ -19,6 +19,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   audit entry. Not in this release: WebSocket upstreams, a key in the path, `https://`
   upstreams. See `docs/USAGE.md` §3.4.
 
+- **`idle_connections` on each device in `GET /relay/v1/devices`** — the data connections it has
+  waiting. A device that heartbeats but cannot replace them (its new connections refused by a
+  rate limit on a shared outbound address, for one) answers `503 no data connection available`
+  while looking attached; this shows it before a caller finds out.
+
 - **`stdin` on the WebSocket `execute` message**, as on `POST /api/v1/execute` since 0.31.0;
   its `result` carries `stdin_written`.
 
@@ -31,8 +36,8 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   what `operator` withholds instead of saying nothing is withheld.
 
 - Library: `AuditEvent` gained `expose`, `AppState` `exposes`, `WsClientMessage::Execute`
-  `stdin` and `WsServerMessage::Result` `stdin_written`; a literal of any of them stops
-  compiling.
+  `stdin`, `WsServerMessage::Result` `stdin_written` and `relay::registry::DeviceSummary`
+  `idle_connections`; a literal of any of them stops compiling.
 
 ### Fixed
 

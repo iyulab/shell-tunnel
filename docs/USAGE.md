@@ -1789,10 +1789,18 @@ curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com/relay/v
 
 ```json
 {"devices":[{"id":"build-box","label":null,"attached_secs":42,"last_seen_secs":3,
-             "exchanges":17,"last_exchange_ms":38,"mean_exchange_ms":44,
+             "idle_connections":4,"exchanges":17,"last_exchange_ms":38,"mean_exchange_ms":44,
              "slowest_exchange_ms":210,
              "public_url":"https://relay.example.com/d/build-box"}]}
 ```
+
+**`idle_connections` is how many data connections the device has waiting** (since
+0.32.0). Each proxied request takes one and asks the device for another, and a
+device keeps four ready. A count that stays at zero while requests arrive means the
+device is not managing to replace them — its new connections are being refused, a
+rate limit on its outbound address for one (§5, *Rate limiting on the relay*) — and
+its callers get `503 no data connection available`. Such a device still heartbeats
+and still looks attached; this is the number that shows it.
 
 **The four `exchange` fields are how long this device has been taking to
 answer**, and they are the way to tell a slow device from a slow relay without

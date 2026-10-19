@@ -946,3 +946,53 @@ async fn health_is_never_throttled() {
         assert_eq!(status, 200, "health check {attempt} should always answer");
     }
 }
+
+/// The device list says how many data connections each device has waiting, so
+/// a device that heartbeats but cannot be served is visible before a caller
+/// meets its `503`.
+#[tokio::test]
+async fn the_device_list_counts_each_devices_waiting_connections() {
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let list = || async {
+        let (_, body) = http_get_authed(
+            &format!("http://{addr}/relay/v1/devices"),
+            Some(("authorization", "Bearer secret")),
+        )
+        .await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        parsed["devices"][0]["idle_connections"].as_u64()
+    };
+
+    assert_eq!(
+        list().await,
+        Some(0),
+        "enrolled, with no connection opened yet"
+    );
+
+    let mut held = Vec::new();
+    for expected in 1..=2u64 {
+        let (mut conn, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/relay/v1/data"))
+            .await
+            .unwrap();
+        let attach = DeviceMessage::Attach {
+            device_id: device_id.clone(),
+            enroll_token: "secret".to_string(),
+            attach_id: None,
+        };
+        conn.send(Message::Text(serde_json::to_string(&attach).unwrap()))
+            .await
+            .unwrap();
+        held.push(conn);
+        // The connection joins the pool once the relay has read its attach.
+        let mut seen = None;
+        for _ in 0..100 {
+            seen = list().await;
+            if seen == Some(expected) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(seen, Some(expected));
+    }
+}

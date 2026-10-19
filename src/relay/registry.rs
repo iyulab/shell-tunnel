@@ -188,6 +188,14 @@ impl Device {
         }
     }
 
+    /// How many data connections are waiting in the pool.
+    ///
+    /// Read from the sending half's spare capacity, so it neither locks the
+    /// pool nor waits on a request holding it.
+    pub fn idle_connections(&self) -> usize {
+        self.pool_tx.max_capacity() - self.pool_tx.capacity()
+    }
+
     /// Take an idle data connection, waiting up to `timeout` for one.
     ///
     /// Asks the device to open a replacement first: the request that consumes a
@@ -239,6 +247,14 @@ pub struct DeviceSummary {
     pub attached_secs: u64,
     /// Seconds since its last heartbeat.
     pub last_seen_secs: u64,
+    /// Data connections waiting in its pool right now, ready for a request.
+    ///
+    /// Each proxied request takes one and asks the device for a replacement.
+    /// A device whose count sits at zero answers `503 no data connection
+    /// available` after a wait — seen here before a caller meets it, which is
+    /// the point: a device whose replacements are being refused (a rate limit
+    /// on its outbound address, for one) still heartbeats and looks attached.
+    pub idle_connections: usize,
     /// Proxied exchanges measured so far, absent until there has been one.
     ///
     /// Absent rather than zero: a device nothing has called yet has no timing,
@@ -392,6 +408,7 @@ impl DeviceRegistry {
                             .lock()
                             .map(|seen| seen.elapsed().as_secs())
                             .unwrap_or_default(),
+                        idle_connections: device.idle_connections(),
                         exchanges: measured.map(|e| e.count),
                         last_exchange_ms: measured.map(|e| e.last_ms),
                         mean_exchange_ms: measured.map(|e| e.total_ms / e.count),
