@@ -810,6 +810,11 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
 
     let state = state.with_chunk_size(chunk_size, relayed_chunk_size);
 
+    // A background process does not outlive the server that started it. Held
+    // to the end of this function, so returning, failing, or being dropped by
+    // a service stop request all end them.
+    let _processes = state.processes.shutdown_on_drop();
+
     // Sessions never survive a restart, so any `.part` staging file still
     // present is unreachable — nothing can resume it and nothing will
     // complete it. Swept once, here, before the server starts accepting.

@@ -42,6 +42,7 @@ pub mod activity;
 pub mod fs;
 pub mod fs_edit;
 pub mod handlers;
+pub mod processes;
 pub mod router;
 pub mod sweep;
 pub mod types;

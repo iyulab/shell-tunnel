@@ -119,6 +119,9 @@ pub struct AuditEvent {
     /// The version an `update.*` event moves to — the one the relay announced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_version: Option<String>,
+    /// The background process a `process.*` event is about.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_id: Option<u64>,
     /// Where an `fs.move` put the entry `file` names, in the same form as
     /// `file`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,6 +154,7 @@ impl AuditEvent {
             params: None,
             from_version: None,
             to_version: None,
+            process_id: None,
             target: None,
         }
     }
@@ -182,6 +186,19 @@ impl AuditEvent {
     /// Attach the session the command ran in.
     pub fn with_session(mut self, session_id: u64) -> Self {
         self.session_id = Some(session_id);
+        self
+    }
+
+    /// Attach the background process an event is about.
+    pub fn with_process(mut self, id: u64) -> Self {
+        self.process_id = Some(id);
+        self
+    }
+
+    /// Attach a byte count that is not a file transfer's: what a background
+    /// process produced, or what was written to its stdin.
+    pub fn with_bytes(mut self, bytes: u64) -> Self {
+        self.bytes = Some(bytes);
         self
     }
 

@@ -24,6 +24,7 @@
 mod command;
 mod executor;
 mod pipe;
+pub mod processes;
 mod result;
 
 pub use command::{Command, CommandBuilder, Invocation};

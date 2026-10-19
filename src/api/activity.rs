@@ -143,6 +143,7 @@ pub fn is_idle(state: &AppState) -> bool {
     state.activity.in_flight() == 0
         && state.store.count_active() == 0
         && state.uploads.live_count() == 0
+        && state.processes.running_count() == 0
 }
 
 /// Close the latch only if the whole server is idle, and leave it open if not.
@@ -161,7 +162,10 @@ pub fn latch_if_idle(state: &AppState) -> bool {
     if !state.activity.latch() {
         return false;
     }
-    if state.store.count_active() == 0 && state.uploads.live_count() == 0 {
+    if state.store.count_active() == 0
+        && state.uploads.live_count() == 0
+        && state.processes.running_count() == 0
+    {
         return true;
     }
     state.activity.unlatch();

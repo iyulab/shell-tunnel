@@ -39,6 +39,8 @@ pub struct AppState {
     pub actions: Arc<crate::actions::ActionSet>,
     /// What is in flight, and the latch an update closes the door with.
     pub activity: Arc<super::activity::Activity>,
+    /// Background processes (`/api/v1/processes`).
+    pub processes: crate::execution::processes::ProcessTable,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             )),
             actions: Arc::new(crate::actions::ActionSet::default()),
             activity: Arc::new(super::activity::Activity::new()),
+            processes: crate::execution::processes::ProcessTable::new(),
         }
     }
 
@@ -67,6 +70,7 @@ impl AppState {
 
     /// Record execution events to `sink`.
     pub fn with_audit(mut self, sink: Arc<crate::audit::AuditSink>) -> Self {
+        self.processes.set_audit(Arc::clone(&sink));
         self.audit = sink;
         self
     }
@@ -77,6 +81,7 @@ impl AppState {
     /// unless asked for — see [`CommandExecutor::kill_orphans`].
     pub fn with_kill_orphans(mut self, kill: bool) -> Self {
         self.executor = Arc::new(CommandExecutor::new(Arc::clone(&self.store)).kill_orphans(kill));
+        self.processes.set_kill_orphans(kill);
         self
     }
 

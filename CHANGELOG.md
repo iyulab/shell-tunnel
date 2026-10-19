@@ -15,9 +15,22 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   into place, answering `413 body-too-large` with the `limit` above that. None of them
   replaces a directory, and an upload in flight holds its destination against them (`409
   destination-busy`). All three need `fs.write` and are recorded in the audit trail
-  (`fs.mkdir*`, `fs.move*`, `fs.write*`). See `docs/USAGE.md` §3.3.
+  (`fs.mkdir*`, `fs.move*`, `fs.write*`). See `docs/USAGE.md` §3.1.
+
+- **Background processes: `/api/v1/processes`.** Start a command and get an id; read its
+  stdout and stderr by offset — waiting up to 25 s for output with `wait_ms` — from any
+  connection, for as long as the handle is kept; write its stdin; send `terminate`, `kill`
+  or `interrupt` to its process group; `DELETE` ends it. Output is drained by one thread
+  for every process, never by a thread per pipe and never from the blocking pool `execute`
+  uses. Handles live in memory: kept an hour after exit, at most 64, and stopping the server
+  ends every process they started. A running one holds off `--follow-relay-updates`. All
+  routes need `exec`; recorded as `process.start`, `process.exit`, `process.stdin` (byte
+  count only), `process.signal` and `process.delete`. See `docs/USAGE.md` §3.3.
 
 ### Changed
+
+- **`AuditEvent` gains `process_id`**, set on `process.*` events. An embedder building the
+  struct with a literal stops compiling.
 
 - **`AuditEvent` has one more public field, `target`**, set on `fs.move*` events to where
   the entry went. An embedder that builds the struct with a literal rather than

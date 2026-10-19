@@ -109,6 +109,28 @@ impl KillGroup {
         self.reap_on_drop.store(true, Ordering::Relaxed);
     }
 
+    /// Undo [`Self::reap_on_drop`]: dropping the group leaves its members
+    /// running. For a background process that exited on its own, where what
+    /// it left behind is `--kill-orphans`'s to decide, not the handle's.
+    pub(crate) fn keep_on_drop(&self) {
+        self.reap_on_drop.store(false, Ordering::Relaxed);
+    }
+
+    /// Send `signal` to every process in the group. Unix only — Windows has
+    /// no signals to send, and its job can only be terminated.
+    #[cfg(unix)]
+    pub(crate) fn signal(&self, signal: i32) {
+        let pid = self.pid.load(Ordering::Relaxed);
+        if pid == 0 {
+            return;
+        }
+        // SAFETY: `kill` with a negative pid signals the process group this
+        // group's leader created with `setsid` in `prepare`.
+        unsafe {
+            libc::kill(-(pid as i32), signal);
+        }
+    }
+
     /// Take ownership of a freshly spawned child.
     ///
     /// Call this as the statement following `spawn`. On Windows a grandchild

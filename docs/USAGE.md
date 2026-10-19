@@ -332,7 +332,9 @@ API key was generated for this start (the next start would generate a different 
 pass `-k` or set it in the config file); when the executable's directory is not
 writable; and on a Windows service without the restart policy above.
 
-An update waits for running commands and open uploads, but it is still a restart: a
+An update waits for running commands, open uploads and running background processes
+([§3.3](#33-background-processes)) — a device with a long-running one is not updated
+until it ends — but it is still a restart: a
 session that exists without a command running in it is gone afterwards, exactly as
 after a reboot (above). With an audit trail configured, each step is recorded:
 `update.available`, `update.applying`, `update.applied`, `update.rolled-back`,
@@ -642,6 +644,10 @@ notices, which on default settings is hours.
 | `GET`, `PATCH`, `DELETE` | `/api/v1/fs/uploads/{id}` | `fs.write` |
 | `GET` | `/api/v1/actions` | *(any valid token — the list is filtered to the token)* |
 | `POST` | `/api/v1/actions/{id}` | `action:{id}` or `action:*` |
+| `GET`, `POST` | `/api/v1/processes` | `exec` |
+| `GET`, `DELETE` | `/api/v1/processes/{id}` | `exec` |
+| `GET` | `/api/v1/processes/{id}/output` | `exec` |
+| `POST` | `/api/v1/processes/{id}/stdin`, `/api/v1/processes/{id}/signal` | `exec` |
 
 `GET /api/v1/fs/uploads/{id}` needs `fs.write`, not `fs.read` — an upload session is a
 write operation end to end, including checking where it left off. See [§3.1](#31-files)
@@ -927,7 +933,7 @@ upload does not keep a marker afterwards. `list` never shows it and `stat` and `
 refuse it by name while it exists, since a predictable session id would otherwise let
 one caller reach into another's transfer.
 
-#### 3.3 Directories, moves and small files
+#### Directories, moves and small files
 
 Three writes that need no upload session (since 0.30.0). All take `fs.write`, resolve
 every path the way the routes above do, refuse the reserved staging directory by name,
@@ -1055,6 +1061,56 @@ can be run with no body at all.
 `--capabilities action:<id>` naming an action the file does not define, and
 `--capabilities action:*` with no `--actions` file, are refused at startup: either would
 issue a token that can do nothing, and nothing would say so until a caller was refused.
+
+### 3.3 Background processes
+
+`execute` waits for its command; a session's WebSocket streams output but loses what
+arrives while nobody is connected. A background process is the third shape (since
+0.30.0): start a command, get an id, and read its output **by offset** — now, later, from
+another connection — for as long as the handle is kept.
+
+```bash
+# Start. stdin=true keeps a pipe to its stdin; otherwise it reads an empty one.
+curl -s -X POST "$BASE/api/v1/processes" -H 'Content-Type: application/json'   -d '{"command":"cargo build --release","working_dir":"/srv/app"}'
+# {"id":0,"command":"cargo build --release","pid":4711,"state":"running",
+#  "started_at_ms":…,"stdout_end":0,"stderr_end":0,"stdout_start":0,"stderr_start":0,
+#  "output_complete":false,"stdin_open":false}
+
+# Read from an offset. wait_ms (at most 25000) waits for output when there is none yet,
+# and answers as soon as some arrives. Ask again from `next`.
+curl -s "$BASE/api/v1/processes/0/output?stream=stderr&since=0&wait_ms=20000"
+# {"stream":"stderr","start":0,"next":312,"text":"   Compiling …","complete":false,
+#  "state":"running","exit_code":null}
+
+curl -s "$BASE/api/v1/processes/0"                       # state, exit_code, offsets
+curl -s -X POST "$BASE/api/v1/processes/0/signal" -H 'Content-Type: application/json'   -d '{"signal":"terminate"}'                            # terminate | kill | interrupt
+curl -s -X DELETE "$BASE/api/v1/processes/0"             # ends it if running, forgets it
+```
+
+**Offsets count every byte a stream ever produced**, so `next` from one read is the
+`since` of the next, on any connection. Each stream keeps its newest 1 MiB; a `since` the
+buffer no longer holds reads from the oldest byte it does, and `start` comes back larger
+than `since` — the gap is what was discarded, never skipped silently. `text` is cut at a
+character boundary (an incomplete multi-byte character waits for the next read), and
+bytes that are not UTF-8 arrive as U+FFFD. `complete: true` means the process has ended
+and everything it wrote has been read.
+
+**Run through the platform shell**, as `execute` is (`cmd /c` or `/bin/sh -c`), with no
+terminal. The process and everything it starts form one group: `kill` and `DELETE` end
+the whole group. `terminate` is `SIGTERM` to the group on Linux and macOS and the same
+as `kill` on Windows; `interrupt` (`SIGINT`) is `422 signal-unsupported` on Windows.
+When the process exits on its own, what it left running survives unless the server was
+started with `--kill-orphans` — the rule `execute` follows.
+
+**A handle lives in the server's memory.** An exited process's handle is kept for an
+hour, then forgotten; at most 64 handles exist at once (`429 too-many-processes`) —
+delete the ones you are done with. **Stopping or restarting the server ends every
+background process** it started, and a running one holds off `--follow-relay-updates`
+(§2). A stdin write returns once the process has read it, so writing more than a pipe
+holds to a process that never reads waits until it ends or is killed.
+
+Through a relay this works as it does locally — each read is an ordinary request, and
+a 25 s wait sits well inside the relay's per-request limit.
 
 ## 4. Authentication and capabilities
 
@@ -1338,6 +1394,11 @@ capability token is the access control — withhold `exec` to deny execution.
 | `fs.write` | a file written by `PUT` | `file`, `bytes` |
 | `fs.write.refused` | a `PUT` the server turned away | `file`, `status`, `reason` (`reserved-path`, `body-too-large`, `destination-exists`, `destination-is-directory`, `destination-busy`) |
 | `fs.write.failed` | a write the filesystem refused | `file`, `status`, `reason` (the underlying error) |
+| `process.start` | a background process started (§3.3) | `process_id`, `command`, identity |
+| `process.exit` | a background process ended on its own or by a signal (one that `DELETE` or a server stop ends is recorded as `process.delete` instead) | `process_id`, `exit_code` (absent when a signal ended it on Linux or macOS), `duration_ms`, `bytes` (stdout and stderr together) |
+| `process.stdin` | bytes written to a background process's stdin | `process_id`, `bytes` — never what was written |
+| `process.signal` | a signal sent | `process_id`, `reason` (`terminate`, `kill`, `interrupt`) |
+| `process.delete` | a handle removed | `process_id`, `reason` (`ended` when its process was still running and was ended, `removed` when it had exited, `server-stopping` for each process a server stop ends) |
 | `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
 | `upload.refused` | a session the server declined to open | `file`, `status`, `reason` (`destination-busy`, `destination-is-directory`, `reserved-path`, `bad-digest`, `too-many-uploads`, `io-error` — the same code the HTTP body carries). No `upload_id`: no session was opened to name |
 | `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
@@ -2090,7 +2151,10 @@ startup rather than serving local-only.
 | **400** on `POST /api/v1/sessions` with an empty body | `Content-Type: application/json` was declared and no body sent. The route wants no body at all, but a declared JSON body still has to be one | send no content type and no body, or send `{}`. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
 | **409** `destination-exists` on `PUT .../fs/file` or `POST .../fs/move` | something is already at the destination | pass `overwrite=true` to replace a file; a directory is never replaced (`409 destination-is-directory`) |
-| **409** `destination-busy` on `PUT .../fs/file` or `POST .../fs/move` | an upload in flight names that path, or a path under the tree being moved (§3.3) | cancel the upload or wait for it to finish, then retry |
+| **409** `destination-busy` on `PUT .../fs/file` or `POST .../fs/move` | an upload in flight names that path, or a path under the tree being moved (§3.1) | cancel the upload or wait for it to finish, then retry |
+| **404** `process-not-found` on `.../processes/{id}` | no such handle: deleted, kept past its hour after exit, or the server restarted | handles do not survive a restart (§3.3) |
+| **429** `too-many-processes` on `POST .../processes` | 64 handles exist | `DELETE` the ones you are done with |
+| **409** `stdin-unavailable` on `POST .../processes/{id}/stdin` | stdin was not requested at start, was closed, or another write is in progress | start with `"stdin": true`; one write at a time |
 | **409** `cross-device` on `POST .../fs/move` | source and destination are on different filesystems | a move does not copy: download and upload, or run the copy as a command |
 | **413** `body-too-large` on `PUT .../fs/file` | the body is over one upload chunk (`limit` in the body) | send it through `POST /api/v1/fs/uploads` (§3.1) |
 | **404** on `POST .../fs/mkdir` | the parent does not exist | pass `parents=true` |

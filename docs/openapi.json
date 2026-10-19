@@ -39,6 +39,10 @@
     {
       "name": "Actions",
       "description": "Commands the device's owner defined, which a token can be granted one by one instead of `exec`."
+    },
+    {
+      "name": "Processes",
+      "description": "Background processes read by offset."
     }
   ],
   "paths": {
@@ -1663,6 +1667,460 @@
         }
       }
     },
+    "/api/v1/processes": {
+      "get": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "List background processes",
+        "operationId": "processList",
+        "description": "Every handle this server holds, running or exited within the last hour.\n\nRequired capability: `exec`.",
+        "responses": {
+          "200": {
+            "description": "The handles.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "processes": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ProcessInfo"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "Start a background process",
+        "operationId": "processStart",
+        "description": "Starts a command and returns at once with its handle. Its output is kept per stream (newest 1 MiB) and read by offset with `.../output`. At most 64 handles exist; stopping the server ends every process. A running process holds off `--follow-relay-updates`. Since 0.30.0.\n\nRequired capability: `exec`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartProcess"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Started.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "422": {
+            "description": "A body field this server does not recognise."
+          },
+          "429": {
+            "description": "`too-many-processes`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`process-failed`: the OS could not start it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/processes/{id}": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "One background process",
+        "operationId": "processGet",
+        "description": "State, exit code and stream offsets.\n\nRequired capability: `exec`.",
+        "responses": {
+          "200": {
+            "description": "The handle.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`process-not-found`: deleted, kept past its hour after exit, or the server restarted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "End and forget a background process",
+        "operationId": "processDelete",
+        "description": "Ends the process group if it still runs, then removes the handle.\n\nRequired capability: `exec`.",
+        "responses": {
+          "204": {
+            "description": "Gone."
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`process-not-found`: deleted, kept past its hour after exit, or the server restarted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/processes/{id}/output": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "get": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "Read output by offset",
+        "operationId": "processOutput",
+        "description": "Bytes of one stream from `since`. With `wait_ms`, waits for output when there is none yet and answers as soon as some arrives, or the stream completes.\n\nRequired capability: `exec`.",
+        "parameters": [
+          {
+            "name": "stream",
+            "in": "query",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "stdout",
+                "stderr"
+              ],
+              "default": "stdout"
+            }
+          },
+          {
+            "name": "since",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "name": "wait_ms",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 0,
+              "maximum": 25000
+            },
+            "description": "Capped at 25000 rather than refused."
+          },
+          {
+            "name": "max_bytes",
+            "in": "query",
+            "schema": {
+              "type": "integer",
+              "default": 65536,
+              "minimum": 1,
+              "maximum": 1048576
+            },
+            "description": "Clamped rather than refused."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "A read, possibly empty.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProcessOutput"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A query parameter this server does not recognise, or a `stream` other than `stdout`/`stderr` (plain text)."
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`process-not-found`: deleted, kept past its hour after exit, or the server restarted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/processes/{id}/stdin": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "post": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "Write to stdin",
+        "operationId": "processStdin",
+        "description": "Writes the body to the process's stdin; `close=true` closes it after, so the process reads end-of-file. Returns once the process has read what was written. Recorded with the byte count only.\n\nRequired capability: `exec`.",
+        "parameters": [
+          {
+            "name": "close",
+            "in": "query",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Written."
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`process-not-found`: deleted, kept past its hour after exit, or the server restarted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`process-not-running`, or `stdin-unavailable` (not requested at start, closed, or another write in progress).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`process-failed`: the write failed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/processes/{id}/signal": {
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer"
+          }
+        }
+      ],
+      "post": {
+        "tags": [
+          "Processes"
+        ],
+        "summary": "Signal the process group",
+        "operationId": "processSignal",
+        "description": "`terminate` is SIGTERM on Linux/macOS and ends the group on Windows; `kill` ends the group; `interrupt` is SIGINT, unsupported on Windows.\n\nRequired capability: `exec`.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "signal"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "signal": {
+                    "type": "string",
+                    "enum": [
+                      "terminate",
+                      "kill",
+                      "interrupt"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Sent. The exit shows in the handle once the process has ended."
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "$ref": "#/components/responses/ForbiddenError"
+          },
+          "404": {
+            "description": "`process-not-found`: deleted, kept past its hour after exit, or the server restarted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`process-not-running`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "`signal-unsupported`, or a body this server does not recognise.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
     "/api/v1/actions": {
       "get": {
         "tags": [
@@ -2714,6 +3172,147 @@
           },
           "replaced": {
             "type": "boolean"
+          }
+        }
+      },
+      "ProcessInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "command",
+          "pid",
+          "state",
+          "started_at_ms",
+          "stdout_end",
+          "stderr_end",
+          "stdout_start",
+          "stderr_start",
+          "output_complete",
+          "stdin_open"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "command": {
+            "type": "string"
+          },
+          "pid": {
+            "type": "integer",
+            "description": "The shell's process id: the leader of the process group."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "exited"
+            ]
+          },
+          "exit_code": {
+            "type": "integer",
+            "description": "Absent while running. A process ended by a signal on Linux or macOS reports -1."
+          },
+          "started_at_ms": {
+            "type": "integer"
+          },
+          "ended_at_ms": {
+            "type": "integer"
+          },
+          "stdout_end": {
+            "type": "integer",
+            "description": "Offset one past the newest stdout byte: every byte stdout ever produced."
+          },
+          "stderr_end": {
+            "type": "integer"
+          },
+          "stdout_start": {
+            "type": "integer",
+            "description": "Offset of the oldest stdout byte still held (each stream keeps its newest 1 MiB)."
+          },
+          "stderr_start": {
+            "type": "integer"
+          },
+          "output_complete": {
+            "type": "boolean",
+            "description": "The process has ended and no more output can arrive."
+          },
+          "stdin_open": {
+            "type": "boolean"
+          }
+        }
+      },
+      "StartProcess": {
+        "type": "object",
+        "required": [
+          "command"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Run through the platform shell (`cmd /c` / `/bin/sh -c`), as `execute` is."
+          },
+          "working_dir": {
+            "type": "string"
+          },
+          "env": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "stdin": {
+            "type": "boolean",
+            "default": false,
+            "description": "Keep a pipe to stdin for `POST .../stdin`; otherwise stdin is empty."
+          }
+        }
+      },
+      "ProcessOutput": {
+        "type": "object",
+        "required": [
+          "stream",
+          "start",
+          "next",
+          "text",
+          "complete"
+        ],
+        "properties": {
+          "stream": {
+            "type": "string",
+            "enum": [
+              "stdout",
+              "stderr"
+            ]
+          },
+          "start": {
+            "type": "integer",
+            "description": "Offset of the first byte in `text`: larger than the requested `since` when the bytes between were discarded."
+          },
+          "next": {
+            "type": "integer",
+            "description": "Ask for this offset next."
+          },
+          "text": {
+            "type": "string",
+            "description": "UTF-8, cut at a character boundary; bytes that are not UTF-8 arrive as U+FFFD."
+          },
+          "complete": {
+            "type": "boolean",
+            "description": "The process has ended and this stream has been read to its end."
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "running",
+              "exited"
+            ]
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         }
       }

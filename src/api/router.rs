@@ -226,6 +226,7 @@ fn routes() -> Router<AppState> {
         .route("/ws", any(ws_oneshot_handler))
         .route("/actions", get(super::actions::list_actions))
         .route("/actions/{id}", post(super::actions::run_action))
+        .nest("/processes", process_routes())
         .nest("/fs", fs_routes())
         .nest("/sessions", session_routes);
 
@@ -312,6 +313,11 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
         ("GET", "/api/v1/sessions/{id}") => Capability("session.read"),
         ("DELETE", "/api/v1/sessions/{id}") => Capability("session.manage"),
         ("POST", "/api/v1/sessions/{id}/execute") => Capability("exec"),
+        // Starting a background process is `execute`'s power; reading,
+        // feeding and ending one is no less.
+        (_, path) if path == "/api/v1/processes" || path.starts_with("/api/v1/processes/") => {
+            Capability("exec")
+        }
         (_, "/api/v1/sessions/{id}/ws") => Capability("exec"),
         ("GET", "/api/v1/fs/list") => Capability("fs.read"),
         ("GET", "/api/v1/fs/stat") => Capability("fs.read"),
@@ -995,6 +1001,17 @@ async fn shutdown_signal() {
             tracing::info!("Received SIGTERM, initiating graceful shutdown...");
         }
     }
+}
+
+/// Background-process routes (`super::processes`).
+fn process_routes() -> Router<AppState> {
+    use super::processes as p;
+    Router::new()
+        .route("/", get(p::list).post(p::start))
+        .route("/{id}", get(p::get).delete(p::delete))
+        .route("/{id}/output", get(p::output))
+        .route("/{id}/stdin", post(p::stdin))
+        .route("/{id}/signal", post(p::signal))
 }
 
 /// Filesystem routes, shared by the plain and the secured router.
