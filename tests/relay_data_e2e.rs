@@ -109,9 +109,16 @@ async fn serve_one_request(
         // Request body frame; always sent, empty for GETs.
         let _ = conn.next().await;
 
+        // A sized body, as a real device forwards one: its local server
+        // answers with `content-length`, and the relay passes it on. Without
+        // it the relay streams the body chunked, which is correct HTTP but not
+        // what this minimal client parses.
         let head = ProxyResponse {
             status,
-            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            headers: vec![
+                ("content-type".to_string(), "text/plain".to_string()),
+                ("content-length".to_string(), reply.len().to_string()),
+            ],
         };
         conn.send(Message::Text(serde_json::to_string(&head).unwrap()))
             .await

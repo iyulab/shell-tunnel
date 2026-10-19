@@ -46,7 +46,7 @@ use crate::security::{
 use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
-    VIA_RELAY_FRAME_LIMIT_HEADER,
+    RESPONSE_IDLE_TIMEOUT, VIA_RELAY_FRAME_LIMIT_HEADER,
 };
 use registry::{Device, DeviceRegistry};
 
@@ -1144,24 +1144,27 @@ async fn forward(
         }
     };
 
-    // A read error here must not be mistaken for the end of the body. The
-    // device sends the response as a single binary frame, so a body over the
-    // WebSocket message limit fails the *read* — and `while let Some(Ok(_))`
-    // treats that failure exactly like a clean close, leaving `body` short (in
-    // practice empty) while the status, already taken from the header frame
-    // above, stays whatever the device answered. That shipped a truncated body
-    // under `200 OK`: silent data loss, reported as success. Live-verified at
-    // exactly 16 MiB against both `/execute` and a `fs/file` download.
-    let mut body = Vec::new();
-    loop {
+    // The first body frame is awaited before the response is committed, for
+    // the one refusal that must still be a status: a frame over the WebSocket
+    // message limit fails the *read*, and once the status line has gone out
+    // the caller could only see a broken body. A device that sends its body as
+    // one frame (every device before streaming) is therefore answered exactly
+    // as before — whole, or `413` — and one that streams has its first chunk
+    // within moments of its headers.
+    //
+    // A read error must never pass for the end of the body: `while let
+    // Some(Ok(_))` once treated a failed read like a clean close and shipped a
+    // truncated body under `200 OK`. Here it is `Err` before the commit, and
+    // an aborted body after it.
+    let first = loop {
         match conn.recv().await {
-            Some(Ok(Message::Binary(chunk))) => body.extend_from_slice(&chunk),
-            Some(Ok(Message::Close(_))) | None => break,
+            Some(Ok(Message::Binary(chunk))) => break Some(chunk),
+            Some(Ok(Message::Close(_))) | None => break None,
             Some(Ok(_)) => continue,
             Some(Err(err)) if is_frame_too_large(&err) => return Err("response-frame-too-large"),
             Some(Err(_)) => return Err("response-body-truncated"),
         }
-    }
+    };
 
     let mut response = Response::builder().status(head.status);
     for (name, value) in head.headers {
@@ -1169,9 +1172,55 @@ async fn forward(
             response = response.header(name, value);
         }
     }
-    response
-        .body(axum::body::Body::from(body))
-        .map_err(|_| "response-build")
+    let body = match first {
+        None => axum::body::Body::empty(),
+        Some(first) => axum::body::Body::from_stream(response_frames(conn, first)),
+    };
+    response.body(body).map_err(|_| "response-build")
+}
+
+/// The rest of a response body, frame by frame, as it arrives.
+///
+/// Nothing is buffered: each binary frame becomes a body chunk the moment it
+/// is read, so an event stream or a long download reaches the caller as the
+/// device produces it. There is no total time limit — an event stream is long
+/// by definition — only [`RESPONSE_IDLE_TIMEOUT`] between frames.
+///
+/// Every way the exchange can fail after the status went out ends the stream
+/// with an error, which aborts the response rather than completing it: a
+/// chunked body loses its terminating chunk, a sized one comes up short, and
+/// either way the caller can tell. Completing it would be the truncated-`200`
+/// defect `forward` already guards against before the commit.
+fn response_frames(
+    conn: WebSocket,
+    first: Bytes,
+) -> impl futures_util::Stream<Item = std::result::Result<Bytes, std::io::Error>> + Send {
+    futures_util::stream::unfold((Some(first), Some(conn)), |(pending, conn)| async move {
+        if let Some(chunk) = pending {
+            return Some((Ok(chunk), (None, conn)));
+        }
+        let mut conn = conn?;
+        loop {
+            match tokio::time::timeout(RESPONSE_IDLE_TIMEOUT, conn.recv()).await {
+                Ok(Some(Ok(Message::Binary(chunk)))) => {
+                    return Some((Ok(chunk), (None, Some(conn))))
+                }
+                Ok(Some(Ok(Message::Close(_)))) | Ok(None) => return None,
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) => {
+                    let error = std::io::Error::other("device connection failed mid-response");
+                    return Some((Err(error), (None, None)));
+                }
+                Err(_) => {
+                    let error = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "device sent nothing for the relay's idle limit mid-response",
+                    );
+                    return Some((Err(error), (None, None)));
+                }
+            }
+        }
+    })
 }
 
 /// Send a rejection and close, best-effort.

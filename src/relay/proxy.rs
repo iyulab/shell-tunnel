@@ -14,8 +14,15 @@ use serde::{Deserialize, Serialize};
 /// How long a request waits for a free data connection before giving up.
 pub const POOL_WAIT: Duration = Duration::from_secs(5);
 
-/// How long a proxied request may take before the relay gives up on the device.
+/// How long a proxied request may take, up to its response headers and first
+/// body frame, before the relay gives up on the device. The body after that is
+/// bounded by [`RESPONSE_IDLE_TIMEOUT`] between frames, not by this.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Longest a device may go without sending a frame once its response has
+/// started. A response has no total limit — an event stream runs as long as it
+/// runs — so this is what ends one whose device has stopped answering.
+pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Header the relay injects on every request it forwards to a device, naming
 /// the byte limit its own data-connection framing enforces on the response
