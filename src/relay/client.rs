@@ -2581,9 +2581,14 @@ mod tests {
         format!("ws://{addr}")
     }
 
+    /// Twenty heartbeats to a silence limit. At six (600 ms) the acknowledging
+    /// control failed once in a full-suite run on a loaded workstation — the
+    /// test's single-thread runtime, which also runs the fake relay, was not
+    /// scheduled for longer than the limit. The margin is bought in the ratio,
+    /// not by loosening what either test asserts.
     const FAST: Liveness = Liveness {
         heartbeat: Duration::from_millis(100),
-        silence_limit: Duration::from_millis(600),
+        silence_limit: Duration::from_millis(2000),
     };
 
     #[tokio::test]

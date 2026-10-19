@@ -30,11 +30,14 @@ const POOL: usize = 4;
 
 /// A command that runs long enough to be timed against a loaded machine's noise.
 fn slow_command() -> &'static str {
+    // Four seconds rather than two: spawning a shell on a loaded host varies by
+    // most of a second, and that noise is what the ratios below must stand
+    // clear of. The margin is bought in the command, not in the tolerance.
     if cfg!(windows) {
-        // `ping -n 3` sends three echoes a second apart: about two seconds.
-        "ping -n 3 127.0.0.1"
+        // `ping -n 5` sends five echoes a second apart: about four seconds.
+        "ping -n 5 127.0.0.1"
     } else {
-        "sleep 2"
+        "sleep 4"
     }
 }
 
@@ -122,8 +125,15 @@ fn a_command_holds_one_blocking_thread_for_its_whole_run() {
              almost entirely; if they do not, this is measuring contention for \
              something other than the pool and the rest of the figure is unsafe"
         );
+        // The fifth command starts when the *first* of the four frees its slot,
+        // so `over` is about one command longer than that first finish — not
+        // than `fits`, which a loaded host stretches by staggering the four
+        // spawns. Hence a bound on `over` against the null hypothesis (no pool
+        // limit: `over` ≈ `fits`) plus a clear gap above `fits`, instead of the
+        // `over >= fits * 1.5` that failed under load at 1.87 vs 1.31 while the
+        // fifth command had plainly waited.
         assert!(
-            over_ratio >= fits_ratio * 1.5,
+            over_ratio >= 1.6 && over_ratio >= fits_ratio + 0.4,
             "{} commands took {over:?} where {POOL} took {fits:?} (ratios \
              {over_ratio:.2} vs {fits_ratio:.2}). The step must land exactly on \
              the pool boundary: if it does not, a command is not holding a slot \
