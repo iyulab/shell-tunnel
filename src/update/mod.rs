@@ -10,7 +10,12 @@ use self_update::cargo_crate_version;
 use crate::Result;
 
 #[cfg(feature = "relay-client")]
+pub mod stage;
+#[cfg(feature = "relay-client")]
 pub mod state;
+
+#[cfg(all(windows, feature = "relay-client"))]
+pub mod authenticode;
 
 /// GitHub repository owner.
 const REPO_OWNER: &str = "iyulab";
@@ -34,7 +39,7 @@ const BIN_NAME: &str = "shell-tunnel";
 /// update failed with "No asset found for target". The naming has to be handed
 /// to it explicitly, and [`tests::release_targets_match_the_published_assets`]
 /// keeps this table and the workflow from drifting apart.
-fn release_target() -> Option<&'static str> {
+pub(crate) fn release_target() -> Option<&'static str> {
     Some(match (std::env::consts::OS, std::env::consts::ARCH) {
         ("windows", "x86_64") => "windows-x64",
         ("linux", "x86_64") => "linux-x64",

@@ -144,6 +144,14 @@ windows-sys = { version = "0.61", features = [
     # Answering the service control manager when started as a Windows
     # service; see `src/winservice.rs`.
     "Win32_System_Services",
+    # Verifying a downloaded release's Authenticode signature and reading its
+    # publisher before it may replace this binary; see
+    # `src/update/authenticode.rs`. Catalog and Sip only gate the declarations
+    # of the WTHelper* functions that read the signer back out.
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
 ] }
 
 
