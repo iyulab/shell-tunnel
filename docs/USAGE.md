@@ -1123,11 +1123,11 @@ Each token carries a set of capabilities; each route declares the one it needs:
 
 | Capability | Grants |
 |---|---|
-| `exec` | run commands (HTTP and WebSocket) |
+| `exec` | run commands (HTTP and WebSocket), and start, read, feed, signal and end background processes (§3.3) |
 | `session.read` | list and inspect sessions |
 | `session.manage` | create and delete sessions |
 | `fs.read` | `list`, `stat`, read/download a file |
-| `fs.write` | delete a file or a directory tree, and the whole upload-session lifecycle (including reading a session's own resume point) |
+| `fs.write` | delete a file or a directory tree, make a directory, move an entry, write a small file in one request, and the whole upload-session lifecycle (including reading a session's own resume point) |
 | `action:<id>` | run the named action `<id>` ([§3.2](#32-named-actions)), and nothing else |
 | `action:*` | run every named action this server defines |
 | `*` | everything |
@@ -1659,10 +1659,14 @@ zero, because zero reads as answering instantly.
 Read them for what they measure, which is narrower than "network latency":
 
 - One measurement runs from the relay handing the request to the device's socket
-  to the relay having read the whole answer. That is **transfer time and the
-  device's own processing added together**, and the relay cannot separate them:
-  its send returns as soon as the socket buffer accepts the frame. A request that
-  runs a slow command shows up here as a slow exchange.
+  to the relay having the answer's headers and first body frame — the point it
+  starts answering the caller. That is **transfer time and the device's own
+  processing added together**, and the relay cannot separate them: its send returns
+  as soon as the socket buffer accepts the frame. A request that runs a slow command
+  shows up here as a slow exchange. Since 0.30.0 a streamed answer stops the clock
+  at its first frame, so a long download or an event stream measures how soon it
+  began, not how long it ran; with a device older than 0.30.0, which sends its
+  answer in one frame, the first frame is the whole answer, as before.
 - Waiting for a free connection from the device's pool is *not* included. That
   wait is the relay's queueing, and counting it would blame the device for it.
 - Failed and timed-out exchanges are counted too. A device that stops answering

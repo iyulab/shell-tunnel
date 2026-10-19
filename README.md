@@ -159,6 +159,10 @@ it — so asking the session where it is beats assuming the worst and starting o
 from the server rather than from a constant in your client: it is smaller when the
 device is reached through a relay.
 
+Small edits need no session: `POST /api/v1/fs/mkdir`, `POST /api/v1/fs/move`, and
+`PUT /api/v1/fs/file` for a file up to one chunk ([USAGE §3.1](docs/USAGE.md#31-files)).
+None of them replaces a directory.
+
 Directory removal is opt-in (`recursive=true`) and can be previewed (`dry_run=true`) —
 a guard against a caller's mistake, not against a caller, since a token that can already
 remove one file this way can remove anything the server can reach.
@@ -226,9 +230,10 @@ authenticated, not just encrypted. The startup banner states what is actually in
 Implemented: sessions, one-shot and streaming execution, WebSocket, capability-scoped auth,
 rate limiting, public exposure (Cloudflare tunnel or self-hosted relay), in-process TLS on the
 relay with self-signed generation and fingerprint pinning, host-header checking, an append-only audit
-trail, filesystem operations (list, read, write, delete, optionally confined by `--fs-root`), named
-actions that a token can be granted instead of a shell, and running as a Windows service. On the
-roadmap: native MCP tools.
+trail, filesystem operations (list, read, write, make directories, move, delete, optionally
+confined by `--fs-root`), background processes read by offset after they start, named actions
+that a token can be granted instead of a shell, responses streamed through the relay, a device
+following its relay's version, and running as a Windows service. On the roadmap: native MCP tools.
 
 ## License
 
