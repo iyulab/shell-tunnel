@@ -27,6 +27,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   routes need `exec`; recorded as `process.start`, `process.exit`, `process.stdin` (byte
   count only), `process.signal` and `process.delete`. See `docs/USAGE.md` §3.3.
 
+### Fixed
+
+- **A device no longer passes a `chunked` answer on still chunk-encoded.** The relay drops
+  `transfer-encoding` as a hop-by-hop header, so a local server answering chunked reached a
+  relayed caller with the chunk sizes mixed into the body. The device's own routes answer
+  with a length, so no relayed caller of this server met it; any local server answering
+  chunked would have.
+  A local answer cut short is now `502 device sent the request to its local server but got
+  no answer`, not the part that arrived under the local server's status.
+
 ### Changed
 
 - **The relay passes a device's response on as it arrives.** It used to collect the
@@ -35,8 +45,16 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   comes, with 120 seconds to that first frame and 120 seconds of silence allowed between
   frames after it — no limit on the total. A response that breaks after its status was
   sent is ended without its terminating chunk, so the caller sees it was cut short. A
-  response without `content-length` now reaches the caller chunked. Devices still send a
-  response as one frame; nothing changes for them until they stream too.
+  response without `content-length` now reaches the caller chunked.
+
+- **A device sends its local server's answer as it reads it**, to a relay that says it
+  streams (`streams_responses`, new in the relay's `enrolled` message; a relay before 0.30.0
+  does not send it and still gets the whole answer in one frame, as before). Together with
+  the relay change, a response — server-sent events, a long download — reaches a relayed
+  caller as it is produced, and **a `GET /api/v1/fs/file` larger than 16 MiB crosses the
+  relay whole** instead of being refused `413 response-too-large-for-relay`; a streaming
+  relay marks each request with `x-shell-tunnel-relay-streams`, which lifts that refusal.
+  An older relay or an older device keeps the ceiling and the `413`.
 
 - **`AuditEvent` gains `process_id`**, set on `process.*` events. An embedder building the
   struct with a literal stops compiling.

@@ -25,6 +25,7 @@ type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
 use super::protocol::{reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use super::proxy::{is_forwardable, ProxyRequest, ProxyResponse};
+use super::replay::{ReplayError, ReplayEvent, ResponseReader};
 use crate::error::ShellTunnelError;
 use crate::security::RELAY_HOP_HEADER;
 use crate::Result;
@@ -442,12 +443,13 @@ pub(crate) async fn attach_paced(
     };
     send(&mut control, &enroll).await?;
 
-    let (device_id, attach_id) = match recv(&mut control).await? {
+    let (device_id, attach_id, streams) = match recv(&mut control).await? {
         RelayMessage::Enrolled {
             device_id,
             public_url,
             attach_id,
             relay_version,
+            streams_responses,
             ..
         } => {
             // The only place a device's operator can read what the relay runs
@@ -468,7 +470,7 @@ pub(crate) async fn attach_paced(
                     relay_version: relay_version.clone(),
                 });
             }
-            (device_id, attach_id)
+            (device_id, attach_id, streams_responses)
         }
         RelayMessage::Rejected { code, message } => {
             if let Some(events) = &config.events {
@@ -512,6 +514,7 @@ pub(crate) async fn attach_paced(
                                 config.clone(),
                                 device_id.clone(),
                                 attach_id.clone(),
+                                streams,
                             );
                         }
                     }
@@ -709,9 +712,14 @@ fn spawn_direct_client_role(
 }
 
 /// Open one data connection and serve a single request on it.
-fn spawn_data_connection(config: RelayClientConfig, device_id: String, attach_id: Option<String>) {
+fn spawn_data_connection(
+    config: RelayClientConfig,
+    device_id: String,
+    attach_id: Option<String>,
+    streams: bool,
+) {
     tokio::spawn(async move {
-        if let Err(e) = serve_one(&config, &device_id, attach_id).await {
+        if let Err(e) = serve_one(&config, &device_id, attach_id, streams).await {
             tracing::debug!(target: "relay-client", "data connection ended: {e}");
         }
     });
@@ -722,6 +730,7 @@ async fn serve_one(
     config: &RelayClientConfig,
     device_id: &str,
     attach_id: Option<String>,
+    streams: bool,
 ) -> Result<()> {
     let (mut conn, _) = tokio_tungstenite::connect_async_tls_with_config(
         config
@@ -813,21 +822,24 @@ async fn serve_one(
         Some(Ok(_)) => Vec::new(),
     };
 
-    let (status, headers, body) = replay_locally(
+    if streams {
+        return answer_streaming(
+            &mut conn,
+            config.local,
+            config.local_hop_token.as_deref(),
+            &request,
+            body,
+        )
+        .await;
+    }
+    let answer = replay_locally(
         config.local,
         config.local_hop_token.as_deref(),
         &request,
         body,
     )
     .await;
-
-    let head = ProxyResponse { status, headers };
-    let json = serde_json::to_string(&head)
-        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot encode response: {e}")))?;
-    let _ = conn.send(Message::Text(json)).await;
-    let _ = conn.send(Message::Binary(body)).await;
-    let _ = conn.close(None).await;
-    Ok(())
+    answer_whole(&mut conn, answer).await
 }
 
 /// Append one advice line, indented to sit under the failure text.
@@ -1377,9 +1389,90 @@ async fn replay_locally(
     request: &ProxyRequest,
     body: Vec<u8>,
 ) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let (mut replayed, write_failed) = match start_replay(local, hop_token, request, body).await {
+        Ok(started) => started,
+        Err(refusal) => return refusal,
+    };
+    let mut head: Option<(u16, Vec<(String, String)>)> = None;
+    let mut collected = Vec::new();
+    while let Some(message) = replayed.recv().await {
+        match message {
+            Replayed::Events(events) => {
+                for event in events {
+                    match event {
+                        ReplayEvent::Head { status, headers } => head = Some((status, headers)),
+                        ReplayEvent::Body(bytes) => collected.extend_from_slice(&bytes),
+                        ReplayEvent::End => {
+                            let (status, headers) = head.unwrap_or((502, Vec::new()));
+                            return (status, headers, collected);
+                        }
+                    }
+                }
+            }
+            Replayed::Failed { error, answered } => {
+                return replay_failure(error, answered, write_failed)
+            }
+        }
+    }
+    replay_failure(ReplayError::CutShort, true, write_failed)
+}
+
+/// What the reader of a replayed response reports.
+enum Replayed {
+    Events(Vec<ReplayEvent>),
+    /// The response could not be read to its end. `answered` says whether any
+    /// byte of it had arrived.
+    Failed {
+        error: ReplayError,
+        answered: bool,
+    },
+}
+
+/// The synthetic answer for a replay that did not complete.
+///
+/// A response cut short is never returned as what arrived of it: that is the
+/// truncated-success shape this crate has already shipped once, on the relay's
+/// side. The streaming path aborts instead of calling this, because there the
+/// head may already be with the caller; here nothing has gone out yet.
+fn replay_failure(
+    error: ReplayError,
+    answered: bool,
+    write_failed: bool,
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let reason = match (answered, write_failed, error) {
+        (false, true, _) => "connection closed before an answer arrived".to_string(),
+        (false, false, _) => "the local server closed the connection without answering".to_string(),
+        (true, _, ReplayError::CutShort) => "response was cut short".to_string(),
+        (true, _, ReplayError::Malformed(what)) => format!("response could not be read: {what}"),
+    };
+    bad_gateway(NO_ANSWER_CAME_BACK, reason)
+}
+
+/// Send `request` to the local server and start reading its answer.
+///
+/// Returns a receiver of what the answer's reader decodes, as it decodes it,
+/// and whether writing the request failed. The write and the read run at once,
+/// and the write stops as soon as any answer byte arrives — the same fix, for
+/// the same reset, that [`write_and_read_http1`] documents.
+async fn start_replay(
+    local: SocketAddr,
+    hop_token: Option<&str>,
+    request: &ProxyRequest,
+    body: Vec<u8>,
+) -> std::result::Result<
+    (tokio::sync::mpsc::Receiver<Replayed>, bool),
+    (u16, Vec<(String, String)>, Vec<u8>),
+> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     let stream = match tokio::net::TcpStream::connect(local).await {
         Ok(stream) => stream,
-        Err(e) => return bad_gateway(NOTHING_WAS_SENT, format!("local server unreachable: {e}")),
+        Err(e) => {
+            return Err(bad_gateway(
+                NOTHING_WAS_SENT,
+                format!("local server unreachable: {e}"),
+            ))
+        }
     };
 
     let mut head = format!(
@@ -1407,11 +1500,169 @@ async fn replay_locally(
     }
     head.push_str("\r\n");
 
-    write_and_read_http1(stream, head, body).await
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_answered = std::sync::Arc::clone(&answered);
+    // Bounded, so a caller reading slowly slows this reader and, through TCP,
+    // the local server — instead of the device holding the whole response.
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    // The write half, handed over once writing is done. Not half-closed — see
+    // `write_and_read_http1` for the peer that abandons its answer on reading
+    // EOF — and not dropped early either: it lives exactly as long as the
+    // reader, which holds the receiving end.
+    let (keep_tx, keep_rx) = tokio::sync::oneshot::channel::<WriteHalfOf>();
+    tokio::spawn(async move {
+        let _write_half = keep_rx;
+        let mut reader = ResponseReader::default();
+        let mut buf = vec![0u8; 64 * 1024];
+        let message = loop {
+            match read_half.read(&mut buf).await {
+                Ok(0) => {
+                    break match reader.finish() {
+                        Ok(events) => Replayed::Events(events),
+                        Err(error) => Replayed::Failed {
+                            error,
+                            answered: reader_answered.load(std::sync::atomic::Ordering::Acquire),
+                        },
+                    }
+                }
+                Ok(n) => {
+                    reader_answered.store(true, std::sync::atomic::Ordering::Release);
+                    match reader.feed(&buf[..n]) {
+                        Ok(events) if events.is_empty() => {}
+                        Ok(events) => {
+                            let done = events.last() == Some(&ReplayEvent::End);
+                            if tx.send(Replayed::Events(events)).await.is_err() || done {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            break Replayed::Failed {
+                                error,
+                                answered: true,
+                            }
+                        }
+                    }
+                }
+                Err(_) => {
+                    break Replayed::Failed {
+                        error: ReplayError::CutShort,
+                        answered: reader_answered.load(std::sync::atomic::Ordering::Acquire),
+                    }
+                }
+            }
+        };
+        let _ = tx.send(message).await;
+    });
+
+    let mut write_failed = write_half.write_all(head.as_bytes()).await.is_err();
+    if !write_failed {
+        for chunk in body.chunks(64 * 1024) {
+            // A scheduling point per chunk, and a stop as soon as the peer has
+            // answered — see `write_and_read_http1` for the reset both avoid.
+            tokio::task::yield_now().await;
+            if answered.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            if write_half.write_all(chunk).await.is_err() {
+                write_failed = true;
+                break;
+            }
+        }
+    }
+    let _ = keep_tx.send(write_half);
+    Ok((rx, write_failed))
+}
+
+type WriteHalfOf = tokio::io::WriteHalf<tokio::net::TcpStream>;
+
+/// Answer a relayed request frame by frame, as the local server answers it.
+///
+/// Used only toward a relay that said it passes frames on as they arrive
+/// (`streams_responses` at enrolment). An older relay collects every frame
+/// until the close with no total limit, which would let one large response
+/// grow its memory without bound — so toward one, [`replay_locally`] answers
+/// in a single frame, as before.
+///
+/// Once the head has gone out, a failure can only be shown by ending the
+/// connection without the closing handshake: the relay then ends the caller's
+/// body unfinished rather than complete.
+async fn answer_streaming(
+    conn: &mut WsStream,
+    local: SocketAddr,
+    hop_token: Option<&str>,
+    request: &ProxyRequest,
+    body: Vec<u8>,
+) -> Result<()> {
+    let (mut replayed, write_failed) = match start_replay(local, hop_token, request, body).await {
+        Ok(started) => started,
+        Err(refusal) => return answer_whole(conn, refusal).await,
+    };
+    let mut head_sent = false;
+    while let Some(message) = replayed.recv().await {
+        match message {
+            Replayed::Events(events) => {
+                for event in events {
+                    match event {
+                        ReplayEvent::Head { status, headers } => {
+                            let json = serde_json::to_string(&ProxyResponse { status, headers })
+                                .map_err(|e| {
+                                    ShellTunnelError::Tunnel(format!("cannot encode response: {e}"))
+                                })?;
+                            conn.send(Message::Text(json))
+                                .await
+                                .map_err(|e| ShellTunnelError::Tunnel(e.to_string()))?;
+                            head_sent = true;
+                        }
+                        ReplayEvent::Body(bytes) => {
+                            conn.send(Message::Binary(bytes))
+                                .await
+                                .map_err(|e| ShellTunnelError::Tunnel(e.to_string()))?;
+                        }
+                        ReplayEvent::End => {
+                            let _ = conn.close(None).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Replayed::Failed { error, answered } => {
+                if head_sent {
+                    return Err(ShellTunnelError::Tunnel(format!(
+                        "local response ended early ({error:?}); abandoning the relayed body"
+                    )));
+                }
+                return answer_whole(conn, replay_failure(error, answered, write_failed)).await;
+            }
+        }
+    }
+    if head_sent {
+        return Err(ShellTunnelError::Tunnel(
+            "local response reader stopped; abandoning the relayed body".into(),
+        ));
+    }
+    answer_whole(
+        conn,
+        replay_failure(ReplayError::CutShort, true, write_failed),
+    )
+    .await
+}
+
+/// Answer with a whole response in one frame, and close.
+async fn answer_whole(
+    conn: &mut WsStream,
+    (status, headers, body): (u16, Vec<(String, String)>, Vec<u8>),
+) -> Result<()> {
+    let json = serde_json::to_string(&ProxyResponse { status, headers })
+        .map_err(|e| ShellTunnelError::Tunnel(format!("cannot encode response: {e}")))?;
+    let _ = conn.send(Message::Text(json)).await;
+    let _ = conn.send(Message::Binary(body)).await;
+    let _ = conn.close(None).await;
+    Ok(())
 }
 
 /// Write an HTTP/1.1 request head + body to `stream` and read its response,
-/// generic over the transport (plain TCP for [`replay_locally`], TLS for
+/// generic over the transport (plain TCP and TLS, for
 /// [`send_to_relay`]).
 ///
 /// `head` must already end in `\r\n\r\n` and declare its own `content-length`
@@ -2566,6 +2817,7 @@ mod tests {
                 reflexive_addr: None,
                 attach_id: None,
                 relay_version: None,
+                streams_responses: false,
             })
             .unwrap();
             ws.send(Message::Text(enrolled)).await.unwrap();

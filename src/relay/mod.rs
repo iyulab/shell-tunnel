@@ -20,6 +20,8 @@ pub mod protocol;
 pub mod proxy;
 mod reachability;
 pub mod registry;
+#[cfg(feature = "relay-client")]
+mod replay;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,7 +48,7 @@ use crate::security::{
 use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
-    RESPONSE_IDLE_TIMEOUT, VIA_RELAY_FRAME_LIMIT_HEADER,
+    RESPONSE_IDLE_TIMEOUT, VIA_RELAY_FRAME_LIMIT_HEADER, VIA_RELAY_STREAMS_HEADER,
 };
 use registry::{Device, DeviceRegistry};
 
@@ -553,6 +555,7 @@ async fn control_session(
         reflexive_addr: Some(peer.to_string()),
         attach_id: Some(device.attach_id.clone()),
         relay_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        streams_responses: true,
     };
     if send_json(&mut sink, &enrolled).await.is_err() {
         state.devices.detach(&device);
@@ -867,6 +870,7 @@ async fn proxy_handler(
                 && !name
                     .as_str()
                     .eq_ignore_ascii_case(VIA_RELAY_FRAME_LIMIT_HEADER)
+                && !name.as_str().eq_ignore_ascii_case(VIA_RELAY_STREAMS_HEADER)
         })
         .filter_map(|(name, value)| {
             value
@@ -883,6 +887,7 @@ async fn proxy_handler(
         VIA_RELAY_FRAME_LIMIT_HEADER.to_string(),
         MAX_RELAY_FRAME.to_string(),
     ));
+    headers.push((VIA_RELAY_STREAMS_HEADER.to_string(), "1".to_string()));
 
     // A WebSocket upgrade cannot be answered by buffering: the exchange has no
     // end until one side closes. Because one request already owns one data

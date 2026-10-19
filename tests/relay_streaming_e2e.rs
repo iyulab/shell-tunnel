@@ -208,3 +208,108 @@ async fn a_response_broken_midway_is_delivered_broken() {
         "a broken body must not be completed: {text:?}"
     );
 }
+
+/// Decode an HTTP/1.1 chunked body; panics on anything malformed.
+fn dechunk(mut body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .expect("size line");
+        let size =
+            usize::from_str_radix(std::str::from_utf8(&body[..line_end]).unwrap().trim(), 16)
+                .expect("hex size");
+        body = &body[line_end + 2..];
+        if size == 0 {
+            return out;
+        }
+        out.extend_from_slice(&body[..size]);
+        body = &body[size + 2..];
+    }
+}
+
+/// End to end with the real device client: a local server answering
+/// `chunked`, a little at a time, reaches the caller a little at a time — and
+/// decoded. The device used to read its local server's whole answer before
+/// replying, and to pass a chunked body on still chunk-encoded, which the
+/// caller would have read with the chunk sizes as data.
+#[cfg(feature = "relay-client")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_streams_its_local_servers_answer_through_the_relay() {
+    use shell_tunnel::relay::client::{run, AttachEvent, RelayClientConfig};
+
+    let relay = start_relay().await;
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = local_listener.local_addr().unwrap();
+    let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel::<()>();
+    let local_server = tokio::spawn(async move {
+        let (mut socket, _) = local_listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.unwrap();
+            head.extend_from_slice(&buf[..n]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\nd\r\ndata: first\n\n\r\n",
+            )
+            .await
+            .unwrap();
+        first_seen_rx.await.unwrap();
+        socket
+            .write_all(b"e\r\ndata: second\n\n\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run(
+        RelayClientConfig {
+            relay_url: format!("ws://{relay}"),
+            enroll_token: "secret".to_string(),
+            local,
+            label: None,
+            device_name: Some("streamer".to_string()),
+            fingerprint: None,
+            ca_file: None,
+            events: Some(tx),
+            serve_direct_requests: false,
+            direct_events: None,
+            local_hop_token: None,
+        },
+        None,
+    ));
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, AttachEvent::Enrolled { .. }), "{event:?}");
+    // The pool fills right after enrolment; give it a moment rather than
+    // racing the first request against an empty pool.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut stream = open_request(relay, "streamer").await;
+    let mut raw = Vec::new();
+    read_until(&mut stream, &mut raw, "data: first").await;
+    first_seen_tx.send(()).unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    raw.extend_from_slice(&rest);
+    local_server.await.unwrap();
+
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+    let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200"), "{head}");
+    assert!(head.contains("transfer-encoding: chunked"), "{head}");
+    assert_eq!(
+        String::from_utf8(dechunk(&raw[split + 4..])).unwrap(),
+        "data: first\n\ndata: second\n\n",
+        "decoded once by the device, framed once by the relay"
+    );
+}

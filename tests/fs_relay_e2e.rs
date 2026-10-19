@@ -330,30 +330,26 @@ async fn a_download_too_large_for_one_frame_is_not_reported_as_success() {
     }
 }
 
-/// The device now refuses a download over the relay's frame limit *before*
-/// reading the file — `download_blocking`'s `refuse_if_over_relay_limit`,
-/// gated on the marker header `proxy_handler` (`relay::mod`) injects on every
-/// request it forwards. The test above pins the outward status only, because
-/// it predates this and still holds for the old after-the-fact path too; this
-/// one pins the distinguishing evidence — the error code only the early check
-/// produces (`response-too-large-for-relay`, not the relay's own
-/// `response-frame-too-large`) — so a regression that silently fell back to
-/// reading the whole file and letting the relay's frame read fail would be
-/// caught even though the status code alone would look unchanged.
+/// A download larger than one relay frame arrives whole through a relay that
+/// streams. Before the relay passed responses on frame by frame, this was
+/// refused — first by the relay after reading the whole body
+/// (`response-frame-too-large`), later by the device before reading the file
+/// (`response-too-large-for-relay`). Both limits now bound one frame, and the
+/// device sends many.
 #[tokio::test]
-async fn a_relay_forwarded_download_over_the_frame_limit_is_rejected_before_reading_it() {
+async fn a_relay_forwarded_download_over_one_frame_arrives_whole() {
     let relay_addr = start_relay().await;
     let (dir, local_addr) = start_device_server().await;
 
-    let device_name = "early-reject-device";
+    let device_name = "streaming-download-device";
     spawn_device(relay_addr, local_addr, device_name);
     let base = format!("http://{relay_addr}/d/{device_name}");
     wait_until_attached(&base).await;
 
-    let payload = vec![b'x'; 20 * 1024 * 1024];
+    let payload: Vec<u8> = (0..20 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(dir.path().join("oversize.bin"), &payload).expect("write");
 
-    let (status, json) = http_json(
+    let (status, body) = http_request(
         &format!("{base}/api/v1/fs/file?path=oversize.bin"),
         "GET",
         &[],
@@ -361,12 +357,55 @@ async fn a_relay_forwarded_download_over_the_frame_limit_is_rejected_before_read
     )
     .await;
 
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), payload.len(), "the whole file, not a prefix");
+    assert!(body == payload, "and the same bytes, in order");
+}
+
+/// Behind a relay that does *not* stream, the device still refuses a download
+/// over the relay's frame limit before reading it. Pinned against the device's
+/// own server with the relay's marker set by hand, because every relay this
+/// crate builds now streams: the frame-limit header alone is what an older
+/// relay sends; the streams header is what lifts the refusal.
+#[tokio::test]
+async fn behind_a_relay_that_does_not_stream_a_large_download_is_refused_before_reading() {
+    let (dir, local_addr) = start_device_server().await;
+    std::fs::write(
+        dir.path().join("oversize.bin"),
+        vec![b'x'; 20 * 1024 * 1024],
+    )
+    .expect("write");
+    let url = format!("http://{local_addr}/api/v1/fs/file?path=oversize.bin");
+    let limit = shell_tunnel::relay::MAX_RELAY_FRAME.to_string();
+
+    let (status, json) = http_json(
+        &url,
+        "GET",
+        &[(
+            shell_tunnel::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
+            limit.as_str(),
+        )],
+        &[],
+    )
+    .await;
     assert_eq!(status, 413, "got {json:?}");
-    assert_eq!(
-        json["error"], "response-too-large-for-relay",
-        "this code only comes from the device's own pre-read check; \
-         `response-frame-too-large` would mean it read the whole file first"
-    );
+    assert_eq!(json["error"], "response-too-large-for-relay");
+
+    let (status, body) = http_request(
+        &url,
+        "GET",
+        &[
+            (
+                shell_tunnel::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
+                limit.as_str(),
+            ),
+            (shell_tunnel::relay::proxy::VIA_RELAY_STREAMS_HEADER, "1"),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "a streaming relay lifts the refusal");
+    assert_eq!(body.len(), 20 * 1024 * 1024);
 }
 
 /// The same download, direct — no relay in the path, so no marker header

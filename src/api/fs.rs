@@ -851,10 +851,19 @@ pub async fn download(
     // succeeds without it, so failing to honour a garbled one costs nothing
     // that the relay's own after-the-fact `413` (`relay::mod::forward`)
     // would not already have caught.
+    //
+    // Behind a relay that streams (`VIA_RELAY_STREAMS_HEADER`) the limit bounds
+    // one frame, not the response: this device's relay client sends a large
+    // body as many frames, so there is nothing to refuse in advance.
+    let relay_streams = header_str(axum::http::HeaderName::from_static(
+        crate::relay::proxy::VIA_RELAY_STREAMS_HEADER,
+    ))
+    .is_some();
     let relay_frame_limit: Option<u64> = header_str(axum::http::HeaderName::from_static(
         crate::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
     ))
-    .and_then(|v| v.parse().ok());
+    .and_then(|v| v.parse().ok())
+    .filter(|_| !relay_streams);
 
     // Resolving the path, `stat`-ing it, and reading the bytes (whole file or
     // a span) are all blocking I/O. Same convention as `execution::executor::execute`

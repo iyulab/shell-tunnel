@@ -1787,13 +1787,15 @@ Not a number this document can give you, and that is the useful thing to know
 about it. What it can give you is the shape, which is what tells you where to
 look when a transfer is slower than you expected.
 
-The relay does not stream. It reads a request body **whole**, forwards it as one
-frame down one of the device's data connections, and buffers the whole response
-before answering the caller — one data connection taken from the device's pool
-per request, and refilled afterwards. Two consequences follow:
+The relay reads a request body **whole** and forwards it as one frame down one of
+the device's data connections — one data connection taken from the device's pool per
+request, and refilled afterwards. The response comes back the other way frame by
+frame and is passed on as each frame arrives (since 0.30.0, when relay and device are
+both 0.30.0 or newer; a device older than that sends its response as one frame, so the
+caller receives it all at once at the end). Two consequences follow:
 
 - **Effective throughput is roughly the slower of the two hops**: caller→relay
-  and relay→device. Nothing overlaps them.
+  and relay→device. A request body does not overlap them; a streamed response does.
 - **The relay's own cost is small.** Measured over loopback, with the network
   taken out of the question, the forwarding path moved an 8 MiB download at
   78–98 MB/s and added 15–20 ms to an `/execute` round trip. That is the code
@@ -2139,7 +2141,7 @@ startup rather than serving local-only.
 | **502** `device did not answer` | the relay could not complete the exchange with the device | see below. The request may already have run |
 | **502** `device could not reach its local server` | the device never got a connection to the server it fronts | **nothing ran** — safe to retry any request. Check that server is up |
 | **502** `device sent the request to its local server but got no answer` | the device connected and sent the request, and the exchange then ended with nothing coming back | **the outcome is unknown, not failed** — the request may have been carried out in full. Treat it like `504` (below), not like the row above. ⚠ Until 0.24.0 both of these said the row above's sentence, so a request that had been delivered was reported as one that never left; a `502` from an older device cannot be told apart |
-| **413** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling (§10) | fetch it in pieces with `Range` (§3.1); the whole-file form cannot cross the relay. Read-only — always safe to retry, though retrying without `Range` answers the same `413` again |
+| **413** on a large `GET .../fs/file` | response body over the relay's 16 MiB ceiling — only when the relay or the device is older than 0.30.0, which do not stream (§10) | fetch it in pieces with `Range` (§3.1), or upgrade both; the whole-file form cannot cross a relay that does not stream. Read-only — always safe to retry, though retrying without `Range` answers the same `413` again |
 | **503** from a relay URL | device attached, no free connection | retry; `Retry-After: 1`. The request never reached the device — safe to retry |
 | **504** from a relay URL | device did not answer in 120s | **the outcome is unknown, not failed** — the request may have been carried out in full and only the answer lost. Never treat it as "did not happen". For an upload chunk, ask the session where it is (§3.2) and continue from there; for `/execute`, the command may still be running on the device |
 | **413** | request body over 8 MiB (refused by the relay, and — since 0.24.0 — by the server itself with the plain-text `request body exceeds the server's ceiling`, on every route), over 2 MiB on a route that does not set its own ceiling — `.../execute`, `POST .../fs/uploads` — (refused by the server), an upload chunk over `chunk_size`, or a relayed response over the relay's 16 MiB ceiling (row above) | split the request; bulk bytes belong in an upload session, not in a JSON body. For the response-side case, use `Range` instead |
@@ -2238,7 +2240,8 @@ just the status:
   upload chunk the session says where it stands (§3.2); for anything else, observe the
   effect before running it again.
 - A relayed **`413`** on `GET .../fs/file` is neither of these — it means the file's whole-file
-  response is too big for the relay to carry (above), not that the exchange failed. `GET` has
+  response is too big for a relay that does not stream to carry (above), not that the
+  exchange failed. `GET` has
   no side effect, so it is always safe to retry; retrying without `Range` just answers `413`
   again.
 
@@ -2273,8 +2276,13 @@ documented here.
 
 ## 10. Limits
 
-- **Relay proxies request/response HTTP and WebSocket.** Server-sent events
-  buffer instead of streaming.
+- **Relay proxies request/response HTTP and WebSocket.** Since 0.30.0 a response —
+  server-sent events and long downloads included — streams through the relay when the
+  relay and the device are both 0.30.0 or newer. The relay gives the device 120 s to its
+  response headers and first body frame, then 120 s of silence between frames, with no
+  limit on the total. A response that breaks after its status was sent ends without its
+  terminating chunk, so a caller can tell it was cut short. With an older relay or an older
+  device, a response is collected whole first and the whole exchange has 120 s.
 - **Relay is single-tenant** (one shared enrol token, no isolation between devices).
 - **8 MiB** request body limit through the relay. Over it, the relay answers **413
   `request body over the relay's ceiling`** — naming which ceiling, because the device's
@@ -2304,16 +2312,20 @@ documented here.
   relay, and gets **413**. The `.../fs/uploads/{id}` routes are the ones that set their own
   ceiling instead (8 MiB), which is what lets `chunk_size` be as large as it is. Bulk bytes
   belong in an upload session; a large JSON body is not a supported way to move them.
-- **16 MiB** response body limit through the relay (`relay::MAX_RELAY_FRAME`, declared by
-  this crate since 0.21.1 — before that it was a WebSocket library default this crate never
-  set, so the number here rested on a dependency) — a separate ceiling, and the one a
-  `GET .../fs/file` on a large file reaches first. Over it, the device answers **413**
-  itself, before it reads a byte: every request the relay forwards carries the ceiling as
-  a header, and the device checks the file's size (or a `Range` request's length) against
-  it up front. A relay old enough not to send that header gets the same **413** the slow
-  way instead — the device reads and sends the whole file, and the relay's own read of that
-  oversized frame is what fails. Either way, Range requests are the way to fetch a bigger
-  file (§3.1); nothing about the file itself is wrong.
+- **16 MiB** per frame through the relay (`relay::MAX_RELAY_FRAME`, declared by this crate
+  since 0.21.1 — before that it was a WebSocket library default this crate never set, so
+  the number here rested on a dependency). Since 0.30.0 that bounds one frame, not a
+  response: a device sends a large response as many small frames to a relay that streams
+  (both 0.30.0 or newer), so a `GET .../fs/file` of any size crosses the relay whole.
+  **With an older relay or an older device it is still a response ceiling**, and the one a
+  large download reaches first: over it, the device answers **413** itself, before it reads
+  a byte — every request the relay forwards carries the ceiling as a header, and the device
+  checks the file's size (or a `Range` request's length) against it up front; a relay that
+  streams adds a second header that lifts that check. A relay old enough to send neither
+  gets the same **413** the slow way instead — the device reads and sends the whole file,
+  and the relay's own read of that oversized frame is what fails. Either way, Range
+  requests are the way to fetch a bigger file through such a relay (§3.1); nothing about
+  the file itself is wrong.
 - Each device keeps **4 idle connections** pre-opened; beyond that, requests wait
   briefly for a refill and get **503** after 5 seconds.
 - **`--fs-chunk-size` is refused at startup only at or above 8 MiB**, not below it — a
@@ -2321,7 +2333,7 @@ documented here.
   relay's own body limit, leaving no margin.
 - **Behind a relay, size is not the binding constraint — the deadline is.** The relay
   buffers a request body whole and forwards it as one frame, and gives the device 120s
-  for the whole round trip. So the time a chunk needs grows with its size while the
+  to begin its answer. So the time a chunk needs grows with its size while the
   budget does not, and a chunk too large for the link fails **at zero bytes** with `504`
   rather than transferring slowly. This is a property of **the request**, not of the
   device: a device advertises **256 KiB** instead of 4 MiB only for an upload request

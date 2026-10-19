@@ -141,6 +141,13 @@ pub enum RelayMessage {
         /// which says the relay is older than 0.28.0.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         relay_version: Option<String>,
+        /// Whether this relay passes a response on frame by frame as the
+        /// device sends it. A device streams its responses only to a relay
+        /// that says so: an older one collects every frame until the close,
+        /// with no total limit, so a large streamed response would grow its
+        /// memory without bound. Absent — `false` — from relays before 0.30.0.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        streams_responses: bool,
     },
     /// Enrollment refused, or — with [`reject::SUPERSEDED`] — an attachment
     /// ended because another took its name.
@@ -281,6 +288,7 @@ mod tests {
                 reflexive_addr: Some("203.0.113.5:51820".into()),
                 attach_id: Some("a-1".into()),
                 relay_version: Some("0.28.0".into()),
+                streams_responses: true,
             },
             RelayMessage::Rejected {
                 code: reject::BAD_TOKEN.into(),
@@ -310,7 +318,9 @@ mod tests {
                 reflexive_addr: None,
                 attach_id: None,
                 relay_version: None,
-            }
+                streams_responses: false,
+            },
+            "and an old relay does not stream: a device must not stream to it"
         );
     }
 

@@ -40,6 +40,13 @@ pub const RESPONSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// is what enforces the limit either way.
 pub const VIA_RELAY_FRAME_LIMIT_HEADER: &str = "x-shell-tunnel-relay-frame-limit";
 
+/// Added by a relay that passes responses on as they arrive. A device that
+/// sees it knows [`VIA_RELAY_FRAME_LIMIT_HEADER`]'s limit no longer bounds a
+/// whole response — only a single frame, and a device that streams sends many
+/// small ones — so it need not refuse a large one in advance. An older device
+/// ignores it and keeps refusing, which is still right for how it answers.
+pub const VIA_RELAY_STREAMS_HEADER: &str = "x-shell-tunnel-relay-streams";
+
 /// Request metadata sent to the device ahead of the body.
 ///
 /// Sent once per connection rather than per frame: this is a header, not a

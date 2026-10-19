@@ -781,7 +781,7 @@
             }
           },
           "413": {
-            "description": "`response-too-large-for-relay` — behind a relay, the whole file (or the requested `Range`) is over the relay's 16 MiB response ceiling. Checked, and answered, before the file is read: every request the relay forwards carries that ceiling, so this is what a caller normally sees. A relay old enough not to send it falls back to the same 413 the slow way instead — plain text, not this JSON body, produced by the relay's own read of an oversized frame failing after the device already sent it. `Range` fetches a smaller piece instead (`GET /api/v1/fs/file` above). Never reached on a direct (non-relay) connection.",
+            "description": "`response-too-large-for-relay` — behind a relay that does not stream (one older than 0.30.0, or a device older than 0.30.0), the whole file (or the requested `Range`) is over the relay's 16 MiB response ceiling. A relay that streams lifts this: the device sends a large file as many frames, and it arrives whole. Checked, and answered, before the file is read: every request the relay forwards carries that ceiling, so this is what a caller normally sees. A relay old enough not to send it falls back to the same 413 the slow way instead — plain text, not this JSON body, produced by the relay's own read of an oversized frame failing after the device already sent it. `Range` fetches a smaller piece instead (`GET /api/v1/fs/file` above). Never reached on a direct (non-relay) connection.",
             "content": {
               "application/json": {
                 "schema": {
