@@ -87,6 +87,9 @@
           },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -115,6 +118,9 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       },
@@ -184,6 +190,9 @@
                 "example": "Failed to deserialize the JSON body into the target type: shell: unknown field `shell`, there are no fields at line 1 column 8"
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -227,6 +236,9 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       },
@@ -261,6 +273,9 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -347,6 +362,9 @@
                 "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -418,6 +436,9 @@
                 "example": "Failed to deserialize the JSON body into the target type: workingDir: unknown field `workingDir`, expected one of `command`, `working_dir`, `env`, `timeout_secs`, `max_output_bytes` at line 1 column 33"
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -447,6 +468,9 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -468,6 +492,9 @@
           },
           "403": {
             "$ref": "#/components/responses/ForbiddenError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -583,6 +610,9 @@
           },
           "500": {
             "description": "`list-failed` — the walk panicked unexpectedly."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -659,6 +689,9 @@
           },
           "500": {
             "description": "`stat-failed` — reading the entry panicked unexpectedly."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -767,6 +800,9 @@
           },
           "500": {
             "description": "`download-failed` — reading the file panicked unexpectedly."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       },
@@ -897,6 +933,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -1000,6 +1039,9 @@
           },
           "507": {
             "description": "`io-error` — the destination's filesystem is out of space, or a quota on it is exhausted (Unix `EDQUOT`, Windows `ERROR_DISK_QUOTA_EXCEEDED`)."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -1050,6 +1092,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       },
@@ -1155,6 +1200,9 @@
           },
           "507": {
             "description": "`io-error` — the destination's filesystem is out of space or quota."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       },
@@ -1199,6 +1247,9 @@
           },
           "500": {
             "description": "`cancel-failed` — unexpected failure."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -1265,6 +1316,9 @@
           },
           "507": {
             "description": "`io-error` — the destination's filesystem is out of space or quota."
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -1290,6 +1344,9 @@
           },
           "401": {
             "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -1371,6 +1428,9 @@
                 }
               }
             }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
           }
         }
       }
@@ -2223,6 +2283,24 @@
       },
       "ForbiddenError": {
         "description": "The bearer token is valid but lacks the capability this route requires (empty body)."
+      },
+      "UpdatingError": {
+        "description": "The device is restarting to finish an update it follows from its relay (`--follow-relay-updates`): it answers every request but `/health` this way from the moment it latches until the new binary is serving. Nothing was run. Retry after the `Retry-After` delay. Body: `this device is restarting to finish an update; retry shortly` (text/plain).",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying (30).",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
       }
     }
   },
