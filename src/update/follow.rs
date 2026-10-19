@@ -51,24 +51,33 @@ pub struct FollowConfig {
 
 impl Default for FollowConfig {
     fn default() -> Self {
-        let mut cfg = Self {
+        with_test_timings(Self {
             quiet: Duration::from_secs(60),
             jitter_max: Duration::from_secs(300),
             probation: Duration::from_secs(90),
             base_url: stage::base_url(),
-        };
-        // `quiet_ms,jitter_ms,probation_ms` — end-to-end tests only.
-        #[cfg(debug_assertions)]
-        if let Ok(t) = std::env::var("SHELL_TUNNEL_UPDATE_TIMINGS") {
-            let ms: Vec<u64> = t.split(',').filter_map(|v| v.trim().parse().ok()).collect();
-            if let [q, j, p] = ms[..] {
-                cfg.quiet = Duration::from_millis(q);
-                cfg.jitter_max = Duration::from_millis(j);
-                cfg.probation = Duration::from_millis(p);
-            }
-        }
-        cfg
+        })
     }
+}
+
+#[cfg(not(debug_assertions))]
+fn with_test_timings(cfg: FollowConfig) -> FollowConfig {
+    cfg
+}
+
+/// `SHELL_TUNNEL_UPDATE_TIMINGS=quiet_ms,jitter_ms,probation_ms` — end-to-end
+/// tests only; a release build has no such variable.
+#[cfg(debug_assertions)]
+fn with_test_timings(mut cfg: FollowConfig) -> FollowConfig {
+    if let Ok(t) = std::env::var("SHELL_TUNNEL_UPDATE_TIMINGS") {
+        let ms: Vec<u64> = t.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        if let [q, j, p] = ms[..] {
+            cfg.quiet = Duration::from_millis(q);
+            cfg.jitter_max = Duration::from_millis(j);
+            cfg.probation = Duration::from_millis(p);
+        }
+    }
+    cfg
 }
 
 /// The version this binary counts as its own when deciding whether to follow.
