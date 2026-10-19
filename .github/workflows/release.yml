@@ -121,7 +121,7 @@ jobs:
       # Signed before it goes into the zip: the binary `--update` installs is
       # the one inside the archive, not a top-level release asset.
       - name: Sign
-        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9 # main @ 2026-10-16
+        uses: iyulab/code-sign@c4c68c25295ce0010a396d54cdb017fd248c5cce # main @ 2026-10-17
         with:
           files: bin/shell-tunnel.exe
           description: shell-tunnel
@@ -136,6 +136,11 @@ jobs:
           Write-Host "Status: $($sig.Status)  Signer: $($sig.SignerCertificate.Subject)  Timestamp: $($sig.TimeStamperCertificate.Subject)"
           if ($sig.Status -ne 'Valid') { throw "signature is $($sig.Status): $($sig.StatusMessage)" }
           if (-not $sig.TimeStamperCertificate) { throw "signature carries no timestamp" }
+          # A device following a relay-led update refuses any other publisher
+          # (`EXPECTED_PUBLISHER`, src/update/authenticode.rs), so a release
+          # signed by someone else would be published and then never installed.
+          $publisher = $sig.SignerCertificate.GetNameInfo('SimpleName', $false)
+          if ($publisher -ne 'IYULAB INC.') { throw "signed by '$publisher', not 'IYULAB INC.'" }
 
       - name: Create archive
         shell: pwsh

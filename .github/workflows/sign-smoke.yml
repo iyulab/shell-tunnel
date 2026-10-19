@@ -50,7 +50,7 @@ jobs:
           path: bin
 
       - name: Sign
-        uses: iyulab/code-sign@ad912c9656a20729c7891c0e9b6b4857164efee9 # main @ 2026-10-16
+        uses: iyulab/code-sign@c4c68c25295ce0010a396d54cdb017fd248c5cce # main @ 2026-10-17
         with:
           files: bin/shell-tunnel.exe
           description: shell-tunnel
