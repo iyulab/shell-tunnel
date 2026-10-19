@@ -3,6 +3,16 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.29.1 — 2026-10-19
+
+### Fixed
+
+- **`DELETE /api/v1/fs/file` no longer takes a filesystem root as its target.** With no
+  `--fs-root`, `?path=C:/` on Windows — and, since 0.29.0, `?path=/` on Linux and macOS —
+  named the drive itself as the entry to remove: without `recursive` it answered `400
+  recursive-required`, and with `recursive=true` it walked the whole drive and removed what it
+  could. Such a path is now refused `400 bad-path` before anything is looked at.
+
 ## 0.29.0 — 2026-10-19
 
 ### Changed
