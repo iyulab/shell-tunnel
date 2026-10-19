@@ -112,6 +112,13 @@ pub struct AuditEvent {
     /// action's definition, so each value is one the device's owner allowed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<std::collections::BTreeMap<String, String>>,
+    /// The version an `update.*` event moves from — the one running when it
+    /// was decided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    /// The version an `update.*` event moves to — the one the relay announced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
 }
 
 impl AuditEvent {
@@ -138,6 +145,8 @@ impl AuditEvent {
             upload_id: None,
             action: None,
             params: None,
+            from_version: None,
+            to_version: None,
         }
     }
 
@@ -233,6 +242,19 @@ impl AuditEvent {
     /// still surfaces both ends of its story.
     pub fn with_upload_id(mut self, id: impl Into<String>) -> Self {
         self.upload_id = Some(id.into());
+        self
+    }
+
+    /// Name the two versions an `update.*` event is about.
+    pub fn with_update(mut self, from: impl Into<String>, to: impl Into<String>) -> Self {
+        self.from_version = Some(from.into());
+        self.to_version = Some(to.into());
+        self
+    }
+
+    /// Say why something was refused or failed, without an HTTP status.
+    pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
+        self.reason = Some(reason.into());
         self
     }
 

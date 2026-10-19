@@ -70,27 +70,30 @@ fn remove_if_present(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Start again as whatever binary is now at this executable's path.
+/// Start again as whatever binary is now at `exe`.
+///
+/// `exe` is the path this process was started from, taken *before* any swap.
+/// Asking the system afterwards is wrong on Linux: `/proc/self/exe` follows
+/// the running file through a rename, so after [`swap_in`] it names
+/// `<exe>.prev` — the binary just replaced — and restarting from it would run
+/// the old version while the new one sat unused.
 ///
 /// On Unix this replaces the process image in place (same pid, same
 /// arguments), so it returns only if that failed. Windows has no such call:
 /// the process ends with [`ShellTunnelError::Updated`], which `main` turns
 /// into an exit its supervisor answers by starting it again.
-pub fn restart() -> ShellTunnelError {
+pub fn restart(exe: &Path) -> ShellTunnelError {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let exe = match std::env::current_exe() {
-            Ok(exe) => exe,
-            Err(e) => return ShellTunnelError::Update(format!("cannot restart: {e}")),
-        };
-        let err = std::process::Command::new(&exe)
+        let err = std::process::Command::new(exe)
             .args(std::env::args_os().skip(1))
             .exec();
         ShellTunnelError::Update(format!("cannot restart as {}: {err}", exe.display()))
     }
     #[cfg(not(unix))]
     {
+        let _ = exe;
         ShellTunnelError::Updated
     }
 }

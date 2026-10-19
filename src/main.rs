@@ -1227,6 +1227,18 @@ async fn run_with_relay(
     let hop_token = shell_tunnel::security::generate_api_key();
     server_config.security.rate_limit.trusted_hop_token = Some(hop_token.clone());
 
+    // A binary swapped in by an update counts its start before anything is
+    // served — a start that dies before attaching is the one this protects
+    // against, and it must be counted before it can die.
+    #[cfg(feature = "self-update")]
+    let follow = if args.follow_relay_updates {
+        let exe = std::env::current_exe().map_err(shell_tunnel::ShellTunnelError::Io)?;
+        let pending = shell_tunnel::update::follow::on_start(&exe, &state.audit).await?;
+        Some((exe, pending, state.clone()))
+    } else {
+        None
+    };
+
     let listener = shell_tunnel::api::bind(&server_config).await?;
     let local = listener
         .local_addr()
@@ -1272,9 +1284,13 @@ async fn run_with_relay(
     // off the top of the screen, so a reconnect is a log line — which is also
     // the stream the drop it recovers from was reported on.
     let generated_key = exposure.generated_key.clone();
+    // The follower sees every attach outcome too; the banner task hands each
+    // one on before looking at it.
+    let (follow_tx, follow_rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut announced = false;
         while let Some(event) = events_rx.recv().await {
+            let _ = follow_tx.send(event.clone());
             // Only an enrolment has a line to print; a refusal ends the client
             // and is reported by the error it returns.
             let shell_tunnel::relay::client::AttachEvent::Enrolled {
@@ -1292,12 +1308,34 @@ async fn run_with_relay(
         }
     });
 
+    #[cfg(feature = "self-update")]
+    let follower = async move {
+        use shell_tunnel::update::follow;
+        let Some((exe, pending, state)) = follow else {
+            drop(follow_rx);
+            return std::future::pending().await;
+        };
+        let mut events = follow_rx;
+        let cfg = follow::FollowConfig::default();
+        if let Some(pending) = pending {
+            follow::probation(&exe, pending, &mut events, &cfg, &state.audit).await?;
+        }
+        Err(follow::follow(state, exe, events, cfg).await)
+    };
+    #[cfg(not(feature = "self-update"))]
+    let follower = async move {
+        drop(follow_rx);
+        std::future::pending::<shell_tunnel::Result<()>>().await
+    };
+
     tokio::select! {
         result = server => result.expect("server task panicked"),
         // The client only returns once attaching is pointless — another
         // process has taken this device's name. `exit_for` says so and picks
         // the exit status a service manager can tell apart.
         result = run_relay_client(client_config, None) => result,
+        // Returns only to end the process for an update (or a rollback).
+        result = follower => result,
     }
 }
 

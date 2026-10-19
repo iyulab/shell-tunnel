@@ -10,6 +10,8 @@ use self_update::cargo_crate_version;
 use crate::Result;
 
 #[cfg(feature = "relay-client")]
+pub mod follow;
+#[cfg(feature = "relay-client")]
 pub mod stage;
 #[cfg(feature = "relay-client")]
 pub mod state;
