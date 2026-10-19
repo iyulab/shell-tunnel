@@ -3,6 +3,16 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## 0.32.0 — unreleased
+
+### Fixed
+
+- **A `HEAD` request through a relay answered `502`.** A response to `HEAD` declares the length
+  of the body its `GET` would carry and sends none; since 0.30.0 a device reads its local
+  server's answer as it arrives, read that length as a body still to come, and reported the
+  answer cut short when the connection closed. It now ends a `HEAD` response at its headers.
+  The fix is in the device.
+
 ## 0.31.0 — 2026-10-20
 
 ### Added

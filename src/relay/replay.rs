@@ -53,6 +53,9 @@ const MAX_HEAD: usize = 64 * 1024;
 pub(crate) struct ResponseReader {
     state: State,
     buf: Vec<u8>,
+    /// The request was `HEAD`: the response has headers only, whatever length
+    /// they declare.
+    to_head: bool,
 }
 
 impl Default for ResponseReader {
@@ -60,11 +63,25 @@ impl Default for ResponseReader {
         Self {
             state: State::Head,
             buf: Vec::new(),
+            to_head: false,
         }
     }
 }
 
 impl ResponseReader {
+    /// A reader for the response to a request with this method.
+    ///
+    /// The method matters for exactly one: a response to `HEAD` carries the
+    /// `content-length` the `GET` would have, and no body (RFC 9110 §9.3.2).
+    /// Read by its headers alone it waits for bytes that never come, and the
+    /// connection closing reads as a response cut short.
+    pub(crate) fn for_method(method: &str) -> Self {
+        Self {
+            to_head: method.eq_ignore_ascii_case("HEAD"),
+            ..Self::default()
+        }
+    }
+
     /// Feed bytes as they arrive; returns what they completed.
     pub(crate) fn feed(&mut self, bytes: &[u8]) -> Result<Vec<ReplayEvent>, ReplayError> {
         self.buf.extend_from_slice(bytes);
@@ -221,7 +238,8 @@ impl ResponseReader {
         events.push(ReplayEvent::Head { status, headers });
 
         // RFC 9112 §6.3: no body for these, whatever the headers say.
-        let bodiless = (100..200).contains(&status) || status == 204 || status == 304;
+        let bodiless =
+            self.to_head || (100..200).contains(&status) || status == 204 || status == 304;
         self.state = if bodiless {
             events.push(ReplayEvent::End);
             State::Done
@@ -351,5 +369,32 @@ mod tests {
             reader.feed(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\n"),
             Err(ReplayError::Malformed("bad chunk size"))
         );
+    }
+
+    /// A response to `HEAD` ends at its head, whatever length it declares.
+    #[test]
+    fn a_response_to_head_has_no_body_whatever_its_length_says() {
+        let mut reader = ResponseReader::for_method("HEAD");
+        let events = reader
+            .feed(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\n")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                ReplayEvent::Head {
+                    status: 200,
+                    headers: vec![("content-length".into(), "12".into())],
+                },
+                ReplayEvent::End,
+            ]
+        );
+        assert_eq!(reader.finish().unwrap(), vec![]);
+
+        // The same head to a GET waits for its twelve bytes.
+        let mut reader = ResponseReader::for_method("GET");
+        reader
+            .feed(b"HTTP/1.1 200 OK\r\ncontent-length: 12\r\n\r\n")
+            .unwrap();
+        assert_eq!(reader.finish(), Err(ReplayError::CutShort));
     }
 }

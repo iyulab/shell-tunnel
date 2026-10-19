@@ -574,3 +574,29 @@ async fn a_body_over_the_route_limit_answers_413_not_502() {
         );
     }
 }
+
+/// A `HEAD` through the relay answers with the headers its `GET` would carry,
+/// and no body.
+///
+/// The response to `HEAD` declares the length of the body it does not send. A
+/// device reading its local server's answer by the headers alone waited for
+/// that body, saw the connection close instead, and reported the answer cut
+/// short — a `502` for a request that succeeded.
+#[tokio::test]
+async fn a_head_request_through_the_relay_is_answered_not_reported_broken() {
+    let relay = start_relay().await;
+    let (dir, local) = start_device_server().await;
+    std::fs::write(dir.path().join("probe.txt"), b"twelve bytes").unwrap();
+    spawn_device(relay, local, "header");
+    let base = format!("http://{relay}/d/header");
+    wait_until_attached(&base).await;
+
+    let (status, body) = http_request(
+        &format!("{base}/api/v1/fs/file?path=probe.txt"),
+        "HEAD",
+        &[],
+        &[],
+    )
+    .await;
+    assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+}

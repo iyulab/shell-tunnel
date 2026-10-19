@@ -1517,6 +1517,7 @@ async fn start_replay(
     head.push_str("\r\n");
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
+    let method = request.method.clone();
     let answered = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_answered = std::sync::Arc::clone(&answered);
     // Bounded, so a caller reading slowly slows this reader and, through TCP,
@@ -1529,7 +1530,7 @@ async fn start_replay(
     let (keep_tx, keep_rx) = tokio::sync::oneshot::channel::<WriteHalfOf>();
     tokio::spawn(async move {
         let _write_half = keep_rx;
-        let mut reader = ResponseReader::default();
+        let mut reader = ResponseReader::for_method(&method);
         let mut buf = vec![0u8; 64 * 1024];
         let message = loop {
             match read_half.read(&mut buf).await {
