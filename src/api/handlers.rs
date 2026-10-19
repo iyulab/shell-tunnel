@@ -40,6 +40,36 @@ pub struct AppState {
     pub activity: Arc<super::activity::Activity>,
     /// Background processes (`/api/v1/processes`).
     pub processes: crate::execution::processes::ProcessTable,
+    /// The relay this server last enrolled with, when it runs as a relay
+    /// device. Written by the relay client's attach events, read by
+    /// `GET /api/v1`.
+    pub relay: Arc<std::sync::RwLock<Option<RelayAttachment>>>,
+}
+
+/// What a device knows about the relay it attached to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RelayAttachment {
+    /// The version the relay reported at enrolment; `None` from a relay older
+    /// than 0.28.0, which does not report one.
+    pub version: Option<String>,
+    /// When this device last enrolled with it, in Unix milliseconds.
+    pub enrolled_at_ms: u64,
+}
+
+impl AppState {
+    /// Record an enrolment with a relay that reported `version`.
+    pub fn record_relay_enrolment(&self, version: Option<String>) {
+        let enrolled_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if let Ok(mut relay) = self.relay.write() {
+            *relay = Some(RelayAttachment {
+                version,
+                enrolled_at_ms,
+            });
+        }
+    }
 }
 
 impl AppState {
@@ -58,6 +88,7 @@ impl AppState {
             actions: Arc::new(crate::actions::ActionSet::default()),
             activity: Arc::new(super::activity::Activity::new()),
             processes: crate::execution::processes::ProcessTable::new(),
+            relay: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -147,12 +178,21 @@ pub async fn health() -> &'static str {
 }
 
 /// API information endpoint.
-pub async fn api_info() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
+///
+/// `relay` is present on a relay device once it has enrolled: the relay's
+/// version is otherwise unobservable to a caller, since the relay publishes it
+/// to nobody but the devices it enrols — and a fix split between a relay and a
+/// device works only when both halves are at its version.
+pub async fn api_info(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let mut info = serde_json::json!({
         "name": "shell-tunnel",
         "version": env!("CARGO_PKG_VERSION"),
         "status": "running"
-    }))
+    });
+    if let Some(relay) = state.relay.read().ok().and_then(|r| r.clone()) {
+        info["relay"] = serde_json::json!(relay);
+    }
+    Json(info)
 }
 
 /// List all sessions.
@@ -389,9 +429,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_api_info_endpoint() {
-        let response = api_info().await;
+        let response = api_info(State(AppState::new())).await;
         let json = response.0;
         assert_eq!(json["name"], "shell-tunnel");
         assert_eq!(json["status"], "running");
+        assert!(json.get("relay").is_none(), "not a relay device: {json}");
+    }
+
+    #[tokio::test]
+    async fn api_info_names_the_relay_a_device_enrolled_with() {
+        let state = AppState::new();
+        state.record_relay_enrolment(Some("0.30.0".into()));
+        let json = api_info(State(state.clone())).await.0;
+        assert_eq!(json["relay"]["version"], "0.30.0", "{json}");
+        assert!(json["relay"]["enrolled_at_ms"].as_u64().unwrap() > 0);
+
+        // A relay too old to report its version is still reported as one.
+        state.record_relay_enrolment(None);
+        let json = api_info(State(state)).await.0;
+        assert!(json["relay"]["version"].is_null(), "{json}");
     }
 }

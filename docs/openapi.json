@@ -2309,6 +2309,26 @@
           "status": {
             "type": "string",
             "example": "running"
+          },
+          "relay": {
+            "type": "object",
+            "description": "On a relay device, the relay it last enrolled with. Absent on a server that is not a relay device or has not enrolled yet. Since 0.31.0.",
+            "required": [
+              "version",
+              "enrolled_at_ms"
+            ],
+            "properties": {
+              "version": {
+                "type": "string",
+                "nullable": true,
+                "description": "The version the relay reported at enrolment; null from a relay older than 0.28.0."
+              },
+              "enrolled_at_ms": {
+                "type": "integer",
+                "format": "int64",
+                "description": "When this device last enrolled, in Unix milliseconds."
+              }
+            }
           }
         }
       },

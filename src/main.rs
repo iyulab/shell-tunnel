@@ -1245,6 +1245,8 @@ async fn run_with_relay(
     let local = listener
         .local_addr()
         .map_err(shell_tunnel::ShellTunnelError::Io)?;
+    // Kept for the attach events below, which `GET /api/v1` reports from.
+    let attached = state.clone();
     let server = tokio::spawn(shell_tunnel::api::serve_on(listener, server_config, state));
 
     let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1296,11 +1298,13 @@ async fn run_with_relay(
             // Only an enrolment has a line to print; a refusal ends the client
             // and is reported by the error it returns.
             let shell_tunnel::relay::client::AttachEvent::Enrolled {
-                public_url: url, ..
+                public_url: url,
+                relay_version,
             } = event
             else {
                 continue;
             };
+            attached.record_relay_enrolment(relay_version);
             if announced {
                 info!("re-attached to relay as {url}");
             } else {

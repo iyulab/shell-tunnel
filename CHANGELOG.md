@@ -22,6 +22,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 - **`stream` on WebSocket `output` messages** — `"stdout"` or `"stderr"`.
 
+- **A relay device's `GET /api/v1` names the relay's version** — `relay: {version,
+  enrolled_at_ms}`, from the device's last enrolment. A caller could not see it before: the
+  relay reports it only to the devices it enrols, and fixes split between a relay and a
+  device need both at one version. `version` is `null` for a relay older than 0.28.0.
+
 - **An `execute` audit entry carries `bytes` when the request had `stdin`** — how much the
   command's stdin accepted. The input itself is never recorded.
 
@@ -42,7 +47,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   only variant ever produced and is no longer produced at all. `ExecutionResult` gained
   `stdout`, `stderr` and `stdin_written`, and `Command` gained `stdin`; a struct literal of
   either stops compiling. `ProcessTable::write_stdin` is async and takes a wait; `ProcessInfo`
-  gained `stdin_pending` and `ProcessError` `StdinBacklogFull`.
+  gained `stdin_pending` and `ProcessError` `StdinBacklogFull`, and `AppState` `relay` (with
+  `AppState::record_relay_enrolment`, which an embedder running its own relay client calls
+  to make `GET /api/v1` report the relay).
 
 ### Documentation
 

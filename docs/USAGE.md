@@ -2242,6 +2242,21 @@ not say, and the line reads `older than 0.28.0 — it does not say`. Several fix
 the relay and the device at the same version; this is how whoever runs a device can tell
 without access to the relay — the relay does not publish its version on `/health`.
 
+**A caller can read it too, since 0.31.0**: a relay device's `GET /api/v1` carries
+`relay`, with the version that relay reported when this device last enrolled — through
+the relay or locally, with any valid token:
+
+```bash
+curl -s "$RELAY/d/build-01/api/v1" -H "Authorization: Bearer $KEY"
+# {"name":"shell-tunnel","relay":{"enrolled_at_ms":1792427671678,"version":"0.31.0"},
+#  "status":"running","version":"0.31.0"}
+```
+
+`relay.version` is `null` for a relay older than 0.28.0, which does not report one, and
+`relay` is absent on a server that is not a relay device, or has not enrolled yet. It is
+the *last* enrolment: a device that has since lost its relay keeps reporting it until
+the next one.
+
 ### What many commands at once do to everything else
 
 Commands queue rather than fail. Each one in flight occupies one thread of the
