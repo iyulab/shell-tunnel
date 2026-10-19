@@ -392,3 +392,58 @@ mod reqwest_lite {
         }
     }
 }
+
+/// The WebSocket `execute` takes `stdin` as `POST /api/v1/execute` does, each
+/// chunk names its pipe, and the result says how much input went in.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ws_execute_takes_stdin_and_names_each_chunks_pipe() {
+    let addr = spawn_server().await;
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/v1/ws"))
+        .await
+        .expect("WebSocket connect failed");
+
+    let command = if cfg!(windows) {
+        r#"findstr \"^\" & echo to_err 1>&2"#
+    } else {
+        "cat; echo to_err 1>&2"
+    };
+    ws.send(Message::text(format!(
+        r#"{{"type":"execute","command":"{command}","stdin":"from_ws_stdin\n"}}"#
+    )))
+    .await
+    .expect("send failed");
+
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut result = None;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(msg) = ws.next().await {
+            let Message::Text(text) = msg.expect("ws frame error") else {
+                continue;
+            };
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            match v["type"].as_str() {
+                Some("output") => match v["stream"].as_str() {
+                    Some("stdout") => stdout.push_str(v["data"].as_str().unwrap()),
+                    Some("stderr") => stderr.push_str(v["data"].as_str().unwrap()),
+                    other => panic!("an output chunk must name its pipe: {other:?} in {v}"),
+                },
+                Some("result") => {
+                    result = Some(v);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the exchange should finish");
+
+    assert!(stdout.contains("from_ws_stdin"), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("to_err") && !stdout.contains("to_err"),
+        "stderr: {stderr:?}"
+    );
+    let result = result.expect("a result message");
+    assert_eq!(result["stdin_written"], 14, "{result}");
+}

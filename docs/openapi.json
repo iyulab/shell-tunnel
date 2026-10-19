@@ -3324,6 +3324,10 @@
                 "default": 30,
                 "minimum": 1,
                 "maximum": 300
+              },
+              "stdin": {
+                "type": "string",
+                "description": "Text written to the command's stdin, which is then closed — as on `POST /api/v1/execute`. Since 0.32.0."
               }
             },
             "additionalProperties": false
@@ -3414,6 +3418,11 @@
                 "type": "integer",
                 "format": "int64",
                 "description": "Bytes the command produced. Carried without a `truncated` flag, unlike the REST response: the cap governs the collected result rather than the socket, so there is nothing here for a cap to discard. A consumer that keeps reading receives every chunk; one that stops reading while its command runs on can miss chunks produced after that command's timeout has passed."
+              },
+              "stdin_written": {
+                "type": "integer",
+                "format": "int64",
+                "description": "Bytes of `stdin` the command's stdin accepted; present only when the `execute` message carried `stdin`. Since 0.32.0."
               }
             }
           },

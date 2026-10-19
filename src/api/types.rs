@@ -293,6 +293,10 @@ pub enum WsClientMessage {
         command: String,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// Text written to the command's stdin, which is then closed — as
+        /// `stdin` on `POST /api/v1/execute`.
+        #[serde(default)]
+        stdin: Option<String>,
     },
     /// Connection health. The server answers `Ping` with `Pong`.
     Ping,
@@ -333,6 +337,10 @@ pub enum WsServerMessage {
         duration_ms: u64,
         timed_out: bool,
         total_bytes: u64,
+        /// Bytes of `stdin` the command's stdin accepted; present only when
+        /// the `execute` message carried `stdin`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stdin_written: Option<u64>,
     },
     /// Error message.
     Error {
@@ -400,6 +408,7 @@ mod tests {
         let msg = WsClientMessage::Execute {
             command: "ls".to_string(),
             timeout_secs: Some(10),
+            stdin: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("execute"));

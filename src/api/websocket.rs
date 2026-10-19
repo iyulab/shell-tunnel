@@ -91,11 +91,15 @@ async fn handle_socket(
             WsClientMessage::Execute {
                 command,
                 timeout_secs,
+                stdin,
             } => {
                 // Build command
                 let mut cmd = Command::new(&command);
                 if let Some(secs) = timeout_secs {
                     cmd = cmd.timeout(Duration::from_secs(secs));
+                }
+                if let Some(input) = stdin {
+                    cmd = cmd.stdin(input.into_bytes());
                 }
 
                 // Busy for the whole command, exactly as the REST path is. This
@@ -185,6 +189,7 @@ async fn handle_socket(
                                     duration_ms: result.duration.as_millis() as u64,
                                     timed_out: result.timed_out,
                                     total_bytes: result.total_bytes,
+                                    stdin_written: result.stdin_written,
                                 };
                                 if let Ok(json) = serde_json::to_string(&result_msg) {
                                     let _ = sink.send(Message::Text(json.into())).await;
@@ -349,10 +354,14 @@ async fn handle_oneshot_socket(
             WsClientMessage::Execute {
                 command,
                 timeout_secs,
+                stdin,
             } => {
                 let mut cmd = Command::new(&command);
                 if let Some(secs) = timeout_secs {
                     cmd = cmd.timeout(Duration::from_secs(secs));
+                }
+                if let Some(input) = stdin {
+                    cmd = cmd.stdin(input.into_bytes());
                 }
 
                 match state.executor.execute_async(&cmd).await {
@@ -400,6 +409,7 @@ async fn handle_oneshot_socket(
                                     duration_ms: result.duration.as_millis() as u64,
                                     timed_out: result.timed_out,
                                     total_bytes: result.total_bytes,
+                                    stdin_written: result.stdin_written,
                                 };
                                 if let Ok(json) = serde_json::to_string(&result_msg) {
                                     let _ = sink.send(Message::Text(json.into())).await;

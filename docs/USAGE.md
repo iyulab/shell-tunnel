@@ -448,8 +448,8 @@ string cannot carry arbitrary bytes, so binary input goes to a background
 process instead (§3.3), whose stdin route takes a raw body. The whole request
 body, `stdin` included, is limited to 2 MiB — larger is refused with `413` before
 anything runs; for more input than that, use a background process. The same
-field works on a session's execute; the WebSocket `execute` message does not
-take it.
+field works on a session's execute, and — since 0.32.0 — on the WebSocket `execute`
+message, whose `result` then carries `stdin_written` too.
 
 A command runs with the server's own environment, passed through unchanged: the
 server adds no variable of its own. Before 0.29.0 it added one — `RUST_LOG`, set
@@ -622,7 +622,7 @@ sending the same `Authorization` header. Messages are JSON, tagged by `type`:
 
 | Direction | Message |
 |---|---|
-| → server | `{"type":"execute","command":"...","timeout_secs":30}` |
+| → server | `{"type":"execute","command":"...","timeout_secs":30,"stdin":"..."}` — `stdin` optional (since 0.32.0), as on `POST /api/v1/execute` |
 | ← server | `{"type":"output","data":"...","stream":"stdout","is_final":false}` — `stream` is `stdout` or `stderr` (since 0.31.0) |
 | ← server | `{"type":"result","success":true,"exit_code":0,"duration_ms":5,"timed_out":false,"total_bytes":6}` |
 | ← server | `{"type":"error","code":"...","message":"..."}` |

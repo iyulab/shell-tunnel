@@ -19,6 +19,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   audit entry. Not in this release: WebSocket upstreams, a key in the path, `https://`
   upstreams. See `docs/USAGE.md` §3.4.
 
+- **`stdin` on the WebSocket `execute` message**, as on `POST /api/v1/execute` since 0.31.0;
+  its `result` carries `stdin_written`.
+
 ### Changed
 
 - **`operator` does not hold `expose:*`**, the one capability it does not carry. A key scoped
@@ -27,8 +30,9 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   when the server's keys cannot reach a service it exposes, and its scope line now names
   what `operator` withholds instead of saying nothing is withheld.
 
-- Library: `AuditEvent` gained `expose`, and `AppState` `exposes`; a struct literal of
-  either stops compiling.
+- Library: `AuditEvent` gained `expose`, `AppState` `exposes`, `WsClientMessage::Execute`
+  `stdin` and `WsServerMessage::Result` `stdin_written`; a literal of any of them stops
+  compiling.
 
 ### Fixed
 
