@@ -119,6 +119,10 @@ pub struct AuditEvent {
     /// The version an `update.*` event moves to — the one the relay announced.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_version: Option<String>,
+    /// Where an `fs.move` put the entry `file` names, in the same form as
+    /// `file`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 impl AuditEvent {
@@ -147,6 +151,7 @@ impl AuditEvent {
             params: None,
             from_version: None,
             to_version: None,
+            target: None,
         }
     }
 
@@ -220,6 +225,12 @@ impl AuditEvent {
     pub fn with_file(mut self, path: impl Into<String>, bytes: Option<u64>) -> Self {
         self.file = Some(path.into());
         self.bytes = bytes;
+        self
+    }
+
+    /// Attach where a move put its entry.
+    pub fn with_target(mut self, path: impl Into<String>) -> Self {
+        self.target = Some(path.into());
         self
     }
 

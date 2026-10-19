@@ -938,6 +938,346 @@
             "$ref": "#/components/responses/UpdatingError"
           }
         }
+      },
+      "put": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Write a small file in one request",
+        "description": "Writes the request body as the whole file at `path`. The body may be at most the `chunk_size` an upload session would advertise to this caller (4 MiB by default, less through a relay); a larger one is `413 body-too-large` and belongs to `POST /api/v1/fs/uploads`. Written into the staging directory and renamed into place, so no reader sees a partial file. The parent must exist. Since 0.30.0.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsPut",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "app/config.json"
+          },
+          {
+            "name": "overwrite",
+            "in": "query",
+            "description": "Replace a file already at `path`. A directory is never replaced.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string",
+                "format": "binary"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Written; nothing was there.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutResult"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Written over an existing file (`overwrite=true`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PutResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path`, or a query parameter this server does not recognise (plain text).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found` — the parent directory does not exist.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`destination-exists`, `destination-is-directory`, or `destination-busy` — an upload in flight holds this path; the body carries its `upload_id`, as `POST /api/v1/fs/uploads` does.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "`body-too-large`, with the per-request `limit` in bytes. A body over the server's 8 MiB ceiling is refused before it is read, without this body.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "limit": {
+                      "type": "integer"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "`too-many-uploads` — the write needs an upload slot for its moment, and every one is taken.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "`write-failed` — the filesystem refused it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/fs/mkdir": {
+      "post": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Create a directory",
+        "description": "Creates one directory, or with `parents=true` the whole missing chain (and accepts one that already exists). Paths resolve as for every fs route; the reserved staging directory is refused by name. Since 0.30.0.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsMkdir",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MkdirRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MkdirResult"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Already a directory, and `parents=true` accepted it (`created: false`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MkdirResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found` — the parent does not exist and `parents` is not set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`exists` (a directory, without `parents`) or `exists-not-directory` (something else is in the way, whatever `parents` says).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A body field this server does not recognise."
+          },
+          "500": {
+            "description": "`mkdir-failed` — the filesystem refused it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
+      }
+    },
+    "/api/v1/fs/move": {
+      "post": {
+        "tags": [
+          "Filesystem"
+        ],
+        "summary": "Move or rename one entry",
+        "description": "Renames `from` to `to` within what the file API reaches. A rename, not a copy: across two filesystems it is refused (`409 cross-device`). A symlink named as `from` moves as the link. A file at `to` is replaced only with `overwrite=true`; a directory there never is. The destination's parent must exist. Since 0.30.0.\n\nRequired capability: `fs.write`.",
+        "operationId": "fsMove",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MoveRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Moved. Also answered, with nothing done, when `from` and `to` name the same entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MoveResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`bad-path` — including a directory moved into itself.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/UnauthorizedError"
+          },
+          "403": {
+            "description": "`fs-not-enabled`, `path-escapes-root`, or `reserved-path` (either path).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "`not-found` — `from` does not exist, or `to`'s parent does not.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "`destination-exists`, `destination-is-directory`, `destination-busy` (an upload in flight names `to`, or a path at or under `from`), `staging-in-tree` (`from` is a tree holding staged upload bytes), or `cross-device`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A body field this server does not recognise."
+          },
+          "500": {
+            "description": "`move-failed` — the filesystem refused it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "$ref": "#/components/responses/UpdatingError"
+          }
+        }
       }
     },
     "/api/v1/fs/uploads": {
@@ -2275,6 +2615,107 @@
             }
           }
         ]
+      },
+      "MkdirRequest": {
+        "type": "object",
+        "required": [
+          "path"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Directory to create, in the same form as every fs path.",
+            "example": "app/releases/v2"
+          },
+          "parents": {
+            "type": "boolean",
+            "default": false,
+            "description": "Create missing parents too, and accept a directory that already exists (`mkdir -p`)."
+          }
+        }
+      },
+      "MkdirResult": {
+        "type": "object",
+        "required": [
+          "path",
+          "created"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "created": {
+            "type": "boolean",
+            "description": "`false` only when `parents=true` found the directory already there."
+          }
+        }
+      },
+      "MoveRequest": {
+        "type": "object",
+        "required": [
+          "from",
+          "to"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "from": {
+            "type": "string",
+            "example": "app/current"
+          },
+          "to": {
+            "type": "string",
+            "example": "app/previous"
+          },
+          "overwrite": {
+            "type": "boolean",
+            "default": false,
+            "description": "Replace a file at `to`. A directory there is never replaced."
+          }
+        }
+      },
+      "MoveResult": {
+        "type": "object",
+        "required": [
+          "from",
+          "to",
+          "replaced"
+        ],
+        "properties": {
+          "from": {
+            "type": "string"
+          },
+          "to": {
+            "type": "string"
+          },
+          "replaced": {
+            "type": "boolean"
+          }
+        }
+      },
+      "PutResult": {
+        "type": "object",
+        "required": [
+          "path",
+          "bytes",
+          "sha256",
+          "replaced"
+        ],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "bytes": {
+            "type": "integer"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "SHA-256 of what was written, lowercase hex."
+          },
+          "replaced": {
+            "type": "boolean"
+          }
+        }
       }
     },
     "responses": {

@@ -40,6 +40,7 @@
 pub mod actions;
 pub mod activity;
 pub mod fs;
+pub mod fs_edit;
 pub mod handlers;
 pub mod router;
 pub mod sweep;

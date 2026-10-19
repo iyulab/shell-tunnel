@@ -476,6 +476,101 @@ impl UploadStore {
             .count()
     }
 
+    /// Write `body` as the whole file at `dest_abs`, through the same claim
+    /// and staging an upload session uses — a session that opens, receives
+    /// everything and completes inside one call.
+    ///
+    /// Claiming is the point. A one-shot write racing an upload to the same
+    /// destination is the last-writer-wins loss the claim exists to prevent,
+    /// and a check-then-write against `live_destinations_at` would leave the
+    /// window between the two open; holding the claim refuses the second
+    /// writer, whichever kind it is, as `Conflict`. It also means the staging
+    /// directory is reclaimed by `release` under the claim lock, so a
+    /// machine-wide write does not leave a `.shell-tunnel-uploads` beside its
+    /// destination — the artifact `release`'s own doc says this API cleans up
+    /// after itself.
+    ///
+    /// The staged name is an `up-` id like a session's, so a crash between
+    /// write and rename leaves a `.part` the orphan sweep already reclaims.
+    /// Not a session: the id is never in `sessions`, and a `Conflict` naming it
+    /// refers to a write that is over within this call.
+    pub fn write_whole(
+        &self,
+        root: &crate::fs::FsRoot,
+        dest_abs: &Path,
+        dest_rel: String,
+        body: &[u8],
+    ) -> Result<(), UploadError> {
+        let staging = Self::staging_dir(root, dest_abs);
+        let serial = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let id = format!("up-{serial:016x}");
+        {
+            let mut claimed = self.claimed.lock().map_err(|_| poisoned())?;
+            if let Some(holder) = claimed.get(&dest_rel) {
+                return Err(UploadError::Conflict {
+                    upload_id: holder.upload_id.clone(),
+                });
+            }
+            if claimed.len() >= MAX_CONCURRENT_UPLOADS {
+                return Err(UploadError::TooManySessions);
+            }
+            claimed.insert(
+                dest_rel.clone(),
+                Claim {
+                    staging: staging.clone(),
+                    upload_id: id.clone(),
+                },
+            );
+        }
+
+        let part_path = staging.join(format!("{id}.part"));
+        let written = (|| -> std::io::Result<()> {
+            std::fs::create_dir_all(&staging)?;
+            // `create_new` for the reason `create` gives: never follow
+            // whatever might sit at the staged name.
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&part_path)?;
+            std::io::Write::write_all(&mut file, body)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&part_path, dest_abs)
+        })();
+        if written.is_err() {
+            std::fs::remove_file(&part_path).ok();
+        }
+        self.release(&dest_rel);
+        written.map_err(UploadError::from)
+    }
+
+    /// How many live sessions will land at or under `path`, for a `path` that
+    /// may not exist yet.
+    ///
+    /// [`Self::live_destinations_under`] canonicalises its argument, so for a
+    /// path that does not exist it can only give its conservative answer —
+    /// which makes it useless to a route that is about to *create* that path.
+    /// This takes the path as `FsRoot` already resolved it (`resolve_for_create`
+    /// or a named entry: a canonical parent and literal components), the same
+    /// form `create` stores as a session's destination, so the two compare
+    /// without touching the disk. A poisoned lock still answers one.
+    pub fn live_destinations_at(&self, path: &Path) -> usize {
+        let Ok(sessions) = self.sessions.read() else {
+            return 1;
+        };
+        sessions
+            .values()
+            .filter(|session| {
+                session
+                    .lock()
+                    .map(|s| s.dest_abs.starts_with(path))
+                    .unwrap_or(true)
+            })
+            .count()
+    }
+
     /// Open a session for `dest_rel`, which need not exist yet.
     ///
     /// Does *not* sweep expired sessions itself, even opportunistically — an

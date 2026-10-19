@@ -636,7 +636,8 @@ notices, which on default settings is hours.
 | `POST` | `/api/v1/execute` | `exec` |
 | `WS` | `/api/v1/ws`, `/api/v1/sessions/{id}/ws` | `exec` |
 | `GET` | `/api/v1/fs/list`, `/api/v1/fs/stat`, `/api/v1/fs/file` | `fs.read` |
-| `DELETE` | `/api/v1/fs/file` | `fs.write` |
+| `DELETE`, `PUT` | `/api/v1/fs/file` | `fs.write` |
+| `POST` | `/api/v1/fs/mkdir`, `/api/v1/fs/move` | `fs.write` |
 | `POST` | `/api/v1/fs/uploads`, `/api/v1/fs/uploads/{id}/complete` | `fs.write` |
 | `GET`, `PATCH`, `DELETE` | `/api/v1/fs/uploads/{id}` | `fs.write` |
 | `GET` | `/api/v1/actions` | *(any valid token — the list is filtered to the token)* |
@@ -925,6 +926,49 @@ through it ends — completed, abandoned, or swept — so a directory that recei
 upload does not keep a marker afterwards. `list` never shows it and `stat` and `delete`
 refuse it by name while it exists, since a predictable session id would otherwise let
 one caller reach into another's transfer.
+
+#### 3.3 Directories, moves and small files
+
+Three writes that need no upload session (since 0.30.0). All take `fs.write`, resolve
+every path the way the routes above do, refuse the reserved staging directory by name,
+and leave an audit line (§4).
+
+```bash
+# Make a directory. parents=true also creates missing parents and accepts one that
+# already exists — mkdir -p. Without it, a missing parent is 404 and an existing
+# directory is 409 exists.
+curl -s -X POST "$BASE/api/v1/fs/mkdir" -H 'Content-Type: application/json'   -d '{"path":"app/releases/v2","parents":true}'
+# {"path":"app/releases/v2","created":true}
+
+# Move or rename one entry. A file at the destination is replaced only with
+# overwrite=true; a directory there is never replaced.
+curl -s -X POST "$BASE/api/v1/fs/move" -H 'Content-Type: application/json'   -d '{"from":"app/current","to":"app/previous"}'
+# {"from":"app/current","to":"app/previous","replaced":false}
+
+# Write a whole small file in one request. overwrite=true to replace one.
+curl -s -X PUT "$BASE/api/v1/fs/file?path=app/config.json" --data-binary @config.json
+# {"path":"app/config.json","bytes":42,"sha256":"…","replaced":false}
+```
+
+**`move` renames; it does not copy.** Source and destination must be on one filesystem —
+across two (two drives, or a mount point, with no `--fs-root`) it answers `409
+cross-device` and nothing moves. A symlink named as `from` is moved as the link, not
+as what it points to. A directory cannot be moved into itself (`400`), and the
+destination's parent must already exist (`404`).
+
+**`PUT` takes at most one upload chunk's worth** — the `chunk_size` an upload session
+would advertise to the same caller (4 MiB by default, less through a relay). A larger
+body answers `413 body-too-large` with `limit` in the body; send that file through
+`POST /api/v1/fs/uploads`. The bytes are written into the staging directory and renamed
+onto the destination, so a reader never sees half a file and a failed write leaves the
+old one in place. The destination's parent must exist — make it with `mkdir` first.
+
+**An upload in flight holds its destination.** `PUT` to the path an open upload names,
+or a `move` of a tree an upload is destined into or of anything onto such a path, is
+`409 destination-busy` — the upload would undo the write when it completed. A `PUT`
+holds the path the same way for as long as it writes, and takes one of the upload
+slots while it does (`429 too-many-uploads` when every slot is taken). A move of a
+tree that holds staged bytes is `409 staging-in-tree`, as for `DELETE`.
 
 ---
 
@@ -1285,6 +1329,15 @@ capability token is the access control — withhold `exec` to deny execution.
 | `fs.delete.partial` | a directory removal where some entries survived | `file`, `bytes`, `entries` (a count — not a lower bound: an entry whose removal itself failed is still counted, so this is what was attempted, not what actually disappeared) |
 | `fs.delete.refused` | a removal the server turned away before touching the disk | `file`, `status`, `reason` (`recursive-required`, `staging-in-tree`, or `reserved-path` — the same code the HTTP body carries) |
 | `fs.delete.failed` | a removal that was attempted and the filesystem refused | `file`, `status`, `reason` (the underlying error) |
+| `fs.mkdir` | a directory created (not recorded when `parents=true` found it already there) | `file` |
+| `fs.mkdir.refused` | a directory the server would not create | `file`, `status`, `reason` (`exists`, `exists-not-directory`, `reserved-path`) |
+| `fs.mkdir.failed` | a creation the filesystem refused | `file`, `status`, `reason` (the underlying error) |
+| `fs.move` | an entry moved | `file` (where it was), `target` (where it is now) |
+| `fs.move.refused` | a move the server turned away before touching the disk, or one across filesystems | `file`, `target`, `status`, `reason` (`reserved-path`, `destination-exists`, `destination-is-directory`, `destination-busy`, `staging-in-tree`, `cross-device`, `bad-path` for a directory into itself) |
+| `fs.move.failed` | a move the filesystem refused | `file`, `target`, `status`, `reason` (the underlying error) |
+| `fs.write` | a file written by `PUT` | `file`, `bytes` |
+| `fs.write.refused` | a `PUT` the server turned away | `file`, `status`, `reason` (`reserved-path`, `body-too-large`, `destination-exists`, `destination-is-directory`, `destination-busy`) |
+| `fs.write.failed` | a write the filesystem refused | `file`, `status`, `reason` (the underlying error) |
 | `upload.start` | a session opened | `file` (destination), `bytes` (declared size), `upload_id` |
 | `upload.refused` | a session the server declined to open | `file`, `status`, `reason` (`destination-busy`, `destination-is-directory`, `reserved-path`, `bad-digest`, `too-many-uploads`, `io-error` — the same code the HTTP body carries). No `upload_id`: no session was opened to name |
 | `upload.complete` | the digest verified and the file was published | `file`, `bytes`, `digest_ok: true`, `upload_id` |
@@ -2036,6 +2089,11 @@ startup rather than serving local-only.
 | **422** `unknown field \`…\`, there are no fields` | `POST /api/v1/sessions` carries a body with anything in it. Create took `shell`, `working_dir` and `env` until 0.20.0 and none of them ever reached a command; they are gone rather than ignored (§3) | drop the field. Set `working_dir` and `env` on each **execute** instead, where they do take effect. Nothing ran |
 | **400** on `POST /api/v1/sessions` with an empty body | `Content-Type: application/json` was declared and no body sent. The route wants no body at all, but a declared JSON body still has to be one | send no content type and no body, or send `{}`. Nothing ran |
 | **400** `Failed to deserialize query string: … unknown field \`…\`` | a query string carries a parameter this server does not recognise, such as `dryRun` for `dry_run` | use the name the message lists. Nothing was changed |
+| **409** `destination-exists` on `PUT .../fs/file` or `POST .../fs/move` | something is already at the destination | pass `overwrite=true` to replace a file; a directory is never replaced (`409 destination-is-directory`) |
+| **409** `destination-busy` on `PUT .../fs/file` or `POST .../fs/move` | an upload in flight names that path, or a path under the tree being moved (§3.3) | cancel the upload or wait for it to finish, then retry |
+| **409** `cross-device` on `POST .../fs/move` | source and destination are on different filesystems | a move does not copy: download and upload, or run the copy as a command |
+| **413** `body-too-large` on `PUT .../fs/file` | the body is over one upload chunk (`limit` in the body) | send it through `POST /api/v1/fs/uploads` (§3.1) |
+| **404** on `POST .../fs/mkdir` | the parent does not exist | pass `parents=true` |
 | **400** `recursive-required` on `DELETE .../fs/file` | path is a real directory | pass `recursive=true` to remove it and everything under it |
 | **409** `staging-in-tree` on `DELETE .../fs/file` | an upload's staging directory is under this directory — which, under `--fs-root`, is the jail root rather than the destination's parent, so an upload merely *destined* into the tree does not raise this (§3.1) | cancel it or wait for it to finish, then retry. `dry_run=true` still answers `200`, with `staging_in_tree: true`. For the case this does *not* refuse, read `uploads_into_tree` in the `200` — a non-zero count means the removal will be undone when those uploads complete (§3.1) |
 | **500** `partial-delete` / `preview-incomplete` on `DELETE .../fs/file?recursive=true` | some entries survived a removal, or could not even be enumerated during a preview | see `failures` in the body; nothing was removed for `preview-incomplete` |

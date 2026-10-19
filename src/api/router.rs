@@ -317,6 +317,9 @@ pub fn required_capability(method: &Method, matched_path: &str) -> RequiredCapab
         ("GET", "/api/v1/fs/stat") => Capability("fs.read"),
         ("GET", "/api/v1/fs/file") => Capability("fs.read"),
         ("DELETE", "/api/v1/fs/file") => Capability("fs.write"),
+        ("PUT", "/api/v1/fs/file") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/mkdir") => Capability("fs.write"),
+        ("POST", "/api/v1/fs/move") => Capability("fs.write"),
         ("POST", "/api/v1/fs/uploads") => Capability("fs.write"),
         ("GET", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
         ("PATCH", "/api/v1/fs/uploads/{id}") => Capability("fs.write"),
@@ -1028,8 +1031,20 @@ fn fs_routes() -> Router<AppState> {
         .route("/stat", get(super::fs::stat))
         .route(
             "/file",
-            get(super::fs::download).delete(super::fs::delete_file),
+            get(super::fs::download)
+                .delete(super::fs::delete_file)
+                // Same raised limit as the chunk route, and for the same
+                // reason: a body over axum's 2 MiB default must reach
+                // `put_file`, whose own `413` names the limit and the upload
+                // route. Layered on this one handler so `GET`/`DELETE` keep
+                // the default.
+                .put(axum::handler::Handler::layer(
+                    super::fs_edit::put_file,
+                    DefaultBodyLimit::max(crate::fs::MAX_CHUNK_SIZE),
+                )),
         )
+        .route("/mkdir", post(super::fs_edit::mkdir))
+        .route("/move", post(super::fs_edit::move_entry))
         .route("/uploads", post(super::fs::create_upload))
         .merge(upload_session_routes)
         .route("/uploads/{id}/complete", post(super::fs::complete_upload))

@@ -131,7 +131,7 @@ pub fn fs_error_response(error: FsError) -> Response {
 /// one that arrived over a Phase 3 direct-connect socket on a relay-joined
 /// device: that socket is a separate TCP connection straight to this
 /// process's own local server, never routed through `proxy_handler`.
-fn via_relay(headers: &axum::http::HeaderMap) -> bool {
+pub(super) fn via_relay(headers: &axum::http::HeaderMap) -> bool {
     headers.contains_key(axum::http::HeaderName::from_static(
         crate::relay::proxy::VIA_RELAY_FRAME_LIMIT_HEADER,
     ))
@@ -257,7 +257,7 @@ pub use crate::fs::UPLOAD_DIR;
 ///
 /// A caller's own directory that happens to be named `.shell-tunnel-uploads`
 /// is refused too. The name is reserved; refusing is the safe direction.
-fn is_reserved_path(rel: &str) -> bool {
+pub(super) fn is_reserved_path(rel: &str) -> bool {
     rel.split('/').any(|segment| segment == UPLOAD_DIR)
 }
 
@@ -265,7 +265,7 @@ fn is_reserved_path(rel: &str) -> bool {
 /// something inside it. Same code and wording `create_upload` already used
 /// for refusing it as a destination — kept identical rather than letting each
 /// caller invent its own phrasing for the same condition.
-fn reserved_path_response() -> Response {
+pub(super) fn reserved_path_response() -> Response {
     error_response(
         StatusCode::FORBIDDEN,
         "reserved-path",
@@ -315,7 +315,7 @@ fn reserved_path_response() -> Response {
 /// what is otherwise the hot read path — to close a leak that only ever
 /// reveals a boolean, against a caller who is not thereby granted anything
 /// they could not already reach.
-fn refuse_if_reserved(root: &FsRoot, resolved: &std::path::Path) -> Option<Response> {
+pub(super) fn refuse_if_reserved(root: &FsRoot, resolved: &std::path::Path) -> Option<Response> {
     match root.relative(resolved) {
         Some(rel) if is_reserved_path(&rel) => Some(reserved_path_response()),
         Some(_) => None,
@@ -1143,7 +1143,7 @@ pub async fn delete_file(
 /// A separator at index 0 (`/srv`, machine-wide on Unix) leaves the anchor
 /// itself, `/`, as the parent. Slicing up to the separator gave `""` instead,
 /// which `resolve_existing` refuses as an empty path — so no entry directly
-/// under `/` could be deleted at all.
+/// under `/` could be named at all.
 fn split_last_component(rel: &str) -> (&str, &str) {
     match rel.rfind(['/', '\\']) {
         Some(0) => (&rel[..1], &rel[1..]),
@@ -1152,17 +1152,22 @@ fn split_last_component(rel: &str) -> (&str, &str) {
     }
 }
 
-/// The synchronous body of `delete_file`. Blocking throughout — see
-/// `delete_file`, which runs this via `spawn_blocking` rather than directly on
-/// the async runtime.
+/// The entry a request path names — its final component taken literally,
+/// never followed — joined onto a parent that went through the jail.
 ///
-/// Deliberately does not act on what `resolve_existing(&query.path)` returns:
+/// Factored out of `delete_file_blocking`, where it was written inline: a
+/// second route acting on a directory entry rather than on whatever it
+/// points to needs every guard below, and a copy would have to get each one
+/// right again.
+///
+/// Deliberately does not act on what `resolve_existing(rel)` returns:
 /// that path follows symlinks all the way to their target
-/// (`src/fs/root.rs:122-132`), so for a same-root symlink it would remove
-/// whatever the link points to and leave the link itself behind — dangling,
-/// and undeletable afterward, since `resolve_existing` refuses every dangling
-/// symlink (`src/fs/root.rs:145-147`). A caller who named a link would see a
-/// different file disappear and the one they named survive.
+/// (`src/fs/root.rs:122-132`), so for a same-root symlink it would name
+/// whatever the link points to and leave the link itself behind — for a
+/// delete, dangling and undeletable afterward, since `resolve_existing`
+/// refuses every dangling symlink (`src/fs/root.rs:145-147`). A caller who
+/// named a link would see a different file disappear and the one they named
+/// survive.
 ///
 /// Instead: resolve the request path in full once, purely to get
 /// `FsRoot`'s Malformed/Escapes/NotFound verdict exactly as every other
@@ -1179,31 +1184,27 @@ fn split_last_component(rel: &str) -> (&str, &str) {
 /// two jail-approved paths to act on — the request's own final component, not
 /// whatever that component's target happens to be.
 ///
-/// The very first line below is what enforces `delete_file`'s documented
-/// "accepted limitation": a symlink pointing outside the root, or a
-/// dangling one, is refused with `Escapes` right there, before any of the
-/// named-entry logic that follows ever runs.
-fn delete_file_blocking(
-    root: &FsRoot,
-    audit: &crate::audit::AuditSink,
-    uploads: &crate::fs::UploadStore,
-    identity: Option<crate::audit::Identity>,
-    query: &DeleteQuery,
-) -> Response {
-    if let Err(error) = root.resolve_existing(&query.path) {
-        return fs_error_response(error);
-    }
+/// The first resolution is also what enforces `delete_file`'s documented
+/// "accepted limitation": a symlink pointing outside the root, or a dangling
+/// one, is refused with `Escapes` right there, before any of the named-entry
+/// logic that follows ever runs.
+///
+/// The result's parent is canonical and its last component is one checked
+/// name, so `FsRoot::relative` can always name it.
+pub(super) fn resolve_named_entry(root: &FsRoot, rel: &str) -> Result<std::path::PathBuf, FsError> {
+    root.resolve_existing(rel)?;
 
-    let (parent_rel, name) = split_last_component(&query.path);
+    let (parent_rel, name) = split_last_component(rel);
 
     // An empty last component means the request named a filesystem anchor
     // (`C:/`, or `/` on Unix) — or ended in a separator, which only an anchor
     // survives the full resolution above with. Joining `""` onto the parent
     // gives the parent back, so without this the anchor itself became the
-    // entry, and with `recursive=true` the whole drive went to `remove_tree`.
-    // An anchor is not an entry this route can name.
+    // entry — for a delete with `recursive=true` the whole drive went to
+    // `remove_tree`, and a move would rename the drive. An anchor is not an
+    // entry any named-entry route can act on.
     if name.is_empty() {
-        return fs_error_response(FsError::Malformed(
+        return Err(FsError::Malformed(
             "path must name an entry, not a filesystem root",
         ));
     }
@@ -1215,10 +1216,11 @@ fn delete_file_blocking(
     // `..` onto an in-root `parent` produces a path whose *actual* location —
     // once something reads it — is one level above `parent`, without ever
     // having gone through the jail. `X/..` always names a directory, but that
-    // no longer refuses it by itself: `path=app/..&recursive=true` reaches the
-    // directory branch below with `recursive` set, so without this guard it
-    // would walk and remove a real directory one level above `parent` —
-    // outside the root — through `remove_tree`. This check is what stops
+    // no longer refuses it by itself: `path=app/..&recursive=true` reaches
+    // `delete_file_blocking`'s directory branch with `recursive` set, and a
+    // move's source is renamed whole, so without this guard either would act
+    // on a real directory one level above `parent` — outside the root — by
+    // `remove_tree` or by `rename`. This check is what stops
     // that, checked here explicitly before `..` is ever joined, load-bearing
     // on its own regardless of `recursive`.
     //
@@ -1243,7 +1245,7 @@ fn delete_file_blocking(
     // Unix, while on Windows the `starts_with(&parent)` postcondition below
     // (built for the drive-letter-injection case) ends up refusing `..` too.
     if name == ".." {
-        return fs_error_response(FsError::Escapes);
+        return Err(FsError::Escapes);
     }
 
     // `.` is the other value `FsRoot::components` never runs `check_component`
@@ -1260,15 +1262,10 @@ fn delete_file_blocking(
     // cover. `Malformed`, not `Escapes`: naming an entry as `.` is not an
     // escape, just not a name.
     if name == "." {
-        return fs_error_response(FsError::Malformed(
-            "delete target must name an entry, not `.`",
-        ));
+        return Err(FsError::Malformed("path must name an entry, not `.`"));
     }
 
-    let parent = match root.resolve_existing(parent_rel) {
-        Ok(path) => path,
-        Err(error) => return fs_error_response(error),
-    };
+    let parent = root.resolve_existing(parent_rel)?;
     let named = parent.join(name);
 
     // `named` above assumes `join` appends exactly one ordinary component. It
@@ -1298,8 +1295,28 @@ fn delete_file_blocking(
     // check's scope narrows for a reason that has nothing to do with this
     // handler.
     if !named.starts_with(&parent) {
-        return fs_error_response(FsError::Escapes);
+        return Err(FsError::Escapes);
     }
+    Ok(named)
+}
+
+/// The synchronous body of `delete_file`. Blocking throughout — see
+/// `delete_file`, which runs this via `spawn_blocking` rather than directly on
+/// the async runtime.
+///
+/// Acts on the named entry, not on a symlink's target — see
+/// [`resolve_named_entry`] for why, and for the guards that make that safe.
+fn delete_file_blocking(
+    root: &FsRoot,
+    audit: &crate::audit::AuditSink,
+    uploads: &crate::fs::UploadStore,
+    identity: Option<crate::audit::Identity>,
+    query: &DeleteQuery,
+) -> Response {
+    let named = match resolve_named_entry(root, &query.path) {
+        Ok(named) => named,
+        Err(error) => return fs_error_response(error),
+    };
 
     // Same reservation `create_upload` enforces on the way in and `list`
     // enforces on the way out: without it, a predictable session id let an
@@ -1636,7 +1653,7 @@ pub struct UploadState {
 }
 
 /// Map an upload refusal onto HTTP.
-fn upload_error_response(error: crate::fs::UploadError) -> Response {
+pub(super) fn upload_error_response(error: crate::fs::UploadError) -> Response {
     use crate::fs::UploadError;
     match error {
         UploadError::NotFound => error_response(
@@ -1994,7 +2011,7 @@ fn audit_upload_refusal(
 /// Kept beside that function deliberately: the two must agree, and a reader
 /// changing one sees the other. Taken by reference so the caller can record
 /// the code and *then* hand the error over to be rendered.
-fn upload_error_code(error: &crate::fs::UploadError) -> &'static str {
+pub(super) fn upload_error_code(error: &crate::fs::UploadError) -> &'static str {
     use crate::fs::UploadError;
     match error {
         UploadError::NotFound => "no-such-upload",
@@ -2443,14 +2460,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_parent_of_an_entry_directly_under_the_root_is_the_root() {
-        assert_eq!(split_last_component("/srv"), ("/", "srv"));
-        assert_eq!(split_last_component("/srv/app"), ("/srv", "app"));
-        assert_eq!(split_last_component("C:/srv"), ("C:", "srv"));
-        assert_eq!(split_last_component("app"), (".", "app"));
-    }
-
-    #[test]
     fn ranges_parse_into_inclusive_bounds() {
         use RangeOutcome::Satisfiable;
 
@@ -2523,6 +2532,22 @@ mod tests {
         let response =
             refuse_if_reserved(&root, &unrelated).expect("None must refuse, not silently allow");
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// The split every named-entry route rests on. Index 0 is the case worth
+    /// pinning: machine-wide on Unix, `/srv` has its separator there, and the
+    /// parent has to be the anchor `/` — an empty string is a path
+    /// `resolve_existing` refuses, which left nothing directly under `/`
+    /// nameable. Not reachable from an HTTP test on a Windows host, where
+    /// every machine-wide path starts with a drive letter.
+    #[test]
+    fn the_last_component_splits_off_its_parent_including_at_the_anchor() {
+        assert_eq!(split_last_component("app/x.txt"), ("app", "x.txt"));
+        assert_eq!(split_last_component(r"app\x.txt"), ("app", "x.txt"));
+        assert_eq!(split_last_component("x.txt"), (".", "x.txt"));
+        assert_eq!(split_last_component("/srv"), ("/", "srv"));
+        assert_eq!(split_last_component("/srv/x"), ("/srv", "x"));
+        assert_eq!(split_last_component("C:/x"), ("C:", "x"));
     }
 
     #[test]

@@ -3,6 +3,25 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Added
+
+- **`POST /api/v1/fs/mkdir`, `POST /api/v1/fs/move` and `PUT /api/v1/fs/file`.** Making a
+  directory, moving or renaming an entry, and writing a small file no longer need a shell
+  command or an upload session. `mkdir` takes `parents` (`mkdir -p`); `move` renames within
+  one filesystem (`409 cross-device` otherwise), moves a symlink as the link, and replaces a
+  file only with `overwrite`; `PUT` writes a body of up to one upload chunk and renames it
+  into place, answering `413 body-too-large` with the `limit` above that. None of them
+  replaces a directory, and an upload in flight holds its destination against them (`409
+  destination-busy`). All three need `fs.write` and are recorded in the audit trail
+  (`fs.mkdir*`, `fs.move*`, `fs.write*`). See `docs/USAGE.md` §3.3.
+
+### Changed
+
+- **`AuditEvent` has one more public field, `target`**, set on `fs.move*` events to where
+  the entry went. An embedder that builds the struct with a literal rather than
+  `AuditEvent::new` stops compiling.
 ## 0.29.1 — 2026-10-19
 
 ### Fixed
