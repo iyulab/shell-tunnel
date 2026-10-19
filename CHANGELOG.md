@@ -14,6 +14,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   struct literal stops compiling, and a receiver that read the URL directly now matches on
   `AttachEvent::Enrolled`.
 
+- **The Linux release binaries are statically linked (musl).** Built against the build
+  machine's glibc, the `linux-x64` binary needed glibc 2.39 or newer and refused to start on
+  Debian 12, RHEL 9 or Ubuntu 22.04 (`GLIBC_2.39 not found`), and on Alpine at all. The
+  archive names are unchanged, so `--update` and existing download commands keep working.
+
 - **`AuditEvent` has two more public fields, `from_version` and `to_version`**, set on the
   new `update.*` events and absent from every other line of the trail. An embedder that
   builds the struct with a literal rather than `AuditEvent::new` stops compiling.

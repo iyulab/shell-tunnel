@@ -51,7 +51,9 @@ curl -LO https://github.com/iyulab/shell-tunnel/releases/latest/download/shell-t
 tar xzf shell-tunnel-linux-x64.tar.gz && sudo mv shell-tunnel /usr/local/bin/
 ```
 
-Release binaries can update themselves: `shell-tunnel --update`.
+The Linux release binaries are statically linked (musl), so they run on any distribution —
+Debian 12, RHEL 9 and Alpine included — with no glibc version to match. Release binaries can
+update themselves: `shell-tunnel --update`.
 
 ## How it works
 

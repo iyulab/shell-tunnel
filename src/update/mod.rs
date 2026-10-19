@@ -235,6 +235,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn linux_releases_are_built_static() {
+        // A glibc-linked release needs the runner's glibc or newer on every
+        // machine it is installed on; musl makes it run anywhere, Alpine
+        // included. `--update` installs these, so a regression would reach
+        // every Linux device that updates.
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/.github/workflows/release.yml"
+        ))
+        .expect("release workflow should be readable");
+        for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+            assert!(
+                workflow.contains(&format!("target: {target}")),
+                "release.yml does not build {target}"
+            );
+        }
+        assert!(
+            !workflow.contains("unknown-linux-gnu"),
+            "release.yml still builds a glibc-linked Linux binary"
+        );
+        assert!(workflow.contains("statically linked|static-pie linked"));
+    }
+
     use super::*;
 
     #[test]

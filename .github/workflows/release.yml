@@ -20,12 +20,16 @@ jobs:
     strategy:
       matrix:
         include:
+          # Linux releases are static (musl): a binary linked against the
+          # runner's glibc needs that glibc or newer, so one built on
+          # ubuntu-latest refused to start on Debian 12, RHEL 9 and Alpine.
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             artifact: shell-tunnel
             archive: shell-tunnel-linux-x64.tar.gz
+            cross: true
           - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
             artifact: shell-tunnel
             archive: shell-tunnel-linux-arm64.tar.gz
             cross: true
@@ -53,7 +57,7 @@ jobs:
 
       # Prebuilt `cross` binary instead of `cargo install --git` (which compiles
       # from source every release) — cuts several minutes of Actions time.
-      - name: Install cross (for ARM64 Linux)
+      - name: Install cross (for the Linux targets)
         if: matrix.cross
         uses: taiki-e/install-action@v2
         with:
@@ -69,6 +73,14 @@ jobs:
       - name: Build
         if: ${{ !matrix.cross }}
         run: cargo build --release --features self-update,relay-client,tls --target ${{ matrix.target }}
+
+      # "Static" is the promise the release makes, so it is checked rather than
+      # assumed: a dynamically linked binary here would ship and then fail on
+      # exactly the systems the musl build exists for.
+      - name: Verify the Linux binary is static
+        if: matrix.cross
+        run: |
+          file target/${{ matrix.target }}/release/${{ matrix.artifact }} | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
 
       - name: Create archive
         if: ${{ !matrix.sign }}
