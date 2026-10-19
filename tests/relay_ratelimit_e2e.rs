@@ -341,3 +341,97 @@ async fn a_hop_with_the_wrong_marker_is_counted() {
         "and it is the device's own limiter that refused"
     );
 }
+
+/// The relay's own `429` reaches a caller who is still sending a body.
+///
+/// The limiter answered before anything had read the request body, and a
+/// server that closes on unread bytes makes the OS send a reset, which throws
+/// away the answer the caller had not read yet. The device had this for every
+/// refusal until 0.24.0 drained bodies first; the relay kept it for its rate
+/// limit, and an upload throttled there reached its caller as a dropped
+/// connection (`WinError 10053`) instead of a `429` it could wait out.
+///
+/// Multi-threaded, as the binary runs: the default flavour hides most of this
+/// race (see `fs_relay_e2e::a_body_over_the_route_limit_answers_413_not_502`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_429_is_delivered_to_a_caller_still_sending_a_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = RelayConfig::new(addr, "secret");
+    config.rate_limit = RateLimitConfig::custom(1, 60);
+    let router = relay_router(RelayState::new(config));
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Spends the one slot: a device-name miss stays charged.
+    assert_eq!(
+        http_get(&format!("http://{addr}/d/nobody/x")).await.status,
+        502
+    );
+
+    let body = vec![b'x'; 7 * 1024 * 1024];
+    for attempt in 0..12 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /d/nobody/upload HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut read_half, mut write_half) = stream.split();
+        let write = async {
+            let _ = write_half.write_all(head.as_bytes()).await;
+            let _ = write_half.write_all(&body).await;
+        };
+        let read = async {
+            let mut raw = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(20), read_half.read_to_end(&mut raw))
+                .await;
+            raw
+        };
+        let ((), raw) = tokio::join!(write, read);
+        let head = String::from_utf8_lossy(&raw[..raw.len().min(64)]).into_owned();
+        assert!(
+            head.starts_with("HTTP/1.1 429"),
+            "attempt {attempt}: the caller received {head:?} — an empty answer is the reset \
+             that discarded the relay's refusal"
+        );
+    }
+}
+
+/// The same for the relay's `502 device is not connected`: an upload to a
+/// device that has just gone away is told so, rather than dropped.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_502_for_a_missing_device_is_delivered_to_a_caller_still_sending_a_body() {
+    let addr = start_relay().await;
+    let body = vec![b'x'; 7 * 1024 * 1024];
+    for attempt in 0..12 {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /d/gone/upload HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\ncontent-length: {}\r\n\r\n",
+            body.len()
+        );
+        let (mut read_half, mut write_half) = stream.split();
+        let write = async {
+            let _ = write_half.write_all(head.as_bytes()).await;
+            let _ = write_half.write_all(&body).await;
+        };
+        let read = async {
+            let mut raw = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(20), read_half.read_to_end(&mut raw))
+                .await;
+            raw
+        };
+        let ((), raw) = tokio::join!(write, read);
+        let head = String::from_utf8_lossy(&raw[..raw.len().min(64)]).into_owned();
+        assert!(
+            head.starts_with("HTTP/1.1 502"),
+            "attempt {attempt}: {head:?}"
+        );
+    }
+}

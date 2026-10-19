@@ -32,6 +32,14 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A relay's `429`, and its `502 device is not connected`, reached a caller still sending a
+  body as a dropped connection.** They were answered before the body was read, and closing on
+  unread bytes makes the operating system reset the connection, which discards the answer: a
+  throttled upload through a relay showed up as a socket error (`10053` on Windows) instead of
+  a `429` to wait out. A refused body is now read and discarded first, up to 8 MiB and 10
+  seconds. The fix is in the relay (and in a device's own limiter, where the body had already
+  been read).
+
 - **A `HEAD` request through a relay answered `502`.** A response to `HEAD` declares the length
   of the body its `GET` would carry and sends none; since 0.30.0 a device reads its local
   server's answer as it arrives, read that length as a body still to come, and reported the

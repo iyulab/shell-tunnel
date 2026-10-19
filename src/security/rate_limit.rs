@@ -456,6 +456,7 @@ pub async fn rate_limit_middleware(
             response
         }
         RateLimitDecision::Limited { retry_after } => {
+            crate::api::router::discard_body(request.into_body()).await;
             let mut response = (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Rate limit exceeded. Please try again later.",

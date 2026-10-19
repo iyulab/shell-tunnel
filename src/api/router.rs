@@ -630,6 +630,49 @@ fn host_is_allowed(header: Option<&str>, allowed: &[String]) -> bool {
 }
 
 /// Reject requests carrying a `Host` this server does not answer to.
+/// The most of a refused request's body [`discard_body`] reads, and for how long.
+///
+/// The same ceiling the server's own body guard holds every request to
+/// (`fs::MAX_CHUNK_SIZE`), and a time bound so a caller trickling a body
+/// cannot hold the refusal open. Past either, the answer goes out with the
+/// rest unread — the reset that may follow is accepted there, as it is for
+/// a body over the ceiling.
+pub(crate) const DISCARD_CEILING: usize = crate::fs::MAX_CHUNK_SIZE;
+pub(crate) const DISCARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read a refused request's body off the socket and throw it away.
+///
+/// A server that answers before consuming a request body and then closes
+/// leaves unread bytes behind, and the OS answers those with a reset that
+/// discards the response the caller has not read yet — the reason the
+/// gateway reads every body before anything may refuse it
+/// ([`drain_request_body_middleware`]). For a refusal made outside that guard
+/// — the rate limiter, which on the gateway sits inside it and finds the body
+/// already in memory, and the relay, which has no such guard — this is the
+/// same logic at the point of refusal. Without it a throttled upload reached
+/// its caller through a relay as a dropped connection instead of a `429` it
+/// could wait out, and an upload to a device that had just gone away as one
+/// instead of a `502`.
+///
+/// Discarded, not collected: refusing means holding nothing for the request,
+/// so a refused caller costs this server bandwidth it was sending anyway and
+/// no memory.
+pub(crate) async fn discard_body(body: axum::body::Body) {
+    use futures_util::StreamExt;
+
+    let mut stream = body.into_data_stream();
+    let mut read = 0usize;
+    let _ = tokio::time::timeout(DISCARD_DEADLINE, async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            read += chunk.len();
+            if read > DISCARD_CEILING {
+                break;
+            }
+        }
+    })
+    .await;
+}
+
 /// Read every request body off the socket before anything can refuse it.
 ///
 /// A server that answers before consuming the request body leaves unread bytes

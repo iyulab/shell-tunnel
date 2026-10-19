@@ -2020,6 +2020,15 @@ recover (§8); it used to retry in silence. Refusals that come *after* the
 connection is established, a rejected enrol token among them, are a separate
 message and were always reported.
 
+**A caller the relay refuses gets the refusal, even mid-upload.** Before 0.32.0 the
+relay's `429`, and its `502 device is not connected`, were answered before the
+request's body had been read; closing on unread bytes makes the operating system
+reset the connection, and the reset discards the answer — so a throttled or
+misdirected upload reached its caller as a dropped connection (a socket error,
+`10053` on Windows) instead of a status it could act on. The relay now reads such a
+body and throws it away before answering, up to 8 MiB and 10 seconds; past either it
+answers anyway, and a reset is possible there as it is for any body over the ceiling.
+
 **A proxied request that reaches an attached device is refunded the same way,
 once the device has answered** — unless the answer was `401` or `403`. What
 stays on the caller's tab: a device name that is not attached (`502 device is

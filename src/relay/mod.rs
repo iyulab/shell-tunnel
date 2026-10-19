@@ -849,13 +849,17 @@ async fn proxy_handler(
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| request.uri().path().to_string());
 
+    // Both refusals below come before the body is read, so each reads it
+    // first and throws it away — see `discard_body` for the reset otherwise.
     let Some((device_id, tail)) = split_device_path(&path_and_query) else {
+        crate::api::router::discard_body(request.into_body()).await;
         return StatusCode::NOT_FOUND.into_response();
     };
 
     let Some(device) = state.devices.get(device_id) else {
         // The device is not attached: this is the relay reporting a missing
         // upstream, which is exactly what 502 means.
+        crate::api::router::discard_body(request.into_body()).await;
         return (StatusCode::BAD_GATEWAY, "device is not connected").into_response();
     };
 
