@@ -443,3 +443,42 @@ fn a_device_busy_with_a_command_waits_for_it_to_finish() {
         finished_ms - applying
     );
 }
+
+/// The attach that ends probation is also where the relay says its version.
+/// Probation hands it on, so a relay still newer than the binary that just
+/// proved itself is followed at once rather than one re-attach later.
+///
+/// Windows only, because only there can the test choose the restarted
+/// binary's environment: it starts the new binary still claiming 0.0.1, which
+/// stands in for "the relay was upgraded again during probation". On Unix the
+/// process restarts itself and drops that variable on the way.
+#[cfg(windows)]
+#[test]
+fn a_relay_still_newer_after_probation_is_followed_without_a_reattach() {
+    let relay_dir = tempfile::tempdir().unwrap();
+    let relay_port = reserved_port();
+    let _relay = start_relay(relay_dir.path(), relay_port);
+    let device = Device::new(relay_port, serve_release(), "300,0,20000");
+
+    let mut first = device.start(true);
+    device.wait_for_kind("update.applying", Duration::from_secs(120));
+    assert_eq!(exit_code(&mut first, Duration::from_secs(30)), Some(4));
+
+    let _second = device.start(true);
+    device.wait_for_kind("update.applied", Duration::from_secs(60));
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while device
+        .kinds()
+        .iter()
+        .filter(|k| *k == "update.available")
+        .count()
+        < 2
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the enrolment that ended probation was not acted on: {:#?}",
+            device.update_lines()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -1317,10 +1317,13 @@ async fn run_with_relay(
         };
         let mut events = follow_rx;
         let cfg = follow::FollowConfig::default();
-        if let Some(pending) = pending {
-            follow::probation(&exe, pending, &mut events, &cfg, &state.audit).await?;
-        }
-        Err(follow::follow(state, exe, events, cfg).await)
+        let first = match pending {
+            Some(pending) => {
+                follow::probation(&exe, pending, &mut events, &cfg, &state.audit).await?
+            }
+            None => None,
+        };
+        Err(follow::follow(state, exe, events, cfg, first).await)
     };
     #[cfg(not(feature = "self-update"))]
     let follower = async move {

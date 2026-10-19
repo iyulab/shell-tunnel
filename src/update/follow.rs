@@ -154,20 +154,28 @@ pub async fn on_start(
 
 /// Watch the first attach of a freshly swapped-in binary and settle it.
 ///
-/// `Ok` once the update is judged applied (or not the new binary's fault);
-/// otherwise the old binary is restored and the restart's error returned.
+/// `Ok` once the update is judged applied (or not the new binary's fault),
+/// carrying the enrolment it saw so [`follow`] can act on it: that attach is
+/// also where the relay says its version, and a relay upgraded while this
+/// binary was on probation would otherwise be followed only one re-attach
+/// later. Otherwise the old binary is restored and the restart's error
+/// returned.
 pub async fn probation(
     exe: &Path,
     pending: Pending,
     events: &mut UnboundedReceiver<AttachEvent>,
     cfg: &FollowConfig,
     audit: &Arc<AuditSink>,
-) -> Result<(), ShellTunnelError> {
+) -> Result<Option<AttachEvent>, ShellTunnelError> {
     let deadline = tokio::time::Instant::now() + cfg.probation;
     let mut refused_credential = false;
+    let mut enrolment = None;
     let observation = loop {
         match tokio::time::timeout_at(deadline, events.recv()).await {
-            Ok(Some(AttachEvent::Enrolled { .. })) => break ProbationObservation::Enrolled,
+            Ok(Some(event @ AttachEvent::Enrolled { .. })) => {
+                enrolment = Some(event);
+                break ProbationObservation::Enrolled;
+            }
             Ok(Some(AttachEvent::Rejected { code })) => {
                 let obs = ProbationObservation::Rejected(code);
                 if state::judge(&obs) == Verdict::KeepWaiting {
@@ -199,7 +207,7 @@ pub async fn probation(
                     AuditEvent::new("update.applied").with_update(&pending.from, &pending.to),
                 )
                 .await;
-            Ok(())
+            Ok(enrolment)
         }
         verdict => {
             let why = match &observation {
@@ -209,7 +217,9 @@ pub async fn probation(
                     cfg.probation.as_secs()
                 ),
             };
-            roll_back(exe, &pending, verdict, &why, st, audit).await
+            roll_back(exe, &pending, verdict, &why, st, audit)
+                .await
+                .map(|()| None)
         }
     }
 }
@@ -271,6 +281,9 @@ async fn roll_back(
 
 /// Follow the relay's version for the life of the process.
 ///
+/// `first` is an attach outcome already taken off `events` — the one
+/// [`probation`] judged — handled before anything newer.
+///
 /// Returns only when the process must end: after a swap, with the restart's
 /// error (Windows), or if the event stream closes for good.
 pub async fn follow(
@@ -278,11 +291,20 @@ pub async fn follow(
     exe: PathBuf,
     mut events: UnboundedReceiver<AttachEvent>,
     cfg: FollowConfig,
+    first: Option<AttachEvent>,
 ) -> ShellTunnelError {
     let current = current_version();
     let dir = exe_dir(&exe).to_path_buf();
     let mut announced: Option<String> = None;
-    while let Some(event) = events.recv().await {
+    let mut next = first;
+    loop {
+        let event = match next.take() {
+            Some(event) => event,
+            None => match events.recv().await {
+                Some(event) => event,
+                None => break,
+            },
+        };
         let AttachEvent::Enrolled {
             relay_version: Some(relay),
             ..
