@@ -267,6 +267,77 @@ as the hazard.
 Neither is recovered on restart, and neither is a failure to report — but a
 caller that assumes a session id outlives the process will see it as one.
 
+### Following the relay's version
+
+`--follow-relay-updates` makes a relay-attached device update itself to the version
+its relay runs, so upgrading a fleet is upgrading the relay. It is off unless asked
+for: replacing the running binary with one fetched from the network is a change this
+program makes only when told to.
+
+**Which version.** Exactly the one the relay reports when the device attaches (relays
+report their version since 0.28.0), and only when it is newer than the device's — a
+device never moves down. It is downloaded from this project's GitHub release of that
+version; nothing asks GitHub for "the latest".
+
+**When.** Once the device has been idle for 60 seconds without a break — no request
+being served, no command running in a session, no upload open — and then after a
+random delay of up to five minutes, so a fleet that saw one relay restart does not
+restart all at once. A session that merely exists does not count as busy. The device
+then answers every request except `/health` with `503 this device is restarting to
+finish an update; retry shortly` and `Retry-After: 30` until the new binary is up.
+
+**What is checked before it replaces anything.** The archive's SHA-256 must match the
+release's own `SHA256SUMS`. On Windows the binary must carry a valid Authenticode
+signature from the publisher that signs these releases (`IYULAB INC.`); a binary
+validly signed by anyone else is refused. Everywhere, the new binary must answer
+`--version` with the expected version. On Linux and macOS there is no signature to
+check — the guarantee is HTTPS to GitHub plus the checksum published in the same
+release, which protects against a corrupted or swapped download but not against a
+compromised release.
+
+**How it restarts.** On Linux and macOS the process replaces itself in place: same
+pid, same arguments, nothing for a supervisor to do. On Windows it cannot, so it exits
+with status **4** — a failure on purpose — and relies on whatever runs it to start it
+again. Under a Windows service that means the failure actions from the recipe above,
+*both* lines: `sc.exe failure … actions= restart/5000` and `sc.exe failureflag … 1`.
+Without the second, the service manager does not restart a process that exited on
+purpose, and the device would stay down after its first update. A service that lacks
+them is refused at startup, with the two commands in the log; a Windows console run is
+allowed, with a banner line saying nothing will start it again. A wrapper script that
+restarts the device should treat 3 as "stop" and every other ending, 4 included, as
+"start again".
+
+**Proving the new binary.** The new binary has 90 seconds to attach to the relay. If
+it does, the update is recorded as applied. If it does not, the previous binary is put
+back, the one that failed is kept beside it as `<exe>.failed`, and the device restarts
+into the old one; that version is tried again after six hours. If the relay refuses the
+new version outright (`unsupported-version`, `bad-handshake`), or the new binary dies
+twice before it can attach, the version is abandoned — never followed again by that
+device. A relay that refuses the *token* is not the new binary's fault, and does not
+roll it back.
+
+**Files it keeps next to the executable** — so the account running the device must be
+able to create files in that directory, which is checked at startup:
+
+| File | What it is |
+|---|---|
+| `shell-tunnel.update.json` | Which update is on probation, which versions are abandoned, when to try again. Delete it to forget all three. |
+| `<exe>.prev` | The binary the last update replaced, kept until the next update. Put it back by hand to undo an update. |
+| `<exe>.failed` | A binary that was rolled back. |
+| `shell-tunnel.staged[.exe]` | A verified download waiting for the device to be idle. |
+
+**Refused at startup** (exit 1, with the reason): `--follow-relay-updates` without
+`--relay`; in a build without the `self-update` and `relay-client` features; when the
+API key was generated for this start (the next start would generate a different one —
+pass `-k` or set it in the config file); when the executable's directory is not
+writable; and on a Windows service without the restart policy above.
+
+An update waits for running commands and open uploads, but it is still a restart: a
+session that exists without a command running in it is gone afterwards, exactly as
+after a reboot (above). With an audit trail configured, each step is recorded:
+`update.available`, `update.applying`, `update.applied`, `update.rolled-back`,
+`update.failed` ([Audit trail](#audit-trail)).
+
 ---
 
 ## 3. Calling the API
@@ -1218,6 +1289,11 @@ capability token is the access control — withhold `exec` to deny execution.
 | `upload.expired` | an idle session was swept automatically after an hour | `file`, `bytes`, `upload_id` |
 | `session.expired` | a shell session was swept automatically after an hour idle | `session_id` (no `file` or `command` — a swept session is named by nothing else, and what it last ran is already in its own `execute` entries) |
 | `upload.orphaned` | a staging file from a previous run was found and removed at startup | `bytes`, `upload_id` (no `file` — its destination lived only in the session a restart already discarded) |
+| `update.available` | the relay runs a newer version than this device and the device will follow it ([Following the relay's version](#following-the-relays-version)) — once per version per process | `from_version`, `to_version` |
+| `update.applying` | the device was idle, latched itself shut, and is about to swap its binary | `from_version`, `to_version` |
+| `update.applied` | the new binary attached to the relay within its probation | `from_version`, `to_version` |
+| `update.rolled-back` | the new binary did not prove itself and the previous one was put back | `from_version`, `to_version`, `reason` |
+| `update.failed` | following a version stopped before any swap — a release not published yet (recorded once per version), a download, checksum, signature or trial-run failure, or a swap the filesystem refused | `from_version`, `to_version`, `reason` (`not-yet-released`, `checksum: …`, `signature: …`, `trial run: …`, `download: …`, `swap: …`) |
 
 `output_bytes` appears on an `execute` entry **only when the output was capped**, and
 carries what the command produced rather than what the response returned (§3). Its
@@ -1780,6 +1856,7 @@ is involved to spend anything further.
 | `--tunnel-command <C>` | Publish by running your own tunnel client | - |
 | `--relay <URL>` | Attach to a relay (needs `--enroll-token`) | - |
 | `--device-name <N>` | Stable name to claim on the relay | this machine's name |
+| `--follow-relay-updates` | Update to the version the relay runs, from its release, once idle ([§2](#following-the-relays-version)). Needs `--relay`, a fixed API key, a writable executable directory, and — on a Windows service — a restart-on-failure policy | `false` |
 | `--allow-host <HOST>` | Also answer to this host name (repeatable) | local names, when loopback-bound and unpublished; no host checking otherwise |
 | `--relay-fingerprint <FP>` | Expect exactly this certificate (no file, no name matching) | - |
 | `--relay-ca <FILE>` | Also trust this authority when dialling a relay | public roots |
@@ -1910,6 +1987,9 @@ startup rather than serving local-only.
 | `did not publish a public URL within 30s` | tunnel client never printed one | check its own output at `-l debug` |
 | `Tunnel closed: the public URL is no longer reachable` | tunnel client died; server exited with it | restart (a new URL is allocated) |
 | `--no-auth cannot be combined with a publicly reachable server` | a tunnel, a relay, or a non-loopback bind | drop `--no-auth`, or bind loopback |
+| `503 this device is restarting to finish an update; retry shortly` with `Retry-After: 30` | a device following its relay's version was idle and is swapping its binary ([§2](#following-the-relays-version)); `/health` still answers | retry after the header's delay — nothing was run |
+| `Configuration error: --follow-relay-updates …` (exit 1) | an update could not be applied by this start: no `--relay`, a build without self-update, a generated API key, an executable directory it cannot write, or a Windows service without a restart policy | the line after it names the fix |
+| device exits with status 4 (Windows), `restarting to finish an update` | an update was swapped in and the process ended so its supervisor starts the new binary | nothing — restart it, as the service's failure actions do. A device that stays down after this has no restart policy |
 | `Configuration error: connect requires --relay` — likewise `--enroll-token`, `--peer` | `connect` needs all three before it can do anything: which relay to join, the secret to join it with, and which attached device to forward to ([§5](#reaching-a-device-through-a-local-port-connect)) | supply the one it names. It reports them one at a time, in that order |
 | `connect and -H/--host cannot be used together` | `connect` always binds loopback — nothing outside this machine dials the port it opens, so a bind address is not a choice it offers | drop `-H`. `-p` *is* accepted and pins the local port, which is otherwise OS-chosen ([§6](#6-cli-reference)) |
 | `connect and --device-name cannot be used together` | `connect` attaches as an unnamed device that exists for the one invocation; a stable name would name nothing worth addressing later | drop `--device-name`. The name that matters is `--peer`, the device being forwarded to |

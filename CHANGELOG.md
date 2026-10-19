@@ -14,7 +14,26 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   struct literal stops compiling, and a receiver that read the URL directly now matches on
   `AttachEvent::Enrolled`.
 
+- **`AuditEvent` has two more public fields, `from_version` and `to_version`**, set on the
+  new `update.*` events and absent from every other line of the trail. An embedder that
+  builds the struct with a literal rather than `AuditEvent::new` stops compiling.
+
 ### Added
+
+- **`--follow-relay-updates`: a device updates itself to its relay's version.** When the
+  relay it attaches to runs a newer version (relays report theirs since 0.28.0), the device
+  downloads exactly that release, checks it against the release's `SHA256SUMS` — and on
+  Windows its Authenticode signature and publisher — trial-runs it, waits until it has been
+  idle for a minute plus a random delay of up to five minutes, then swaps its binary and
+  restarts: in place on Linux and macOS, by exiting with the new status **4** on Windows for
+  the service manager to restart. The new binary must attach within 90 seconds or the
+  previous one is put back. Off by default. Refused at startup where an update could not be
+  applied: without `--relay`, with a generated API key, in an executable directory it cannot
+  write, or on a Windows service whose failure actions do not restart it. While it swaps,
+  every request but `/health` is answered `503` with `Retry-After: 30`. Recorded as
+  `update.available`, `update.applying`, `update.applied`, `update.rolled-back` and
+  `update.failed`, with new `from_version`/`to_version` fields on the audit event. See
+  `docs/USAGE.md`, «Following the relay's version».
 
 - **Releases carry a `SHA256SUMS` file.** It lists the SHA-256 of every release archive
   in the GNU `sha256sum` format (`<hex>  <archive name>`, one bare file name per line),

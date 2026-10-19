@@ -111,6 +111,11 @@ curl -X POST https://relay.example.com:8443/d/<name>/api/v1/execute \
 To list what is attached without logging into any target:
 `curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com:8443/relay/v1/devices`.
 
+Add `--follow-relay-updates` to a device and upgrading the relay upgrades it: once idle, it
+installs the relay's version from its GitHub release (checked against the release's
+`SHA256SUMS`, and on Windows its signature) and restarts into it, rolling back if the new binary
+cannot attach (`docs/USAGE.md`, «Following the relay's version»).
+
 **Or give one device a local port** — the same API, at a shorter URL:
 
 ```bash

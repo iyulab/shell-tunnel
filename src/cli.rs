@@ -489,9 +489,10 @@ OPTIONS:
                             survives reconnects [default: this machine's name]
         --follow-relay-updates
                             Update to the version the relay runs, from its
-                            signed release, once nothing is in flight. Needs a
-                            fixed API key and a supervisor that restarts this
-                            process [default: off]
+                            release (checksum-verified; signature-checked on
+                            Windows), once nothing is in flight. Needs a fixed
+                            API key; on Windows, a supervisor that restarts
+                            this process [default: off]
         --relay-fingerprint <FP>
                             Expect exactly this certificate from the relay, as
                             printed by `shell-tunnel relay --tls-self-signed`.
