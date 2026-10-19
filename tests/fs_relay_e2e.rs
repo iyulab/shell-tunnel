@@ -83,6 +83,7 @@ fn spawn_device(relay_addr: SocketAddr, local_addr: SocketAddr, device_name: &st
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: None,
+        activity: None,
     };
     tokio::spawn(run(config, None));
 }

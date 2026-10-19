@@ -42,12 +42,18 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   it, held that thread for as long as the process ran — and for good, if something the process
   started kept its stdin open.
 
+- **A response a relay device is still sending through the relay holds off its update.** With
+  `--follow-relay-updates`, a device restarted once idle — and "idle" counted requests only
+  while their handler ran. Since 0.30.0 a device streams a response to the relay after its
+  handler has returned, so a restart could cut one off mid-way. The relay client now counts
+  the request until its answer is through.
+
 - **Library: `OutputSource::Combined` and `OutputChunk::combined` are removed.** Execution now
   produces `Stdout` and `Stderr` chunks, which the type had carried unused; `Combined` was the
   only variant ever produced and is no longer produced at all. `ExecutionResult` gained
   `stdout`, `stderr` and `stdin_written`, and `Command` gained `stdin`; a struct literal of
   either stops compiling. `ProcessTable::write_stdin` is async and takes a wait; `ProcessInfo`
-  gained `stdin_pending` and `ProcessError` `StdinBacklogFull`, and `AppState` `relay` (with
+  gained `stdin_pending` and `ProcessError` `StdinBacklogFull`, `RelayClientConfig` `activity`, and `AppState` `relay` (with
   `AppState::record_relay_enrolment`, which an embedder running its own relay client calls
   to make `GET /api/v1` report the relay).
 

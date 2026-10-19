@@ -102,6 +102,7 @@ fn spawn_device_marking(
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: hop_token.map(str::to_string),
+        activity: None,
     };
     tokio::spawn(run(config, None));
 }

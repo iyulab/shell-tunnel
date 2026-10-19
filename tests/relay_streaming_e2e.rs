@@ -279,6 +279,7 @@ async fn a_device_streams_its_local_servers_answer_through_the_relay() {
             serve_direct_requests: false,
             direct_events: None,
             local_hop_token: None,
+            activity: None,
         },
         None,
     ));
@@ -312,4 +313,105 @@ async fn a_device_streams_its_local_servers_answer_through_the_relay() {
         "data: first\n\ndata: second\n\n",
         "decoded once by the device, framed once by the relay"
     );
+}
+
+/// While the device is still streaming an answer to the relay, it counts as
+/// busy — after the local server's handler has long returned — and stops
+/// counting once the answer is through.
+///
+/// An update latches only when nothing is in flight. The local server's own
+/// count ends when its handler hands back the response; the relay leg runs on
+/// after that. Uncounted, a device could restart under a response a caller is
+/// still receiving — a server-sent event stream, which a device exposing a
+/// local service would carry for minutes.
+#[cfg(feature = "relay-client")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_response_still_streaming_to_the_relay_counts_as_work() {
+    use shell_tunnel::api::activity::Activity;
+    use shell_tunnel::relay::client::{run, AttachEvent, RelayClientConfig};
+    use std::sync::Arc;
+
+    let relay = start_relay().await;
+    let local_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = local_listener.local_addr().unwrap();
+    let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel::<()>();
+    let local_server = tokio::spawn(async move {
+        let (mut socket, _) = local_listener.accept().await.unwrap();
+        let mut head = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = socket.read(&mut buf).await.unwrap();
+            head.extend_from_slice(&buf[..n]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\n\r\nd\r\ndata: first\n\n\r\n",
+            )
+            .await
+            .unwrap();
+        first_seen_rx.await.unwrap();
+        socket
+            .write_all(b"e\r\ndata: second\n\n\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        socket.shutdown().await.unwrap();
+    });
+
+    let activity = Arc::new(Activity::new());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(run(
+        RelayClientConfig {
+            relay_url: format!("ws://{relay}"),
+            enroll_token: "secret".to_string(),
+            local,
+            label: None,
+            device_name: Some("busy".to_string()),
+            fingerprint: None,
+            ca_file: None,
+            events: Some(tx),
+            serve_direct_requests: false,
+            direct_events: None,
+            local_hop_token: None,
+            activity: Some(Arc::clone(&activity)),
+        },
+        None,
+    ));
+    let event = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(event, AttachEvent::Enrolled { .. }), "{event:?}");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(activity.in_flight(), 0, "an idle pool is not work");
+
+    let mut stream = open_request(relay, "busy").await;
+    let mut raw = Vec::new();
+    read_until(&mut stream, &mut raw, "data: first").await;
+    // The caller holds the first event; the device holds the rest of the
+    // answer open. This fake local server has no count of its own, so the one
+    // unit in flight is the relay leg's.
+    assert_eq!(
+        activity.in_flight(),
+        1,
+        "a response still going out through the relay must hold an update off"
+    );
+    assert!(!activity.latch(), "nothing may latch while it streams");
+
+    first_seen_tx.send(()).unwrap();
+    let mut rest = Vec::new();
+    tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
+    local_server.await.unwrap();
+
+    // Delivered: the count falls back, shortly after the last frame.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while activity.in_flight() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the relay leg's count was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

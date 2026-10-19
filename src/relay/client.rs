@@ -149,6 +149,15 @@ pub struct RelayClientConfig {
     /// server then counts the hop like any client; `connect`'s local proxy
     /// never talks to a server of its own and leaves it unset.
     pub local_hop_token: Option<String>,
+    /// The local server's count of work in flight, so that a response this
+    /// client is still streaming to the relay counts as work.
+    ///
+    /// The local server's own count ends when its handler returns the
+    /// response; the relay leg runs on after that, for as long as the relay
+    /// takes the frames. An update that latched in between would restart the
+    /// device under a response still being delivered. `None` counts nothing —
+    /// `connect`'s local proxy serves no server of its own.
+    pub activity: Option<std::sync::Arc<crate::api::activity::Activity>>,
 }
 
 impl RelayClientConfig {
@@ -821,6 +830,13 @@ async fn serve_one(
         }
         Some(Ok(_)) => Vec::new(),
     };
+
+    // Held until the answer has been handed to the relay in full. Taken here,
+    // before the local request takes its own, so there is no instant between
+    // the two at which the server reads as idle. A latched server gets no
+    // guard and the request goes ahead anyway: the local server refuses it
+    // with its 503, which this client then relays like any answer.
+    let _busy = config.activity.as_ref().and_then(|a| a.try_guard());
 
     if streams {
         return answer_streaming(
@@ -2173,6 +2189,7 @@ mod tests {
             serve_direct_requests: true,
             direct_events: None,
             local_hop_token: None,
+            activity: None,
         }
     }
 

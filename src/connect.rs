@@ -518,6 +518,7 @@ mod tests {
             serve_direct_requests: false,
             direct_events: None,
             local_hop_token: None,
+            activity: None,
         }
     }
 

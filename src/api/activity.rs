@@ -10,8 +10,15 @@
 //! keeps one session and uses it every few minutes would otherwise hold an
 //! update off forever, and an idle session has nothing to lose to a restart —
 //! each command already gets a fresh shell. What is counted is work that a
-//! restart would destroy: a request being served, a command running in a
-//! session, an upload being assembled, and an open WebSocket.
+//! restart would destroy: a request being served, a response the relay client
+//! is still delivering, a command running in a session, a background process,
+//! an upload being assembled, and an open WebSocket.
+//!
+//! The relay leg is counted by the relay client itself
+//! (`RelayClientConfig::activity`), because it outlives the request: the
+//! handler returns the response, this server's count for it ends, and the
+//! client is still handing frames to the relay for as long as the relay takes
+//! them.
 //!
 //! Only the request count lives in the latch word. A session command and an
 //! upload are live *between* requests, holding no guard, so [`Activity::latch`]
@@ -185,7 +192,9 @@ pub fn latch_if_idle(state: &AppState) -> bool {
 /// The guard lives until the handler has produced its response. No route
 /// streams a body from this process (every response is built in memory), so
 /// that is the whole of the request; a streamed body would need the guard
-/// moved into it.
+/// moved into it — a route that streams takes its own [`Activity::guard`]
+/// into the stream, since this layer cannot hold one across a body without a
+/// body type of its own. The relay leg after it is the relay client's to count.
 pub(crate) async fn activity_middleware(
     State(activity): State<Arc<Activity>>,
     request: Request,

@@ -359,6 +359,7 @@ async fn a_device_reports_its_public_url_to_whoever_started_it() {
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: None,
+        activity: None,
     };
     tokio::spawn(run(config, None));
 
@@ -399,6 +400,7 @@ fn event_client(
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: None,
+        activity: None,
     }
 }
 
@@ -709,6 +711,7 @@ async fn a_replaced_client_stops_instead_of_taking_its_name_back() {
         serve_direct_requests: false,
         direct_events: None,
         local_hop_token: None,
+        activity: None,
     };
 
     let (first_tx, mut first_rx) = tokio::sync::mpsc::unbounded_channel();

@@ -280,7 +280,8 @@ device never moves down. It is downloaded from this project's GitHub release of 
 version; nothing asks GitHub for "the latest".
 
 **When.** Once the device has been idle for 60 seconds without a break — no request
-being served, no command running in a session, no upload open — and then after a
+being served, no response still on its way out through the relay, no command running in
+a session, no background process running, no upload open — and then after a
 random delay of up to five minutes, so a fleet that saw one relay restart does not
 restart all at once. A session that merely exists does not count as busy. The device
 then answers every request except `/health` with `503 this device is restarting to

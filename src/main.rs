@@ -331,6 +331,7 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
                 direct_events: None,
                 // `connect` fronts no local server of its own.
                 local_hop_token: None,
+                activity: None,
             };
             let local_port = if args.port_explicit { args.port } else { 0 };
 
@@ -1273,6 +1274,7 @@ async fn run_with_relay(
         serve_direct_requests: true,
         direct_events: None,
         local_hop_token: Some(hop_token),
+        activity: Some(std::sync::Arc::clone(&attached.activity)),
     };
 
     for warning in &exposure.warnings {
