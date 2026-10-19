@@ -1241,7 +1241,10 @@ an update waits for it (§2).
 
 Every request is recorded as an `expose` entry (§4): the service's name, method and path
 — never the query — the status, the bytes of the answer's body and how long it took.
-Neither body is recorded.
+Neither body is recorded. The entry is written when the answer's body has ended — delivered
+or cut off — so it lands just after the response, and its `bytes` are what was actually
+sent. An answer still streaming when the server stops
+may leave no entry.
 
 Not in 0.32.0: WebSocket upstreams (a notebook's kernel channel, for one) — an upgrade
 request is passed on as a plain request and does not become a WebSocket; a key in the
@@ -1788,10 +1791,9 @@ curl -H "Authorization: Bearer <enroll-token>" https://relay.example.com/relay/v
 ```
 
 ```json
-{"devices":[{"id":"build-box","label":null,"attached_secs":42,"last_seen_secs":3,
-             "idle_connections":4,"exchanges":17,"last_exchange_ms":38,"mean_exchange_ms":44,
-             "slowest_exchange_ms":210,
-             "public_url":"https://relay.example.com/d/build-box"}]}
+{"devices":[{"attached_secs":42,"exchanges":17,"id":"build-box","idle_connections":4,
+             "label":null,"last_exchange_ms":38,"last_seen_secs":3,"mean_exchange_ms":44,
+             "public_url":"https://relay.example.com/d/build-box","slowest_exchange_ms":210}]}
 ```
 
 **`idle_connections` is how many data connections the device has waiting** (since
