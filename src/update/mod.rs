@@ -13,6 +13,8 @@ use crate::Result;
 pub mod stage;
 #[cfg(feature = "relay-client")]
 pub mod state;
+#[cfg(feature = "relay-client")]
+pub mod swap;
 
 #[cfg(all(windows, feature = "relay-client"))]
 pub mod authenticode;

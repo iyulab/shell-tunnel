@@ -94,6 +94,14 @@ impl Exit {
 /// refusals' status.
 const EXIT_SUPERSEDED: i32 = 3;
 
+/// The exit status of a device that ended so its supervisor would start the
+/// newer binary it just put in place (Windows; Unix restarts in place).
+///
+/// A failure on purpose: a supervisor's restart policy is what brings the
+/// device back, and every supervisor restarts a failure.
+#[cfg(all(feature = "self-update", feature = "relay-client"))]
+const EXIT_UPDATED: i32 = 4;
+
 /// How long a stopping runtime may wait for work still in flight — a command
 /// holding a blocking thread — before the process ends anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -187,6 +195,21 @@ fn main() {
 /// service manager that asks rather than kills ends the process; a console
 /// run has none and ends the way it always has.
 fn serve(args: Args, stop: Option<Arc<tokio::sync::Notify>>) -> Exit {
+    // Only a service is known to be one here, and a refusal has to end it as a
+    // failure the SCM records rather than by exiting under it.
+    #[cfg(all(windows, feature = "self-update", feature = "relay-client"))]
+    if args.follow_relay_updates && stop.is_some() {
+        if let Some(lines) = service_follow_refusal(
+            &winservice::service_name(),
+            winservice::restarts_on_failure(),
+        ) {
+            for line in lines {
+                errln!("{line}");
+                tracing::error!("{line}");
+            }
+            return Exit::FAILURE;
+        }
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -225,6 +248,14 @@ fn exit_for(result: shell_tunnel::Result<()>) -> Exit {
             Exit {
                 code: EXIT_SUPERSEDED,
                 failed: false,
+            }
+        }
+        #[cfg(all(feature = "self-update", feature = "relay-client"))]
+        Err(e @ shell_tunnel::ShellTunnelError::Updated) => {
+            errln!("{e}");
+            Exit {
+                code: EXIT_UPDATED,
+                failed: true,
             }
         }
         Err(e) => {
@@ -377,6 +408,12 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
 
     if args.relay_url.is_some() && args.enroll_token.is_none() {
         eprintln!("Configuration error: --relay requires --enroll-token");
+        std::process::exit(1);
+    }
+    if let Some(lines) = follow_refusal(&args, exposure.generated_key.is_some()) {
+        for line in lines {
+            eprintln!("{line}");
+        }
         std::process::exit(1);
     }
 
@@ -692,6 +729,9 @@ async fn async_main(args: Args) -> shell_tunnel::Result<()> {
     // read past where the missing line would have been, and a test that stops
     // at the previous line cannot tell "not printed" from "not printed yet".
     for line in orphan_banner(args.kill_orphans) {
+        outln!("{line}");
+    }
+    for line in follow_banner(args.follow_relay_updates, cfg!(windows) && !is_service()) {
         outln!("{line}");
     }
     outln!("File API:    {}", fs_root.describe());
@@ -1633,6 +1673,97 @@ fn generated_api_key_lines(key: &str) -> String {
 /// Unlike [`posture_banner`] this does not go quiet on a local bind. The reach
 /// of a token is a property of exposure; what happens to a process a command
 /// leaves behind is not.
+/// Why `--follow-relay-updates` cannot be honoured by this start, as the lines
+/// to print — or `None` when it can (or was not asked for).
+///
+/// Checked before anything is served: an update that could never be applied
+/// is refused at startup, not discovered on the day a relay is upgraded.
+fn follow_refusal(args: &Args, key_generated: bool) -> Option<Vec<String>> {
+    if !args.follow_relay_updates {
+        return None;
+    }
+    if args.relay_url.is_none() {
+        return Some(vec![
+            "Configuration error: --follow-relay-updates requires --relay".to_string(),
+            "A device follows the version of the relay it attaches to.".to_string(),
+        ]);
+    }
+    #[cfg(not(all(feature = "self-update", feature = "relay-client")))]
+    {
+        let _ = key_generated;
+        Some(vec![
+            "Configuration error: this build cannot update itself.".to_string(),
+            "Rebuild with `--features self-update,relay-client`.".to_string(),
+        ])
+    }
+    #[cfg(all(feature = "self-update", feature = "relay-client"))]
+    {
+        if key_generated {
+            return Some(vec![
+                "Configuration error: --follow-relay-updates needs a fixed API key.".to_string(),
+                "This start generated one, and an update restarts the process, which would generate another and lock out whoever holds this one.".to_string(),
+                "Pass -k <KEY>, or set api_key in the config file.".to_string(),
+            ]);
+        }
+        let replaceable = std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .and_then(|exe| shell_tunnel::update::swap::can_replace(&exe));
+        if let Err(e) = replaceable {
+            return Some(vec![
+                format!("Configuration error: --follow-relay-updates cannot replace this binary: {e}"),
+                "An update is written next to the executable; the account running this device must be able to create files there.".to_string(),
+            ]);
+        }
+        None
+    }
+}
+
+/// Why a Windows service cannot follow relay updates, as lines to print, or
+/// `None` when it can. A service comes back as the new binary only by being
+/// restarted, and the SCM restarts an exit on purpose only when told to.
+#[cfg(all(windows, feature = "self-update", feature = "relay-client"))]
+fn service_follow_refusal(name: &str, restarts: Result<bool, String>) -> Option<Vec<String>> {
+    let why = match restarts {
+        Ok(true) => return None,
+        Ok(false) => "this service is not restarted when it ends with a failure".to_string(),
+        Err(e) => format!("its restart policy could not be read: {e}"),
+    };
+    Some(vec![
+        format!("Configuration error: --follow-relay-updates on a Windows service needs a restart policy — {why}."),
+        "Set one (as an administrator), then start the service again:".to_string(),
+        format!("  sc.exe failure {name} reset= 86400 actions= restart/5000"),
+        format!("  sc.exe failureflag {name} 1"),
+    ])
+}
+
+#[cfg(windows)]
+fn is_service() -> bool {
+    winservice::is_service()
+}
+
+#[cfg(not(windows))]
+fn is_service() -> bool {
+    false
+}
+
+/// The banner lines announcing that this device follows its relay's version.
+/// `unsupervised` is a Windows console run, which an update ends for good.
+fn follow_banner(follow: bool, unsupervised: bool) -> Vec<String> {
+    if !follow {
+        return Vec::new();
+    }
+    let mut lines = vec![
+        "Updates:     follows the relay's version when idle (--follow-relay-updates)".to_string(),
+    ];
+    if unsupervised {
+        lines.push(
+            "             an update ends this process; nothing here will start it again — run it as a service"
+                .to_string(),
+        );
+    }
+    lines
+}
+
 fn orphan_banner(kill_orphans: bool) -> Vec<String> {
     if !kill_orphans {
         return Vec::new();
@@ -1873,6 +2004,58 @@ fn audit_log_is_inside_fs_root(audit_log: &Path, fs_root: &Path) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_follow_banner_says_so_and_warns_an_unsupervised_run() {
+        assert!(follow_banner(false, true).is_empty());
+        let supervised = follow_banner(true, false);
+        assert_eq!(
+            supervised,
+            ["Updates:     follows the relay's version when idle (--follow-relay-updates)"]
+        );
+        let console = follow_banner(true, true);
+        assert_eq!(console.len(), 2);
+        assert!(console[1].contains("nothing here will start it again"));
+    }
+
+    #[cfg(all(windows, feature = "self-update", feature = "relay-client"))]
+    #[test]
+    fn a_service_without_a_restart_policy_is_told_the_two_commands() {
+        assert_eq!(service_follow_refusal("st", Ok(true)), None);
+        let lines = service_follow_refusal("st", Ok(false)).unwrap();
+        assert!(lines[0].contains("not restarted when it ends with a failure"));
+        // The same two lines docs/USAGE.md gives, for this service's name.
+        assert_eq!(
+            lines[2].trim(),
+            "sc.exe failure st reset= 86400 actions= restart/5000"
+        );
+        assert_eq!(lines[3].trim(), "sc.exe failureflag st 1");
+        let unreadable = service_follow_refusal("st", Err("denied".into())).unwrap();
+        assert!(unreadable[0].contains("could not be read: denied"));
+    }
+
+    #[cfg(all(feature = "self-update", feature = "relay-client"))]
+    #[test]
+    fn an_updated_ending_is_a_failure_with_status_4() {
+        // A failure so every supervisor's restart policy brings the device back
+        // as the new binary; 4 so a log tells it from a crash.
+        let exit = exit_for(Err(shell_tunnel::ShellTunnelError::Updated));
+        assert_eq!(
+            exit,
+            Exit {
+                code: 4,
+                failed: true
+            }
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            winservice::exit_codes_for_test(Some(exit)),
+            (
+                windows_sys::Win32::Foundation::ERROR_SERVICE_SPECIFIC_ERROR,
+                4
+            )
+        );
+    }
 
     /// Nothing in the test suite reaches `async_main` (no test binds a real
     /// server from CLI args), so this is a direct unit test of the pure

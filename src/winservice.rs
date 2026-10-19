@@ -55,6 +55,9 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 static EXIT: Mutex<Option<Exit>> = Mutex::new(None);
 static STOP: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static STATUS_HANDLE: OnceLock<usize> = OnceLock::new();
+/// The name the SCM started this service under (`argv[0]` of `service_main`),
+/// NUL-terminated. The process cannot otherwise learn it.
+static SERVICE_NAME: OnceLock<Vec<u16>> = OnceLock::new();
 
 /// Run `serve` as a Windows service if the SCM started this process.
 ///
@@ -100,10 +103,21 @@ pub fn run_if_service(args: Args, serve: Serve) -> Result<Exit, Box<Args>> {
     Ok(EXIT.lock().expect("not poisoned").unwrap_or(Exit::FAILURE))
 }
 
-unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core::PWSTR) {
+unsafe extern "system" fn service_main(argc: u32, argv: *mut windows_sys::core::PWSTR) {
     let Some(Pending { args, serve }) = PENDING.lock().expect("not poisoned").take() else {
         return;
     };
+    // SAFETY: the SCM passes `argc` valid NUL-terminated strings; the first
+    // is the service's name.
+    if argc >= 1 && !argv.is_null() {
+        let first = unsafe { *argv };
+        if !first.is_null() {
+            let len = (0..).take_while(|&i| unsafe { *first.add(i) } != 0).count();
+            let mut name = unsafe { std::slice::from_raw_parts(first, len) }.to_vec();
+            name.push(0);
+            let _ = SERVICE_NAME.set(name);
+        }
+    }
     let stop = STOP
         .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
         .clone();
@@ -164,6 +178,25 @@ unsafe extern "system" fn control_handler(
         }
         SERVICE_CONTROL_INTERROGATE => NO_ERROR,
         _ => ERROR_CALL_NOT_IMPLEMENTED,
+    }
+}
+
+#[cfg(all(test, feature = "self-update", feature = "relay-client"))]
+pub(crate) fn exit_codes_for_test(exit: Option<Exit>) -> (u32, u32) {
+    exit_codes(exit)
+}
+
+/// Whether the SCM started this process as a service.
+pub fn is_service() -> bool {
+    SERVICE_NAME.get().is_some()
+}
+
+/// The name the SCM started this service under, or `<name>` outside one.
+#[cfg(all(feature = "self-update", feature = "relay-client"))]
+pub fn service_name() -> String {
+    match SERVICE_NAME.get() {
+        Some(name) => String::from_utf16_lossy(&name[..name.len() - 1]),
+        None => "<name>".to_string(),
     }
 }
 
@@ -233,3 +266,140 @@ mod tests {
         assert_eq!(exit_codes(None), (NO_ERROR, 0));
     }
 }
+
+/// Reading the service's restart policy, which only following relay updates
+/// needs: a Windows device comes back as the new binary by being restarted.
+#[cfg(all(feature = "self-update", feature = "relay-client"))]
+mod failure_restart {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, QueryServiceConfig2W, SC_ACTION,
+        SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SERVICE_CONFIG_FAILURE_ACTIONS,
+        SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, SERVICE_FAILURE_ACTIONSW,
+        SERVICE_FAILURE_ACTIONS_FLAG, SERVICE_QUERY_CONFIG,
+    };
+
+    use super::SERVICE_NAME;
+
+    /// Whether the SCM will start this service again after it ends with a
+    /// failure — which is how a Windows device comes back after an update.
+    ///
+    /// True only when the failure actions include a restart *and* the flag that
+    /// applies them to a non-crash failure is on (`sc.exe failureflag <name> 1`):
+    /// without the flag a process that exits on purpose, as an update does, is
+    /// not restarted. `Err` when this process is not a service or the
+    /// configuration cannot be read.
+    pub fn restarts_on_failure() -> Result<bool, String> {
+        let name = SERVICE_NAME
+            .get()
+            .ok_or("not running as a Windows service")?;
+        // SAFETY: handles are checked before use and closed on every path.
+        unsafe {
+            let scm = OpenSCManagerW(std::ptr::null(), std::ptr::null(), SC_MANAGER_CONNECT);
+            if scm.is_null() {
+                return Err(format!(
+                    "cannot open the service manager (error {})",
+                    GetLastError()
+                ));
+            }
+            let service = OpenServiceW(scm, name.as_ptr(), SERVICE_QUERY_CONFIG);
+            if service.is_null() {
+                let error = GetLastError();
+                CloseServiceHandle(scm);
+                return Err(format!("cannot open this service (error {error})"));
+            }
+            let result = read_restart_policy(service);
+            CloseServiceHandle(service);
+            CloseServiceHandle(scm);
+            result
+        }
+    }
+
+    /// # Safety
+    /// `service` must be an open handle with `SERVICE_QUERY_CONFIG`.
+    unsafe fn read_restart_policy(service: SC_HANDLE) -> Result<bool, String> {
+        let actions = unsafe { query_config(service, SERVICE_CONFIG_FAILURE_ACTIONS) }?;
+        // SAFETY: the SCM wrote a SERVICE_FAILURE_ACTIONSW at the buffer's start,
+        // and the array it points to lives in the same buffer.
+        let fa = unsafe { &*(actions.as_ptr() as *const SERVICE_FAILURE_ACTIONSW) };
+        let list: &[SC_ACTION] = if fa.cActions == 0 || fa.lpsaActions.is_null() {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(fa.lpsaActions, fa.cActions as usize) }
+        };
+        let flag = unsafe { query_config(service, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG) }?;
+        let flag = unsafe { &*(flag.as_ptr() as *const SERVICE_FAILURE_ACTIONS_FLAG) };
+        Ok(restart_policy(
+            list,
+            flag.fFailureActionsOnNonCrashFailures != 0,
+        ))
+    }
+
+    /// One `QueryServiceConfig2W` level, in an 8-aligned buffer of the size the
+    /// SCM asks for.
+    ///
+    /// # Safety
+    /// `service` must be an open handle with `SERVICE_QUERY_CONFIG`.
+    unsafe fn query_config(service: SC_HANDLE, level: u32) -> Result<Vec<u64>, String> {
+        let mut needed = 0u32;
+        unsafe { QueryServiceConfig2W(service, level, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+        let ok = unsafe {
+            QueryServiceConfig2W(
+                service,
+                level,
+                buf.as_mut_ptr() as *mut u8,
+                (buf.len() * 8) as u32,
+                &mut needed,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "cannot read the service's failure actions (error {})",
+                unsafe { GetLastError() }
+            ));
+        }
+        Ok(buf)
+    }
+
+    /// The decision itself, apart from reading it out of the SCM.
+    fn restart_policy(actions: &[SC_ACTION], on_non_crash_failures: bool) -> bool {
+        on_non_crash_failures && actions.iter().any(|a| a.Type == SC_ACTION_RESTART)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_restart_counts_only_when_failure_actions_apply_to_non_crash_failures() {
+            use windows_sys::Win32::System::Services::{SC_ACTION_NONE, SC_ACTION_REBOOT};
+            let restart = SC_ACTION {
+                Type: SC_ACTION_RESTART,
+                Delay: 5000,
+            };
+            let none = SC_ACTION {
+                Type: SC_ACTION_NONE,
+                Delay: 0,
+            };
+            let reboot = SC_ACTION {
+                Type: SC_ACTION_REBOOT,
+                Delay: 0,
+            };
+            assert!(restart_policy(&[none, restart], true));
+            // `sc.exe failure` without `failureflag 1`: an exit on purpose is not
+            // restarted, so an update would leave the device down.
+            assert!(!restart_policy(&[restart], false));
+            assert!(!restart_policy(&[], true));
+            assert!(!restart_policy(&[reboot, none], true));
+        }
+
+        #[test]
+        fn outside_a_service_the_restart_policy_is_an_error_not_a_guess() {
+            assert!(restarts_on_failure().is_err());
+        }
+    }
+}
+
+#[cfg(all(feature = "self-update", feature = "relay-client"))]
+pub use failure_restart::restarts_on_failure;

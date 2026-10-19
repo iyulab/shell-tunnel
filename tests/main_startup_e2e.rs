@@ -667,6 +667,69 @@ fn a_relay_on_a_taken_port_says_nothing_about_listening() {
 /// the default build's tests"
 /// (`a_relay_joined_banner_names_the_chunk_size_it_will_advertise`, ungated,
 /// failing every plain `cargo test --all`).
+mod follow_refusals {
+    use super::*;
+
+    #[test]
+    fn following_relay_updates_without_a_relay_refuses_to_start() {
+        let (code, _stdout, stderr) =
+            run_with_timeout(&["--follow-relay-updates"], Duration::from_secs(10));
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("--follow-relay-updates requires --relay"),
+            "stderr was: {stderr}"
+        );
+    }
+
+    /// Refused before any connection: the relay address is never dialled.
+    #[cfg(all(feature = "self-update", feature = "relay-client"))]
+    #[test]
+    fn following_relay_updates_with_a_generated_key_refuses_to_start() {
+        let (code, stdout, stderr) = run_with_timeout(
+            &[
+                "--relay",
+                "https://127.0.0.1:9",
+                "--enroll-token",
+                "t",
+                "--follow-relay-updates",
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, Some(1), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(
+            stderr.contains("--follow-relay-updates needs a fixed API key"),
+            "stderr was: {stderr}"
+        );
+        assert!(stderr.contains("Pass -k <KEY>"), "stderr was: {stderr}");
+        assert!(
+            !stdout.contains("Updates:"),
+            "a banner was printed: {stdout}"
+        );
+    }
+
+    #[cfg(not(all(feature = "self-update", feature = "relay-client")))]
+    #[test]
+    fn a_build_that_cannot_update_itself_refuses_to_follow() {
+        let (code, _stdout, stderr) = run_with_timeout(
+            &[
+                "--relay",
+                "https://127.0.0.1:9",
+                "--enroll-token",
+                "t",
+                "-k",
+                "fixed",
+                "--follow-relay-updates",
+            ],
+            Duration::from_secs(10),
+        );
+        assert_eq!(code, Some(1));
+        assert!(
+            stderr.contains("this build cannot update itself"),
+            "stderr was: {stderr}"
+        );
+    }
+}
+
 #[cfg(feature = "relay-client")]
 mod connect_refusals {
     use super::*;

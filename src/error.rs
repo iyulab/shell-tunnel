@@ -87,6 +87,13 @@ pub enum ShellTunnelError {
     #[cfg(feature = "self-update")]
     #[error("update error: {0}")]
     Update(String),
+
+    /// A newer binary is in place and this process must end so its
+    /// supervisor starts that one — Windows' half of restarting after an
+    /// update (Unix replaces the process image instead).
+    #[cfg(all(feature = "self-update", feature = "relay-client"))]
+    #[error("restarting to finish an update")]
+    Updated,
 }
 
 /// What to say when another process has taken this device's name.

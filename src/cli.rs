@@ -56,6 +56,11 @@ pub struct Args {
     pub public_base: Option<String>,
     /// Stable name to claim on the relay (keeps one URL across reconnects).
     pub device_name: Option<String>,
+    /// Update this device to the version its relay announces, once idle.
+    ///
+    /// Off by default: replacing the running binary with one fetched from the
+    /// network is the kind of change this project makes only when asked.
+    pub follow_relay_updates: bool,
     /// PEM certificate chain for serving HTTPS directly.
     pub tls_cert: Option<PathBuf>,
     /// PEM private key matching `tls_cert`.
@@ -131,6 +136,7 @@ impl Default for Args {
             enroll_token: None,
             public_base: None,
             device_name: None,
+            follow_relay_updates: false,
             tls_cert: None,
             tls_key: None,
             tls_self_signed: false,
@@ -264,6 +270,9 @@ where
             }
             Long("device-name") => {
                 result.device_name = Some(parser.value()?.parse()?);
+            }
+            Long("follow-relay-updates") => {
+                result.follow_relay_updates = true;
             }
             Long("tls-cert") => {
                 result.tls_cert = Some(parser.value()?.parse()?);
@@ -402,6 +411,9 @@ where
     if result.connect && result.device_name.is_some() {
         return Err(ArgsError::Conflicting("connect", "--device-name"));
     }
+    if result.connect && result.follow_relay_updates {
+        return Err(ArgsError::Conflicting("connect", "--follow-relay-updates"));
+    }
     // A local proxy by name: nothing publishes it, so a non-default bind
     // address is a user error worth naming rather than silently accepting.
     if result.connect && result.host_explicit {
@@ -475,6 +487,11 @@ OPTIONS:
                             unless -p says otherwise
         --device-name <N>   Claim a stable name on the relay, so the device URL
                             survives reconnects [default: this machine's name]
+        --follow-relay-updates
+                            Update to the version the relay runs, from its
+                            signed release, once nothing is in flight. Needs a
+                            fixed API key and a supervisor that restarts this
+                            process [default: off]
         --relay-fingerprint <FP>
                             Expect exactly this certificate from the relay, as
                             printed by `shell-tunnel relay --tls-self-signed`.
@@ -681,6 +698,21 @@ mod tests {
     fn test_connect_and_tunnel_conflict() {
         let err = parse_args_from(args(&["connect", "--tunnel"])).unwrap_err();
         assert!(matches!(err, ArgsError::Conflicting("connect", "--tunnel")));
+    }
+
+    #[test]
+    fn follow_relay_updates_is_off_unless_asked_and_refused_by_connect() {
+        assert!(!parse_args_from(args(&[])).unwrap().follow_relay_updates);
+        assert!(
+            parse_args_from(args(&["--follow-relay-updates"]))
+                .unwrap()
+                .follow_relay_updates
+        );
+        let err = parse_args_from(args(&["connect", "--follow-relay-updates"])).unwrap_err();
+        assert!(matches!(
+            err,
+            ArgsError::Conflicting("connect", "--follow-relay-updates")
+        ));
     }
 
     #[test]
