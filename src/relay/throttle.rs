@@ -8,6 +8,15 @@
 //! `503`, and nothing saying why. This is the middle: the first
 //! occurrence is reported at once, repeats inside the interval are counted, and
 //! the next report says how many it stood for.
+//!
+//! It is used for an audit-trail entry as well as for log lines
+//! (`api::router`'s refusal by the host check). That use has a reason beyond
+//! tidiness: a refusal that anyone able to reach the server can cause for free
+//! would, entry per request, let them fill the trail and rotate real history
+//! out of it, so the trail records the first one and a count of the rest. Before
+//! writing any new entry for something a caller can trigger without cost to
+//! themselves, ask who pays for each one — and use this if the answer is the
+//! operator.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
