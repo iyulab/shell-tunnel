@@ -1802,7 +1802,9 @@ device keeps four ready. A count that stays at zero while requests arrive means 
 device is not managing to replace them — its new connections are being refused, a
 rate limit on its outbound address for one (§5, *Rate limiting on the relay*) — and
 its callers get `503 no data connection available`. Such a device still heartbeats
-and still looks attached; this is the number that shows it.
+and still looks attached; this is the number that shows it. Both ends now say why at
+the default log level — the device when it cannot open one, the relay when it closes
+one it was offered — see the log lines in [§8](#8-failure-modes).
 
 **The four `exchange` fields are how long this device has been taking to
 answer**, and they are the way to tell a slow device from a slow relay without
@@ -2055,8 +2057,8 @@ behind one gateway gives them: the caller's own chunks filled the bucket, the
 device's replacement data connections were refused by it *before* the enrol
 token they carry could earn their refund, the pool ran dry, and every request
 to that device answered `503 no data connection available` until the window
-slid. The device now logs a `WARN` when a data connection is refused this way;
-it used to say so only at `debug`.
+slid. The device now logs a `WARN` when a data connection fails to open — this
+reason among others; it used to say so only at `debug`, and only this reason at all.
 
 It is also the *only* place per-caller limiting can work for proxied traffic. A
 device replays each request to its own loopback listener, so the device's own
@@ -2288,7 +2290,9 @@ startup rather than serving local-only.
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) resolves inside --fs-root` | the working directory (where the default audit log lands) sits inside `--fs-root`, and no `--audit-log` was given | pass `--audit-log` with a path outside the fs root, or point `--fs-root` elsewhere |
 | `A publicly reachable server writes an audit trail, and its default location (shell-tunnel-audit.jsonl) cannot be created` | the working directory is not writable — a read-only service directory, a share, a protected install location | start the server somewhere writable, or pass `--audit-log` with a path elsewhere |
 | `relay refused this connection: HTTP 429` | the relay is rate limiting this device's **address**, not rejecting the device | transient — the device keeps retrying and attaches once the address is under the limit. If it persists, something else on this outbound address is spending the relay's per-address budget: raise the relay's limit, or give the device an address of its own |
-| `relay refused a data connection: HTTP 429` (device log, `WARN`) | same cause, on a replacement data connection: the device stays attached but cannot refill its pool, so callers get `503` | same remedy. Before 0.25.0 a caller sharing the device's address caused this with nothing but its own upload, and the line was `debug` only |
+| `could not open a data connection to the relay: the relay answered HTTP 429 …` (device log, `WARN`) | same cause, on a replacement data connection: the device stays attached but cannot refill its pool, so callers get `503` | same remedy. Before 0.25.0 a caller sharing the device's address caused this with nothing but its own upload, and the line was `debug` only |
+| `could not open a data connection to the relay: <reason>. Requests to this device answer 503 while none is waiting` (device log, `WARN`) | a replacement data connection failed for the reason named — `could not connect`, `the TLS handshake failed`, `the relay refused the upgrade: HTTP <status>`, `the handshake failed`, `no answer from the relay within <time>`. The device stays attached but cannot refill its pool, so callers get `503 no data connection available`. Said once per distinct reason a minute, with `(N more like it since the last report)` | fix what the reason names. Before this release every reason but `429` was `debug` only, so a device could answer `503` for as long as the cause lasted while its log said it was attached |
+| `refused a data connection from <address>: <reason>` (relay log, `WARN`) | the relay closed a device's data connection instead of pooling it: the enrol token it presented is wrong, no device is attached under that name (the control connection dropped first), or it was opened under an attachment that has since been replaced. Said once per reason a minute | match the device's `--enroll-token` to the relay's; for the other two, the device is mid-reconnect and the next connection is the one that counts — if the line repeats while `idle_connections` stays `0`, read the device's own log at the same time |
 | `relay refused this device (bad-token)` | enrol token mismatch | device retries with backoff |
 | `relay refused this device (bad-device-name)` | name is not URL-path safe | letters, digits, `-`, `_`, ≤64 |
 | `another process attached to the relay as '<name>' and now receives this device's requests, so this one has stopped` (exit status 3) | a second process attached under the same `--device-name`; the relay routes the name to the latest one ([§ Surviving a reboot](#surviving-a-reboot)) | intended when moving a device into a service. Otherwise two processes share a name: stop one, or rename one. Restarting this one takes the name back and stops the other |

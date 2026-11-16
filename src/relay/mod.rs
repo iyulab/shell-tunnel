@@ -23,6 +23,9 @@ pub mod registry;
 // Not behind `relay-client`: `--expose` reads its upstream's answers with the
 // same reader, in every build.
 pub(crate) mod replay;
+// Both ends say why a data connection did not come to anything, and both would
+// otherwise say it once per retry.
+pub(crate) mod throttle;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -777,7 +780,7 @@ async fn attach_data_connection(
     };
 
     if !constant_time_eq(&enroll_token, &state.config.enroll_token) {
-        tracing::debug!(target: "relay", "data connection rejected: bad token");
+        refuse_data_connection(peer, "bad-token", "the enrol token it presented is wrong");
         let _ = socket.close().await;
         return;
     }
@@ -791,6 +794,11 @@ async fn attach_data_connection(
     }
 
     let Some(device) = state.devices.get(&device_id) else {
+        refuse_data_connection(
+            peer,
+            "unknown-device",
+            &format!("no device is attached as {device_id}"),
+        );
         let _ = socket.close().await;
         return;
     };
@@ -800,10 +808,12 @@ async fn attach_data_connection(
     // one that replaced it. Absent from a device that predates the field,
     // which is matched by name as before.
     if attach_id.is_some_and(|claimed| claimed != device.attach_id) {
-        tracing::debug!(
-            target: "relay",
-            device_id = %device_id,
-            "data connection refused: opened under a replaced attachment"
+        refuse_data_connection(
+            peer,
+            "replaced-attachment",
+            &format!(
+                "it was opened under an attachment of {device_id} that has since been replaced"
+            ),
         );
         let _ = socket.close().await;
         return;
@@ -813,6 +823,29 @@ async fn attach_data_connection(
     // extra socket is better than holding it open forever.
     if let Some(mut extra) = device.offer(socket).await {
         let _ = extra.close().await;
+    }
+}
+
+/// Data connections the relay turned away, by reason.
+static DATA_REFUSALS: throttle::Throttle = throttle::Throttle::new(throttle::REPORT_INTERVAL);
+
+/// Say why a data connection was closed instead of pooled.
+///
+/// These were `debug!` lines. From the device's side a refusal is a socket that
+/// opens and closes with nothing in between, so a pool that never fills had no
+/// explanation anywhere at the default level — on either end. Throttled per
+/// reason: a device retrying against the same refusal reports once a minute,
+/// not once per request.
+///
+/// `reason` is the throttle key and must not vary per occurrence; `detail` may.
+fn refuse_data_connection(peer: SocketAddr, reason: &str, detail: &str) {
+    if let throttle::Report::Now { suppressed } = DATA_REFUSALS.admit_now(reason) {
+        tracing::warn!(
+            target: "relay",
+            "refused a data connection from {}: {detail}{}",
+            peer.ip(),
+            throttle::repeats_note(suppressed)
+        );
     }
 }
 

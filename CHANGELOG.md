@@ -3,6 +3,30 @@
 Notable changes per release. Dates are UTC. This project is pre-1.0, so a minor
 bump may carry a behaviour change; breaking items are called out explicitly.
 
+## Unreleased
+
+### Changed
+
+- **A device says, at the default log level, why it could not open a data connection — and
+  stops waiting on one that never answers.** Only an HTTP `429` was a `WARN`; every other
+  failure to open one (the connection, the TLS handshake, an upgrade the relay refused, an
+  attach frame that could not be sent) was `debug`. A device that cannot replace its data
+  connections still heartbeats and still reads as attached, while every request to it
+  answers `503 no data connection available`, and its log said nothing. The line is
+  `could not open a data connection to the relay: <reason>`, once per
+  distinct reason a minute with a count of the repeats. A dial that gets no answer from the
+  relay now ends after the interval the device already uses for "the relay has stopped
+  answering" (it had no bound at all). A failure while *serving* a request stays `debug`:
+  a caller that gives up mid-download is routine.
+
+- **The relay says why it closed a data connection instead of pooling it** — a wrong enrol
+  token, no device attached under that name, or an attachment that has since been replaced —
+  as `refused a data connection from <address>: <reason>`, once per reason a minute. These
+  were `debug`.
+
+  Not changed: a device whose pool stays empty does not drop its control connection and
+  attach again on its own. The lines above are how to find out why it is empty.
+
 ## 0.32.0 — 2026-10-20
 
 ### Added

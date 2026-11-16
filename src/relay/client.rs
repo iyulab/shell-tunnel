@@ -524,6 +524,7 @@ pub(crate) async fn attach_paced(
                                 device_id.clone(),
                                 attach_id.clone(),
                                 streams,
+                                liveness.silence_limit,
                             );
                         }
                     }
@@ -726,12 +727,116 @@ fn spawn_data_connection(
     device_id: String,
     attach_id: Option<String>,
     streams: bool,
+    dial_deadline: Duration,
 ) {
     tokio::spawn(async move {
-        if let Err(e) = serve_one(&config, &device_id, attach_id, streams).await {
+        if let Err(e) = serve_one(&config, &device_id, attach_id, streams, dial_deadline).await {
             tracing::debug!(target: "relay-client", "data connection ended: {e}");
         }
     });
+}
+
+/// Data connections this device failed to open, by failure.
+static DATA_FAILURES: super::throttle::Throttle =
+    super::throttle::Throttle::new(super::throttle::REPORT_INTERVAL);
+
+/// Say that a data connection could not be opened, once per failure per minute.
+///
+/// Only the opening: a failure *serving* a request is the caller's request
+/// going wrong (a caller that gave up mid-download closes the data connection
+/// under it), which is routine and stays a `debug!` in [`spawn_data_connection`].
+/// A connection that cannot even be opened is what makes every request to this
+/// device answer `503` — the relay asks for one only when it needs one — and
+/// that was a `debug!` line too, except for the single case of a `429`. A device
+/// whose replacements were failing for any other reason answered `503` for as
+/// long as it lasted while its log said it was attached.
+fn report_data_failure(failure: &str) {
+    if let super::throttle::Report::Now { suppressed } = DATA_FAILURES.admit_now(failure) {
+        tracing::warn!(
+            target: "relay-client",
+            "could not open a data connection to the relay: {failure}. Requests to this device answer 503 while none is waiting{}",
+            super::throttle::repeats_note(suppressed)
+        );
+    }
+}
+
+/// What a failed dial of a data connection means, in the words an operator
+/// needs. Pure, so the wording is tested without a network.
+fn explain_data_failure(error: &tokio_tungstenite::tungstenite::Error) -> String {
+    use tokio_tungstenite::tungstenite::Error;
+    match error {
+        // The control channel already says this out loud when *it* is turned
+        // away (see `attach`); a data connection turned away the same way used
+        // to say nothing, which left a device starving for replacement
+        // connections with nothing at the default log level saying why.
+        // Measured 2026-09-13: a caller sharing this device's outbound address
+        // filled the relay's bucket with its own requests, and the replacements
+        // were refused before the enrol token they carry could earn their
+        // refund.
+        Error::Http(response) if response.status() == 429 => "the relay answered HTTP 429, it is rate limiting this address — something sharing this machine's outbound address is spending the relay's per-address budget".to_string(),
+        Error::Http(response) => format!("the relay refused the upgrade: HTTP {}", response.status()),
+        Error::Io(e) => format!("could not connect: {e}"),
+        Error::Tls(e) => format!("the TLS handshake failed: {e}"),
+        other => format!("the handshake failed: {other}"),
+    }
+}
+
+/// Open one data connection and tell the relay which device it belongs to.
+///
+/// Everything before the device starts *waiting* for a request: the dial, the
+/// TLS handshake, the WebSocket upgrade, the attach frame. Bounded as a whole
+/// by `deadline`, which is one the device already uses for the same question —
+/// "has the relay stopped answering?" (see [`RELAY_SILENCE_LIMIT`]). This had no
+/// bound at all: a path that accepts the connection and then answers nothing
+/// left the task pending for as long as the operating system kept the socket.
+async fn open_data_connection(
+    config: &RelayClientConfig,
+    device_id: &str,
+    attach_id: Option<String>,
+    deadline: Duration,
+) -> std::result::Result<WsStream, String> {
+    let url = config
+        .data_url()
+        .into_client_request()
+        .map_err(|e| format!("bad relay url: {e}"))?;
+    let tls = connector(config).map_err(|e| e.to_string())?.0;
+    let dial = async {
+        let (mut conn, _) = tokio_tungstenite::connect_async_tls_with_config(
+            url,
+            // The other end of the same ceiling: this connection reads relayed
+            // request bodies and writes response bodies, and both sides must
+            // agree on the limit or the disagreement shows up as a truncation on
+            // one of them. Declared rather than defaulted — see
+            // `relay::MAX_RELAY_FRAME`. Struct literal rather than the builder
+            // method: the field is public in every version this crate has
+            // compiled against, while the builder arrived later.
+            Some(tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+                max_frame_size: Some(crate::relay::MAX_RELAY_FRAME),
+                ..Default::default()
+            }),
+            false,
+            // The recorded certificate is not read here: a data connection only
+            // opens after the control channel enrolled over the same TLS
+            // configuration, so a pin that failed has already been reported once
+            // by `attach` with both fingerprints in it.
+            tls,
+        )
+        .await
+        .map_err(|e| explain_data_failure(&e))?;
+        let attach = DeviceMessage::Attach {
+            device_id: device_id.to_string(),
+            enroll_token: config.enroll_token.clone(),
+            attach_id,
+        };
+        send(&mut conn, &attach)
+            .await
+            .map_err(|e| format!("could not send the attach frame: {e}"))?;
+        Ok(conn)
+    };
+    match tokio::time::timeout(deadline, dial).await {
+        Ok(result) => result,
+        Err(_) => Err(format!("no answer from the relay within {deadline:?}")),
+    }
 }
 
 /// Wait for one proxied request, replay it locally, return the response.
@@ -740,57 +845,17 @@ async fn serve_one(
     device_id: &str,
     attach_id: Option<String>,
     streams: bool,
+    dial_deadline: Duration,
 ) -> Result<()> {
-    let (mut conn, _) = tokio_tungstenite::connect_async_tls_with_config(
-        config
-            .data_url()
-            .into_client_request()
-            .map_err(|e| ShellTunnelError::Tunnel(format!("bad relay url: {e}")))?,
-        // The other end of the same ceiling: this connection reads relayed
-        // request bodies and writes response bodies, and both sides must agree
-        // on the limit or the disagreement shows up as a truncation on one of
-        // them. Declared rather than defaulted — see `relay::MAX_RELAY_FRAME`.
-        // Struct literal rather than the builder method: the field is public in
-        // every version this crate has compiled against, while the builder
-        // arrived later.
-        Some(tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
-            max_frame_size: Some(crate::relay::MAX_RELAY_FRAME),
-            ..Default::default()
-        }),
-        false,
-        // The recorded certificate is not read here: a data connection only
-        // opens after the control channel enrolled over the same TLS
-        // configuration, so a pin that failed has already been reported once
-        // by `attach` with both fingerprints in it.
-        connector(config)?.0,
-    )
-    .await
-    .map_err(|e| {
-        // The control channel already says this out loud when *it* is turned
-        // away (see `attach`); a data connection turned away the same way was
-        // a `debug!` line, which left a device starving for replacement
-        // connections — every request to it answering `503` — with nothing at
-        // the default log level saying why. Measured 2026-09-13: a caller
-        // sharing this device's outbound address filled the relay's bucket
-        // with its own requests, and the replacements were refused before
-        // the enrol token they carry could earn their refund.
-        if let tokio_tungstenite::tungstenite::Error::Http(response) = &e {
-            if response.status() == 429 {
-                tracing::warn!(
-                    target: "relay-client",
-                    "relay refused a data connection: HTTP 429 — the relay is rate limiting this address, so requests to this device answer 503 until it is under the limit again. Something sharing this machine's outbound address is spending the relay's per-address budget"
-                );
-            }
+    let mut conn = match open_data_connection(config, device_id, attach_id, dial_deadline).await {
+        Ok(conn) => conn,
+        Err(failure) => {
+            // Said here, not returned: `spawn_data_connection` would add its
+            // `debug!` line and a failure to open is already reported in full.
+            report_data_failure(&failure);
+            return Ok(());
         }
-        ShellTunnelError::Tunnel(format!("data connection refused: {e}"))
-    })?;
-
-    let attach = DeviceMessage::Attach {
-        device_id: device_id.to_string(),
-        enroll_token: config.enroll_token.clone(),
-        attach_id,
     };
-    send(&mut conn, &attach).await?;
 
     let request: ProxyRequest = loop {
         match conn.next().await {
@@ -2886,5 +2951,98 @@ mod tests {
         )
         .await;
         assert!(still_attached.is_err(), "ended: {still_attached:?}");
+    }
+
+    /// A relay that takes the TCP connection and then says nothing — the shape
+    /// of a path that lost the flow after the handshake began.
+    async fn relay_that_accepts_and_stays_silent() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A relay that completes the WebSocket upgrade and reads the attach frame.
+    async fn relay_that_takes_data_connections() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(socket).await else {
+                        return;
+                    };
+                    let _ = ws.next().await;
+                    // Hold the connection open, waiting for a request that
+                    // never comes, as a pooled one does.
+                    while ws.next().await.is_some() {}
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn a_data_connection_the_relay_never_answers_gives_up_and_says_so() {
+        let config = config(&relay_that_accepts_and_stays_silent().await);
+        let deadline = Duration::from_millis(300);
+        let opened = tokio::time::timeout(
+            Duration::from_secs(10),
+            open_data_connection(&config, "d", None, deadline),
+        )
+        .await
+        .expect("the dial must end at its own deadline, not at the operating system's");
+        let failure = opened.expect_err("a relay that never answers is a failure");
+        assert!(
+            failure.contains("no answer from the relay within"),
+            "{failure}"
+        );
+    }
+
+    /// The control for the test above: the same dial against a relay that does
+    /// answer succeeds inside the same deadline, so the bound is not what
+    /// failed it.
+    #[tokio::test]
+    async fn a_data_connection_the_relay_answers_opens_inside_the_deadline() {
+        let config = config(&relay_that_takes_data_connections().await);
+        let opened = open_data_connection(&config, "d", None, Duration::from_secs(10)).await;
+        assert!(opened.is_ok(), "{:?}", opened.err());
+    }
+
+    #[test]
+    fn a_failed_dial_is_explained_by_what_failed() {
+        use tokio_tungstenite::tungstenite::{http, Error};
+        let refused = |status: u16| {
+            Error::Http(
+                http::Response::builder()
+                    .status(status)
+                    .body(None)
+                    .expect("a status and no body is a response"),
+            )
+        };
+        let limited = explain_data_failure(&refused(429));
+        assert!(
+            limited.contains("429") && limited.contains("rate limiting"),
+            "{limited}"
+        );
+        // Any other refusal says it was a refusal and what the relay answered —
+        // not that the relay could not be reached.
+        let other = explain_data_failure(&refused(500));
+        assert!(
+            other.contains("refused the upgrade") && other.contains("500"),
+            "{other}"
+        );
+        let unreachable = explain_data_failure(&Error::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(
+            unreachable.starts_with("could not connect"),
+            "{unreachable}"
+        );
     }
 }
