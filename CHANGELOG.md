@@ -7,6 +7,17 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Added
 
+- **`/x/<name>/…` carries a WebSocket to the exposed service.** A notebook's kernel channel or a
+  model server's realtime endpoint, behind the same key, trail and relay path as the rest of the
+  service. The service's own handshake — its `101`, the sub-protocol and extensions it accepted —
+  reaches the caller and the connection's bytes then cross untouched in both directions, so the
+  service's framing, compression and close behaviour are its own. A service that will not upgrade
+  answers with the refusal it gave. One `expose` audit entry per connection (`status` `101`, bytes
+  in both directions); it counts as work while open. Through a relay the sub-protocol the service
+  chose is not reported back to the caller and no extension is negotiated (the relay answers the
+  caller's upgrade before the service has answered). A browser's `WebSocket` cannot send
+  `X-Shell-Tunnel-Key` and so cannot open one. See `docs/USAGE.md` §3.4.
+
 - **The audit trail names the caller's address.** `client` existed on every event and no event ever
   filled it. It is now set on every event that names an authenticated caller, and on `denied`
   events: the TCP peer for a request that reached the server directly, and for one that came
@@ -70,6 +81,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
   Not changed: a device whose pool stays empty does not drop its control connection and
   attach again on its own. The lines above are how to find out why it is empty.
+
+- The relay leg of a WebSocket no longer forwards the caller's `Sec-WebSocket-Extensions` to the
+  local server: the relay answers the caller's upgrade without any extension and the device's own
+  client does not implement them, so an extension the local server then accepted (compression)
+  produced frames nothing on that leg could read, and the connection closed at once.
 
 - Library: `audit::Identity` gained `client` (not serialized) — a literal of it stops compiling —
   and `AuditEvent` gained `with_client_opt`; `security::ClientAddr` and

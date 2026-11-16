@@ -1712,6 +1712,8 @@ dependencies = [
  "axum-server",
  "futures-util",
  "getrandom 0.3.4",
+ "hyper",
+ "hyper-util",
  "lexopt",
  "libc",
  "rcgen",

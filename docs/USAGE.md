@@ -1264,9 +1264,31 @@ or cut off — so it lands just after the response, and its `bytes` are what was
 sent. An answer still streaming when the server stops
 may leave no entry.
 
-Not in 0.32.0: WebSocket upstreams (a notebook's kernel channel, for one) — an upgrade
-request is passed on as a plain request and does not become a WebSocket; a key in the
-path for clients that cannot add a header; `https://` upstreams. A service on loopback
+**A WebSocket to a service** (a notebook's kernel channel, a model server's realtime
+endpoint) works at the same address: `ws://…/x/<name>/…`, with the key in
+`X-Shell-Tunnel-Key` on the upgrade request. This server passes the service's own
+handshake back — its `101`, the sub-protocol and extensions it accepted — and then
+carries the connection's bytes both ways without reading them, so the service's framing,
+compression and close behaviour are exactly its own. A service that will not upgrade
+answers with its own status, which reaches the caller as the refusal it was (the table
+above applies as for any request). The connection is one `expose` entry, written when it
+ends, with its `status` `101` and the bytes that crossed it in both directions. It
+counts as work while it is open, so an update waits for it (§2).
+
+**A browser's `WebSocket` cannot send `X-Shell-Tunnel-Key`** — the API takes no custom
+headers — so a page cannot open one of these directly; a client that can set a header
+(a server, a script, a native app, most WebSocket libraries) can.
+
+**Through a relay** the upgrade crosses two more hops, each of which ends the caller's
+WebSocket and starts a new one, so two things differ from the direct case: the relay has
+already answered `101` when the service answers, so **the sub-protocol the service chose
+is not reported back to the caller** (the service still sees the one the caller asked
+for), and **no extension is negotiated** — compression off, whatever the caller offered.
+Messages and their order are as sent.
+
+Not in this release: a key in the path for clients that cannot add a header; `https://`
+upstreams. Until WebSocket upstreams were added, an upgrade was passed on as a plain
+request and did not become a WebSocket. A service on loopback
 that checks no credential of its own — many do, on the reasoning that only this machine
 can reach them — is guarded by this server's key alone once exposed, and the banner says
 so.

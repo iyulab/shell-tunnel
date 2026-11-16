@@ -1376,6 +1376,11 @@ async fn pipe_websocket(
     for (name, value) in &request.headers {
         if !is_forwardable(name)
             || name.eq_ignore_ascii_case("sec-websocket-key")
+            // The relay answered the caller's upgrade without any extension, so
+            // none was negotiated with it, and this client does not implement
+            // them. Offering the caller's list to the local server would let it
+            // compress frames that nothing on this leg can read.
+            || name.eq_ignore_ascii_case("sec-websocket-extensions")
             || name.eq_ignore_ascii_case(RELAY_HOP_HEADER)
         {
             continue;

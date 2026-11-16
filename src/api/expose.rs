@@ -6,6 +6,9 @@
 //! reader a relay device uses for its own local server (`relay::replay`). No
 //! HTTP client dependency: this crate deliberately has none, and the reader is
 //! already the part that has to be right.
+//!
+//! A WebSocket upgrade is the one exception: the service's `101` is passed back
+//! and the connection becomes a byte pipe ([`upgrade_to_service`]).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -125,10 +128,15 @@ pub async fn proxy(
     State(state): State<AppState>,
     identity: Option<axum::Extension<Identity>>,
     axum::extract::Path(params): axum::extract::Path<std::collections::HashMap<String, String>>,
-    request: Request,
+    mut request: Request,
 ) -> Response {
     let identity = identity.map(|axum::Extension(id)| id);
     let name = params.get("name").cloned().unwrap_or_default();
+    // Taken before the request is taken apart: the handle that completes an
+    // upgrade lives in the request's extensions, and is only useful if the 101
+    // is answered.
+    let upgrade = crate::relay::is_websocket_upgrade(request.headers())
+        .then(|| hyper::upgrade::on(&mut request));
     let (parts, body) = request.into_parts();
     let method = parts.method.as_str().to_string();
     let path = parts.uri.path().to_string();
@@ -153,6 +161,10 @@ pub async fn proxy(
             "this server exposes no service by that name",
         );
     };
+
+    if let Some(upgrade) = upgrade {
+        return upgrade_to_service(&state, &exposure, &name, &parts, upgrade, record).await;
+    }
 
     // The body was read whole by the outermost layer already; this only
     // collects it. The route's own limit is that layer's ceiling.
@@ -326,6 +338,218 @@ pub async fn proxy(
     );
     *response.body_mut() = Body::from_stream(stream);
     response.into_response()
+}
+
+/// The longest head an upstream's answer to an upgrade may have.
+const MAX_UPGRADE_HEAD: usize = 64 * 1024;
+
+/// The most of a refusal's body that is passed on when a service answers an
+/// upgrade with something other than `101`.
+const MAX_REFUSAL_BODY: usize = 1024 * 1024;
+
+/// A service's answer to an upgrade request: status line and headers, and the
+/// bytes of whatever followed them in the same read.
+struct UpstreamHead {
+    status: u16,
+    headers: Vec<(String, String)>,
+    rest: Vec<u8>,
+}
+
+/// Read an answer's head from the service, leaving the stream positioned after
+/// the bytes returned in `rest`. `None` for anything that is not a head.
+async fn read_upstream_head(stream: &mut tokio::net::TcpStream) -> Option<UpstreamHead> {
+    let mut raw = Vec::new();
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(at) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break at;
+        }
+        if raw.len() > MAX_UPGRADE_HEAD {
+            return None;
+        }
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => raw.extend_from_slice(&buf[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines.next()?.split_whitespace().nth(1)?.parse().ok()?;
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
+        .collect();
+    Some(UpstreamHead {
+        status,
+        headers,
+        rest: raw[head_end + 4..].to_vec(),
+    })
+}
+
+/// Pass a WebSocket upgrade to the service and, if it agrees, become a pipe.
+///
+/// The service's own handshake is what reaches the caller — its `101`, its
+/// accepted sub-protocol, its extensions — because after the head this server
+/// reads no more of the connection than it writes on: bytes go both ways
+/// untouched. Re-framing the messages here would mean reproducing every
+/// negotiation the service might make, and a pipe cannot get one wrong.
+///
+/// A service that answers with anything but `101` is passed back as the plain
+/// answer it gave. The connection counts as work for as long as it lasts, as
+/// the WebSocket handlers' do.
+async fn upgrade_to_service(
+    state: &AppState,
+    exposure: &Exposure,
+    name: &str,
+    parts: &axum::http::request::Parts,
+    upgrade: hyper::upgrade::OnUpgrade,
+    mut record: ExposeRecord,
+) -> Response {
+    let unreachable = |record: &mut ExposeRecord| {
+        record.finish_with(502);
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            "expose-upstream-unreachable",
+            &format!(
+                "nothing accepted a connection at {}, where `{name}` is exposed",
+                exposure.url()
+            ),
+        )
+    };
+
+    let target = upstream_target(exposure, parts.uri.path(), parts.uri.query());
+    let mut head = format!("GET {target} HTTP/1.1\r\n").into_bytes();
+    head.extend_from_slice(format!("host: {}\r\n", exposure.authority()).as_bytes());
+    // The two hop-by-hop headers an upgrade is made of — withheld from every
+    // other request, and written here as this connection's own.
+    head.extend_from_slice(b"connection: Upgrade\r\nupgrade: websocket\r\n");
+    for (header, value) in &parts.headers {
+        if withheld_from_upstream(header.as_str()) {
+            continue;
+        }
+        head.extend_from_slice(header.as_str().as_bytes());
+        head.extend_from_slice(b": ");
+        head.extend_from_slice(value.as_bytes());
+        head.extend_from_slice(b"\r\n");
+    }
+    head.extend_from_slice(b"\r\n");
+
+    let connected = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tokio::net::TcpStream::connect(exposure.authority()),
+    )
+    .await;
+    let Ok(Ok(mut stream)) = connected else {
+        return unreachable(&mut record);
+    };
+    if stream.write_all(&head).await.is_err() {
+        return unreachable(&mut record);
+    }
+
+    let answered = tokio::time::timeout(HEAD_TIMEOUT, read_upstream_head(&mut stream)).await;
+    let answer = match answered {
+        Ok(Some(answer)) => answer,
+        Err(_) => {
+            record.finish_with(504);
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "expose-upstream-timeout",
+                &format!(
+                    "the service exposed as `{name}` sent no answer within {} s",
+                    HEAD_TIMEOUT.as_secs()
+                ),
+            );
+        }
+        Ok(None) => {
+            record.finish_with(502);
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "expose-upstream-bad-answer",
+                &format!(
+                    "the service exposed as `{name}` closed the connection or answered with something that is not HTTP/1.1"
+                ),
+            );
+        }
+    };
+    record.finish_with(answer.status);
+
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::from_u16(answer.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    let switching = answer.status == 101;
+    for (header, value) in &answer.headers {
+        // The body of a refusal is sent with a length of its own below.
+        if !switching
+            && (header.eq_ignore_ascii_case("content-length")
+                || header.eq_ignore_ascii_case("transfer-encoding")
+                || header.eq_ignore_ascii_case("connection"))
+        {
+            continue;
+        }
+        if let (Ok(header), Ok(value)) = (
+            HeaderName::from_bytes(header.as_bytes()),
+            HeaderValue::from_str(value),
+        ) {
+            response.headers_mut().append(header, value);
+        }
+    }
+
+    if !switching {
+        // A service that will not upgrade says why in a body that is passed on,
+        // as far as it declared one and no further than a refusal needs.
+        let declared = answer
+            .headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.parse::<usize>().ok())
+            .unwrap_or(answer.rest.len())
+            .min(MAX_REFUSAL_BODY);
+        let mut body = answer.rest;
+        body.truncate(declared);
+        let mut buf = [0u8; 4096];
+        while body.len() < declared {
+            let read = tokio::time::timeout(CONNECT_TIMEOUT, stream.read(&mut buf)).await;
+            match read {
+                Ok(Ok(n)) if n > 0 => {
+                    let take = n.min(declared - body.len());
+                    body.extend_from_slice(&buf[..take]);
+                }
+                _ => break,
+            }
+        }
+        record.bytes = body.len() as u64;
+        *response.body_mut() = Body::from(body);
+        return response;
+    }
+
+    // From here the connection is a pipe, and it is work for as long as it is
+    // open: the request's own count ends when this returns.
+    let guard = state.activity.guard();
+    let rest = answer.rest;
+    tokio::spawn(async move {
+        // Moved in whole: a closure captures the fields it names, and naming
+        // only `record.bytes` would leave the record — whose `Drop` writes the
+        // audit entry — behind, to be written as the handler returns.
+        let mut record = record;
+        let _guard = guard;
+        let Ok(upgraded) = upgrade.await else {
+            return;
+        };
+        let mut caller = hyper_util::rt::TokioIo::new(upgraded);
+        if !rest.is_empty() {
+            // The service may have sent its first frame in the same read as its
+            // head; it belongs to the caller.
+            if caller.write_all(&rest).await.is_err() {
+                return;
+            }
+            record.bytes += rest.len() as u64;
+        }
+        if let Ok((to_service, to_caller)) =
+            tokio::io::copy_bidirectional(&mut caller, &mut stream).await
+        {
+            record.bytes += to_service + to_caller;
+        }
+    });
+    response
 }
 
 #[cfg(test)]
