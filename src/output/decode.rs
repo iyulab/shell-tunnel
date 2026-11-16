@@ -111,6 +111,15 @@ fn decode_with(raw: &[u8], legacy: Option<&dyn Legacy>) -> Decoded {
             }
             Err(error) => error,
         };
+        // Everything before the error is valid UTF-8 and the error is the end of
+        // the input: UTF-8 cut in the middle of a character (by a cap on the
+        // output, or the end of a stream). That is not text in another encoding —
+        // the cut tail is lossy, as it always was, and no code page is named for
+        // text that was UTF-8 all along.
+        if error.error_len().is_none() {
+            text.push_str(&String::from_utf8_lossy(rest));
+            break;
+        }
         let bad_at = error.valid_up_to();
         // The whole run of non-ASCII bytes the first invalid byte sits in —
         // widened backwards over any bytes in it that happen to be valid UTF-8,
@@ -343,6 +352,23 @@ mod tests {
         let decoded = decode(b"ok \xC7\xD1\xB1\xDB done\r\n");
         assert_eq!(decoded.text, "ok <c7d1><b1db> done\r\n");
         assert_eq!(decoded.code_page, Some(949));
+    }
+
+    #[test]
+    fn utf8_cut_in_the_middle_of_a_character_is_not_taken_for_a_legacy_page() {
+        // What a byte cap on the output leaves: whole UTF-8 text, then half a
+        // character. It was UTF-8 all along, so no page is named and only the
+        // cut tail is replaced.
+        let mut raw = "한글 ok ".as_bytes().to_vec();
+        raw.extend_from_slice(&"한".as_bytes()[..2]);
+        let decoded = decode(&raw);
+        assert_eq!(decoded.text, "한글 ok \u{FFFD}");
+        assert_eq!(decoded.code_page, None);
+        // The whole run, not only the tail: two valid characters then the cut.
+        let mut run = "한글".as_bytes().to_vec();
+        run.extend_from_slice(&"한".as_bytes()[..1]);
+        assert_eq!(decode(&run).text, "한글\u{FFFD}");
+        assert_eq!(decode(&run).code_page, None);
     }
 
     #[test]
