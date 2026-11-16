@@ -39,6 +39,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **A device no longer waits forever on a relay connection that was accepted and never answered.**
+  Opening the control connection had no time limit on its WebSocket upgrade or on the relay's
+  answer to the enrolment. A network path that kept the TCP connection but lost its state
+  (a NAT or firewall forgetting the flow mid-handshake) left the device waiting on it for as
+  long as the process ran: no log line, no retry, and every request to the device answered
+  `502 device is not connected` until it was restarted. Both steps now end at the same silence
+  limit the device already applies to an attached relay (90 s) and the device attaches again.
+  Reproduced on Windows and on Linux with a proxy that swallows the connection.
+
 - **Starting a background process no longer holds up everything that reads the process table.**
   The child was spawned while the table's lock was held, and every long-poll for output and the
   thread that drains every running process wait on that lock. Creating a process takes a few

@@ -429,7 +429,7 @@ pub(crate) async fn attach_paced(
     let (tcp_stream, local_port) = super::direct::dial_with_local_port(&config.dial_target())
         .await
         .map_err(|e| ShellTunnelError::Tunnel(format!("cannot reach relay: {e}")))?;
-    let (mut control, _) = tokio_tungstenite::client_async_tls_with_config(
+    let upgrade = tokio_tungstenite::client_async_tls_with_config(
         config
             .control_url()
             .into_client_request()
@@ -437,12 +437,21 @@ pub(crate) async fn attach_paced(
         tcp_stream,
         None,
         tls,
-    )
-    .await
-    .map_err(|e| {
-        let presented = seen.lock().ok().and_then(|s| s.clone());
-        ShellTunnelError::Tunnel(explain_dial_failure(&e, config, presented.as_deref()))
-    })?;
+    );
+    // A connection that was accepted and is never answered must end, or the
+    // device waits on it for as long as the process lives.
+    let (mut control, _) = tokio::time::timeout(liveness.silence_limit, upgrade)
+        .await
+        .map_err(|_| {
+            ShellTunnelError::Tunnel(format!(
+                "cannot reach relay: no answer to the upgrade within {:?}",
+                liveness.silence_limit
+            ))
+        })?
+        .map_err(|e| {
+            let presented = seen.lock().ok().and_then(|s| s.clone());
+            ShellTunnelError::Tunnel(explain_dial_failure(&e, config, presented.as_deref()))
+        })?;
 
     let enroll = DeviceMessage::Enroll {
         enroll_token: config.enroll_token.clone(),
@@ -452,7 +461,15 @@ pub(crate) async fn attach_paced(
     };
     send(&mut control, &enroll).await?;
 
-    let (device_id, attach_id, streams) = match recv(&mut control).await? {
+    let first = tokio::time::timeout(liveness.silence_limit, recv(&mut control))
+        .await
+        .map_err(|_| {
+            ShellTunnelError::Tunnel(format!(
+                "the relay did not answer the enrolment within {:?}",
+                liveness.silence_limit
+            ))
+        })??;
+    let (device_id, attach_id, streams) = match first {
         RelayMessage::Enrolled {
             device_id,
             public_url,
@@ -2990,6 +3007,51 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    /// The control connection had no bound on its own opening: a path that
+    /// accepted the TCP connection and then lost the flow (a middlebox that
+    /// forgot its state) left `attach` waiting on the upgrade for as long as the
+    /// process lived — no log line, no retry, and every request to the device
+    /// answering `502 device is not connected` until it was restarted. Both
+    /// steps that wait on the relay now end at the silence limit, the bound the
+    /// device already uses for «has the relay stopped answering».
+    #[tokio::test]
+    async fn a_relay_that_takes_the_connection_and_never_upgrades_it_is_given_up_on() {
+        let identity = super::super::direct::DirectIdentity::generate().unwrap();
+        let config = config(&relay_that_accepts_and_stays_silent().await);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            attach_paced(&config, &identity, &mut None, FAST),
+        )
+        .await
+        .expect("the attach must end at its own deadline, not at the operating system's");
+        let failure = ended.expect_err("a relay that never answers is a failure");
+        assert!(
+            failure.to_string().contains("no answer to the upgrade"),
+            "{failure}"
+        );
+    }
+
+    /// The same, one step later: the upgrade completes and the relay reads the
+    /// enrolment and never answers it.
+    #[tokio::test]
+    async fn a_relay_that_upgrades_and_never_answers_the_enrolment_is_given_up_on() {
+        let identity = super::super::direct::DirectIdentity::generate().unwrap();
+        // This fake reads one frame and then holds the connection, which is
+        // exactly what a relay that stops responding after the upgrade does.
+        let config = config(&relay_that_takes_data_connections().await);
+        let ended = tokio::time::timeout(
+            Duration::from_secs(10),
+            attach_paced(&config, &identity, &mut None, FAST),
+        )
+        .await
+        .expect("the attach must end at its own deadline, not at the operating system's");
+        let failure = ended.expect_err("a relay that never answers is a failure");
+        assert!(
+            failure.to_string().contains("did not answer the enrolment"),
+            "{failure}"
+        );
     }
 
     #[tokio::test]
