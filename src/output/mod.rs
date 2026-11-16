@@ -20,8 +20,10 @@
 //! let lines = screen.non_empty_lines();
 //! ```
 
+mod decode;
 mod sanitizer;
 mod screen;
 
+pub use decode::{decodable_len, decode_output, Decoded, OutputDecoder};
 pub use sanitizer::OutputSanitizer;
 pub use screen::VirtualScreen;

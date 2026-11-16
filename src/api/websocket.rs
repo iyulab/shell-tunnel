@@ -13,8 +13,45 @@ use futures_util::{SinkExt, StreamExt};
 
 use super::handlers::AppState;
 use super::types::{WsClientMessage, WsServerMessage};
-use crate::execution::Command;
+use crate::execution::{Command, OutputChunk, OutputSource};
+use crate::output::OutputDecoder;
 use crate::session::{BusySession, SessionId};
+
+/// Turns a command's output chunks into the text a client is sent, keeping
+/// stdout and stderr apart.
+///
+/// Decoding each chunk by itself cut a character in two wherever the pipe
+/// happened to split it, and sent a replacement character for each half — in
+/// plain UTF-8 as much as in a legacy code page. A character split across two
+/// chunks is held until its other half arrives, and handed on at the end if it
+/// never does.
+#[derive(Default)]
+struct ChunkText {
+    stdout: OutputDecoder,
+    stderr: OutputDecoder,
+}
+
+impl ChunkText {
+    /// The text of `chunk` that is a whole character so far — empty while the
+    /// chunk is only the start of one.
+    fn push(&mut self, chunk: &OutputChunk) -> String {
+        match chunk.source {
+            OutputSource::Stdout => self.stdout.push(&chunk.raw).text,
+            OutputSource::Stderr => self.stderr.push(&chunk.raw).text,
+        }
+    }
+
+    /// What is still held once the output is over, by stream.
+    fn finish(&mut self) -> Vec<(OutputSource, String)> {
+        [
+            (OutputSource::Stdout, self.stdout.finish().text),
+            (OutputSource::Stderr, self.stderr.finish().text),
+        ]
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+        .collect()
+    }
+}
 
 /// WebSocket upgrade handler.
 pub async fn ws_handler(
@@ -123,9 +160,15 @@ async fn handle_socket(
                         let mut finished = None;
 
                         // Stream output chunks
+                        let mut text = ChunkText::default();
                         while let Some(chunk) = rx.recv().await {
+                            let data = text.push(&chunk);
+                            if data.is_empty() {
+                                // Only the start of a character: nothing to say yet.
+                                continue;
+                            }
                             let output = WsServerMessage::Output {
-                                data: String::from_utf8_lossy(&chunk.raw).to_string(),
+                                data,
                                 stream: Some(chunk.source.as_str().to_string()),
                                 is_final: false,
                             };
@@ -140,6 +183,16 @@ async fn handle_socket(
                                 if sent.is_err() {
                                     break;
                                 }
+                            }
+                        }
+                        for (source, data) in text.finish() {
+                            let output = WsServerMessage::Output {
+                                data,
+                                stream: Some(source.as_str().to_string()),
+                                is_final: false,
+                            };
+                            if let Ok(json) = serde_json::to_string(&output) {
+                                let _ = sink.send(Message::Text(json.into())).await;
                             }
                         }
 
@@ -366,9 +419,14 @@ async fn handle_oneshot_socket(
 
                 match state.executor.execute_async(&cmd).await {
                     Ok((mut rx, handle)) => {
+                        let mut text = ChunkText::default();
                         while let Some(chunk) = rx.recv().await {
+                            let data = text.push(&chunk);
+                            if data.is_empty() {
+                                continue;
+                            }
                             let output = WsServerMessage::Output {
-                                data: String::from_utf8_lossy(&chunk.raw).to_string(),
+                                data,
                                 stream: Some(chunk.source.as_str().to_string()),
                                 is_final: false,
                             };
@@ -376,6 +434,16 @@ async fn handle_oneshot_socket(
                                 if sink.send(Message::Text(json.into())).await.is_err() {
                                     break;
                                 }
+                            }
+                        }
+                        for (source, data) in text.finish() {
+                            let output = WsServerMessage::Output {
+                                data,
+                                stream: Some(source.as_str().to_string()),
+                                is_final: false,
+                            };
+                            if let Ok(json) = serde_json::to_string(&output) {
+                                let _ = sink.send(Message::Text(json.into())).await;
                             }
                         }
 
@@ -476,5 +544,56 @@ mod tests {
         let json = r#"{"type": "ping"}"#;
         let msg: WsClientMessage = serde_json::from_str(json).unwrap();
         assert!(matches!(msg, WsClientMessage::Ping));
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_arrives_whole() {
+        let mut text = ChunkText::default();
+        let han = "한".as_bytes(); // three bytes
+        let first = text.push(&OutputChunk::new(han[..2].to_vec(), OutputSource::Stdout));
+        assert_eq!(first, "", "half a character is not sent");
+        let second = text.push(&OutputChunk::new(han[2..].to_vec(), OutputSource::Stdout));
+        assert_eq!(second, "한");
+        assert!(text.finish().is_empty());
+    }
+
+    #[test]
+    fn each_stream_holds_its_own_half_character() {
+        // stderr's bytes arriving between the two halves of a stdout character
+        // must not be taken for its second half.
+        let mut text = ChunkText::default();
+        let han = "한".as_bytes();
+        assert_eq!(
+            text.push(&OutputChunk::new(han[..2].to_vec(), OutputSource::Stdout)),
+            ""
+        );
+        assert_eq!(
+            text.push(&OutputChunk::new(
+                b"err
+"
+                .to_vec(),
+                OutputSource::Stderr
+            )),
+            "err
+"
+        );
+        assert_eq!(
+            text.push(&OutputChunk::new(han[2..].to_vec(), OutputSource::Stdout)),
+            "한"
+        );
+    }
+
+    #[test]
+    fn a_character_the_output_ends_in_the_middle_of_is_handed_on_at_the_end() {
+        let mut text = ChunkText::default();
+        let han = "한".as_bytes();
+        assert_eq!(
+            text.push(&OutputChunk::new(han[..2].to_vec(), OutputSource::Stdout)),
+            ""
+        );
+        let rest = text.finish();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].0, OutputSource::Stdout);
+        assert!(!rest[0].1.is_empty(), "what arrived is not dropped");
     }
 }

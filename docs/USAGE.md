@@ -506,6 +506,22 @@ and there is no way to disable the cap — an uncapped response is one the relay
 cannot deliver (§10). To read more than the cap allows, write the output to a
 file and fetch it with `GET /api/v1/fs/file`, which supports `Range`.
 
+**Output text** is UTF-8 when the bytes are UTF-8, and — on Windows — the machine's
+OEM code page when they are not. A console program writes in that page (949 on a
+Korean system, 437 or 850 on a Western one), and reading its bytes as UTF-8 loses every
+non-ASCII character in a way the caller cannot undo. `output`, `stdout` and `stderr`
+are read run by run: a stretch of non-ASCII bytes between ASCII ones is taken as UTF-8
+if it is valid UTF-8 and as the OEM page otherwise, so one command can print UTF-8 from
+one program and a localized `cmd` error in the same output. When any of it was read
+from a code page the response carries `output_encoding` (`"cp949"`); it is absent
+otherwise, which is the usual case. Not known: the page a command *actually* wrote in —
+one that switched its own console (`chcp 437`) and printed something that is not UTF-8
+is still read as the OEM page. A Windows whose system code page is already UTF-8 (the
+"Beta: Use Unicode UTF-8" setting) and every Unix have no page to fall back to: bytes
+that are not UTF-8 arrive as U+FFFD there, as they always did. A WebSocket consumer gets
+the same text per chunk, with a character the pipe happened to split held until its
+other half arrives.
+
 The cap applies to the collected result, not to the stream. A WebSocket consumer
 **that keeps reading** receives every chunk regardless of the cap; one that stops
 reading while its command runs on can miss chunks produced after that command's
@@ -1128,7 +1144,9 @@ curl -s -X DELETE "$BASE/api/v1/processes/0"             # ends it if running, f
 buffer no longer holds reads from the oldest byte it does, and `start` comes back larger
 than `since` — the gap is what was discarded, never skipped silently. `text` is cut at a
 character boundary (an incomplete multi-byte character waits for the next read), and
-bytes that are not UTF-8 arrive as U+FFFD. `complete: true` means the process has ended
+bytes that are not UTF-8 are read the way `execute` reads them (§3, *Output text*):
+as the machine's OEM code page where there is one, with `output_encoding` naming it,
+and as U+FFFD where there is not. `complete: true` means the process has ended
 and everything it wrote has been read.
 
 **Run through the platform shell**, as `execute` is (`cmd /c` or `/bin/sh -c`), with no

@@ -199,22 +199,37 @@ pub struct ExecuteCommandResponse {
     /// stdin, before taking all of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stdin_written: Option<u64>,
+    /// The code page the text was read from, as `cp949` — present only when part
+    /// of the command's output was not UTF-8 and was read as this machine's OEM
+    /// code page instead (Windows). Absent when every byte was UTF-8, which is
+    /// the usual case and always the case on Unix.
+    ///
+    /// A caller that sees it knows `output` was converted; the characters are
+    /// the command's own, not replacements for ones that were lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_encoding: Option<String>,
 }
 
 impl ExecuteCommandResponse {
     pub fn from_result(result: &crate::execution::ExecutionResult) -> Self {
+        // Each stream is decoded from its own bytes — the result keeps them
+        // apart — so the split text is read the same way the merged text was.
+        let stdout = crate::output::decode_output(&result.stdout);
+        let stderr = crate::output::decode_output(&result.stderr);
+        let code_page = result.code_page.or(stdout.code_page).or(stderr.code_page);
         Self {
             success: result.exit_code.map(|c| c == 0).unwrap_or(false) && !result.timed_out,
             exit_code: result.exit_code,
             output: result.text_output.clone(),
-            stdout: crate::output::OutputSanitizer::strip_ansi(&result.stdout),
-            stderr: crate::output::OutputSanitizer::strip_ansi(&result.stderr),
+            stdout: crate::output::OutputSanitizer::strip_ansi(stdout.text.as_bytes()),
+            stderr: crate::output::OutputSanitizer::strip_ansi(stderr.text.as_bytes()),
             raw_output: None, // Only include if requested
             duration_ms: result.duration.as_millis() as u64,
             timed_out: result.timed_out,
             total_bytes: result.total_bytes,
             truncated: result.truncated,
             stdin_written: result.stdin_written,
+            output_encoding: code_page.map(|page| format!("cp{page}")),
         }
     }
 

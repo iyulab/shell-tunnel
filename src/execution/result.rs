@@ -35,6 +35,11 @@ pub struct ExecutionResult {
     /// Bytes of the command's input its stdin pipe accepted, when it was given
     /// input; `None` when it was not (stdin was empty).
     pub stdin_written: Option<u64>,
+    /// The code page some of `text_output` was read from, when part of the
+    /// output was not UTF-8 — `None` when all of it was (see
+    /// [`crate::output::decode_output`]). Only the machine's OEM page is ever
+    /// named, and only on Windows.
+    pub code_page: Option<u32>,
 }
 
 impl ExecutionResult {
@@ -57,6 +62,7 @@ impl ExecutionResult {
             stdout: Vec::new(),
             stderr: Vec::new(),
             stdin_written: None,
+            code_page: None,
         }
     }
 
@@ -74,6 +80,7 @@ impl ExecutionResult {
             stdout: Vec::new(),
             stderr: Vec::new(),
             stdin_written: None,
+            code_page: None,
         }
     }
 
@@ -92,6 +99,12 @@ impl ExecutionResult {
     pub fn with_streams(mut self, stdout: Vec<u8>, stderr: Vec<u8>) -> Self {
         self.stdout = stdout;
         self.stderr = stderr;
+        self
+    }
+
+    /// Record the code page the text was read from, if it was not UTF-8.
+    pub fn with_code_page(mut self, code_page: Option<u32>) -> Self {
+        self.code_page = code_page;
         self
     }
 
@@ -141,6 +154,7 @@ impl Default for ExecutionResult {
             stdout: Vec::new(),
             stderr: Vec::new(),
             stdin_written: None,
+            code_page: None,
         }
     }
 }
@@ -150,7 +164,9 @@ impl Default for ExecutionResult {
 pub struct OutputChunk {
     /// Raw bytes.
     pub raw: Vec<u8>,
-    /// Decoded text (best effort).
+    /// This chunk decoded on its own (best effort): a character split across two
+    /// chunks is not joined here. A consumer that needs the text of a stream
+    /// feeds `raw` to a [`crate::output::OutputDecoder`] instead.
     pub text: String,
     /// Stream source.
     pub source: OutputSource,
@@ -178,7 +194,7 @@ impl OutputSource {
 impl OutputChunk {
     /// Create a new output chunk.
     pub fn new(raw: Vec<u8>, source: OutputSource) -> Self {
-        let text = String::from_utf8_lossy(&raw).into_owned();
+        let text = crate::output::decode_output(&raw).text;
         Self { raw, text, source }
     }
 

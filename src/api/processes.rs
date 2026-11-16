@@ -174,28 +174,30 @@ pub async fn output(
     // two reads would otherwise come back as two replacement characters. The
     // incomplete tail is left for the next read by moving `next` back — unless
     // the stream is over, when no more bytes can complete it.
-    let mut consumed = read.data.len();
-    if !read.complete {
-        if let Err(e) = std::str::from_utf8(&read.data) {
-            if e.error_len().is_none() {
-                consumed = e.valid_up_to();
-            }
-        }
-    }
-    let text = String::from_utf8_lossy(&read.data[..consumed]).into_owned();
+    let consumed = if read.complete {
+        read.data.len()
+    } else {
+        crate::output::decodable_len(&read.data)
+    };
+    let decoded = crate::output::decode_output(&read.data[..consumed]);
     let next = read.start + consumed as u64;
     let complete = read.complete && consumed == read.data.len();
     let info = state.processes.info(id).ok();
-    Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "stream": match stream { Stream::Stdout => "stdout", Stream::Stderr => "stderr" },
         "start": read.start,
         "next": next,
-        "text": text,
+        "text": decoded.text,
         "complete": complete,
         "state": info.as_ref().map(|i| i.state),
         "exit_code": info.and_then(|i| i.exit_code),
-    }))
-    .into_response()
+    });
+    // Present only when this read's text was not UTF-8 — see `output_encoding`
+    // on the execute response.
+    if let Some(page) = decoded.code_page {
+        body["output_encoding"] = serde_json::Value::String(format!("cp{page}"));
+    }
+    Json(body).into_response()
 }
 
 /// Query of `POST /api/v1/processes/{id}/stdin`.

@@ -152,6 +152,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Cryptography_Catalog",
     "Win32_Security_Cryptography_Sip",
     "Win32_Security_WinTrust",
+    # Reading a command's output in the machine's OEM code page when it is not
+    # UTF-8 (`GetOEMCP`, `MultiByteToWideChar`, `IsDBCSLeadByteEx`); see
+    # `src/output/decode.rs`.
+    "Win32_Globalization",
 ] }
 
 

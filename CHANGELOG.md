@@ -5,6 +5,24 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Fixed
+
+- **Command output on a Windows whose console code page is not UTF-8 is no longer
+  destroyed.** The server read every byte a command wrote as UTF-8, so on a Korean system
+  (code page 949) `echo 한글` came back as replacement characters — a loss the caller cannot
+  undo, since the original bytes were gone. It also hid the localized text of an error
+  (`'x' is not recognized as an internal or external command` in the system's language).
+  `output`, `stdout` and `stderr` are now read as UTF-8 where the bytes are UTF-8 and as
+  the machine's OEM code page where they are not, run by run, so one output can mix the two.
+  The conversion is reported: the execute response (and a background process's output read)
+  carries `output_encoding`, e.g. `"cp949"`, when any of it was converted, and omits it
+  otherwise. A Windows whose system code page is UTF-8, and every Unix, have no page to fall
+  back to and behave as before. See `docs/USAGE.md` §3, *Output text*.
+
+- **A character split by the pipe is no longer sent as two replacement characters** on a
+  WebSocket `execute`, in plain UTF-8 as much as in a legacy code page: the halves are
+  held until the other arrives, per stream.
+
 ### Changed
 
 - **A device says, at the default log level, why it could not open a data connection — and
@@ -26,6 +44,11 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
   Not changed: a device whose pool stays empty does not drop its control connection and
   attach again on its own. The lines above are how to find out why it is empty.
+
+- Library: `ExecutionResult` gained `code_page` and `ExecuteCommandResponse` `output_encoding`;
+  a literal of either stops compiling. New `output::{decode_output, decodable_len,
+  OutputDecoder, Decoded}`. On Windows the build now enables `windows-sys`'s
+  `Win32_Globalization` (already compiled for the target; no new crate).
 
 ## 0.32.0 — 2026-10-20
 

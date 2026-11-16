@@ -11,7 +11,7 @@ use super::command::Invocation;
 use super::pipe::{PipeDrain, PipeFeed};
 use super::result::{ExecutionResult, OutputChunk, OutputSource};
 use crate::error::ShellTunnelError;
-use crate::output::OutputSanitizer;
+use crate::output::{decode_output, OutputSanitizer};
 use crate::process::{direct_command, shell_command, KillGroup};
 use crate::session::{BusySession, SessionStore};
 use crate::Result;
@@ -352,13 +352,18 @@ fn run_command_streaming(
         stdout,
         stderr,
     } = kept;
-    let text = OutputSanitizer::strip_ansi(&raw_output);
+    // Decoded before the escape sequences are stripped: the stripper reads UTF-8
+    // and would turn a legacy code page's bytes into replacement characters
+    // itself, whatever is done to the result afterwards.
+    let decoded = decode_output(&raw_output);
+    let text = OutputSanitizer::strip_ansi(decoded.text.as_bytes());
     let truncated = total_bytes > raw_output.len() as u64;
 
     if timed_out {
         return Ok(ExecutionResult::timeout(raw_output, text, duration)
             .with_output_extent(total_bytes, truncated)
             .with_streams(stdout, stderr)
+            .with_code_page(decoded.code_page)
             .with_stdin_written(stdin_written));
     }
 
@@ -366,6 +371,7 @@ fn run_command_streaming(
     let mut result = ExecutionResult::new(raw_output, text, duration)
         .with_output_extent(total_bytes, truncated)
         .with_streams(stdout, stderr)
+        .with_code_page(decoded.code_page)
         .with_stdin_written(stdin_written);
     if let Some(code) = exit_code {
         result = result.with_exit_code(code);
