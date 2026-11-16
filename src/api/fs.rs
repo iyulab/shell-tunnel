@@ -823,12 +823,17 @@ pub fn parse_range(header: &str, size: u64) -> RangeOutcome {
 /// headers a `GET` would.
 pub async fn download(
     State(state): State<AppState>,
+    identity: Option<axum::Extension<crate::audit::Identity>>,
     method: axum::http::Method,
     headers: axum::http::HeaderMap,
     Query(query): Query<PathQuery>,
 ) -> Response {
     let Some(root) = state.fs.clone() else {
         return fs_not_enabled();
+    };
+    let trail = ReadTrail {
+        audit: state.audit.clone(),
+        identity: identity.map(|axum::Extension(id)| id),
     };
 
     // Everything this handler needs from the headers, extracted before
@@ -880,6 +885,7 @@ pub async fn download(
             if_range_header.as_deref(),
             include_body,
             relay_frame_limit,
+            &trail,
         )
     })
     .await
@@ -908,6 +914,7 @@ fn download_blocking(
     if_range_header: Option<&str>,
     include_body: bool,
     relay_frame_limit: Option<u64>,
+    trail: &ReadTrail,
 ) -> Response {
     let resolved = match root.resolve_existing(&query.path) {
         Ok(path) => path,
@@ -973,6 +980,15 @@ fn download_blocking(
             } else {
                 Vec::new()
             };
+            if include_body {
+                trail.record(
+                    root,
+                    &resolved,
+                    &query.path,
+                    bytes.len(),
+                    StatusCode::PARTIAL_CONTENT,
+                );
+            }
             (
                 StatusCode::PARTIAL_CONTENT,
                 [
@@ -1020,6 +1036,9 @@ fn download_blocking(
             } else {
                 size
             };
+            if include_body {
+                trail.record(root, &resolved, &query.path, bytes.len(), StatusCode::OK);
+            }
             (
                 StatusCode::OK,
                 [
@@ -1032,6 +1051,46 @@ fn download_blocking(
             )
                 .into_response()
         }
+    }
+}
+
+/// Who to record a file read against, and where to write it.
+///
+/// A read is recorded **when the content is handed to the response**, which is
+/// when it has left the file: a caller that hangs up afterwards still read it.
+/// Only a request that carries content is recorded — a `HEAD`, a refused range,
+/// a path that does not resolve and a relay's early refusal all read nothing,
+/// and `list`/`stat` return metadata, not content. The scope is deliberate (a
+/// tool walking a tree would otherwise fill the trail with its own traffic and
+/// rotate real history out of it); `docs/USAGE.md` §4 states it.
+struct ReadTrail {
+    audit: std::sync::Arc<crate::audit::AuditSink>,
+    identity: Option<crate::audit::Identity>,
+}
+
+impl ReadTrail {
+    /// `bytes` is what the response carries: the whole file, or the span a
+    /// `Range` asked for (`status` tells the two apart). The path recorded is
+    /// the one that was read — canonical, symlinks resolved — and falls back to
+    /// the caller's spelling rather than lose the entry.
+    fn record(
+        &self,
+        root: &FsRoot,
+        resolved: &std::path::Path,
+        requested: &str,
+        bytes: usize,
+        status: StatusCode,
+    ) {
+        let file = root
+            .relative(resolved)
+            .unwrap_or_else(|| requested.to_string());
+        self.audit.record(
+            crate::audit::AuditEvent::new("fs.read")
+                .with_identity(self.identity.clone())
+                .with_route("GET /api/v1/fs/file")
+                .with_file(file, Some(bytes as u64))
+                .with_status(status.as_u16()),
+        );
     }
 }
 

@@ -4051,6 +4051,96 @@ async fn a_deleted_files_audit_event_carries_the_callers_identity() {
     assert_eq!(deleted["identity"]["label"], "test");
 }
 
+/// A file's content leaving the server is recorded, once, with what left.
+/// Reading used to leave the trail empty (USAGE §4); this is the half of it
+/// that carries content.
+#[tokio::test]
+async fn a_downloaded_file_is_audited_once_with_its_size_and_the_callers_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("secret.bin"), b"0123456789").expect("write");
+    let (state, log) = audited_state(&dir);
+    let app = secure_app_with_token(state, "reader", &["fs.read"]);
+
+    let response = app
+        .oneshot(authed_get("/api/v1/fs/file?path=secret.bin", "reader"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let events = audit_lines(&log);
+    let reads: Vec<_> = events.iter().filter(|e| e["kind"] == "fs.read").collect();
+    assert_eq!(reads.len(), 1, "{events:?}");
+    assert_eq!(reads[0]["file"], "secret.bin");
+    assert_eq!(reads[0]["bytes"], 10);
+    assert_eq!(reads[0]["status"], 200);
+    assert_eq!(reads[0]["identity"]["label"], "test");
+}
+
+/// A `Range` response records the span it carried, and its `206` is what tells
+/// it from a whole-file read.
+#[tokio::test]
+async fn a_ranged_download_is_audited_with_the_span_it_carried() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("big.bin"), b"0123456789").expect("write");
+    let (state, log) = audited_state(&dir);
+
+    let response = common::plain_app(state)
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/fs/file?path=big.bin")
+                .header(axum::http::header::RANGE, "bytes=2-5")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+
+    let events = audit_lines(&log);
+    let read = events
+        .iter()
+        .find(|e| e["kind"] == "fs.read")
+        .expect("a ranged read carries content and must be recorded");
+    assert_eq!(read["bytes"], 4);
+    assert_eq!(read["status"], 206);
+}
+
+/// What is deliberately not recorded, pinned so that widening the scope is a
+/// decision and not a drift: nothing here carries file content to the caller.
+/// `list` and `stat` return metadata (a tool walking a tree would fill the
+/// trail with its own traffic); a `HEAD` reads nothing; a path that does not
+/// resolve and a range that cannot be satisfied read nothing either.
+#[tokio::test]
+async fn requests_that_carry_no_file_content_leave_no_read_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("a.txt"), b"abc").expect("write");
+    let (state, log) = audited_state(&dir);
+    let app = common::plain_app(state);
+
+    for (method, uri, range) in [
+        ("GET", "/api/v1/fs/list?path=.", None),
+        ("GET", "/api/v1/fs/stat?path=a.txt", None),
+        ("HEAD", "/api/v1/fs/file?path=a.txt", None),
+        ("GET", "/api/v1/fs/file?path=missing.txt", None),
+        ("GET", "/api/v1/fs/file?path=a.txt", Some("bytes=50-60")),
+    ] {
+        let mut request = Request::builder().method(method).uri(uri);
+        if let Some(range) = range {
+            request = request.header(axum::http::header::RANGE, range);
+        }
+        app.clone()
+            .oneshot(request.body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+    }
+
+    let reads = audit_lines(&log)
+        .into_iter()
+        .filter(|e| e["kind"] == "fs.read")
+        .count();
+    assert_eq!(reads, 0, "no request above carried file content");
+}
+
 /// The four `fs.delete*` kinds exist so an operator can grep the trail for
 /// exactly one outcome without reading every event's body. Nothing pinned
 /// that contract down before this: a mutation collapsing all four kinds to

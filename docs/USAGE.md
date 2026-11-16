@@ -1452,12 +1452,17 @@ that is a gap you cannot close from the outside. It is narrower than it was
 described as being through 0.21.0, when this said flatly that such a command is
 not recorded: that sentence was measured on one path and was false on the other.
 
-**Reading is not recorded.** `list`, `stat` and `download` write nothing when
-they succeed: the only file kinds in the table are `fs.delete*` and `upload.*`.
-This is the gap with the widest operational reach — on a server started without
-`--fs-root`, a token holding `fs.read` can read every file the process can
-reach, and the trail stays empty throughout. Three successful reads, zero
-entries, measured against a running server rather than read off the table.
+**Only reading that carries file content is recorded.** A `GET` of `.../fs/file` that returns
+content — the whole file or a `Range` of it — writes an `fs.read` entry naming the file and how many
+bytes the response carried (`status` `206` marks a range). It is written when the content has been
+read, before it is sent, so a caller that hangs up on the way still left it. Nothing else that reads
+is recorded, and each of these is deliberate: `list` and `stat` return metadata, and a tool walking a
+tree would fill the trail with its own traffic and rotate real history out of it; a `HEAD` reads no
+content; a request that is refused or cannot be satisfied — a path that does not resolve, a range past
+the end of the file — carries nothing out. What is left is still a gap with wide reach: on a server
+started without `--fs-root`, a token holding `fs.read` can list every directory the process can reach
+and the trail stays empty for it — what it then downloads shows up, where it looked does not. Before
+this release no read was recorded at all.
 
 A request whose *path* does not resolve — missing, malformed, or escaping
 `--fs-root` — is turned away by machinery shared with `list`, `stat`, and
@@ -1579,6 +1584,7 @@ capability token is the access control — withhold `exec` to deny execution.
 | `denied` | a request was refused by the host check (`--allow-host`, §4), by the authentication layer, by the server's own body ceiling, or by the actions route before anything ran | `status`, `reason` (`host-not-allowed:<host>` — the `Host` the request named, bounded to 64 characters, at most one entry a minute with `(N more like it since the last report)` appended, because this refusal costs a caller nothing and an entry each would let it fill the trail; `missing-token`, `invalid-token`, `body-over-ceiling`, `missing-capability:action:<id>`, `missing-capability:expose:<name>`, `unknown-action:<id>`, `invalid-param:<name>`, `malformed-body`, …) |
 | `expose` | a request for an exposed service was answered, or could not be ([§3.4](#34-exposed-services)) | `expose` (the name), `route` (method and path, never the query), `status` (the service's, or this server's `404`/`502`/`504`), `bytes` (of the answer's body as delivered), `duration_ms` (until the body ended) |
 | `action` | a named action ran | `action`, `params` (the values as accepted — each one the definition allowed), `command` (the argv that ran, rendered), `exit_code`, `timed_out`, `duration_ms`, `output_bytes` (as for `execute`) |
+| `fs.read` | a file's content was returned by `GET …/fs/file` — the whole file or a `Range` of it | `file` (the canonical path that was read), `bytes` (what the response carried), `status` (`200` whole, `206` range) |
 | `fs.delete` | a file removed, or a whole directory tree removed cleanly | `file`; `bytes`/`entries` (a count) only for a tree removal — a single entry carries neither |
 | `fs.delete.dry_run` | a preview that enumerated everything — nothing changed on disk | `file`, `bytes`; `entries` (a count) only when previewing a tree |
 | `fs.delete.preview_incomplete` | a preview that hit an enumeration failure — nothing changed on disk | `file`, `bytes`, `entries` (a count — a lower bound here: an entry that could not be enumerated was never counted) |

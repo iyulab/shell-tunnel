@@ -7,6 +7,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Added
 
+- **A file download is recorded.** Reading left the audit trail empty: a token holding `fs.read`
+  could download every file the process could reach and nothing showed it. A `GET` of
+  `…/fs/file` that returns content — the whole file or a `Range` — now writes an `fs.read` entry:
+  the canonical `file` that was read, the `bytes` the response carried, and `status` (`200`, or
+  `206` for a range). Still not recorded, on purpose: `list` and `stat` (metadata — a tool
+  walking a tree would fill the trail and rotate real history out of it), `HEAD`, and a request
+  that is refused or cannot be satisfied. So a token can still enumerate a tree without a trace;
+  what it then downloads is recorded. See `docs/USAGE.md` §4.
+
 - **A request refused by the host check is recorded.** The defence against DNS rebinding
   (`--allow-host`, a loopback-bound server's answer to a request naming any other host) turned
   the request away with `403` and left nothing in the audit trail — the one refusal in that
