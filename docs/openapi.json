@@ -3,7 +3,7 @@
   "info": {
     "title": "Shell-Tunnel API",
     "description": "Ultra-lightweight remote shell gateway. Provides a cross-platform REST/WebSocket API for programmatic interaction with system shells. \n\nScope: these are the paths a device serves — the gateway's own API. The relay and `shell-tunnel connect` are transports that carry this same API rather than surfaces of their own, so their routes (`/d/<device>/...`, `/relay/v1/devices`, and connect's local port) are not listed here; docs/USAGE.md documents those. A status code that only arises when a request crosses a relay is documented on the path it happens to, not separately.",
-    "version": "0.32.0",
+    "version": "0.33.0",
     "license": {
       "name": "MIT",
       "url": "https://opensource.org/licenses/MIT"
@@ -2955,7 +2955,7 @@
           },
           "output_encoding": {
             "type": "string",
-            "description": "The code page some of `output` (and `stdout`/`stderr`) was read from, as `cp949` — present only when part of the command's output was not UTF-8 and was read as this machine's OEM code page instead (Windows). Absent when every byte was UTF-8, which is the usual case and always the case on Unix. The characters are the command's own, not replacements for ones that were lost."
+            "description": "The code page some of `output` (and `stdout`/`stderr`) was read from, as `cp949` — present only when part of the command's output was not UTF-8 and was read as this machine's OEM code page instead (Windows). Absent when every byte was UTF-8, which is the usual case and always the case on Unix. Since 0.33.0. The characters are the command's own, not replacements for ones that were lost."
           },
           "exit_code": {
             "type": "integer",
@@ -3832,7 +3832,7 @@
           },
           "output_encoding": {
             "type": "string",
-            "description": "The code page this read's `text` was converted from, as `cp949`. Present only when part of it was not UTF-8 and a machine code page was applied."
+            "description": "The code page this read's `text` was converted from, as `cp949`. Present only when part of it was not UTF-8 and a machine code page was applied. Since 0.33.0."
           },
           "complete": {
             "type": "boolean",

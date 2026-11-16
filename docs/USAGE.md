@@ -1286,8 +1286,8 @@ is not reported back to the caller** (the service still sees the one the caller 
 for), and **no extension is negotiated** — compression off, whatever the caller offered.
 Messages and their order are as sent.
 
-Not in this release: a key in the path for clients that cannot add a header; `https://`
-upstreams. Until WebSocket upstreams were added, an upgrade was passed on as a plain
+Not supported: a key in the path for clients that cannot add a header; `https://`
+upstreams. Before 0.33.0 an upgrade was passed on as a plain
 request and did not become a WebSocket. A service on loopback
 that checks no credential of its own — many do, on the reasoning that only this machine
 can reach them — is guarded by this server's key alone once exposed, and the banner says
@@ -1462,7 +1462,7 @@ content; a request that is refused or cannot be satisfied — a path that does n
 the end of the file — carries nothing out. What is left is still a gap with wide reach: on a server
 started without `--fs-root`, a token holding `fs.read` can list every directory the process can reach
 and the trail stays empty for it — what it then downloads shows up, where it looked does not. Before
-this release no read was recorded at all.
+0.33.0 no read was recorded at all.
 
 A request whose *path* does not resolve — missing, malformed, or escaping
 `--fs-root` — is turned away by machinery shared with `list`, `stat`, and
