@@ -52,7 +52,8 @@ use crate::security::{
 use protocol::{direct_unavailable, reject, DeviceMessage, RelayMessage, PROTOCOL_VERSION};
 use proxy::{
     is_forwardable, split_device_path, ProxyRequest, ProxyResponse, POOL_WAIT, REQUEST_TIMEOUT,
-    RESPONSE_IDLE_TIMEOUT, VIA_RELAY_FRAME_LIMIT_HEADER, VIA_RELAY_STREAMS_HEADER,
+    RESPONSE_IDLE_TIMEOUT, VIA_RELAY_CLIENT_HEADER, VIA_RELAY_FRAME_LIMIT_HEADER,
+    VIA_RELAY_STREAMS_HEADER,
 };
 use registry::{Device, DeviceRegistry};
 
@@ -909,6 +910,7 @@ async fn proxy_handler(
                     .as_str()
                     .eq_ignore_ascii_case(VIA_RELAY_FRAME_LIMIT_HEADER)
                 && !name.as_str().eq_ignore_ascii_case(VIA_RELAY_STREAMS_HEADER)
+                && !name.as_str().eq_ignore_ascii_case(VIA_RELAY_CLIENT_HEADER)
         })
         .filter_map(|(name, value)| {
             value
@@ -926,6 +928,9 @@ async fn proxy_handler(
         MAX_RELAY_FRAME.to_string(),
     ));
     headers.push((VIA_RELAY_STREAMS_HEADER.to_string(), "1".to_string()));
+    // Who is asking, as this relay sees it: the one fact a device cannot know
+    // about a request that reached it over a connection of its own making.
+    headers.push((VIA_RELAY_CLIENT_HEADER.to_string(), peer.to_string()));
 
     // A WebSocket upgrade cannot be answered by buffering: the exchange has no
     // end until one side closes. Because one request already owns one data

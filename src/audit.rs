@@ -29,6 +29,17 @@ pub struct Identity {
     pub token_id: String,
     /// The token's label (`operator`, `configured`, `legacy`, …).
     pub label: String,
+    /// The address of whoever presented the token, for this request.
+    ///
+    /// Not part of the identity — the same token comes from many addresses — and
+    /// so not written under `identity`. It rides here because this is what every
+    /// handler already carries to the place it records an event, which makes the
+    /// address reach each event kind without a second thing to thread through
+    /// forty call sites: [`AuditEvent::with_identity`] copies it into the
+    /// event's own `client`. Set by the authentication layer from the request,
+    /// never by a token's registration.
+    #[serde(skip)]
+    pub client: Option<String>,
 }
 
 /// One recorded event.
@@ -42,7 +53,16 @@ pub struct AuditEvent {
     /// Caller identity, when the request was authenticated.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<Identity>,
-    /// Client address as the server saw it.
+    /// The caller's address.
+    ///
+    /// A request that reached this server directly: the TCP peer. One that came
+    /// through the relay: the address the *relay* saw the caller at, which the
+    /// relay sends and this server believes only because the request carries
+    /// this process's own relay marker — over any other connection the claim is
+    /// discarded. Present on an event that names an authenticated caller, and on
+    /// `denied` events; absent from events no request caused (`update.*`, a
+    /// process ending) and from a server running with authentication off, where
+    /// no event identifies a caller at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client: Option<String>,
     /// Request method and path, for correlating with access logs.
@@ -165,8 +185,12 @@ impl AuditEvent {
         }
     }
 
-    /// Attach the caller's identity.
+    /// Attach the caller's identity — and the address it came from, when the
+    /// identity carries one and the event does not already name its own.
     pub fn with_identity(mut self, identity: Option<Identity>) -> Self {
+        if self.client.is_none() {
+            self.client = identity.as_ref().and_then(|id| id.client.clone());
+        }
         self.identity = identity;
         self
     }
@@ -174,6 +198,14 @@ impl AuditEvent {
     /// Attach the client address.
     pub fn with_client(mut self, client: impl Into<String>) -> Self {
         self.client = Some(client.into());
+        self
+    }
+
+    /// Attach the client address when there is one, leaving a named one alone.
+    pub fn with_client_opt(mut self, client: Option<String>) -> Self {
+        if client.is_some() {
+            self.client = client;
+        }
         self
     }
 
@@ -602,6 +634,33 @@ mod tests {
     }
 
     #[test]
+    fn an_identity_brings_its_address_to_the_event_but_not_into_the_identity_json() {
+        let event = AuditEvent::new("execute").with_identity(Some(Identity {
+            token_id: "tok-1".into(),
+            label: "operator".into(),
+            client: Some("203.0.113.7:51000".into()),
+        }));
+        assert_eq!(event.client.as_deref(), Some("203.0.113.7:51000"));
+        // The same token comes from many addresses: the address is the event's,
+        // not part of who the token is.
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["client"], "203.0.113.7:51000");
+        assert!(json["identity"].get("client").is_none(), "{json}");
+    }
+
+    #[test]
+    fn an_address_an_event_already_names_is_not_replaced_by_the_identitys() {
+        let event = AuditEvent::new("denied")
+            .with_client("198.51.100.4:40000")
+            .with_identity(Some(Identity {
+                token_id: "tok-1".into(),
+                label: "operator".into(),
+                client: Some("203.0.113.7:51000".into()),
+            }));
+        assert_eq!(event.client.as_deref(), Some("198.51.100.4:40000"));
+    }
+
+    #[test]
     fn an_execution_event_carries_who_what_and_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
@@ -612,6 +671,7 @@ mod tests {
                 .with_identity(Some(Identity {
                     token_id: "tok-1".into(),
                     label: "operator".into(),
+                    client: None,
                 }))
                 .with_client("203.0.113.7:51000")
                 .with_route("POST /api/v1/execute")

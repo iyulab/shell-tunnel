@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use axum::{
     extract::{
-        connect_info::IntoMakeServiceWithConnectInfo, DefaultBodyLimit, FromRequestParts,
-        MatchedPath, Request, State,
+        connect_info::IntoMakeServiceWithConnectInfo, ConnectInfo, DefaultBodyLimit,
+        FromRequestParts, MatchedPath, Request, State,
     },
     http::{header::AUTHORIZATION, Method, StatusCode},
     middleware::{self, Next},
@@ -26,7 +26,8 @@ use super::handlers::{
 };
 use super::websocket::{ws_handler, ws_oneshot_handler};
 use crate::security::{
-    rate_limit_middleware, ApiKeyStore, AuthConfig, CapabilitySet, RateLimitConfig, RateLimiter,
+    rate_limit_middleware, ApiKeyStore, AuthConfig, CapabilitySet, ClientAddr, RateLimitConfig,
+    RateLimiter, RELAY_HOP_HEADER,
 };
 
 /// Cross-Origin Resource Sharing (CORS) configuration.
@@ -244,7 +245,7 @@ fn routes() -> Router<AppState> {
 /// exactly as the secure one would. When this guard lived in each constructor
 /// separately (0.24.0), adding it meant adding it twice, and a guard that
 /// lives in one of two constructors is a guard nobody can rely on.
-fn seal(router: Router<AppState>, state: AppState) -> Router {
+fn seal(router: Router<AppState>, state: AppState, hop_token: Option<Arc<str>>) -> Router {
     router
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state.activity),
@@ -254,7 +255,54 @@ fn seal(router: Router<AppState>, state: AppState) -> Router {
             Arc::clone(&state.audit),
             drain_request_body_middleware,
         ))
+        // Outermost of all, so the body guard above and every layer under it
+        // read the same answer to «who is asking».
+        .layer(middleware::from_fn_with_state(
+            hop_token,
+            client_address_middleware,
+        ))
         .with_state(state)
+}
+
+/// Settle the caller's address once and put it on the request as [`ClientAddr`].
+///
+/// The TCP peer, unless the request came through the relay: the relay sends the
+/// address it saw the caller at in `VIA_RELAY_CLIENT_HEADER`, and that is
+/// believed only when the request also carries this process's own relay marker —
+/// the one `RateLimitConfig::trusted_hop_token` is. Over any other connection the
+/// header is a caller describing itself, and it is discarded. It is taken off the
+/// request in every case, so nothing past here can read a claim back.
+///
+/// The marker is read, not taken: the rate limiter, further in, is what removes it.
+async fn client_address_middleware(
+    State(hop_token): State<Option<Arc<str>>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let claimed = request
+        .headers_mut()
+        .remove(crate::relay::proxy::VIA_RELAY_CLIENT_HEADER);
+    let over_own_relay_hop = match (&hop_token, request.headers().get(RELAY_HOP_HEADER)) {
+        (Some(expected), Some(presented)) => presented
+            .to_str()
+            .is_ok_and(|presented| crate::security::constant_time_eq(presented, expected)),
+        _ => false,
+    };
+    let reported = claimed
+        .filter(|_| over_own_relay_hop)
+        .and_then(|value| value.to_str().ok().map(str::to_owned))
+        // Parsed rather than copied: the trail is a file people read, and a
+        // header is whatever bytes the relay's caller put near it.
+        .and_then(|text| text.parse::<std::net::SocketAddr>().ok())
+        .map(|addr| addr.to_string());
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.to_string());
+    if let Some(addr) = reported.or(peer) {
+        request.extensions_mut().insert(ClientAddr(addr));
+    }
+    next.run(request).await
 }
 
 /// The capability a route requires (Phase A spec §3).
@@ -457,7 +505,18 @@ async fn capability_auth_middleware(
             .and_then(|header| store.extract_key(header))
     };
 
-    let identity = token.as_deref().and_then(|t| store.identity(t));
+    let client = request
+        .extensions()
+        .get::<ClientAddr>()
+        .map(|addr| addr.0.clone());
+    // The identity carries the address to wherever a handler records an event.
+    let identity = token
+        .as_deref()
+        .and_then(|t| store.identity(t))
+        .map(|mut identity| {
+            identity.client = client.clone();
+            identity
+        });
 
     let capabilities = match token.as_deref().and_then(|t| store.capabilities(t)) {
         Some(caps) => caps,
@@ -489,6 +548,7 @@ async fn capability_auth_middleware(
             audit
                 .record_async(
                     crate::audit::AuditEvent::new("denied")
+                        .with_client_opt(client)
                         .with_route(route)
                         .with_denial(401, reason),
                 )
@@ -711,9 +771,14 @@ async fn drain_request_body_middleware(
             // exactly what a trail is asked about afterwards, and a body at the
             // ceiling is a probe worth having a line for.
             let route = format!("{} {}", parts.method, parts.uri.path());
+            let client = parts
+                .extensions
+                .get::<ClientAddr>()
+                .map(|addr| addr.0.clone());
             audit
                 .record_async(
                     crate::audit::AuditEvent::new("denied")
+                        .with_client_opt(client)
                         .with_route(route)
                         .with_denial(413, "body-over-ceiling"),
                 )
@@ -834,6 +899,13 @@ pub fn create_secure_router(
 ) -> (Router, Arc<ApiKeyStore>, Arc<RateLimiter>) {
     // Create security components
     let auth_store = Arc::new(ApiKeyStore::new(security.auth));
+    // Read before the limiter takes its config: the same marker that exempts a
+    // relay hop from the limit is what lets a relayed caller's address be believed.
+    let hop_token: Option<Arc<str>> = security
+        .rate_limit
+        .trusted_hop_token
+        .as_deref()
+        .map(Arc::from);
     let rate_limiter = Arc::new(RateLimiter::new(security.rate_limit));
 
     // Register API keys with their configured capabilities.
@@ -888,7 +960,7 @@ pub fn create_secure_router(
         router = router.layer(cors);
     }
 
-    (seal(router, state), auth_store, rate_limiter)
+    (seal(router, state, hop_token), auth_store, rate_limiter)
 }
 
 /// Server configuration.

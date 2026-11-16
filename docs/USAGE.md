@@ -1494,10 +1494,10 @@ shell-tunnel --tunnel --preset operator --audit-log /var/log/shell-tunnel.jsonl
 
 ```json
 {"at_ms":1784646769697,"kind":"execute","identity":{"token_id":"tok_78c6b1db17d3","label":"configured"},
- "route":"POST /api/v1/execute","command":"echo audited","exit_code":0,"timed_out":false,"duration_ms":170}
-{"at_ms":1784646769917,"kind":"denied","route":"POST /api/v1/execute","status":401,"reason":"invalid-token"}
+ "client":"203.0.113.7:51000","route":"POST /api/v1/execute","command":"echo audited","exit_code":0,"timed_out":false,"duration_ms":170}
+{"at_ms":1784646769917,"kind":"denied","client":"203.0.113.7:51002","route":"POST /api/v1/execute","status":401,"reason":"invalid-token"}
 {"at_ms":1784646795525,"kind":"denied","identity":{"token_id":"tok_99b8787ac16b","label":"configured"},
- "route":"POST /api/v1/execute","status":403,"reason":"missing-capability:exec"}
+ "client":"203.0.113.7:51004","route":"POST /api/v1/execute","status":403,"reason":"missing-capability:exec"}
 ```
 
 Logs go to stderr and this banner-style output to stdout, so
@@ -1527,6 +1527,19 @@ themselves. Zero does not mean "rotate at zero bytes"; that would keep nothing.
 registration and the token's label, which identify a caller across a run without
 putting a credential in a file that tends to be kept and copied. That id is
 per-process: tokens are not persisted, so neither is it.
+
+**`client` is the caller's address.** For a request that reached this server
+directly it is the TCP peer. For one that came through a relay it is the address
+the *relay* saw the caller at — the relay sends it, and a device believes it only
+on a request that also carries that device's own relay marker; over any other
+connection a caller's claim about its own address is discarded, so it cannot put
+a false one in the trail. Behind a reverse proxy in front of the relay that
+address is the proxy's: the relay does not read `X-Forwarded-For`. A request that
+came over a direct-connect socket shows the loopback address of the local proxy,
+as the device's rate limiter does (§5). `client` is on every event that names an
+authenticated caller and on `denied` events. It is absent from events no request
+caused (`update.*`, a background process ending) and from a server running with
+authentication off, which is loopback-only and records no caller at all.
 
 **Commands are written in full**, which is the substance of the trail — "someone
 called `/execute`" says almost nothing. A command that embeds a secret therefore

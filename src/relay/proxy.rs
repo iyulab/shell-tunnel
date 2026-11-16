@@ -47,6 +47,17 @@ pub const VIA_RELAY_FRAME_LIMIT_HEADER: &str = "x-shell-tunnel-relay-frame-limit
 /// ignores it and keeps refusing, which is still right for how it answers.
 pub const VIA_RELAY_STREAMS_HEADER: &str = "x-shell-tunnel-relay-streams";
 
+/// Header the relay sets on every request it forwards, naming the address it
+/// saw the caller at (`ip:port`).
+///
+/// The relay drops any instance a caller sent and adds its own, so what a device
+/// receives is the relay's observation or nothing. A device reads it only when
+/// the request also carries the marker of its own relay client
+/// (`security::RELAY_HOP_HEADER`); anywhere else it is a caller's claim about
+/// itself, and the server discards it. Behind a reverse proxy in front of the
+/// relay the address is the proxy's — the relay does not read `X-Forwarded-For`.
+pub const VIA_RELAY_CLIENT_HEADER: &str = "x-shell-tunnel-relay-client";
+
 /// Request metadata sent to the device ahead of the body.
 ///
 /// Sent once per connection rather than per frame: this is a header, not a

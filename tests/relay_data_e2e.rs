@@ -224,6 +224,36 @@ async fn the_authorization_header_reaches_the_device_unchanged() {
     );
 }
 
+/// The relay names the address it saw the caller at, and a caller cannot name
+/// one for it: a header the caller sent under the same name is replaced.
+#[tokio::test]
+async fn the_relay_tells_the_device_who_is_calling_and_ignores_the_callers_own_claim() {
+    use shell_tunnel::relay::proxy::VIA_RELAY_CLIENT_HEADER;
+
+    let addr = start_relay().await;
+    let (device_id, _control) = enroll(addr).await;
+    let device = serve_one_request(addr, &device_id, "secret", 200, "ok").await;
+
+    let (status, _body) = http_get(
+        &format!("http://{addr}/d/{device_id}/api/v1/sessions"),
+        Some((VIA_RELAY_CLIENT_HEADER, "198.51.100.99:1")),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let seen = device.await.unwrap();
+    let named: Vec<&String> = seen
+        .headers
+        .iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(VIA_RELAY_CLIENT_HEADER))
+        .map(|(_, value)| value)
+        .collect();
+    // Exactly one, and it is the relay's observation — this test's own socket,
+    // on loopback — not what the caller wrote.
+    assert_eq!(named.len(), 1, "{:?}", seen.headers);
+    assert!(named[0].starts_with("127.0.0.1:"), "{}", named[0]);
+}
+
 #[tokio::test]
 async fn an_unknown_device_is_a_bad_gateway() {
     let addr = start_relay().await;

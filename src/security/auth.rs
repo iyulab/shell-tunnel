@@ -173,6 +173,7 @@ impl ApiKeyStore {
             tokens.get(key).map(|record| crate::audit::Identity {
                 token_id: record.id.clone(),
                 label: record.label.clone(),
+                client: None,
             })
         })
     }

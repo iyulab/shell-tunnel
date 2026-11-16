@@ -5,6 +5,18 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ## Unreleased
 
+### Added
+
+- **The audit trail names the caller's address.** `client` existed on every event and no event ever
+  filled it. It is now set on every event that names an authenticated caller, and on `denied`
+  events: the TCP peer for a request that reached the server directly, and for one that came
+  through the relay the address *the relay* saw the caller at. The relay sends it
+  (`x-shell-tunnel-relay-client`, replacing any value a caller sent) and a device believes it only
+  on a request carrying that device's own relay marker; on any other connection the claim is
+  discarded, so a caller cannot write a false address into the trail. Absent from events no
+  request caused (`update.*`, a background process ending). Behind a reverse proxy in front of the
+  relay the address is the proxy's. See `docs/USAGE.md` §4.
+
 ### Fixed
 
 - **Command output on a Windows whose console code page is not UTF-8 is no longer
@@ -59,8 +71,10 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   Not changed: a device whose pool stays empty does not drop its control connection and
   attach again on its own. The lines above are how to find out why it is empty.
 
-- Library: `ExecutionResult` gained `code_page` and `ExecuteCommandResponse` `output_encoding`;
-  a literal of either stops compiling. New `output::{decode_output, decodable_len,
+- Library: `audit::Identity` gained `client` (not serialized) — a literal of it stops compiling —
+  and `AuditEvent` gained `with_client_opt`; `security::ClientAddr` and
+  `relay::proxy::VIA_RELAY_CLIENT_HEADER` are new. `ExecutionResult` gained `code_page` and
+  `ExecuteCommandResponse` `output_encoding`; a literal of either stops compiling. New `output::{decode_output, decodable_len,
   OutputDecoder, Decoded}`. On Windows the build now enables `windows-sys`'s
   `Win32_Globalization` (already compiled for the target; no new crate).
 

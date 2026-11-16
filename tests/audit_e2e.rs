@@ -16,11 +16,24 @@ use shell_tunnel::{api, api::SecurityConfig, AppState, CapabilitySet};
 
 /// Start a server with auth and an audit trail, returning its address.
 async fn start(dir: &Path, key: &str, capabilities: &[&str]) -> (SocketAddr, std::path::PathBuf) {
+    start_behind_relay_marker(dir, key, capabilities, None).await
+}
+
+/// [`start`], with the marker a relay client on this process would put on the
+/// requests it replays — the one that makes the relay's word about the caller
+/// believable.
+async fn start_behind_relay_marker(
+    dir: &Path,
+    key: &str,
+    capabilities: &[&str],
+    hop_token: Option<&str>,
+) -> (SocketAddr, std::path::PathBuf) {
     let trail = dir.join("audit.jsonl");
     let sink = Arc::new(AuditSink::file(&trail).unwrap());
 
     let mut security = SecurityConfig::secure().with_api_key(key);
     security.auth.enabled = true;
+    security.rate_limit.trusted_hop_token = hop_token.map(str::to_string);
     if !capabilities.is_empty() {
         security =
             security.with_capabilities(CapabilitySet::from_iter(capabilities.iter().copied()));
@@ -614,4 +627,154 @@ async fn an_execute_records_the_size_of_its_stdin_and_never_its_content() {
     assert_eq!(entries[0].bytes, Some(18));
     let raw = std::fs::read_to_string(&trail).unwrap();
     assert!(!raw.contains("not-for-the-trail"), "{raw}");
+}
+
+/// An authenticated `execute` with extra request headers, returning the one
+/// entry it leaves.
+async fn execute_with_headers(
+    addr: SocketAddr,
+    token: &str,
+    headers: &[(&str, &str)],
+    trail: &Path,
+) -> AuditEvent {
+    let body = r#"{"command":"echo hi"}"#;
+    let extra: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let request = format!(
+        "POST /api/v1/execute HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nAuthorization: Bearer {token}\r\n{extra}\
+         Content-Length: {}\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    tokio::time::timeout(Duration::from_secs(20), stream.read_to_end(&mut raw))
+        .await
+        .expect("server should answer")
+        .unwrap();
+    assert!(String::from_utf8_lossy(&raw).contains(" 200 "), "{raw:?}");
+    events(trail, 1).await.remove(0)
+}
+
+#[tokio::test]
+async fn an_execution_names_the_address_it_came_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "k-addr", &["exec"]).await;
+
+    let event = execute_with_headers(addr, "k-addr", &[], &trail).await;
+
+    let client = event
+        .client
+        .expect("an authenticated event names its caller");
+    assert!(client.starts_with("127.0.0.1:"), "{client}");
+}
+
+#[tokio::test]
+async fn a_refused_request_names_its_address_too() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) = start(dir.path(), "k-denied", &["exec"]).await;
+
+    assert_eq!(
+        post(addr, "/api/v1/execute", Some("wrong"), "{}").await,
+        401
+    );
+
+    let event = events(&trail, 1).await.remove(0);
+    assert_eq!(event.kind, "denied");
+    let client = event
+        .client
+        .expect("a refusal is the entry most worth an address");
+    assert!(client.starts_with("127.0.0.1:"), "{client}");
+}
+
+/// The relay's word about who is calling is believed only over this process's own
+/// relay hop. Anywhere else the header is a caller describing itself, and the
+/// trail must keep the socket's address.
+#[tokio::test]
+async fn a_claimed_caller_address_is_ignored_without_the_relays_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) =
+        start_behind_relay_marker(dir.path(), "k-spoof", &["exec"], Some("hop-secret")).await;
+
+    let event = execute_with_headers(
+        addr,
+        "k-spoof",
+        &[("x-shell-tunnel-relay-client", "203.0.113.9:4000")],
+        &trail,
+    )
+    .await;
+
+    let client = event.client.unwrap();
+    assert!(client.starts_with("127.0.0.1:"), "{client}");
+    assert!(
+        !std::fs::read_to_string(&trail)
+            .unwrap()
+            .contains("203.0.113.9"),
+        "the claim reached the file"
+    );
+}
+
+#[tokio::test]
+async fn a_claimed_caller_address_is_ignored_with_the_wrong_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) =
+        start_behind_relay_marker(dir.path(), "k-wrong", &["exec"], Some("hop-secret")).await;
+
+    let event = execute_with_headers(
+        addr,
+        "k-wrong",
+        &[
+            ("x-shell-tunnel-relay-hop", "not-the-secret"),
+            ("x-shell-tunnel-relay-client", "203.0.113.9:4000"),
+        ],
+        &trail,
+    )
+    .await;
+
+    assert!(event.client.unwrap().starts_with("127.0.0.1:"));
+}
+
+/// The control for the two above: the same request with the right marker is
+/// believed, so the tests above are failing for the marker and not for the header.
+#[tokio::test]
+async fn the_relays_word_about_the_caller_is_believed_over_the_relay_hop() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) =
+        start_behind_relay_marker(dir.path(), "k-relay", &["exec"], Some("hop-secret")).await;
+
+    let event = execute_with_headers(
+        addr,
+        "k-relay",
+        &[
+            ("x-shell-tunnel-relay-hop", "hop-secret"),
+            ("x-shell-tunnel-relay-client", "203.0.113.9:4000"),
+        ],
+        &trail,
+    )
+    .await;
+
+    assert_eq!(event.client.as_deref(), Some("203.0.113.9:4000"));
+}
+
+#[tokio::test]
+async fn a_relay_claim_that_is_not_an_address_falls_back_to_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, trail) =
+        start_behind_relay_marker(dir.path(), "k-junk", &["exec"], Some("hop-secret")).await;
+
+    let event = execute_with_headers(
+        addr,
+        "k-junk",
+        &[
+            ("x-shell-tunnel-relay-hop", "hop-secret"),
+            ("x-shell-tunnel-relay-client", "not an address\"}"),
+        ],
+        &trail,
+    )
+    .await;
+
+    assert!(event.client.unwrap().starts_with("127.0.0.1:"));
 }

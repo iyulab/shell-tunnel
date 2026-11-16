@@ -60,6 +60,17 @@ pub use validation::{
     looks_like_injection, sanitize_for_display, CommandValidator, ValidationConfig, ValidationError,
 };
 
+/// The address of whoever made a request, as this server resolves it.
+///
+/// Put on the request once, by the outermost layer, so everything inside — the
+/// authentication layer that names it in the audit trail, the body guard that
+/// refuses an oversized request before authentication — reads one answer. That
+/// answer is the TCP peer, except for a request that came through the relay and
+/// carries this process's own relay marker, where it is the address the relay
+/// reported (`relay::proxy::VIA_RELAY_CLIENT_HEADER`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientAddr(pub String);
+
 /// Compare secrets without leaking their contents through timing.
 ///
 /// The token is short and comparisons are rare, but an early-exit `==` on a
