@@ -176,9 +176,6 @@ pub struct ExecuteCommandResponse {
     pub stdout: String,
     /// Cleaned text from stderr alone. See `stdout`.
     pub stderr: String,
-    /// Raw output (base64 encoded if binary content detected).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub raw_output: Option<String>,
     /// Execution duration in milliseconds.
     pub duration_ms: u64,
     /// Whether the command timed out.
@@ -223,7 +220,6 @@ impl ExecuteCommandResponse {
             output: result.text_output.clone(),
             stdout: crate::output::OutputSanitizer::strip_ansi(stdout.text.as_bytes()),
             stderr: crate::output::OutputSanitizer::strip_ansi(stderr.text.as_bytes()),
-            raw_output: None, // Only include if requested
             duration_ms: result.duration.as_millis() as u64,
             timed_out: result.timed_out,
             total_bytes: result.total_bytes,
@@ -231,14 +227,6 @@ impl ExecuteCommandResponse {
             stdin_written: result.stdin_written,
             output_encoding: code_page.map(|page| format!("cp{page}")),
         }
-    }
-
-    pub fn with_raw_output(mut self, include: bool, raw: &[u8]) -> Self {
-        if include {
-            // Convert to string, lossy if non-UTF8
-            self.raw_output = Some(String::from_utf8_lossy(raw).to_string());
-        }
-        self
     }
 }
 

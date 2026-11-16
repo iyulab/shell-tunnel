@@ -23,6 +23,12 @@ bump may carry a behaviour change; breaking items are called out explicitly.
   WebSocket `execute`, in plain UTF-8 as much as in a legacy code page: the halves are
   held until the other arrives, per stream.
 
+### Removed
+
+- Library: `ExecuteCommandResponse::raw_output` and `with_raw_output`. The field was documented as
+  «base64 encoded if binary content detected», no route ever set it, and the bytes it would have
+  carried were converted to text lossily; the server's responses never had it.
+
 ### Changed
 
 - **A device says, at the default log level, why it could not open a data connection — and
