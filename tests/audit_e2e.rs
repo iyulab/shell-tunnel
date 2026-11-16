@@ -778,3 +778,75 @@ async fn a_relay_claim_that_is_not_an_address_falls_back_to_the_socket() {
 
     assert!(event.client.unwrap().starts_with("127.0.0.1:"));
 }
+
+/// A request that names a host this server does not answer to is what a DNS
+/// rebinding attempt looks like. It used to be turned away with nothing in the
+/// trail.
+#[tokio::test]
+async fn a_request_for_a_host_the_server_does_not_answer_to_is_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let trail = dir.path().join("audit.jsonl");
+    let sink = Arc::new(AuditSink::file(&trail).unwrap());
+    let security = SecurityConfig::secure()
+        .with_api_key("k-host")
+        .with_allowed_hosts(vec!["localhost".to_string()]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut security = security;
+    security.auth.enabled = true;
+    let config =
+        api::ServerConfig::new("127.0.0.1".to_string(), addr.port()).with_security(security);
+    let state = AppState::new().with_audit(sink);
+    tokio::spawn(async move {
+        api::serve_on(listener, config, state).await.unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            b"GET /api/v1/sessions HTTP/1.1\r\nHost: rebound.example.net\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    assert!(String::from_utf8_lossy(&raw).contains(" 403 "), "{raw:?}");
+
+    // Two more refusals straight after: they cost the caller nothing, so they
+    // must not each cost the trail an entry.
+    for _ in 0..2 {
+        let mut again = tokio::net::TcpStream::connect(addr).await.unwrap();
+        again
+            .write_all(
+                b"GET /api/v1/sessions HTTP/1.1\r\nHost: rebound.example.net\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut sink = Vec::new();
+        again.read_to_end(&mut sink).await.unwrap();
+    }
+
+    let event = events(&trail, 1).await.remove(0);
+    assert_eq!(event.kind, "denied");
+    assert_eq!(event.status, Some(403));
+    assert_eq!(
+        event.reason.as_deref(),
+        Some("host-not-allowed:rebound.example.net")
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let refusals = events(&trail, 1)
+        .await
+        .into_iter()
+        .filter(|e| {
+            e.reason
+                .as_deref()
+                .is_some_and(|r| r.starts_with("host-not-allowed"))
+        })
+        .count();
+    assert_eq!(refusals, 1, "three refusals, one entry");
+    assert!(event
+        .client
+        .as_deref()
+        .is_some_and(|c| c.starts_with("127.0.0.1:")));
+}

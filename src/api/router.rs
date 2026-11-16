@@ -794,8 +794,19 @@ async fn drain_request_body_middleware(
         .await
 }
 
+/// Host-check refusals written to the trail, bounded: one entry a minute, with a
+/// count of the ones it stands for.
+///
+/// This layer is outside the rate limiter and authentication, so anyone who can
+/// reach the server can make it refuse a request for free — and an entry per
+/// refusal would let them fill the trail, rotating the history it exists to keep
+/// out of the file. The first refusal is recorded at once, as it is what shows
+/// the attempt; the rest are counted into the next entry.
+static HOST_REFUSALS: crate::relay::throttle::Throttle =
+    crate::relay::throttle::Throttle::new(crate::relay::throttle::REPORT_INTERVAL);
+
 async fn host_check_middleware(
-    State(allowed): State<Arc<Vec<String>>>,
+    State((allowed, audit)): State<(Arc<Vec<String>>, Arc<crate::audit::AuditSink>)>,
     request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, String)> {
@@ -812,6 +823,38 @@ async fn host_check_middleware(
     // proxy needs to know which name was refused and how to permit it.
     let seen = header.unwrap_or("(none)").to_string();
     tracing::debug!(host = %seen, "request refused: host not allowed");
+    // A request that names a host this server does not answer to is what a DNS
+    // rebinding attempt looks like — exactly what a trail is asked about
+    // afterwards, and it left nothing. The host is the caller's text, so it is
+    // bounded before it goes in.
+    let shown: String = seen.chars().take(64).collect();
+    if let crate::relay::throttle::Report::Now { suppressed } =
+        HOST_REFUSALS.admit_now("host-not-allowed")
+    {
+        audit
+            .record_async(
+                crate::audit::AuditEvent::new("denied")
+                    .with_client_opt(
+                        request
+                            .extensions()
+                            .get::<ClientAddr>()
+                            .map(|addr| addr.0.clone()),
+                    )
+                    .with_route(format!(
+                        "{} {}",
+                        request.method(),
+                        request.uri().path().chars().take(256).collect::<String>()
+                    ))
+                    .with_denial(
+                        403,
+                        format!(
+                            "host-not-allowed:{shown}{}",
+                            crate::relay::throttle::repeats_note(suppressed)
+                        ),
+                    ),
+            )
+            .await;
+    }
     Err((
         StatusCode::FORBIDDEN,
         format!(
@@ -950,7 +993,7 @@ pub fn create_secure_router(
     // store or the rate limiter's bookkeeping.
     if let Some(hosts) = allowed_hosts {
         router = router.layer(middleware::from_fn_with_state(
-            Arc::new(hosts),
+            (Arc::new(hosts), Arc::clone(&state.audit)),
             host_check_middleware,
         ));
     }

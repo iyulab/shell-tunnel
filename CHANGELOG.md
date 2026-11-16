@@ -7,6 +7,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Added
 
+- **A request refused by the host check is recorded.** The defence against DNS rebinding
+  (`--allow-host`, a loopback-bound server's answer to a request naming any other host) turned
+  the request away with `403` and left nothing in the audit trail — the one refusal in that
+  family whose whole meaning is «someone tried something». It is now a `denied` entry with
+  reason `host-not-allowed:<host>` (the `Host` header the request carried, bounded) and the
+  caller's address. At most one entry a minute, with a count of the refusals it stands for: this
+  layer is outside the rate limiter and authentication, so an entry each would let anyone who can
+  reach the server fill the trail and rotate real history out of it.
+
 - **`/x/<name>/…` carries a WebSocket to the exposed service.** A notebook's kernel channel or a
   model server's realtime endpoint, behind the same key, trail and relay path as the rest of the
   service. The service's own handshake — its `101`, the sub-protocol and extensions it accepted —
