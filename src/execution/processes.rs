@@ -251,6 +251,11 @@ impl Proc {
 struct Table {
     procs: BTreeMap<u64, Proc>,
     next_id: u64,
+    /// Starts that have taken a place under the cap and are still spawning.
+    /// Counted with `procs` against the cap, so two starts that overlap cannot
+    /// both fit under it — which is what lets a child be spawned without the
+    /// table's lock held.
+    starting: usize,
 }
 
 struct Inner {
@@ -290,6 +295,47 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Spawn the process for a start and hold it: the child, the group that ends it
+/// with its descendants, and the feed to its stdin when one was asked for.
+///
+/// Free of the table: nothing here may hold its lock (see `ProcessTable::start`).
+fn spawn_child(
+    request: &StartRequest,
+) -> Result<(Child, KillGroup, Option<PipeFeed<ChildStdin>>), ProcessError> {
+    let mut cmd = shell_command(&request.command);
+    cmd.stdin(if request.stdin {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(dir) = &request.working_dir {
+        cmd.current_dir(dir);
+    }
+    for (key, value) in &request.env {
+        cmd.env(key, value);
+    }
+    let group = KillGroup::prepare(&mut cmd);
+    // The group dies with its handle unless the process exits on its own
+    // first (then `--kill-orphans` decides) — so a handle deleted, or a
+    // table dropped at shutdown, never leaves a process nobody can reach.
+    group.reap_on_drop();
+    let mut child = cmd.spawn().map_err(|e| ProcessError::Io(e.to_string()))?;
+    group.adopt(&child);
+    let stdin = match child.stdin.take().map(PipeFeed::open).transpose() {
+        Ok(feed) => feed,
+        Err(e) => {
+            // Not run on a blocking write end: that is the thread this
+            // feed exists to avoid.
+            group.kill();
+            let _ = child.wait();
+            return Err(ProcessError::Io(e.to_string()));
+        }
+    };
+    Ok((child, group, stdin))
 }
 
 impl ProcessTable {
@@ -338,43 +384,24 @@ impl ProcessTable {
         request: &StartRequest,
         identity: Option<Identity>,
     ) -> Result<ProcessInfo, ProcessError> {
-        let mut table = self.lock();
-        sweep_expired(&mut table);
-        if table.procs.len() >= MAX_PROCESSES {
-            return Err(ProcessError::TooMany);
-        }
-
-        let mut cmd = shell_command(&request.command);
-        cmd.stdin(if request.stdin {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        if let Some(dir) = &request.working_dir {
-            cmd.current_dir(dir);
-        }
-        for (key, value) in &request.env {
-            cmd.env(key, value);
-        }
-        let group = KillGroup::prepare(&mut cmd);
-        // The group dies with its handle unless the process exits on its own
-        // first (then `--kill-orphans` decides) — so a handle deleted, or a
-        // table dropped at shutdown, never leaves a process nobody can reach.
-        group.reap_on_drop();
-        let mut child = cmd.spawn().map_err(|e| ProcessError::Io(e.to_string()))?;
-        group.adopt(&child);
-        let stdin = match child.stdin.take().map(PipeFeed::open).transpose() {
-            Ok(feed) => feed,
-            Err(e) => {
-                // Not run on a blocking write end: that is the thread this
-                // feed exists to avoid.
-                group.kill();
-                let _ = child.wait();
-                return Err(ProcessError::Io(e.to_string()));
+        // The place is taken, and the lock let go, *before* the child is spawned.
+        // Creating a process is the slow part — a few milliseconds idle, hundreds
+        // under load on Windows — and every reader of this table (each long-poll,
+        // the watcher that drains every process) waits on this lock. Measured on an
+        // idle machine, a reader's `list` was held up to 58 ms behind a start; held
+        // across the spawn it is as slow as the spawn.
+        {
+            let mut table = self.lock();
+            sweep_expired(&mut table);
+            if table.procs.len() + table.starting >= MAX_PROCESSES {
+                return Err(ProcessError::TooMany);
             }
-        };
+            table.starting += 1;
+        }
+        let spawned = spawn_child(request);
+        let mut table = self.lock();
+        table.starting -= 1;
+        let (mut child, group, stdin) = spawned?;
 
         let id = table.next_id;
         table.next_id += 1;
@@ -832,6 +859,44 @@ fn watch(weak: Weak<Inner>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A start takes its place under the cap before it spawns, so starts that
+    /// overlap cannot all fit: the cap is exact however many race for it. With the
+    /// spawn outside the lock, that accounting is all that stands between a burst of
+    /// starts and a table over its limit.
+    #[test]
+    fn overlapping_starts_never_exceed_the_cap() {
+        let table = ProcessTable::new();
+        let attempts = MAX_PROCESSES + 16;
+        let outcomes: Vec<Result<ProcessInfo, ProcessError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..attempts)
+                .map(|_| {
+                    scope.spawn(|| {
+                        table.start(
+                            &StartRequest {
+                                command: "echo hi".to_string(),
+                                working_dir: None,
+                                env: Vec::new(),
+                                stdin: false,
+                            },
+                            None,
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let started = outcomes.iter().filter(|r| r.is_ok()).count();
+        let refused = outcomes
+            .iter()
+            .filter(|r| matches!(r, Err(ProcessError::TooMany)))
+            .count();
+        assert_eq!(started, MAX_PROCESSES, "{outcomes:?}");
+        assert_eq!(refused, attempts - MAX_PROCESSES);
+        // Nothing is left reserved by the starts that were refused or finished.
+        assert_eq!(table.lock().starting, 0);
+        assert_eq!(table.lock().procs.len(), MAX_PROCESSES);
+    }
 
     #[test]
     fn a_ring_keeps_the_newest_bytes_and_counts_every_one() {

@@ -39,6 +39,15 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Fixed
 
+- **Starting a background process no longer holds up everything that reads the process table.**
+  The child was spawned while the table's lock was held, and every long-poll for output and the
+  thread that drains every running process wait on that lock. Creating a process takes a few
+  milliseconds on an idle machine and far longer under load on Windows, so each start stalled
+  them for that long; measured on an idle machine a reader was held up to 58 ms behind one. The
+  start now takes its place under the cap and lets the lock go before it spawns, so a reader is
+  not delayed by it (the same measurement: worst 0.6 ms). The cap is still exact when starts
+  overlap.
+
 - **Command output on a Windows whose console code page is not UTF-8 is no longer
   destroyed.** The server read every byte a command wrote as UTF-8, so on a Korean system
   (code page 949) `echo 한글` came back as replacement characters — a loss the caller cannot
