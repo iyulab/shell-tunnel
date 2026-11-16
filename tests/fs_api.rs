@@ -1,9 +1,10 @@
 //! HTTP-level tests for the filesystem API.
 
+mod common;
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use shell_tunnel::api::handlers::AppState;
-use shell_tunnel::api::router::create_router_with_state;
 use shell_tunnel::FsRoot;
 use tower::ServiceExt;
 
@@ -31,7 +32,7 @@ async fn body_json(response: axum::response::Response) -> serde_json::Value {
 #[tokio::test]
 async fn stat_reports_a_file() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -58,7 +59,7 @@ async fn stat_reports_a_file() {
 #[tokio::test]
 async fn stat_refuses_a_path_outside_the_root() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -78,7 +79,7 @@ async fn stat_refuses_a_path_outside_the_root() {
 #[tokio::test]
 async fn stat_reports_a_missing_file_as_not_found() {
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -102,7 +103,7 @@ async fn stat_refuses_a_malformed_path_with_bad_path() {
     // nothing at the HTTP level proves `fs_error_response` wires it to 400
     // rather than, say, 500.
     let (_dir, state) = state_with_files(&[("app/config.json", b"hello")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -121,7 +122,7 @@ async fn stat_refuses_a_malformed_path_with_bad_path() {
 
 #[tokio::test]
 async fn the_fs_api_is_off_without_a_root() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     let response = app
         .oneshot(
@@ -245,7 +246,7 @@ async fn create_test_upload(state: AppState, path: &str, payload: &[u8]) -> Stri
         hasher.update(payload);
         hasher.finish()
     };
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -319,7 +320,7 @@ async fn a_second_upload_into_the_same_directory_leaves_the_first_intact() {
     let _second =
         create_test_upload(state.clone(), &format!("{base}/second.bin"), b"hello world").await;
 
-    let patched = create_router_with_state(state.clone())
+    let patched = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -333,7 +334,7 @@ async fn a_second_upload_into_the_same_directory_leaves_the_first_intact() {
         .expect("response");
     assert_eq!(patched.status(), StatusCode::OK);
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -384,7 +385,7 @@ async fn the_staging_directory_stays_reserved_without_a_jail() {
         format!("/api/v1/fs/stat?path={staging}"),
         format!("/api/v1/fs/file?path={staging}/up-0000000000000000.part"),
     ] {
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(&uri)
@@ -400,7 +401,7 @@ async fn the_staging_directory_stays_reserved_without_a_jail() {
         );
     }
 
-    let deleted = create_router_with_state(state.clone())
+    let deleted = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -418,7 +419,7 @@ async fn the_staging_directory_stays_reserved_without_a_jail() {
         "a staging file must not be deletable through the file API"
     );
 
-    let listed = create_router_with_state(state)
+    let listed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/fs/list?path={base}"))
@@ -471,7 +472,7 @@ async fn paginating_a_machine_wide_directory_returns_every_entry_once() {
             Some(c) => format!("/api/v1/fs/list?path={base}&limit=2&cursor={c}"),
             None => format!("/api/v1/fs/list?path={base}&limit=2"),
         };
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(&uri)
@@ -519,7 +520,7 @@ async fn two_sessions_for_aliased_absolute_spellings_are_refused() {
     let open = |path: String| {
         let state = state.clone();
         async move {
-            create_router_with_state(state)
+            common::plain_app(state)
                 .oneshot(
                     Request::builder()
                         .method("POST")
@@ -623,7 +624,7 @@ async fn list_reports_entries_sorted_by_path() {
         ("app/a.txt", b"a"),
         ("top.txt", b"ttt"),
     ]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -647,7 +648,7 @@ async fn list_reports_entries_sorted_by_path() {
 #[tokio::test]
 async fn list_recurses_when_asked() {
     let (_dir, state) = state_with_files(&[("app/nested/deep.txt", b"d"), ("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -673,7 +674,7 @@ async fn list_recurses_when_asked() {
 #[tokio::test]
 async fn list_hashes_only_when_asked() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"abc")]);
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
 
     let plain = app
         .oneshot(
@@ -694,7 +695,7 @@ async fn list_hashes_only_when_asked() {
         .expect("object")
         .contains_key("sha256"));
 
-    let hashed = create_router_with_state(state)
+    let hashed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/list?path=app&hash=sha256")
@@ -821,7 +822,7 @@ async fn list_hash_does_not_follow_a_symlink_out_of_the_root() {
         return; // symlink privilege unavailable on this runner; skip
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -863,7 +864,7 @@ async fn list_paginates_and_the_cursor_covers_everything_once() {
             Some(c) => format!("/api/v1/fs/list?path=app&limit=10&cursor={c}"),
             None => "/api/v1/fs/list?path=app&limit=10".to_string(),
         };
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -906,7 +907,7 @@ async fn list_caps_the_limit() {
         ("app/c.txt", b"c"),
     ]);
 
-    let response = create_router_with_state(state.clone())
+    let response = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/list?path=app&limit=2")
@@ -926,7 +927,7 @@ async fn list_caps_the_limit() {
     );
 
     // The lower bound is enforced too: `limit=0` must not mean "empty page".
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/list?path=app&limit=0")
@@ -968,7 +969,7 @@ async fn list_cursor_survives_a_plus_in_the_filename_at_a_page_boundary() {
             Some(c) => format!("/api/v1/fs/list?path=app&limit=2&cursor={c}"),
             None => "/api/v1/fs/list?path=app&limit=2".to_string(),
         };
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -993,7 +994,7 @@ async fn list_cursor_survives_a_plus_in_the_filename_at_a_page_boundary() {
 #[tokio::test]
 async fn list_refuses_a_bad_cursor() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1055,7 +1056,7 @@ async fn paginate_all(state: &AppState, path: &str, recursive: bool, limit: usiz
             ),
             None => format!("/api/v1/fs/list?path={path}&recursive={recursive}&limit={limit}"),
         };
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .uri(uri)
@@ -1140,7 +1141,7 @@ async fn list_pagination_matches_an_independent_walk_at_every_limit() {
 #[tokio::test]
 async fn list_refuses_a_file_path() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1159,7 +1160,7 @@ async fn list_refuses_a_file_path() {
 async fn list_hides_the_upload_staging_directory() {
     let (_dir, state) =
         state_with_files(&[("app/a.txt", b"a"), (".shell-tunnel-uploads/x.part", b"p")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1275,7 +1276,7 @@ async fn body_bytes(response: axum::response::Response) -> Vec<u8> {
 #[tokio::test]
 async fn download_returns_the_whole_file_with_an_etag() {
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1302,7 +1303,7 @@ async fn download_returns_the_whole_file_with_an_etag() {
 #[tokio::test]
 async fn download_honours_a_range() {
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1329,7 +1330,7 @@ async fn download_honours_a_range() {
 #[tokio::test]
 async fn an_unsatisfiable_range_is_refused() {
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1362,7 +1363,7 @@ async fn an_unrecognised_range_unit_is_ignored_not_refused() {
     // first built from asserted the opposite for `parse_range` in isolation;
     // this is the HTTP-level proof the corrected behaviour actually ships.
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1382,7 +1383,7 @@ async fn an_unrecognised_range_unit_is_ignored_not_refused() {
 #[tokio::test]
 async fn download_refuses_a_directory_with_not_a_file() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1427,7 +1428,7 @@ async fn download_head_does_not_read_a_file_it_lacks_permission_to_open() {
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -1480,7 +1481,7 @@ async fn download_head_with_a_range_does_not_read_a_file_it_lacks_permission_to_
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -1508,7 +1509,7 @@ async fn download_head_with_a_range_does_not_read_a_file_it_lacks_permission_to_
 #[tokio::test]
 async fn download_head_reports_content_length_without_reading_the_body() {
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1541,7 +1542,7 @@ async fn download_head_honours_a_range_without_reading_the_body() {
     // ranged `HEAD` still 206s (does not collapse to a whole-file 200) and
     // that its `content-length` matches the *range*, not the file.
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1576,7 +1577,7 @@ async fn download_head_honours_a_range_without_reading_the_body() {
 #[tokio::test]
 async fn if_range_falls_back_to_the_whole_file_when_it_changed() {
     let (dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
 
     let first = app
         .oneshot(
@@ -1597,7 +1598,7 @@ async fn if_range_falls_back_to_the_whole_file_when_it_changed() {
     // Change the file, so the stale validator must be rejected.
     std::fs::write(dir.path().join("app/a.bin"), b"COMPLETELY DIFFERENT").expect("rewrite");
 
-    let second = create_router_with_state(state)
+    let second = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/file?path=app/a.bin")
@@ -1618,7 +1619,7 @@ async fn if_range_falls_back_to_the_whole_file_when_it_changed() {
 async fn if_range_serves_the_range_when_unchanged() {
     let (_dir, state) = state_with_files(&[("app/a.bin", b"hello world")]);
 
-    let first = create_router_with_state(state.clone())
+    let first = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/file?path=app/a.bin")
@@ -1634,7 +1635,7 @@ async fn if_range_serves_the_range_when_unchanged() {
         .expect("etag")
         .to_string();
 
-    let second = create_router_with_state(state)
+    let second = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri("/api/v1/fs/file?path=app/a.bin")
@@ -1763,7 +1764,7 @@ async fn list_head_allows_a_token_holding_fs_read() {
 #[tokio::test]
 async fn delete_removes_a_file() {
     let (dir, state) = state_with_files(&[("app/old.dll", b"stale")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1783,7 +1784,7 @@ async fn delete_removes_a_file() {
 #[tokio::test]
 async fn delete_refuses_a_directory() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1813,7 +1814,7 @@ async fn delete_refuses_a_path_outside_the_root() {
     let (dir, state) = state_with_a_neighbour("outside.txt", b"do not touch");
     let neighbour = dir.path().join("outside.txt");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -1871,7 +1872,7 @@ fn state_with_a_neighbour(
 #[tokio::test]
 async fn delete_refuses_a_path_ending_in_dot_dot() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1896,7 +1897,7 @@ async fn delete_refuses_a_path_ending_in_dot_dot() {
 #[tokio::test]
 async fn delete_refuses_a_path_ending_in_dot_dot_even_with_recursive() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -1942,7 +1943,7 @@ async fn delete_refuses_a_path_ending_in_dot() {
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -1982,7 +1983,7 @@ async fn delete_refuses_a_path_ending_in_dot_even_with_recursive() {
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -2029,7 +2030,7 @@ async fn delete_refuses_a_path_ending_in_dot_even_with_recursive() {
 #[tokio::test]
 async fn delete_refuses_a_path_component_containing_a_colon() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -2048,7 +2049,7 @@ async fn delete_refuses_a_path_component_containing_a_colon() {
 #[tokio::test]
 async fn delete_reports_not_found_for_a_missing_file() {
     let (_dir, state) = state_with_files(&[("app/a.txt", b"a")]);
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(
@@ -2114,7 +2115,7 @@ async fn delete_removes_a_symlink_without_touching_its_target() {
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -2153,7 +2154,7 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
         return;
     }
 
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
     let response = app
         .oneshot(
             Request::builder()
@@ -2185,7 +2186,7 @@ async fn delete_removes_a_directory_symlink_without_recursing() {
 async fn deleting_a_directory_without_recursive_is_refused() {
     let (dir, state) = state_with_files(&[("app/config.json", b"hello")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2219,7 +2220,7 @@ async fn deleting_a_directory_without_recursive_is_refused() {
 async fn a_dry_run_reports_the_tree_and_leaves_it_alone() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"xy"), ("app/deep/b.txt", b"xy")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2259,7 +2260,7 @@ async fn a_misspelled_dry_run_is_refused_rather_than_deleting_the_file() {
     let delete = |state, query: &str| {
         let uri = format!("/api/v1/fs/file?{query}");
         async move {
-            create_router_with_state(state)
+            common::plain_app(state)
                 .oneshot(
                     Request::builder()
                         .method("DELETE")
@@ -2342,7 +2343,7 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
          different induction here, the same way the Windows sibling below uses one"
     );
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2406,7 +2407,7 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
         .open(&locked)
         .expect("open directory exclusively");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2449,7 +2450,7 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_reported_as_incomplete_no
 async fn a_recursive_delete_removes_the_tree() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"xy"), ("app/deep/b.txt", b"xy")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2478,7 +2479,7 @@ async fn a_tree_holding_a_live_upload_is_refused_without_removing_anything() {
     std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
     let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2511,7 +2512,7 @@ async fn a_tree_holding_only_an_orphaned_staging_file_is_removed_whole() {
     std::fs::write(staging.join("up-0000000000000000.part"), b"x").expect("write orphan");
     std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2538,7 +2539,7 @@ async fn a_recursive_delete_works_without_a_jail() {
     std::fs::write(dir.path().join("sub/a.txt"), b"xy").expect("write");
     std::fs::write(dir.path().join("sub/deep/b.txt"), b"xy").expect("write");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2580,7 +2581,7 @@ async fn a_partial_removal_is_not_reported_as_success() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555))
         .expect("chmod locked");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2644,7 +2645,7 @@ async fn a_partial_removal_is_not_reported_as_success() {
         .open(&locked_file)
         .expect("open exclusively");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2687,7 +2688,7 @@ async fn a_partial_removal_is_not_reported_as_success() {
 async fn deleting_a_single_file_still_answers_204() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2712,7 +2713,7 @@ async fn deleting_a_single_file_still_answers_204() {
 async fn a_dry_run_on_a_single_file_reports_it_and_leaves_it_alone() {
     let (dir, state) = state_with_files(&[("app/a.txt", b"xy")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -2738,7 +2739,7 @@ async fn a_dry_run_on_a_single_file_reports_it_and_leaves_it_alone() {
 async fn an_upload_round_trips_and_publishes_atomically() {
     let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2765,7 +2766,7 @@ async fn an_upload_round_trips_and_publishes_atomically() {
     // Not published yet.
     assert!(!dir.path().join("app/new.bin").exists());
 
-    let patched = create_router_with_state(state.clone())
+    let patched = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2782,7 +2783,7 @@ async fn an_upload_round_trips_and_publishes_atomically() {
     // Still not published: only `complete` renames.
     assert!(!dir.path().join("app/new.bin").exists());
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2814,7 +2815,7 @@ async fn a_request_carrying_the_relay_marker_gets_the_relayed_chunk_size() {
     let (_dir, mut state) = state_with_files(&[]);
     state = state.with_chunk_size(DEFAULT_CHUNK_SIZE, RELAY_CHUNK_SIZE);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2843,7 +2844,7 @@ async fn a_request_carrying_the_relay_marker_gets_the_relayed_chunk_size() {
     );
 
     let oversized = vec![0_u8; RELAY_CHUNK_SIZE + 1];
-    let patched = create_router_with_state(state)
+    let patched = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2871,7 +2872,7 @@ async fn a_request_carrying_the_relay_marker_gets_the_relayed_chunk_size() {
 async fn a_resumed_upload_continues_from_the_reported_offset() {
     let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2894,7 +2895,7 @@ async fn a_resumed_upload_continues_from_the_reported_offset() {
         .expect("upload_id")
         .to_string();
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2907,7 +2908,7 @@ async fn a_resumed_upload_continues_from_the_reported_offset() {
         .expect("response");
 
     // The client "reconnects" and asks where it left off.
-    let status = create_router_with_state(state.clone())
+    let status = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/fs/uploads/{id}"))
@@ -2919,7 +2920,7 @@ async fn a_resumed_upload_continues_from_the_reported_offset() {
     let offset = body_json(status).await["offset"].as_u64().expect("offset");
     assert_eq!(offset, 6);
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2931,7 +2932,7 @@ async fn a_resumed_upload_continues_from_the_reported_offset() {
         .await
         .expect("response");
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2953,7 +2954,7 @@ async fn a_bad_checksum_refuses_and_leaves_no_file() {
     let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
     let wrong = "0".repeat(64);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -2976,7 +2977,7 @@ async fn a_bad_checksum_refuses_and_leaves_no_file() {
         .expect("upload_id")
         .to_string();
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -2988,7 +2989,7 @@ async fn a_bad_checksum_refuses_and_leaves_no_file() {
         .await
         .expect("response");
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3018,7 +3019,7 @@ async fn a_second_session_for_the_same_destination_is_refused() {
         )
     };
 
-    let first = create_router_with_state(state.clone())
+    let first = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3031,7 +3032,7 @@ async fn a_second_session_for_the_same_destination_is_refused() {
         .expect("response");
     assert_eq!(first.status(), StatusCode::CREATED);
 
-    let second = create_router_with_state(state)
+    let second = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3050,7 +3051,7 @@ async fn an_upload_may_not_target_a_path_outside_the_root() {
     let (dir, state) = state_with_a_neighbour("keep.txt", b"k");
     let escape = dir.path().join("escape.bin");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3096,7 +3097,7 @@ async fn an_upload_may_not_target_a_path_outside_the_root() {
 async fn a_permitted_upload_into_the_same_fixture_does_create_staging() {
     let (dir, state) = state_with_a_neighbour("keep.txt", b"k");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3139,7 +3140,7 @@ async fn a_chunk_at_the_advertised_chunk_size_round_trips_through_the_router() {
         hasher.finish()
     };
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3163,7 +3164,7 @@ async fn a_chunk_at_the_advertised_chunk_size_round_trips_through_the_router() {
         .expect("upload_id")
         .to_string();
 
-    let patched = create_router_with_state(state.clone())
+    let patched = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3184,7 +3185,7 @@ async fn a_chunk_at_the_advertised_chunk_size_round_trips_through_the_router() {
     );
     assert_eq!(body_json(patched).await["offset"], chunk_size as u64);
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3307,7 +3308,7 @@ async fn append_chunk_allows_a_token_holding_fs_write() {
 async fn complete_upload_forbids_a_token_lacking_fs_write() {
     let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
     let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3335,7 +3336,7 @@ async fn complete_upload_forbids_a_token_lacking_fs_write() {
 async fn complete_upload_allows_a_token_holding_fs_write() {
     let (dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
     let id = create_test_upload(state.clone(), "app/new.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3418,14 +3419,14 @@ async fn two_sessions_for_aliased_spellings_of_one_destination_are_refused() {
             .expect("request")
     };
 
-    let first = create_router_with_state(state.clone())
+    let first = common::plain_app(state.clone())
         .oneshot(create("app/aliased.bin"))
         .await
         .expect("response");
     assert_eq!(first.status(), StatusCode::CREATED);
 
     for alias in ["./app/aliased.bin", "app\\aliased.bin", "app/./aliased.bin"] {
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(create(alias))
             .await
             .expect("response");
@@ -3450,7 +3451,7 @@ async fn the_upload_body_limit_does_not_leak_to_other_routes() {
     // a route it must not have.
     let oversized = || vec![0_u8; 3 * 1024 * 1024];
 
-    let execute_response = create_router_with_state(AppState::new())
+    let execute_response = common::plain_app(AppState::new())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3471,7 +3472,7 @@ async fn the_upload_body_limit_does_not_leak_to_other_routes() {
     // fs route quietly gained an 8 MiB limit. `POST /api/v1/fs/uploads` is
     // inside `fs_routes()`, so it closes exactly that gap: it must still
     // 413 at the 2 MiB default too.
-    let create_upload_response = create_router_with_state(AppState::new())
+    let create_upload_response = common::plain_app(AppState::new())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3496,7 +3497,7 @@ async fn the_upload_body_limit_does_not_leak_to_other_routes() {
 async fn create_upload_refuses_a_destination_that_is_already_a_directory() {
     let (_dir, state) = state_with_files(&[("app/existing_dir/inside.txt", b"x")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3529,7 +3530,7 @@ async fn create_upload_refuses_a_destination_that_is_already_a_directory() {
 async fn create_upload_refuses_a_destination_inside_the_staging_directory() {
     let (_dir, state) = state_with_files(&[("app/keep.txt", b"k")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3579,7 +3580,7 @@ async fn create_upload_refuses_a_destination_inside_the_staging_directory() {
 async fn state_with_a_staged_upload() -> (tempfile::TempDir, AppState, String) {
     let (dir, state) = state_with_files(&[]);
 
-    let create = create_router_with_state(state.clone())
+    let create = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3603,7 +3604,7 @@ async fn state_with_a_staged_upload() -> (tempfile::TempDir, AppState, String) {
         .expect("upload_id")
         .to_string();
 
-    let patch = create_router_with_state(state.clone())
+    let patch = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3624,7 +3625,7 @@ async fn state_with_a_staged_upload() -> (tempfile::TempDir, AppState, String) {
 async fn stat_refuses_a_path_inside_the_staging_directory() {
     let (_dir, state, staging_path) = state_with_a_staged_upload().await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/fs/stat?path={staging_path}"))
@@ -3643,7 +3644,7 @@ async fn stat_refuses_a_path_inside_the_staging_directory() {
 async fn download_refuses_a_path_inside_the_staging_directory() {
     let (_dir, state, staging_path) = state_with_a_staged_upload().await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .uri(format!("/api/v1/fs/file?path={staging_path}"))
@@ -3662,7 +3663,7 @@ async fn download_refuses_a_path_inside_the_staging_directory() {
 async fn delete_refuses_a_path_inside_the_staging_directory() {
     let (_dir, state, staging_path) = state_with_a_staged_upload().await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -3704,7 +3705,7 @@ async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (state, log) = audited_state(&dir);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3737,7 +3738,7 @@ async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
         ("bytes 0-5/11", &b"hello "[..]),
         ("bytes 6-10/11", &b"world"[..]),
     ] {
-        create_router_with_state(state.clone())
+        common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("PATCH")
@@ -3750,7 +3751,7 @@ async fn a_completed_upload_is_audited_once_with_its_path_and_size() {
             .expect("response");
     }
 
-    create_router_with_state(state)
+    common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3801,7 +3802,7 @@ async fn an_abandoned_session_is_audited_when_it_is_swept() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (state, log) = audited_state(&dir);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3824,7 +3825,7 @@ async fn an_abandoned_session_is_audited_when_it_is_swept() {
         .expect("upload_id")
         .to_string();
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3865,7 +3866,7 @@ async fn a_cancelled_upload_is_audited() {
     let dir = tempfile::tempdir().expect("tempdir");
     let (state, log) = audited_state(&dir);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3888,7 +3889,7 @@ async fn a_cancelled_upload_is_audited() {
         .expect("upload_id")
         .to_string();
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3900,7 +3901,7 @@ async fn a_cancelled_upload_is_audited() {
         .await
         .expect("response");
 
-    let cancelled = create_router_with_state(state)
+    let cancelled = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -3937,7 +3938,7 @@ async fn a_checksum_mismatch_is_audited_as_rejected() {
     let (state, log) = audited_state(&dir);
     let wrong = "0".repeat(64);
 
-    let created = create_router_with_state(state.clone())
+    let created = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -3960,7 +3961,7 @@ async fn a_checksum_mismatch_is_audited_as_rejected() {
         .expect("upload_id")
         .to_string();
 
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -3972,7 +3973,7 @@ async fn a_checksum_mismatch_is_audited_as_rejected() {
         .await
         .expect("response");
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4002,7 +4003,7 @@ async fn a_deleted_file_is_audited() {
     std::fs::write(dir.path().join("old.dll"), b"stale").expect("write");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4026,9 +4027,9 @@ async fn a_deleted_file_is_audited() {
 /// event identifies who made the request, not just what happened. Routed
 /// through the real capability-checking router (`secure_app_with_token`, used
 /// throughout this file for the auth tests above) rather than
-/// `create_router_with_state`, which never inserts an identity extension at
-/// all — that gap would make this pass even if `delete_file` dropped the
-/// extractor entirely.
+/// `common::plain_app`, which runs with authentication off and so says nothing
+/// about who the caller was — that gap would make this pass even if
+/// `delete_file` dropped the extractor entirely.
 #[tokio::test]
 async fn a_deleted_files_audit_event_carries_the_callers_identity() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -4064,7 +4065,7 @@ async fn a_clean_dry_run_over_a_tree_is_audited_as_fs_delete_dry_run() {
     std::fs::write(dir.path().join("app/deep/b.txt"), b"xy").expect("write");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4093,7 +4094,7 @@ async fn a_clean_recursive_delete_is_audited_as_fs_delete_with_its_entry_count()
     std::fs::write(dir.path().join("app/deep/b.txt"), b"xy").expect("write");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4127,7 +4128,7 @@ async fn a_partial_recursive_delete_is_audited_as_fs_delete_partial() {
         .expect("chmod locked");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4173,7 +4174,7 @@ async fn a_partial_recursive_delete_is_audited_as_fs_delete_partial() {
         .expect("open exclusively");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4216,7 +4217,7 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_audited_as_preview_incomp
     );
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4261,7 +4262,7 @@ async fn a_dry_run_that_cannot_enumerate_everything_is_audited_as_preview_incomp
         .expect("open directory exclusively");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4299,7 +4300,7 @@ async fn a_directory_creation_failure_at_complete_is_audited_as_failed() {
     let (state, log) = audited_state(&dir);
 
     let id = create_test_upload(state.clone(), "blocker/inner.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4311,7 +4312,7 @@ async fn a_directory_creation_failure_at_complete_is_audited_as_failed() {
         .await
         .expect("response");
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4346,7 +4347,7 @@ async fn a_rename_failure_at_complete_is_audited_as_failed() {
     let (state, log) = audited_state(&dir);
 
     let id = create_test_upload(state.clone(), "raced.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4363,7 +4364,7 @@ async fn a_rename_failure_at_complete_is_audited_as_failed() {
     // but nothing stops another process on the same filesystem either.
     std::fs::create_dir_all(dir.path().join("raced.bin")).expect("race a directory into place");
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4415,7 +4416,7 @@ async fn a_resolve_failure_at_complete_is_audited_as_failed() {
         .with_audit(std::sync::Arc::new(sink));
 
     let id = create_test_upload(state.clone(), "escaped/inner.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4442,7 +4443,7 @@ async fn a_resolve_failure_at_complete_is_audited_as_failed() {
         return; // symlink privilege unavailable on this runner; skip
     }
 
-    let completed = create_router_with_state(state)
+    let completed = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4479,7 +4480,7 @@ async fn an_orphaned_staging_file_is_audited_and_correlates_to_its_start_by_uplo
     let (state, log) = audited_state(&dir);
 
     let id = create_test_upload(state.clone(), "orphan.bin", b"hello world").await;
-    create_router_with_state(state.clone())
+    common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4537,7 +4538,7 @@ async fn a_directory_delete_without_recursive_is_audited_as_refused() {
     std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
     let (state, log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4588,7 +4589,7 @@ async fn a_tree_holding_a_live_upload_is_audited_as_refused() {
     std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
     let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4621,7 +4622,7 @@ async fn a_tree_holding_a_live_upload_is_audited_as_refused() {
 async fn deleting_a_reserved_path_is_audited_as_refused() {
     let (_dir, state, staging_path, log) = audited_state_with_a_staged_upload().await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4662,7 +4663,7 @@ async fn a_delete_the_filesystem_refuses_is_audited_as_failed() {
     // the resolution and lstat above it working.
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).expect("chmod");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4708,7 +4709,7 @@ async fn a_delete_the_filesystem_refuses_is_audited_as_failed() {
         .open(&target)
         .expect("open exclusively");
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4746,7 +4747,7 @@ async fn audited_state_with_a_staged_upload(
     // One chunk, so the staging file actually exists on disk: `delete`
     // resolves the path before it consults the reservation, and a path that
     // is not there is a 404 long before it is a refusal.
-    let patch = create_router_with_state(state.clone())
+    let patch = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4842,7 +4843,7 @@ async fn cancelling_an_upload_reclaims_its_staging_directory() {
         "staging must exist while a session is live"
     );
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4899,7 +4900,7 @@ async fn a_sibling_session_keeps_the_staging_directory_alive() {
 async fn push_and_complete(state: AppState, id: &str, payload: &[u8]) {
     let last = payload.len() - 1;
     let total = payload.len();
-    let patch = create_router_with_state(state.clone())
+    let patch = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("PATCH")
@@ -4912,7 +4913,7 @@ async fn push_and_complete(state: AppState, id: &str, payload: &[u8]) {
         .expect("response");
     assert_eq!(patch.status(), StatusCode::OK, "chunk must be accepted");
 
-    let complete = create_router_with_state(state)
+    let complete = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -4937,7 +4938,7 @@ async fn a_preview_is_not_refused_by_an_upload_in_flight() {
     std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
     let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
 
-    let response = create_router_with_state(state.clone())
+    let response = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -4977,7 +4978,7 @@ async fn the_removal_is_still_refused_by_an_upload_in_flight() {
     std::fs::write(dir.path().join("sub/keep.txt"), b"xy").expect("write");
     let _id = create_test_upload(state.clone(), &format!("{base}/sub/x.bin"), b"hello world").await;
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5003,7 +5004,7 @@ async fn a_clean_preview_reports_staging_in_tree_as_false() {
     std::fs::write(dir.path().join("app/a.txt"), b"xy").expect("write");
     let (state, _log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5036,7 +5037,7 @@ async fn a_single_entry_preview_carries_staging_in_tree_too() {
     std::fs::write(dir.path().join("app/a.txt"), b"xyz").expect("write");
     let (state, _log) = audited_state(&dir);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5078,7 +5079,7 @@ async fn a_refused_upload_is_audited_rather_than_silent() {
 
     let first = create_test_upload(state.clone(), "app.bin", b"hello world").await;
 
-    let refused = create_router_with_state(state)
+    let refused = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -5128,7 +5129,7 @@ async fn two_refusals_sharing_a_status_are_recorded_under_different_reasons() {
     std::fs::create_dir(dir.path().join("adir")).expect("mkdir");
     let (state, log) = audited_state(&dir);
 
-    let refused = create_router_with_state(state)
+    let refused = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -5177,7 +5178,7 @@ async fn a_jailed_delete_reports_the_uploads_still_destined_into_the_tree() {
     let (dir, state) = state_with_files(&[("tree/sub/keep.txt", b"xy")]);
     let _id = create_test_upload(state.clone(), "tree/sub/x.bin", b"hello world").await;
 
-    let response = create_router_with_state(state.clone())
+    let response = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5218,7 +5219,7 @@ async fn a_delete_with_nothing_headed_for_it_reports_zero_rather_than_nothing() 
         "/api/v1/fs/file?path=tree&recursive=true&dry_run=true",
         "/api/v1/fs/file?path=tree&recursive=true",
     ] {
-        let response = create_router_with_state(state.clone())
+        let response = common::plain_app(state.clone())
             .oneshot(
                 Request::builder()
                     .method("DELETE")
@@ -5242,7 +5243,7 @@ async fn an_upload_headed_elsewhere_is_not_counted_against_this_tree() {
     let (_dir, state) = state_with_files(&[("tree/keep.txt", b"xy"), ("other/keep.txt", b"xy")]);
     let _id = create_test_upload(state.clone(), "other/x.bin", b"hello world").await;
 
-    let response = create_router_with_state(state.clone())
+    let response = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5272,7 +5273,7 @@ async fn a_single_file_preview_reports_an_upload_destined_at_that_very_path() {
     let (_dir, state) = state_with_files(&[("doomed.bin", b"old")]);
     let _id = create_test_upload(state.clone(), "doomed.bin", b"hello world").await;
 
-    let response = create_router_with_state(state.clone())
+    let response = common::plain_app(state.clone())
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5302,7 +5303,7 @@ async fn a_single_file_preview_reports_an_upload_destined_at_that_very_path() {
 async fn a_single_file_preview_with_no_upload_headed_at_it_reports_zero() {
     let (_dir, state) = state_with_files(&[("plain.txt", b"x")]);
 
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5360,7 +5361,7 @@ fn the_delete_response_has_one_definition() {
 #[tokio::test]
 async fn an_entry_directly_under_the_unix_root_can_be_named_for_deletion() {
     let state = AppState::new().with_fs_root(FsRoot::machine_wide());
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")
@@ -5397,7 +5398,7 @@ async fn delete_refuses_a_path_naming_a_filesystem_anchor() {
     } else {
         "/".to_string()
     };
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method("DELETE")

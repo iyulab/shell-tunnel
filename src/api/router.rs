@@ -189,28 +189,16 @@ fn register_key(store: &ApiKeyStore, key: &str, capabilities: &Option<Capability
     }
 }
 
-/// Create the API router with all routes configured.
-pub fn create_router() -> Router {
-    create_router_with_state(AppState::new())
-}
-
-/// Create the API router with custom state (no security).
-///
-/// This "no security" convenience constructor uses the restrictive CORS
-/// default (no permissive CORS headers emitted).
-pub fn create_router_with_state(state: AppState) -> Router {
-    seal(routes().layer(TraceLayer::new_for_http()), state)
-}
-
 /// Every route this server has, and nothing else — no layers, no state.
 ///
-/// The one place the route table is written. Both public constructors build
-/// on it: [`create_router_with_state`] adds tracing and seals; [`create_secure_router`]
-/// adds authentication, rate limiting, and the optional guards between them and
-/// seals. Until 0.25.0 each constructor spelled the table out itself, and the
-/// two copies could only be kept equal by reading both — `RequiredCapability::for_route`
-/// below maps *matched-path strings*, so a route present in one copy and not the
-/// other would authenticate in one router and 404 in the other, silently.
+/// The one place the route table is written, built on by [`create_secure_router`],
+/// which adds authentication, rate limiting, and the optional guards between
+/// them and seals. Until 0.25.0 two constructors each spelled the table out
+/// themselves, and the two copies could only be kept equal by reading both —
+/// `RequiredCapability::for_route` below maps *matched-path strings*, so a route
+/// present in one copy and not the other would authenticate in one router and 404
+/// in the other, silently. There is now one constructor, so there is one
+/// copy.
 fn routes() -> Router<AppState> {
     // Session routes
     let session_routes = Router::new()
@@ -249,7 +237,7 @@ fn routes() -> Router<AppState> {
 
 /// Put the outermost guard on a router and give it its state.
 ///
-/// The last step of both constructors, and the only place
+/// The last step of the constructor, and the only place
 /// [`drain_request_body_middleware`] is attached: it has to sit outside
 /// everything that can refuse a request, so no refusal is answered with the
 /// body still unread — an embedder serving the plain router answers a refusal
@@ -1235,7 +1223,7 @@ mod tests {
 
     #[test]
     fn test_router_creation() {
-        let _router = create_router();
+        let _router = create_secure_router(AppState::new(), SecurityConfig::development());
         // Router created successfully
     }
 

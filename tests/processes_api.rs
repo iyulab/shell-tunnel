@@ -4,6 +4,8 @@
 //! Every command here is one the platform shell runs itself (`echo`, `sort`,
 //! `ping`/`sleep`) — no interpreter whose startup time would decide a test.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,7 +13,6 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{json, Value};
 use shell_tunnel::api::handlers::AppState;
-use shell_tunnel::api::router::create_router_with_state;
 use shell_tunnel::audit::AuditSink;
 use tower::ServiceExt;
 
@@ -58,7 +59,7 @@ impl Api {
     }
 
     async fn call(&self, method: Method, uri: &str, body: Body) -> (StatusCode, Value) {
-        let response = create_router_with_state(self.state.clone())
+        let response = common::plain_app(self.state.clone())
             .oneshot(
                 Request::builder()
                     .method(method)

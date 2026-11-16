@@ -2,6 +2,8 @@
 //! through the real router: what each creates, what each refuses to replace,
 //! and what the audit trail keeps.
 
+mod common;
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -9,7 +11,6 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use serde_json::{json, Value};
 use shell_tunnel::api::handlers::AppState;
-use shell_tunnel::api::router::create_router_with_state;
 use shell_tunnel::audit::AuditSink;
 use shell_tunnel::FsRoot;
 use tower::ServiceExt;
@@ -44,7 +45,7 @@ impl Fixture {
         if uri.contains("/mkdir") || uri.contains("/move") || uri.ends_with("/uploads") {
             request = request.header("content-type", "application/json");
         }
-        let response = create_router_with_state(self.state.clone())
+        let response = common::plain_app(self.state.clone())
             .oneshot(request.body(body).expect("request"))
             .await
             .expect("response");
@@ -467,7 +468,7 @@ async fn a_machine_wide_put_leaves_no_staging_directory_beside_the_file() {
         .trim_start_matches(r"\\?\")
         .replace('\\', "/");
     let state = AppState::new().with_fs_root(FsRoot::machine_wide());
-    let response = create_router_with_state(state)
+    let response = common::plain_app(state)
         .oneshot(
             Request::builder()
                 .method(Method::PUT)

@@ -2,14 +2,14 @@
 //!
 //! These tests verify the complete API flow end-to-end using axum's test utilities.
 
+mod common;
+
 use axum::{
     body::Body,
     http::{header, Method, Request, StatusCode},
 };
 use serde_json::{json, Value};
-use shell_tunnel::api::{
-    create_router, create_router_with_state, create_secure_router, AppState, SecurityConfig,
-};
+use shell_tunnel::api::{create_secure_router, AppState, SecurityConfig};
 use tower::ServiceExt;
 
 /// Helper to create a JSON request.
@@ -47,7 +47,7 @@ async fn response_json(response: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn test_health_endpoint() {
-    let app = create_router();
+    let app = common::plain_app(AppState::new());
 
     let response = app
         .oneshot(json_request(Method::GET, "/health", None))
@@ -61,7 +61,7 @@ async fn test_health_endpoint() {
 #[tokio::test]
 async fn test_api_info_endpoint() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     // Try both with and without trailing slash
     let response = app
@@ -83,7 +83,7 @@ async fn test_api_info_endpoint() {
 #[tokio::test]
 async fn test_list_sessions_empty() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(Method::GET, "/api/v1/sessions", None))
@@ -100,7 +100,7 @@ async fn test_list_sessions_empty() {
 #[tokio::test]
 async fn test_create_session() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(
@@ -132,7 +132,7 @@ async fn a_session_create_refuses_every_field_it_used_to_ignore() {
         json!({"working_dir": "/tmp"}),
         json!({"env": {"MY_VAR": "my_value"}}),
     ] {
-        let app = create_router_with_state(AppState::new());
+        let app = common::plain_app(AppState::new());
         let response = app
             .oneshot(json_request(
                 Method::POST,
@@ -157,7 +157,7 @@ async fn a_session_create_refuses_every_field_it_used_to_ignore() {
 /// different thing and still a refusal — the caller said a body was coming.
 #[tokio::test]
 async fn a_session_can_be_created_without_a_request_body() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     let bodyless = Request::builder()
         .method(Method::POST)
@@ -178,7 +178,7 @@ async fn a_session_can_be_created_without_a_request_body() {
 /// which two values this API can never return.
 #[tokio::test]
 async fn a_session_status_reports_running_and_not_a_working_directory() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     let created = app
         .clone()
@@ -218,7 +218,7 @@ async fn a_session_status_reports_running_and_not_a_working_directory() {
 /// `idle_seconds`.
 #[tokio::test]
 async fn a_session_reports_running_while_a_command_is_in_flight() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     let created = app
         .clone()
@@ -277,7 +277,7 @@ async fn a_session_reports_running_while_a_command_is_in_flight() {
 /// `Session`.
 #[tokio::test]
 async fn a_session_list_entry_carries_the_same_execution_count_as_its_detail() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     let created = app
         .clone()
@@ -342,7 +342,7 @@ async fn a_session_list_entry_carries_the_same_execution_count_as_its_detail() {
 /// detail view (`#[serde(skip_serializing_if = "Option::is_none")]` on both).
 #[tokio::test]
 async fn a_session_list_entry_omits_last_exit_code_before_any_command_runs() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
 
     app.clone()
         .oneshot(json_request(
@@ -368,7 +368,7 @@ async fn a_session_list_entry_omits_last_exit_code_before_any_command_runs() {
 #[tokio::test]
 async fn test_get_session_not_found() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(Method::GET, "/api/v1/sessions/99999", None))
@@ -381,7 +381,7 @@ async fn test_get_session_not_found() {
 #[tokio::test]
 async fn test_delete_session_not_found() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(Method::DELETE, "/api/v1/sessions/99999", None))
@@ -402,7 +402,7 @@ async fn test_delete_session_not_found() {
 #[tokio::test]
 async fn test_execute_oneshot() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(
@@ -427,7 +427,7 @@ async fn an_execute_takes_stdin_and_reports_each_stream() {
     #[cfg(unix)]
     let command = "cat; echo to_err 1>&2";
 
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
     let response = app
         .oneshot(json_request(
             Method::POST,
@@ -461,7 +461,7 @@ async fn an_execute_takes_stdin_and_reports_each_stream() {
 /// The session route reads the same body: `stdin` is not a one-shot-only field.
 #[tokio::test]
 async fn a_session_execute_takes_stdin_too() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
     let created = response_json(
         app.clone()
             .oneshot(json_request(
@@ -500,7 +500,7 @@ async fn a_session_execute_takes_stdin_too() {
 /// command was given input and took none of it.
 #[tokio::test]
 async fn an_execute_without_stdin_omits_stdin_written() {
-    let app = create_router_with_state(AppState::new());
+    let app = common::plain_app(AppState::new());
     let response = app
         .oneshot(json_request(
             Method::POST,
@@ -522,7 +522,7 @@ async fn an_execute_without_stdin_omits_stdin_written() {
 #[tokio::test]
 async fn test_invalid_json_body() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let request = Request::builder()
         .method(Method::POST)
@@ -540,7 +540,7 @@ async fn test_invalid_json_body() {
 #[tokio::test]
 async fn test_method_not_allowed() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(Method::PUT, "/health", None))
@@ -553,7 +553,7 @@ async fn test_method_not_allowed() {
 #[tokio::test]
 async fn test_not_found_route() {
     let state = AppState::new();
-    let app = create_router_with_state(state);
+    let app = common::plain_app(state);
 
     let response = app
         .oneshot(json_request(Method::GET, "/nonexistent", None))
@@ -644,7 +644,7 @@ fn cors_preflight(uri: &str) -> Request<Body> {
 async fn test_cors_restrictive_by_default() {
     // Default build must emit no permissive CORS headers, so a browser preflight
     // for a cross-origin execute POST is not approved.
-    let app = create_router();
+    let app = common::plain_app(AppState::new());
 
     let response = app
         .oneshot(cors_preflight("/api/v1/execute"))
@@ -1182,22 +1182,19 @@ async fn an_enabled_limiter_reports_its_budget() {
 /// asserted on either, and this repo has shipped four user-facing strings that
 /// no test read back.
 ///
-/// Both router constructors are checked. The guard lives in each of them
-/// separately — `create_router_with_state` does not go through
-/// `create_secure_router` — so covering one would leave the other free to lose
-/// it in a refactor while the suite stayed green.
+/// Two configurations are checked — the development one every handler test
+/// uses and the default one a server starts with. The guard is attached in one
+/// place (`seal`), shared by whatever layers are stacked under it; checking more
+/// than one stack is what would catch a layer that answers before it.
 #[tokio::test]
-async fn a_body_past_the_ceiling_is_refused_before_it_is_read_by_either_router() {
+async fn a_body_past_the_ceiling_is_refused_before_it_is_read_by_either_configuration() {
     // One byte past `fs::MAX_CHUNK_SIZE`, the largest body any route accepts.
     let past_the_ceiling = || vec![0_u8; 8 * 1024 * 1024 + 1];
 
     for (name, router) in [
+        ("development", common::plain_app(AppState::new())),
         (
-            "create_router_with_state",
-            create_router_with_state(AppState::new()),
-        ),
-        (
-            "create_secure_router",
+            "default",
             create_secure_router(AppState::new(), SecurityConfig::default()).0,
         ),
     ] {
@@ -1232,7 +1229,7 @@ async fn a_body_under_the_ceiling_still_reaches_the_route_that_refuses_it() {
     // under the ceiling, so it passes the middleware and is then refused by
     // authentication — which would prove nothing about the route's own limit.
     // That it gets that far is itself the point of the test above.
-    let response = create_router_with_state(AppState::new())
+    let response = common::plain_app(AppState::new())
         .oneshot(
             Request::builder()
                 .method(Method::POST)
@@ -1330,7 +1327,7 @@ async fn start_long_command(app: &axum::Router) -> tokio::task::JoinHandle<Statu
 #[tokio::test]
 async fn a_running_command_is_activity() {
     let state = AppState::new();
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
     assert!(shell_tunnel::api::activity::is_idle(&state));
 
     let running = start_long_command(&app).await;
@@ -1346,7 +1343,7 @@ async fn a_running_command_is_activity() {
 #[tokio::test]
 async fn an_idle_session_does_not_block_idleness() {
     let state = AppState::new();
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
 
     let created = app
         .oneshot(json_request(
@@ -1367,7 +1364,7 @@ async fn an_idle_session_does_not_block_idleness() {
 #[tokio::test]
 async fn a_session_command_counts_while_it_runs_and_not_after() {
     let state = AppState::new();
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
     let created = app
         .clone()
         .oneshot(json_request(
@@ -1405,7 +1402,7 @@ async fn a_session_command_counts_while_it_runs_and_not_after() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_open_websocket_is_activity() {
     let state = AppState::new();
-    let router = create_router_with_state(state.clone());
+    let router = common::plain_app(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -1437,7 +1434,7 @@ async fn an_open_websocket_is_activity() {
 #[tokio::test]
 async fn a_latched_server_answers_503_with_retry_after_except_health() {
     let state = AppState::new();
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
     assert!(state.activity.latch());
 
     for (method, uri) in [
@@ -1480,7 +1477,7 @@ async fn a_latched_server_answers_503_with_retry_after_except_health() {
 #[tokio::test]
 async fn latch_fails_while_a_request_is_in_flight() {
     let state = AppState::new();
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
 
     let running = start_long_command(&app).await;
     assert!(!state.activity.latch(), "latched over a running command");
@@ -1508,7 +1505,7 @@ async fn latch_if_idle_refuses_while_an_upload_is_open() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = shell_tunnel::FsRoot::new(dir.path()).expect("root");
     let state = AppState::new().with_fs_root(root);
-    let app = create_router_with_state(state.clone());
+    let app = common::plain_app(state.clone());
 
     let payload = b"half an upload";
     let digest = {

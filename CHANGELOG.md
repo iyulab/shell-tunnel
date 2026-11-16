@@ -25,6 +25,14 @@ bump may carry a behaviour change; breaking items are called out explicitly.
 
 ### Removed
 
+- **Breaking, library: `api::create_router` and `api::create_router_with_state`.** They built the
+  whole route table with no authentication, no rate limit and no host check — a router that runs
+  commands for whoever can reach it, exported beside the secure one. The server never used them.
+  Use `api::create_secure_router(state, SecurityConfig::development())` for the same thing built
+  through the constructor a real server uses (authentication off, rate limit relaxed); it returns
+  the router together with its key store and limiter, so take `.0`. Embedding a server that is
+  reachable by anyone should use `SecurityConfig::secure()` and a key instead.
+
 - Library: `ExecuteCommandResponse::raw_output` and `with_raw_output`. The field was documented as
   «base64 encoded if binary content detected», no route ever set it, and the bytes it would have
   carried were converted to text lossily; the server's responses never had it.

@@ -52,8 +52,8 @@ pub mod websocket;
 // Re-export commonly used types
 pub use handlers::AppState;
 pub use router::{
-    bind, create_router, create_router_with_state, create_secure_router, serve, serve_on,
-    serve_with_state, CorsConfig, NamedToken, SecurityConfig, ServerConfig,
+    bind, create_secure_router, serve, serve_on, serve_with_state, CorsConfig, NamedToken,
+    SecurityConfig, ServerConfig,
 };
 pub use types::{
     CreateSessionRequest, CreateSessionResponse, ErrorResponse, ExecuteCommandRequest,
